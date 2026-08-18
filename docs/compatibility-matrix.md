@@ -3,7 +3,8 @@
 This is the living behavioural mapping from zlob's public surface to ferralk's
 safe Rust API. “Planned” is not a compatibility claim. Each accepted behaviour
 must have one or more corpus cases and every deliberate divergence must name
-its rationale.
+its rationale. For migration examples and the consolidated divergence list,
+read the [compatibility guide](compatibility-guide.md).
 
 ## Matcher
 

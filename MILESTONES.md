@@ -109,7 +109,7 @@ faster than parallel `ignore` + pruning on all traversal corpora.
 **Exit criterion:** 1.0 published, portable on all platforms, Windows tier-2
 CI green — ADR-0010.
 
-- [ ] Compatibility guide: zlob API mapping and all deliberate divergences
+- [x] Compatibility guide: zlob API mapping and all deliberate divergences
 - [ ] Downstream trial: integrate into Palamedes, fold feedback back
 - [ ] MSRV and feature audit; API review (cargo-semver-checks in CI)
 - [ ] Dependency and unsafe audit (expected: zero unsafe before M5)
@@ -365,3 +365,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   `symlink_metadata` error without a timing race. Public unreadable-directory
   and Linux non-UTF-8 integration coverage already exists; the M2 fixture
   aggregate remains open pending an equivalent public disappearing-file hook.
+- Added `docs/compatibility-guide.md`, a migration-oriented companion to the
+  matrix. It maps the supported matcher and walker APIs and calls out every
+  deliberate compatibility difference, deferred result-shaping policy, and
+  currently unsupported walker flag.
