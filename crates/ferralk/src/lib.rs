@@ -461,6 +461,7 @@ fn traversal_pattern_options() -> PatternOptions {
 #[derive(Debug, Clone)]
 struct TraversalPattern {
     matcher: Pattern,
+    directories_only: bool,
     subtree_root: Option<Pattern>,
     literal_root: Option<Vec<u8>>,
     extension: Option<Vec<u8>>,
@@ -472,6 +473,12 @@ impl TraversalPattern {
         // conventional leading `./` spelling without making it part of the
         // candidate path representation.
         let pattern = pattern.strip_prefix(b"./").unwrap_or(pattern);
+        let directories_only = pattern.len() > 1 && pattern.ends_with(b"/");
+        let pattern = if directories_only {
+            &pattern[..pattern.len() - 1]
+        } else {
+            pattern
+        };
         let options = traversal_pattern_options();
         let subtree_root = pattern
             .strip_suffix(b"/**")
@@ -479,14 +486,15 @@ impl TraversalPattern {
             .transpose()?;
         Ok(Self {
             matcher: Pattern::compile(pattern, options)?,
+            directories_only,
             subtree_root,
             literal_root: literal_pattern_root(pattern),
             extension: literal_extension(pattern),
         })
     }
 
-    fn matches(&self, path: &[u8]) -> bool {
-        self.matcher.is_match_path(path)
+    fn matches(&self, path: &[u8], is_dir: bool) -> bool {
+        (!self.directories_only || is_dir) && self.matcher.is_match_path(path)
     }
 
     fn covers_subtree(&self, path: &[u8]) -> bool {
@@ -726,7 +734,7 @@ impl WalkStream {
             .walker
             .excludes
             .iter()
-            .any(|pattern| pattern.matches(bytes))
+            .any(|pattern| pattern.matches(bytes, entry.is_dir))
         {
             return None;
         }
@@ -763,7 +771,7 @@ impl WalkStream {
                 .walker
                 .includes
                 .iter()
-                .any(|pattern| pattern.matches(bytes))
+                .any(|pattern| pattern.matches(bytes, entry.is_dir))
         {
             return None;
         }
@@ -900,7 +908,7 @@ impl<'walker> WalkState<'walker> {
             .walker
             .excludes
             .iter()
-            .any(|pattern| pattern.matches(bytes))
+            .any(|pattern| pattern.matches(bytes, entry.is_dir))
         {
             return Ok(());
         }
@@ -958,7 +966,7 @@ impl<'walker> WalkState<'walker> {
                     .walker
                     .includes
                     .iter()
-                    .any(|pattern| pattern.matches(bytes)))
+                    .any(|pattern| pattern.matches(bytes, entry.is_dir)))
         {
             if git_ignored {
                 return Ok(());
@@ -1278,6 +1286,8 @@ mod tests {
 
         assert_eq!(paths_for("aaa"), vec![PathBuf::from("aaa")]);
         assert_eq!(paths_for("./aaa"), vec![PathBuf::from("aaa")]);
+        assert_eq!(paths_for("aaa/"), vec![PathBuf::from("aaa")]);
+        assert!(paths_for("aaa/tomato/tomato.txt/").is_empty());
         assert_eq!(paths_for("a*a"), vec![PathBuf::from("aaa")]);
         assert_eq!(
             paths_for("xyz/?"),
@@ -1322,6 +1332,29 @@ mod tests {
             .expect("stream source walk succeeds");
         streamed.sort_by(|left, right| left.path().cmp(right.path()));
         assert_eq!(relative_paths(&streamed, &fixture.root), component_local);
+        let trailing_directory = paths_for("aaa/");
+        let trailing_parallel = Walker::new(&fixture.root)
+            .threads(4)
+            .include("aaa/")
+            .expect("valid trailing directory pattern")
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("parallel trailing directory walk succeeds");
+        assert_eq!(
+            relative_paths(trailing_parallel.entries(), &fixture.root),
+            trailing_directory
+        );
+        let mut trailing_streamed = Walker::new(&fixture.root)
+            .include("aaa/")
+            .expect("valid trailing directory pattern")
+            .stream()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream trailing directory walk succeeds");
+        trailing_streamed.sort_by(|left, right| left.path().cmp(right.path()));
+        assert_eq!(
+            relative_paths(&trailing_streamed, &fixture.root),
+            trailing_directory
+        );
         assert_eq!(
             paths_for("*/*/*.txt"),
             vec![

@@ -81,6 +81,9 @@ let result = Walker::new(".")
 selected. `stream()` is intentionally single-threaded and unsorted so it can
 deliver entries incrementally.
 
+Walker include patterns are root-relative. A leading `./` is accepted, and a
+trailing `/` selects matching directories only.
+
 ## Deliberate differences
 
 - Ferralk has no C ABI and no zlob-Rust migration facade. It exposes the two

@@ -345,7 +345,7 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
         .walker
         .excludes
         .iter()
-        .any(|pattern| pattern.matches(bytes))
+        .any(|pattern| pattern.matches(bytes, entry.is_dir))
     {
         return;
     }
@@ -385,7 +385,7 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
             .walker
             .includes
             .iter()
-            .any(|pattern| pattern.matches(bytes))
+            .any(|pattern| pattern.matches(bytes, entry.is_dir))
     {
         return;
     }

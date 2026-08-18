@@ -675,6 +675,12 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   short candidates, matching suffixes, and hidden paths remain checked against
   the general matcher. The result is still above zlob's 2.51 ns non-match
   reference, so the M1 gate remains open.
+- Completed the trailing-slash root-relative glob scenario from frozen
+  `test_rust_glob.zig`: Walker patterns now accept `./` and make a terminal
+  `/` a directory-only constraint, so a matched file with that suffix is not
+  returned. The fixture validates the same behaviour in serial, parallel, and
+  streaming walks; zlob's C-shaped result buffer and `.`/`..` root results
+  remain deliberate API differences.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no
