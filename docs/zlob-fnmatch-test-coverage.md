@@ -42,6 +42,12 @@ composition. Filesystem-only fixture setup remains outside this in-memory API
 coverage boundary; documented C/Rust disagreements for empty Extglob branches
 and `PERIOD` hidden-name filtering stay flagged in the corpus.
 
+One remaining absolute-fixture assertion, `{.a,a,b}.c` without `PERIOD`, is
+intentionally not represented as `match_paths`: zlob's filesystem iterator
+hides its literal dot-prefixed brace alternative, while the in-memory surface
+does not model directory enumeration. It remains a C traversal-surface
+difference, not an unrecorded matcher gap.
+
 `test/test_internal.zig` additionally supplies eleven public `matchPaths`
 scenarios in the same corpus, covering wildcards, classes, literal and empty
 inputs, component paths, and filename punctuation. Its SIMD-helper assertions
@@ -90,6 +96,7 @@ equivalent public Ferralk type today:
 | 338–385 | `PatternContext` template classification | Internal zlob optimization detail; Ferralk exposes a compiled `Pattern`, not a template-inspection API. |
 | 438–448 | private SIMD index helpers | Implementation detail only; ADR-0008 reserves any equivalent optimization for profiling-backed work. |
 | `test/test_path_matcher.zig` C-string chunking and private component limits | ABI-owned output buffers and private fixed-capacity detail | Ferralk returns native `Vec` values and intentionally has no fixed zlob component limit; the public list and index contracts are corpus-covered. |
+| `test/test_absolute_paths.zig` lines 697–719 | Filesystem iterator handling of a literal hidden brace alternative | Ferralk's in-memory matcher cannot express the enumerator gate; the C/Rust distinction is documented above rather than misrepresented as `match_paths`. |
 
 These exclusions are intentionally not counted as corpus coverage. They keep
 the broad M0 “whole zlob test suite” item open until a compatible corpus model
