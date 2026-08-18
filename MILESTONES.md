@@ -648,3 +648,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   hidden brace alternative is filtered during directory enumeration and has no
   truthful in-memory `match_paths` equivalent. This keeps the M0 suite item
   auditable without falsely claiming an API-level semantic gap.
+- Added `WalkEntry::depth()` as the relative component count below the walk
+  root. Serial, parallel, and streaming walks derive the same value without
+  extra path storage; a source-backed basic-tree fixture checks depths one,
+  two, and three alongside entry kinds and paths.

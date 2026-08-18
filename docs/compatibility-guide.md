@@ -70,6 +70,7 @@ let result = Walker::new(".")
 | `ZLOB_ONLYDIR` | `WalkOptions::directories_only(true)` |
 | `ZLOB_WALK_NO_REPORT_DIRS` | `WalkOptions::files_only(true)` |
 | walker `max_depth` | `WalkOptions::max_depth(depth)` |
+| walker entry depth | `WalkEntry::depth()` counts relative components below the root |
 | thread count | `Walker::threads(n)`; `collect()` defaults to available parallelism |
 | metadata requests | `WalkOptions::metadata(true)` |
 | streaming | `Walker::stream()` returns entry-or-error items incrementally |

@@ -330,6 +330,7 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
         .path
         .strip_prefix(&shared.walker.root)
         .unwrap_or(entry.path.as_path());
+    let depth = relative.components().count();
     if !shared.walker.includes_depth(relative) {
         return;
     }
@@ -411,6 +412,7 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
     worker.entries.push(WalkEntry {
         path: entry.path,
         is_dir: entry.is_dir,
+        depth,
         metadata,
     });
 }

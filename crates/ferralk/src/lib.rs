@@ -136,6 +136,7 @@ impl WalkOptions {
 pub struct WalkEntry {
     path: PathBuf,
     is_dir: bool,
+    depth: usize,
     metadata: Option<fs::Metadata>,
 }
 
@@ -150,6 +151,12 @@ impl WalkEntry {
     #[must_use]
     pub const fn is_dir(&self) -> bool {
         self.is_dir
+    }
+
+    /// Number of path components between the walk root and this entry.
+    #[must_use]
+    pub const fn depth(&self) -> usize {
+        self.depth
     }
 
     /// Metadata collected when WalkOptions metadata is enabled.
@@ -664,6 +671,7 @@ impl WalkStream {
             .path
             .strip_prefix(&self.walker.root)
             .unwrap_or(entry.path.as_path());
+        let depth = relative.components().count();
         if !self.walker.includes_depth(relative) {
             return None;
         }
@@ -739,6 +747,7 @@ impl WalkStream {
         Some(Ok(WalkEntry {
             path: entry.path,
             is_dir: entry.is_dir,
+            depth,
             metadata,
         }))
     }
@@ -835,6 +844,7 @@ impl<'walker> WalkState<'walker> {
             .path
             .strip_prefix(&self.walker.root)
             .unwrap_or(entry.path.as_path());
+        let depth = relative.components().count();
         if !self.walker.includes_depth(relative) {
             return Ok(());
         }
@@ -915,6 +925,7 @@ impl<'walker> WalkState<'walker> {
             self.entries.push(WalkEntry {
                 path: entry.path,
                 is_dir: entry.is_dir,
+                depth,
                 metadata,
             });
         }
@@ -1095,6 +1106,22 @@ mod tests {
             .collect()
     }
 
+    fn relative_paths_and_depths(entries: &[WalkEntry], root: &Path) -> Vec<(PathBuf, usize)> {
+        entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry
+                        .path()
+                        .strip_prefix(root)
+                        .expect("entry is rooted in fixture")
+                        .to_path_buf(),
+                    entry.depth(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn include_exclude_and_sort_are_applied_to_relative_paths() {
         let fixture = Fixture::new();
@@ -1171,6 +1198,52 @@ mod tests {
         assert_eq!(
             relative_paths(brace.entries(), &fixture.root),
             vec![PathBuf::from("docs/d.md"), PathBuf::from("src/b.txt")]
+        );
+    }
+
+    #[test]
+    fn source_walk_entry_depths_are_relative_component_counts() {
+        let fixture = Fixture::new();
+        fixture.write("a.txt");
+        fixture.write("src/b.txt");
+        fixture.write("src/sub/c.txt");
+        let options = WalkOptions::default().sort(true);
+        let expected = vec![
+            (PathBuf::from("a.txt"), 1),
+            (PathBuf::from("src"), 1),
+            (PathBuf::from("src/b.txt"), 2),
+            (PathBuf::from("src/sub"), 2),
+            (PathBuf::from("src/sub/c.txt"), 3),
+        ];
+
+        let serial = Walker::new(&fixture.root)
+            .threads(1)
+            .options(options)
+            .collect()
+            .expect("serial walk succeeds");
+        let parallel = Walker::new(&fixture.root)
+            .threads(4)
+            .options(options)
+            .collect()
+            .expect("parallel walk succeeds");
+        let mut streamed = Walker::new(&fixture.root)
+            .options(options)
+            .stream()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream succeeds");
+        streamed.sort_by(|left, right| left.path.cmp(&right.path));
+
+        assert_eq!(
+            relative_paths_and_depths(serial.entries(), &fixture.root),
+            expected
+        );
+        assert_eq!(
+            relative_paths_and_depths(parallel.entries(), &fixture.root),
+            expected
+        );
+        assert_eq!(
+            relative_paths_and_depths(&streamed, &fixture.root),
+            expected
         );
     }
 
