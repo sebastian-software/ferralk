@@ -54,7 +54,7 @@ matcher ≤1.5x zlob median, ≤1.25x `fast-glob` median on the common subset.
 - [ ] Run differential generation against the oracle; triage every
       disagreement into the corpus — ADR-0007
 - [x] Property tests (literal-only patterns, subset/superset invariants)
-- [ ] Fuzzers for parser and matcher with seeded corpora
+- [x] Fuzzers for parser and matcher with seeded corpora
 - [ ] Refactor the ported code toward the immutable IR (after corpus green) —
       ADR-0002
 - [ ] Profile, then apply memchr/memmem hot-path primitives — ADR-0008
@@ -251,3 +251,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   and for wildcard subset invariants (`?` and `a*` are subsets of `*`
   with leading-period matching explicitly enabled). These complement, rather
   than replace, the source-backed corpus tests.
+- Added independent Cargo-Fuzz parser and matcher targets, seeded with corpus
+  syntax, plus a manual nightly workflow with an explicit time budget. Both
+  targets compile with Rust 1.93. **Local tooling note:** `cargo-fuzz` is not
+  installed in this workspace, so no local mutational fuzz run was possible;
+  this does not block the checked-in targets or their CI execution path.

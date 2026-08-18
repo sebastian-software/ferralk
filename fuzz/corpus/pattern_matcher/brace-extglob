@@ -1,0 +1,2 @@
+{src,lib}/@(main|test).{rs,toml}
+src/main.rs
