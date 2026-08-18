@@ -97,7 +97,7 @@ faster than parallel `ignore` + pruning on all traversal corpora.
       per-worker scratch and result shards — ADR-0009
 - [ ] Single cancellation state, lossless error channel, documented panic
       propagation
-- [ ] Loom models for queue and completion state
+- [x] Loom models for queue and completion state
 - [ ] Stress tests: empty/shallow/imbalanced trees, visitor panic,
       worker-start failure
 - [x] Invariant test: parallel == serial result multiset
@@ -323,3 +323,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   imbalanced directory trees. Thirty-two eight-worker traversals each match a
   serial sorted baseline; worker-start-failure and panic cases remain tracked
   separately before the aggregate stress-test milestone can close.
+- Added Loom models for the scheduler's active-task hand-off and terminal
+  completion transition. They ensure a helper cannot mistake an empty queue
+  for completion while the root is creating a child task, and that exactly one
+  worker observes the final completion transition.
