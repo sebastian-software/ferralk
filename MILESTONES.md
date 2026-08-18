@@ -112,7 +112,7 @@ CI green — ADR-0010.
 - [x] Compatibility guide: zlob API mapping and all deliberate divergences
 - [ ] Downstream trial: integrate into Palamedes, fold feedback back
 - [x] MSRV and feature audit; API review (cargo-semver-checks in CI)
-- [ ] Dependency and unsafe audit (expected: zero unsafe before M5)
+- [x] Dependency and unsafe audit (expected: zero unsafe before M5)
 - [x] Oracle retirement check: corpus is self-sufficient, Zig-free CI
       confirmed — ADR-0007
 - [ ] Publish benchmarks
@@ -382,6 +382,10 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   tasks. It verifies that the returned structured error and the caller's
   shared cancellation token agree, complementing the existing lossless
   `Collect`-channel comparison.
+- Completed the local RustSec audit with `cargo-audit` 0.22.2: the current
+  121-package lockfile scanned clean against 1,217 advisories. Combined with
+  the zero-unsafe source scan and the committed CI gate, this closes the M4
+  dependency/unsafe audit before native backend work.
 - Added `WalkOptions::directories_only` as the non-mutating `ZLOB_ONLYDIR`
   mapping. It filters returned files while preserving descent into directories
   across serial, parallel, and streaming walks; `ZLOB_MARK` remains the
