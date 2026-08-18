@@ -274,6 +274,12 @@ impl Pattern {
     where
         T: AsRef<[u8]> + ?Sized + 'a,
     {
+        if !self.needs_path_filter_semantics() {
+            return paths
+                .into_iter()
+                .filter(|path| self.is_match(path.as_ref()))
+                .collect();
+        }
         let mut matcher = self.clone();
         matcher.options.component_wildcards = true;
         for alternative in &mut matcher.alternatives {
@@ -289,6 +295,18 @@ impl Pattern {
             .into_iter()
             .filter(|path| matcher.is_match(path.as_ref()))
             .collect()
+    }
+
+    fn needs_path_filter_semantics(&self) -> bool {
+        self.alternatives.iter().any(|alternative| {
+            alternative.raw.starts_with(b"./")
+                || alternative.tokens.windows(2).any(|tokens| {
+                    matches!(
+                        tokens,
+                        [Token::Separator, Token::Any | Token::Star | Token::Class(_)]
+                    )
+                })
+        })
     }
 
     fn matches_from(
