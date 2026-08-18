@@ -1,0 +1,2 @@
+{"id":"class-001","pattern":"file[0-9].rs","path":"file7.rs","flags":[],"expected":true,"source":"handwritten","note":"Inclusive byte range."}
+{"id":"class-002","pattern":"file[!0-9].rs","path":"filex.rs","flags":[],"expected":true,"source":"handwritten","note":"POSIX negated class."}

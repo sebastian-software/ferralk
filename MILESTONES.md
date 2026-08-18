@@ -163,3 +163,13 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   configuring repository-side Codecov/CodSpeed credentials require maintainer
   authority. The committed workflows are ready; no external message or
   repository setting has been changed.
+
+### 2026-08-18 — M1 matcher baseline started
+
+- Added a safe, byte-first compiled matcher for literals, `*`, `?`, explicit
+  recursive `**`, character classes, backslash escapes, leading-period rules,
+  and ASCII case folding. The public `Pattern` / `PatternOptions` API is
+  intentionally usable now, but its milestone item remains open until braces,
+  extglobs, byte-platform parity, and corpus verification are complete.
+- The harness now replays non-disputed matcher cases, not just their JSON
+  structure. It validates duplicate IDs and rejects unknown feature flags.
