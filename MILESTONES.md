@@ -568,3 +568,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   fast path. The local ten-sample component-filter median improved from about
   779 ns to 632 ns (roughly 19%); the root filter measured about 56 ns. The
   broader immutable-IR refactor and cross-engine release budgets remain open.
+- Added `Pattern::filter_paths_at` and nine source-backed base-directory
+  cases from frozen `test_path_matcher.zig`. It strips only a complete base
+  path component for matching, preserves the caller's original full paths and
+  order, and skips outside candidates. The normal harness and pinned zlob Rust
+  API replay the trailing-slash, empty-base, literal, recursive, `./`, and
+  no-match scenarios successfully.

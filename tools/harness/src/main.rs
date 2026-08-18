@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         })?
                         .is_match(path),
                     CaseKind::HasWildcards => Pattern::has_wildcards(pattern, options),
-                    CaseKind::MatchPaths => {
+                    CaseKind::MatchPaths | CaseKind::MatchPathsAt => {
                         let paths = case
                             .paths
                             .iter()
@@ -83,7 +83,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let matcher = Pattern::compile(pattern, options).map_err(|error| {
                             format!("{}:{}: {error}", file.display(), line_number + 1)
                         })?;
-                        let selected = matcher.filter_paths(&paths);
+                        let selected = match case.kind {
+                            CaseKind::MatchPaths => matcher.filter_paths(&paths),
+                            CaseKind::MatchPathsAt => {
+                                let base_path = decode_bytes(&case.base_path).map_err(|error| {
+                                    format!(
+                                        "{}:{}: invalid base path: {error}",
+                                        file.display(),
+                                        line_number + 1
+                                    )
+                                })?;
+                                matcher.filter_paths_at(base_path, &paths)
+                            }
+                            CaseKind::Matcher | CaseKind::HasWildcards => unreachable!(),
+                        };
                         if selected
                             .iter()
                             .map(|path| path.as_slice())

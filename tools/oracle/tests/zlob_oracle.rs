@@ -3,7 +3,7 @@
 use std::{fs, path::Path};
 
 use corpus::{Case, CaseKind, decode_bytes};
-use zlob::{ZlobFlags, has_wildcards, zlob_match_paths};
+use zlob::{ZlobFlags, has_wildcards, zlob_match_paths, zlob_match_paths_at};
 
 #[test]
 #[ignore = "requires Zig 0.16 and libclang; run only from the manual oracle workflow"]
@@ -41,7 +41,7 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                     })
                     .is_some(),
                 CaseKind::HasWildcards => has_wildcards(pattern, flags(&case.flags)),
-                CaseKind::MatchPaths => {
+                CaseKind::MatchPaths | CaseKind::MatchPathsAt => {
                     if case.flags.iter().any(|flag| flag == "nocheck") {
                         // zlob 1.6.3's Rust FFI aborts on empty input and
                         // returns corrupted bytes for this synthetic result.
@@ -58,11 +58,27 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                             .iter()
                             .map(|path| std::str::from_utf8(path).expect("zlob paths are UTF-8"))
                             .collect::<Vec<_>>();
-                        let selected =
-                            zlob_match_paths(pattern, paths.as_slice(), flags(&case.flags))
-                                .expect("zlob match paths")
-                                .map(|matches| matches.to_strings())
-                                .unwrap_or_default();
+                        let selected = match case.kind {
+                            CaseKind::MatchPaths => {
+                                zlob_match_paths(pattern, paths.as_slice(), flags(&case.flags))
+                            }
+                            CaseKind::MatchPathsAt => {
+                                let base_path =
+                                    decode_bytes(&case.base_path).expect("decode base path");
+                                let base_path = std::str::from_utf8(&base_path)
+                                    .expect("zlob base path is UTF-8");
+                                zlob_match_paths_at(
+                                    base_path,
+                                    pattern,
+                                    paths.as_slice(),
+                                    flags(&case.flags),
+                                )
+                            }
+                            CaseKind::Matcher | CaseKind::HasWildcards => unreachable!(),
+                        }
+                        .expect("zlob match paths")
+                        .map(|matches| matches.to_strings())
+                        .unwrap_or_default();
                         let mut expected = case
                             .oracle_matches
                             .clone()

@@ -24,6 +24,10 @@ pub struct Case {
     /// The external oracle's selected candidates when it intentionally differs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oracle_matches: Option<Vec<String>>,
+    /// Base directory stripped from input candidates for a
+    /// [`CaseKind::MatchPathsAt`] operation.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base_path: String,
     /// Glob or ignore expression, encoded with [`decode_bytes`].
     pub pattern: String,
     /// Candidate path, encoded with [`decode_bytes`].
@@ -62,6 +66,8 @@ pub enum CaseKind {
     HasWildcards,
     /// Filters a caller-owned list of candidate paths.
     MatchPaths,
+    /// Filters full candidate paths after stripping an explicit base directory.
+    MatchPathsAt,
 }
 
 /// Provenance of a corpus result.

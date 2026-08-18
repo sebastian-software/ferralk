@@ -13,9 +13,10 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | Field | Required | Meaning |
 |---|---:|---|
 | `id` | yes | Stable, topic-local identifier, for example `wildcard-001`. |
-| `kind` | no | `matcher` (default), `has_wildcards` for syntax preflight, or `match_paths` for list filtering. |
+| `kind` | no | `matcher` (default), `has_wildcards` for syntax preflight, `match_paths` for list filtering, or `match_paths_at` for base-relative filtering. |
 | `paths` / `matches` | no | Input and Ferralk-selected path lists for `match_paths`, preserving input order. |
 | `oracle_matches` | no | zlob's selected list for a deliberate list-result divergence. |
+| `base_path` | no | Base directory stripped before matching each input path in a `match_paths_at` case. |
 | `pattern` | yes | Glob or ignore expression using the byte codec below. |
 | `path` | yes | Candidate path using the byte codec below; empty for syntax-only records. |
 | `flags` | no | Ordered behaviour switches from the compatibility matrix. |

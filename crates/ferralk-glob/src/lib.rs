@@ -281,20 +281,43 @@ impl Pattern {
     where
         T: AsRef<[u8]> + ?Sized + 'a,
     {
+        paths
+            .into_iter()
+            .filter(|path| self.matches_path_filter(path.as_ref()))
+            .collect()
+    }
+
+    /// Returns the input paths accepted relative to `base_path`, preserving
+    /// the original full paths and caller order. Candidates outside the base
+    /// directory are ignored.
+    #[must_use]
+    pub fn filter_paths_at<'a, T>(
+        &self,
+        base_path: impl AsRef<[u8]>,
+        paths: impl IntoIterator<Item = &'a T>,
+    ) -> Vec<&'a T>
+    where
+        T: AsRef<[u8]> + ?Sized + 'a,
+    {
+        let base_path = base_path.as_ref();
+        paths
+            .into_iter()
+            .filter(|path| {
+                path_after_base(base_path, path.as_ref())
+                    .is_some_and(|relative| self.matches_path_filter(relative))
+            })
+            .collect()
+    }
+
+    fn matches_path_filter(&self, path: &[u8]) -> bool {
         let Some(alternatives) = &self.path_filter_alternatives else {
-            return paths
-                .into_iter()
-                .filter(|path| self.is_match(path.as_ref()))
-                .collect();
+            return self.is_match(path);
         };
         let options = PatternOptions {
             component_wildcards: true,
             ..self.options
         };
-        paths
-            .into_iter()
-            .filter(|path| self.is_match_with(alternatives, options, path.as_ref()))
-            .collect()
+        self.is_match_with(alternatives, options, path)
     }
 
     fn from_alternatives(alternatives: Vec<Alternative>, options: PatternOptions) -> Self {
@@ -726,6 +749,23 @@ fn contains_hidden_component(path: &[u8]) -> bool {
         offset = index + 1;
     }
     false
+}
+
+fn path_after_base<'a>(base_path: &[u8], path: &'a [u8]) -> Option<&'a [u8]> {
+    if base_path.is_empty() {
+        return Some(path);
+    }
+    let base_path = base_path
+        .iter()
+        .rposition(|byte| !is_separator(*byte))
+        .map_or(&base_path[..1], |last| &base_path[..=last]);
+    if base_path.len() == 1 && is_separator(base_path[0]) {
+        return path.strip_prefix(base_path);
+    }
+    let suffix = path.strip_prefix(base_path)?;
+    suffix
+        .strip_prefix(b"/")
+        .or_else(|| cfg!(windows).then(|| suffix.strip_prefix(b"\\")).flatten())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1627,6 +1667,65 @@ mod tests {
         let root_pattern =
             Pattern::compile("*.rs", PatternOptions::default()).expect("root pattern compiles");
         assert!(root_pattern.path_filter_alternatives.is_none());
+    }
+
+    #[test]
+    fn filter_paths_at_matches_relative_to_a_component_boundary() {
+        let recursive = Pattern::compile(
+            "**/*.c",
+            PatternOptions::default().recursive_double_star(true),
+        )
+        .expect("recursive pattern compiles");
+        let paths = [
+            "/home/user/project/src/main.c",
+            "/home/user/project/src/test/unit.c",
+            "/home/user/project/lib/utils.c",
+            "/home/user/project/docs/readme.md",
+            "/home/user/project-other/ignored.c",
+            "/short",
+        ];
+        let expected = vec![
+            &"/home/user/project/src/main.c",
+            &"/home/user/project/src/test/unit.c",
+            &"/home/user/project/lib/utils.c",
+        ];
+        assert_eq!(
+            recursive.filter_paths_at("/home/user/project/", &paths),
+            expected
+        );
+        assert_eq!(
+            recursive.filter_paths_at("/home/user/project", &paths),
+            expected
+        );
+
+        let literal = Pattern::compile("config.json", PatternOptions::default())
+            .expect("literal pattern compiles");
+        assert_eq!(
+            literal.filter_paths_at(
+                "/srv/data",
+                &["/srv/data/config.json", "/srv/data/readme.md"],
+            ),
+            vec![&"/srv/data/config.json"]
+        );
+
+        let dotted = Pattern::compile(
+            "./**/*.c",
+            PatternOptions::default().recursive_double_star(true),
+        )
+        .expect("dot-slash pattern compiles");
+        assert_eq!(
+            dotted.filter_paths_at(
+                "/home/user/project",
+                &[
+                    "/home/user/project/src/main.c",
+                    "/home/user/project/lib/utils.c"
+                ],
+            ),
+            vec![
+                &"/home/user/project/src/main.c",
+                &"/home/user/project/lib/utils.c"
+            ]
+        );
     }
 
     #[test]
