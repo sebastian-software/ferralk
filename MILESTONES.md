@@ -688,6 +688,12 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   meets the 1.5× zlob and 1.25× fast-glob limits against the current local
   references. The M1 benchmark checkbox remains open only for its required
   external CodSpeed confirmation.
+- Ported the nested Gitignore scenario from frozen `test_walk.zig`: parent
+  `*.log` and directory rules apply below the root, a child negation restores
+  `important.log`, a child directory rule prunes its subtree, and `.git` is
+  omitted under the explicit Gitignore opt-in. The source fixture now asserts
+  the same result multiset in serial, parallel, and stream modes, plus the
+  unfiltered opt-out boundary.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no
