@@ -360,3 +360,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   Braces, classes, escapes, and variable suffixes disable the optimization.
   Together with literal roots, whole-subtree excludes, and the existing
   negation-aware guard, this closes the M2 conservative-pruning checkpoint.
+- Added a deterministic backend fixture for a dirent that vanishes between
+  `read_dir` and requested metadata collection; it asserts a structured
+  `symlink_metadata` error without a timing race. Public unreadable-directory
+  and Linux non-UTF-8 integration coverage already exists; the M2 fixture
+  aggregate remains open pending an equivalent public disappearing-file hook.

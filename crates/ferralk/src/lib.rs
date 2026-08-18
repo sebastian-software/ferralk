@@ -1306,6 +1306,48 @@ mod tests {
     }
 
     #[test]
+    fn metadata_error_is_retained_when_a_dirent_disappears_before_stat() {
+        struct DisappearingFileBackend {
+            root: PathBuf,
+            disappeared: PathBuf,
+        }
+
+        impl super::DirectoryBackend for DisappearingFileBackend {
+            fn read_directory(&self, path: &Path) -> std::io::Result<Vec<super::BackendEntry>> {
+                if path == self.root {
+                    Ok(vec![super::BackendEntry {
+                        path: self.disappeared.clone(),
+                        is_dir: false,
+                        is_symlink: false,
+                    }])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+        }
+
+        let fixture = Fixture::new();
+        let disappeared = fixture.root.join("gone.rs");
+        let walker = Walker::new(&fixture.root)
+            .threads(1)
+            .options(WalkOptions::default().metadata(true));
+        let backend = DisappearingFileBackend {
+            root: fixture.root.clone(),
+            disappeared: disappeared.clone(),
+        };
+        let mut state = super::WalkState::new(&walker);
+
+        state
+            .walk_directory(&backend, fixture.root.clone())
+            .expect("collect policy retains the metadata error");
+
+        assert!(state.entries.is_empty());
+        assert_eq!(state.errors.len(), 1);
+        assert_eq!(state.errors[0].operation(), "symlink_metadata");
+        assert_eq!(state.errors[0].path(), disappeared);
+    }
+
+    #[test]
     fn collect_and_skip_distinguish_recoverable_root_errors() {
         let missing = std::env::temp_dir().join(format!(
             "ferralk-missing-{}",
