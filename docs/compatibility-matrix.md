@@ -31,7 +31,7 @@ its rationale.
 | `ZLOB_ERR` | `ErrorPolicy::{Abort,Skip,Collect}` | Implemented (M2) | `Collect` default. |
 | `ZLOB_APPEND`, `ZLOB_DOOFFS` | — | Deliberate divergence | C output-buffer ownership has no Rust equivalent. |
 | `zlob_at` | `Walker::new(path)` | Planned (M2) | Root is an explicit path. |
-| metadata masks | `WalkOptions` metadata selection | Planned (M2) | Portable abstraction first. |
+| metadata masks | `WalkOptions::metadata` | Implemented (M2) | Opt-in `std::fs::Metadata` collection preserves the default no-extra-stat behaviour. |
 
 ## Inventory provenance
 
