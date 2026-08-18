@@ -243,3 +243,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   accepts that directory. Ordinary suffix or wildcard excludes never prune.
   Literal include roots, extension prefilters, and the M3 ignore-negation guard
   remain explicit open work under the prune-planner item.
+- Expanded the direct brace import through zlob's complex path, character-class,
+  no-match, and long-alternative assertions. `braces.jsonl` now contains 57
+  source-linked cases; the further brace tests are filesystem/API fixtures and
+  remain queued for the M2 walker corpus layer.
