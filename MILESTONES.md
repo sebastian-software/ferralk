@@ -520,3 +520,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   separator to one component and keeps recursive `**` crossing components. A
   regression test covers the `**/lua/*.lua` nested-file boundary before the
   remaining basic path-list corpus block is imported.
+- Imported the non-filesystem half of zlob's frozen `test_basic.zig`: simple
+  wildcards, question marks, bracket classes, explicit directories, recursive
+  path lists, no-match, and empty-list handling. The `./` normalization cases
+  are tracked separately because they exercise a distinct path-normalization
+  policy.
