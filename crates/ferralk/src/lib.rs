@@ -494,7 +494,7 @@ impl TraversalPattern {
     }
 
     fn matches(&self, path: &[u8], is_dir: bool) -> bool {
-        (!self.directories_only || is_dir) && self.matcher.is_match_path(path)
+        (!self.directories_only || is_dir) && self.matcher.is_match_glob_path(path)
     }
 
     fn covers_subtree(&self, path: &[u8]) -> bool {
@@ -1289,6 +1289,15 @@ mod tests {
         assert_eq!(paths_for("aaa/"), vec![PathBuf::from("aaa")]);
         assert!(paths_for("aaa/tomato/tomato.txt/").is_empty());
         assert_eq!(paths_for("a*a"), vec![PathBuf::from("aaa")]);
+        assert_eq!(paths_for("*a*a*a*"), vec![PathBuf::from("aaa")]);
+        assert_eq!(
+            paths_for("???/"),
+            vec![
+                PathBuf::from("aaa"),
+                PathBuf::from("bbb"),
+                PathBuf::from("xyz"),
+            ]
+        );
         assert_eq!(
             paths_for("xyz/?"),
             vec![

@@ -698,6 +698,11 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   Ferralk's native `std::fs::Metadata` surface: metadata remains opt-in, the
   five-byte fixture preserves its length, type, and modification timestamp,
   and Unix additionally verifies a nonzero inode plus owner-readable mode.
+- Separated Walker filesystem-glob matching from the zlob-compatible Path-List
+  root wildcard policy. `Pattern::is_match_glob_path` now makes every ordinary
+  wildcard component-local, including the root; `filter_paths` keeps its
+  established source-compatible semantics. The frozen `test_rust_glob.zig`
+  multiple-star and `???/` directory cases now replay through the Walker.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no

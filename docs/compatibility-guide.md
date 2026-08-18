@@ -83,6 +83,8 @@ deliver entries incrementally.
 
 Walker include patterns are root-relative. A leading `./` is accepted, and a
 trailing `/` selects matching directories only.
+Ordinary wildcards never cross a path-component boundary there; use recursive
+`**` to select descendants.
 
 ## Deliberate differences
 

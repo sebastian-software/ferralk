@@ -35,6 +35,7 @@ pub struct PatternOptions {
     case_insensitive: bool,
     escape: bool,
     component_wildcards: bool,
+    root_component_wildcards: bool,
 }
 
 impl Default for PatternOptions {
@@ -47,6 +48,7 @@ impl Default for PatternOptions {
             case_insensitive: false,
             escape: true,
             component_wildcards: false,
+            root_component_wildcards: false,
         }
     }
 }
@@ -269,7 +271,9 @@ impl Pattern {
         alternatives.iter().any(|alternative| {
             if options.extglob && contains_extglob(&alternative.raw, options.escape) {
                 match_extglob(&alternative.raw, path, options)
-            } else if let Some(fast_path) = &alternative.fast_path {
+            } else if !options.component_wildcards
+                && let Some(fast_path) = &alternative.fast_path
+            {
                 fast_path.is_match(path, options)
             } else {
                 let mut failed = FailedStates::new(&alternative.tokens, path);
@@ -298,6 +302,20 @@ impl Pattern {
     #[must_use]
     pub fn is_match_path(&self, path: impl AsRef<[u8]>) -> bool {
         self.matches_path_filter(path.as_ref())
+    }
+
+    /// Matches one root-relative filesystem-glob path. Every ordinary
+    /// wildcard stays within its path component; recursive `**` remains the
+    /// separator-crossing form. This is stricter than [`Pattern::is_match_path`]
+    /// at the root component and is suitable for traversal filters.
+    #[must_use]
+    pub fn is_match_glob_path(&self, path: impl AsRef<[u8]>) -> bool {
+        let options = PatternOptions {
+            component_wildcards: true,
+            root_component_wildcards: true,
+            ..self.options
+        };
+        self.is_match_with(&self.alternatives, options, path.as_ref())
     }
 
     /// Returns the input paths accepted relative to `base_path`, preserving
@@ -496,8 +514,8 @@ impl Pattern {
 
     fn component_wildcard(tokens: &[Token], token_index: usize, options: PatternOptions) -> bool {
         options.component_wildcards
-            && token_index > 0
-            && matches!(tokens[token_index - 1], Token::Separator)
+            && (options.root_component_wildcards
+                || token_index > 0 && matches!(tokens[token_index - 1], Token::Separator))
     }
 
     fn match_literal(
@@ -1961,6 +1979,11 @@ mod tests {
         assert!(pattern.is_match("nvim/lua/sub/nested.lua"));
         assert!(pattern.is_match_path("nvim/lua/setup.lua"));
         assert!(!pattern.is_match_path("nvim/lua/sub/nested.lua"));
+
+        let root_pattern = Pattern::compile("*.rs", PatternOptions::default()).unwrap();
+        assert!(root_pattern.is_match_path("src/nested.rs"));
+        assert!(!root_pattern.is_match_glob_path("src/nested.rs"));
+        assert!(root_pattern.is_match_glob_path("nested.rs"));
     }
 
     #[test]
