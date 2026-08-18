@@ -9,6 +9,7 @@
 
 use std::{
     collections::HashSet,
+    collections::VecDeque,
     error::Error,
     fmt, fs,
     path::{Path, PathBuf},
@@ -271,6 +272,21 @@ impl Walker {
             cancelled: state.cancelled,
         })
     }
+
+    /// Starts an incremental unsorted traversal. Unlike collect, recoverable
+    /// errors are yielded as individual iterator items under Collect; sorting
+    /// is intentionally a collect-only global operation.
+    #[must_use]
+    pub fn stream(self) -> WalkStream {
+        WalkStream {
+            pending_directories: vec![self.root.clone()],
+            walker: self,
+            pending_entries: VecDeque::new(),
+            visited_directories: HashSet::new(),
+            cancelled: false,
+            stopped: false,
+        }
+    }
 }
 
 fn traversal_pattern_options() -> PatternOptions {
@@ -336,6 +352,148 @@ impl DirectoryBackend for StdBackend {
                 })
             })
             .collect()
+    }
+}
+
+/// Incremental portable traversal produced by Walker stream.
+#[derive(Debug)]
+pub struct WalkStream {
+    walker: Walker,
+    pending_directories: Vec<PathBuf>,
+    pending_entries: VecDeque<BackendEntry>,
+    visited_directories: HashSet<PathBuf>,
+    cancelled: bool,
+    stopped: bool,
+}
+
+impl WalkStream {
+    /// Whether a cancellation request ended this stream.
+    #[must_use]
+    pub const fn was_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    fn check_cancellation(&mut self) -> bool {
+        self.cancelled |= self
+            .walker
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled);
+        self.cancelled
+    }
+
+    fn error(
+        &mut self,
+        operation: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    ) -> Option<Result<WalkEntry, WalkError>> {
+        let error = WalkError::new(operation, path, source);
+        match self.walker.error_policy {
+            ErrorPolicy::Abort => {
+                self.stopped = true;
+                Some(Err(error))
+            }
+            ErrorPolicy::Skip => None,
+            ErrorPolicy::Collect => Some(Err(error)),
+        }
+    }
+
+    fn prepare_directory(&mut self, directory: PathBuf) -> Option<Result<WalkEntry, WalkError>> {
+        if self.walker.options.follow_symlinks {
+            match fs::canonicalize(&directory) {
+                Ok(canonical) => {
+                    if !self.visited_directories.insert(canonical) {
+                        return None;
+                    }
+                }
+                Err(source) => return self.error("canonicalize", directory, source),
+            }
+        }
+        match StdBackend.read_directory(&directory) {
+            Ok(entries) => {
+                self.pending_entries = entries.into();
+                None
+            }
+            Err(source) => self.error("read_dir", directory, source),
+        }
+    }
+
+    fn process_entry(&mut self, mut entry: BackendEntry) -> Option<Result<WalkEntry, WalkError>> {
+        let relative = entry
+            .path
+            .strip_prefix(&self.walker.root)
+            .unwrap_or(entry.path.as_path());
+        let bytes = relative.as_os_str().as_encoded_bytes();
+        if self
+            .walker
+            .excludes
+            .iter()
+            .any(|pattern| pattern.matches(bytes))
+        {
+            return None;
+        }
+        if entry.is_symlink && self.walker.options.follow_symlinks {
+            match fs::metadata(&entry.path) {
+                Ok(metadata) => entry.is_dir = metadata.is_dir(),
+                Err(source) => return self.error("metadata", entry.path, source),
+            }
+        }
+        if entry.is_dir
+            && !self
+                .walker
+                .excludes
+                .iter()
+                .any(|pattern| pattern.covers_subtree(bytes))
+        {
+            self.pending_directories.push(entry.path.clone());
+        }
+        if !self.walker.includes.is_empty()
+            && !self
+                .walker
+                .includes
+                .iter()
+                .any(|pattern| pattern.is_match(bytes))
+        {
+            return None;
+        }
+        let metadata = if self.walker.options.metadata {
+            match fs::symlink_metadata(&entry.path) {
+                Ok(metadata) => Some(metadata),
+                Err(source) => return self.error("symlink_metadata", entry.path, source),
+            }
+        } else {
+            None
+        };
+        Some(Ok(WalkEntry {
+            path: entry.path,
+            is_dir: entry.is_dir,
+            metadata,
+        }))
+    }
+}
+
+impl Iterator for WalkStream {
+    type Item = Result<WalkEntry, WalkError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.stopped {
+            if self.check_cancellation() {
+                self.stopped = true;
+                return None;
+            }
+            if let Some(entry) = self.pending_entries.pop_front() {
+                if let Some(result) = self.process_entry(entry) {
+                    return Some(result);
+                }
+                continue;
+            }
+            let directory = self.pending_directories.pop()?;
+            if let Some(result) = self.prepare_directory(directory) {
+                return Some(result);
+            }
+        }
+        None
     }
 }
 
@@ -664,6 +822,35 @@ mod tests {
         assert!(result.was_cancelled());
         assert!(result.entries().is_empty());
         assert!(result.errors().is_empty());
+    }
+
+    #[test]
+    fn stream_yields_filtered_entries_incrementally_and_honours_cancellation() {
+        let fixture = Fixture::new();
+        fixture.write("src/main.rs");
+        fixture.write("src/lib.txt");
+
+        let mut stream = Walker::new(&fixture.root)
+            .include("**/*.rs")
+            .expect("valid include")
+            .stream();
+        let entries = stream
+            .by_ref()
+            .map(|entry| entry.expect("fixture has no I/O errors"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            relative_paths(&entries, &fixture.root),
+            vec![PathBuf::from("src/main.rs")]
+        );
+        assert!(!stream.was_cancelled());
+
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let mut cancelled = Walker::new(&fixture.root)
+            .cancellation(cancellation)
+            .stream();
+        assert!(cancelled.next().is_none());
+        assert!(cancelled.was_cancelled());
     }
 
     #[cfg(unix)]

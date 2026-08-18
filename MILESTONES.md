@@ -77,7 +77,7 @@ preservation, structured errors.
 - [x] Error model: `ErrorPolicy::{Abort,Skip,Collect}` with `Collect` default
 - [x] Symlink policy and cycle detection
 - [x] Optional sorting and metadata collection
-- [ ] Streaming iterator with cancellation; `collect()` result shape
+- [x] Streaming iterator with cancellation; `collect()` result shape
 - [ ] Filesystem fixture builders + integration tests (unreadable dirs,
       disappearing files, non-UTF-8 names)
 - [ ] Publish `ferralk` 0.1 (serial)
@@ -271,3 +271,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 - Added opt-in metadata collection to `WalkOptions`. Returned entries retain
   `std::fs::Metadata` only when requested, so the default traversal incurs no
   metadata syscall; sorted fixture tests verify both modes and file length.
+- Added `Walker::stream()`, an incremental unsorted iterator that carries the
+  same filters, conservative pruning, symlink cycle guard, optional metadata,
+  error policy, and cooperative cancellation as `collect()`. Streaming errors
+  are yielded as items under `Collect`; global sorting intentionally remains a
+  collect-only operation.
