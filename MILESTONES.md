@@ -632,3 +632,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   fixed terminal `**`: `src/**` now includes the `src` directory itself, as
   zlob's zero-component globstar contract requires, while still including its
   descendants.
+- Extended the compiled matcher IR with a deterministic token path for
+  literals, separators, `?`, and character classes. These patterns no longer
+  allocate a failed-state matrix per match; exhaustive equivalence checks retain
+  the general matcher as the semantic reference. New CodSpeed rows measured
+  local ten-sample medians of about 26.1 ns for a matching class pattern and
+  13.2 ns for its non-match. The broad IR and cross-engine gates remain open.

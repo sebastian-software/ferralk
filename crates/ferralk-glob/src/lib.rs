@@ -421,8 +421,7 @@ impl Pattern {
                 literal,
             ),
             Token::Separator => {
-                path.get(path_index)
-                    .is_some_and(|byte| is_separator(*byte))
+                path.get(path_index).is_some_and(|byte| is_separator(*byte))
                     && Self::matches_from(
                         tokens,
                         token_index + 1,
@@ -644,6 +643,7 @@ struct Alternative {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FastPath {
     LiteralTokens(Vec<Token>),
+    DeterministicTokens(Vec<Token>),
     Star,
     PrefixStar { prefix: Vec<u8> },
     StarSuffix { suffix: Vec<u8> },
@@ -660,6 +660,14 @@ impl FastPath {
             .all(|token| matches!(token, Token::Literal(_) | Token::Separator))
         {
             return Some(Self::LiteralTokens(tokens.to_vec()));
+        }
+        if tokens.iter().all(|token| {
+            matches!(
+                token,
+                Token::Literal(_) | Token::Separator | Token::Any | Token::Class(_)
+            )
+        }) {
+            return Some(Self::DeterministicTokens(tokens.to_vec()));
         }
         match tokens {
             [Token::Star] => return Some(Self::Star),
@@ -719,6 +727,61 @@ impl FastPath {
                             path_index += 1;
                         }
                         _ => unreachable!("literal fast path only stores literal tokens"),
+                    }
+                }
+                path_index == path.len()
+            }
+            Self::DeterministicTokens(tokens) => {
+                let mut path_index = 0;
+                for token in tokens {
+                    match token {
+                        Token::Literal(literal) => {
+                            let Some(candidate) = path.get(path_index..path_index + literal.len())
+                            else {
+                                return false;
+                            };
+                            if !literal.iter().zip(candidate).all(|(&expected, &actual)| {
+                                bytes_equal(expected, actual, options.case_insensitive)
+                            }) {
+                                return false;
+                            }
+                            path_index += literal.len();
+                        }
+                        Token::Separator => {
+                            if !path.get(path_index).is_some_and(|byte| is_separator(*byte)) {
+                                return false;
+                            }
+                            path_index += 1;
+                        }
+                        Token::Any => {
+                            let Some(&byte) = path.get(path_index) else {
+                                return false;
+                            };
+                            if !options.match_hidden
+                                && byte == b'.'
+                                && at_component_start(path, path_index)
+                            {
+                                return false;
+                            }
+                            path_index += 1;
+                        }
+                        Token::Class(class) => {
+                            let Some(&byte) = path.get(path_index) else {
+                                return false;
+                            };
+                            if !class.matches(byte, options.case_insensitive)
+                                || (!options.match_hidden
+                                    && byte == b'.'
+                                    && at_component_start(path, path_index))
+                            {
+                                return false;
+                            }
+                            path_index += 1;
+                        }
+                        Token::Star
+                        | Token::RecursiveStar
+                        | Token::RecursivePrefix
+                        | Token::PathStar => return false,
                     }
                 }
                 path_index == path.len()
@@ -1442,9 +1505,7 @@ mod tests {
         assert!(pattern.is_match("lib.rs"));
         assert!(pattern.is_match("src/bin/main.rs"));
         assert!(!pattern.is_match("src/.private.rs"));
-        assert!(Pattern::compile("src/**", options)
-            .unwrap()
-            .is_match("src"));
+        assert!(Pattern::compile("src/**", options).unwrap().is_match("src"));
         assert!(compile("**/*.rs").is_match("src/main.rs"));
         assert!(compile("**/*.rs").is_match("src/bin/main.rs"));
     }
@@ -1641,6 +1702,38 @@ mod tests {
             assert_eq!(
                 fast.is_match(candidate),
                 general.is_match(candidate),
+                "fast path differs for {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_fast_path_matches_the_general_matcher() {
+        let options = PatternOptions::default().case_insensitive(true);
+        let fast = Pattern::compile("src/[ab]?.[Rr][Ss]", options).expect("pattern compiles");
+        assert!(matches!(
+            fast.alternatives[0].fast_path,
+            Some(FastPath::DeterministicTokens(_))
+        ));
+        let mut general = fast.clone();
+        general.alternatives[0].fast_path = None;
+
+        let mut candidates = vec![
+            b"src/ab.rs".to_vec(),
+            b"src/aX.RS".to_vec(),
+            b"src/.a.rs".to_vec(),
+            b"src/ab.txt".to_vec(),
+            b"lib/ab.rs".to_vec(),
+        ];
+        candidates.extend(
+            byte_words(b"ab./rsRS", 4)
+                .into_iter()
+                .map(|suffix| [b"src/".as_slice(), suffix.as_slice()].concat()),
+        );
+        for candidate in candidates {
+            assert_eq!(
+                fast.is_match(&candidate),
+                general.is_match(&candidate),
                 "fast path differs for {candidate:?}"
             );
         }

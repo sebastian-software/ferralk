@@ -62,6 +62,18 @@ fn matcher(c: &mut Criterion) {
         benchmark.iter(|| black_box(literal.is_match(black_box(common_non_matching))))
     });
 
+    let deterministic = Pattern::compile(
+        "src/[ab]?.[Rr][Ss]",
+        PatternOptions::default().case_insensitive(true),
+    )
+    .expect("deterministic benchmark pattern is valid");
+    c.bench_function("deterministic/ferralk_compiled/matching", |benchmark| {
+        benchmark.iter(|| black_box(deterministic.is_match(black_box("src/aX.RS"))))
+    });
+    c.bench_function("deterministic/ferralk_compiled/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(deterministic.is_match(black_box("src/zz.rs"))))
+    });
+
     let suffix_star = Pattern::compile("*.rs", PatternOptions::default())
         .expect("suffix-star benchmark pattern is valid");
     c.bench_function("single_star/ferralk_compiled/matching", |benchmark| {
