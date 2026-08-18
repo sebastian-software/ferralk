@@ -23,7 +23,7 @@ disputed or undefined zlob semantics are captured as flagged corpus cases.
       ADR-0012
 - [x] Define the corpus schema: JSONL layout, `\xNN` byte-escape codec
       (encoder/decoder in Rust), JSON Schema documentation — ADR-0007
-- [ ] Inventory the zlob 1.6.3 Rust and C APIs and all flags; write the
+- [x] Inventory the zlob 1.6.3 Rust and C APIs and all flags; write the
       compatibility matrix document
 - [ ] Port zlob's own test suite 1:1 into the corpus — ADR-0007
 - [ ] Build the `oracle` crate (zlob 1.6.3 as dev-dependency) with a manually
@@ -152,13 +152,12 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   and formatting checks pass locally.
 - Added a living compatibility matrix seeded from zlob's public README. It is
   deliberately labelled provisional until the frozen source is verified.
-- **Blocker — zlob 1.6.3 source coordinate:** the public repository is
-  available, but its tag and matching Rust crate cannot yet be independently
-  verified from this environment. The `oracle` crate and its manual workflow
-  are intentionally present but fail closed; do not add an unpinned `zlob`
-  dependency or tick the API-inventory/oracle/corpus-import items until the
-  exact tag commit, crate release, LICENSE copyright line, and test-suite
-  revision have been recorded.
+- Resolved the zlob reference: annotated tag `v1.6.3`
+  (`b757d57963cbf578aacfee4635c0305ded615417`) peels to source commit
+  `4bc4da2cbc823d3911b4a1436448687c398977dd`; the package version, MIT
+  attribution, Rust/C APIs, flags, and test-suite paths are recorded in
+  [`docs/zlob-1.6.3-reference.md`](docs/zlob-1.6.3-reference.md). This removes
+  the prior source-coordinate blocker.
 - **Blocker — external actions:** sending a maintainer courtesy notice and
   configuring repository-side Codecov/CodSpeed credentials require maintainer
   authority. The committed workflows are ready; no external message or

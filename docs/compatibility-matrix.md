@@ -35,8 +35,8 @@ its rationale.
 
 ## Inventory provenance
 
-The provisional inventory above comes from zlob's public README and Rust
-examples. Completion requires freezing the exact 1.6.3 tag/commit, inspecting
-`include/zlob.h` and the Rust crate API, and replacing “Planned” with
-case-backed mappings. That work is blocked by the missing verifiable 1.6.3
-release coordinate; see [`../MILESTONES.md`](../MILESTONES.md).
+The zlob 1.6.3 tag, source commit, MIT attribution, Rust API, C API, and every
+flag family were verified from upstream. See the complete
+[frozen reference](zlob-1.6.3-reference.md). “Planned” still means the mapping
+requires corpus-backed implementation; it no longer means that the upstream
+contract is unknown.
