@@ -22,6 +22,9 @@ The additional direct matcher assertions in `test/test_edge_cases.zig` are
 represented in [`corpus/edge-cases.jsonl`](../corpus/edge-cases.jsonl), with
 that file's three path-list assertions added to `match-paths.jsonl`.
 
+The source-level Extglob path-list scenarios in `test/test_extglob.zig` are
+represented in [`corpus/extglob-suite.jsonl`](../corpus/extglob-suite.jsonl).
+
 ## Syntax preflight cases
 
 The flag-sensitive `hasWildcards` assertions are represented by

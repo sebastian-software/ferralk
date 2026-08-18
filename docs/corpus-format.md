@@ -28,8 +28,8 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 
 The initial topic files are `fnmatch.jsonl`, `wildcards.jsonl`, `classes.jsonl`,
 `braces.jsonl`, `extglob.jsonl`, `options.jsonl`, `walk.jsonl`, `ignore.jsonl`,
-`fast-glob.jsonl`, `preflight.jsonl`, `match-paths.jsonl`, and
-`edge-cases.jsonl`. Files are added when a topic gains a
+`fast-glob.jsonl`, `preflight.jsonl`, `match-paths.jsonl`, `edge-cases.jsonl`,
+and `extglob-suite.jsonl`. Files are added when a topic gains a
 case. Case IDs do
 not change once published; a changed expected value is a new case plus an
 explanation in `note`.

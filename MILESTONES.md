@@ -510,3 +510,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   suite item remains open for other source files and private implementation
   assertions, but this independent semantic block now replays in both harness
   and oracle.
+- Added a second source-level Extglob corpus block covering each operator,
+  recursive paths, brace composition, and disabled literal syntax through
+  ordered `match_paths` scenarios. Remaining zlob test files are still tracked
+  by the open M0 whole-suite item.

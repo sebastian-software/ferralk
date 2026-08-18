@@ -63,10 +63,14 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                                 .expect("zlob match paths")
                                 .map(|matches| matches.to_strings())
                                 .unwrap_or_default();
-                        let expected = case.oracle_matches.as_ref().unwrap_or(&case.matches);
+                        let mut expected = case
+                            .oracle_matches
+                            .clone()
+                            .unwrap_or_else(|| case.matches.clone());
+                        expected.sort();
                         assert_eq!(
                             &selected,
-                            expected,
+                            &expected,
                             "{}:{}: list result",
                             file.display(),
                             line_number + 1
