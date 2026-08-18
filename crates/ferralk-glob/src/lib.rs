@@ -266,7 +266,9 @@ impl Pattern {
     }
 
     /// Returns the input paths accepted by this compiled pattern, in input
-    /// order. The returned references borrow the caller-owned path list.
+    /// order. Wildcards after an explicit separator stay within that path
+    /// component; recursive `**` is the separator-crossing form. The returned
+    /// references borrow the caller-owned path list.
     #[must_use]
     pub fn filter_paths<'a, T>(&self, paths: impl IntoIterator<Item = &'a T>) -> Vec<&'a T>
     where

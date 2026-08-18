@@ -19,6 +19,7 @@ read the [compatibility guide](compatibility-guide.md).
 | `ZLOB_NOESCAPE` | `PatternOptions::escape` | Implemented (M1) | Higher-level boolean, not a bitflag. |
 | case folding | `PatternOptions::case_insensitive` | Implemented (M1) | Explicit opt-in on every platform. |
 | `has_wildcards` | `Pattern::has_wildcards` | Implemented (M1) | Byte-first, flag-sensitive preflight matching zlob's active syntax markers. |
+| `zlob_match_paths` | `Pattern::filter_paths` | Implemented (M1) | Preserves caller order rather than zlob's default sort; wildcard tokens after an explicit separator stay in that component, while `**` remains recursive. |
 | `ZLOB_NOCHECK`, `ZLOB_NOMAGIC` | Walker no-match policy | Deferred (M4 review) | These are C/glob result-shaping semantics, not matcher semantics. |
 | `ZLOB_TILDE`, `ZLOB_TILDE_CHECK` | — | Deliberate divergence | Out of scope per RFC non-goals. |
 
