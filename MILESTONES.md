@@ -612,3 +612,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   and punctuation inputs; source-side result sorting is documented while
   Ferralk continues to preserve caller input order. The file's SIMD helpers
   remain excluded as private implementation detail.
+- Expanded the root-independent core of frozen `test_absolute_paths.zig` with
+  seventeen list-filter cases: basic wildcard and class forms, brace variants,
+  recursive selection, and literal directory/file components. The fixture's
+  temporary absolute prefix is intentionally factored out; all of these cases
+  replay in the harness and pinned Rust oracle with caller-order results.

@@ -36,8 +36,9 @@ operations, and the manual oracle invokes the matching zlob Rust APIs.
 The root-independent compositional path-list forms from
 `test/test_absolute_paths.zig` are recorded in that same corpus: multiple
 brace components, brace-plus-suffix expansion, and brace-prefixed recursive
-selection. Filesystem-only fixture setup remains outside this in-memory API
-coverage boundary.
+selection. Its root-independent wildcard, class, brace, recursive, and literal
+component forms are included as well. Filesystem-only fixture setup remains
+outside this in-memory API coverage boundary.
 
 `test/test_internal.zig` additionally supplies eleven public `matchPaths`
 scenarios in the same corpus, covering wildcards, classes, literal and empty
