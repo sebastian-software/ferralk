@@ -197,7 +197,11 @@ fn run_worker_catching_panics(
     worker: &mut WorkerScratch,
     stealers: &[Stealer<PathBuf>],
 ) {
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| run_worker(shared, worker, stealers))) {
+    catch_worker_panic(shared, || run_worker(shared, worker, stealers));
+}
+
+fn catch_worker_panic(shared: &Shared, work: impl FnOnce()) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(work)) {
         shared.record_panic(payload);
     }
 }
@@ -370,4 +374,26 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::Arc,
+    };
+
+    use super::{Shared, Walker, catch_worker_panic, finish};
+    use crate::CancellationToken;
+
+    #[test]
+    fn worker_panic_cancels_siblings_and_resumes_on_the_caller() {
+        let cancellation = CancellationToken::default();
+        let walker = Arc::new(Walker::new(".").cancellation(cancellation.clone()));
+        let shared = Arc::new(Shared::new(walker));
+
+        catch_worker_panic(&shared, || panic!("injected worker panic"));
+        assert!(cancellation.is_cancelled());
+        assert!(catch_unwind(AssertUnwindSafe(|| finish(shared, Vec::new()))).is_err());
+    }
 }
