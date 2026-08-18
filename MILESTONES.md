@@ -529,3 +529,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   `filter_paths` normalizes a leading dot-slash before component matching while
   the direct matcher remains byte-exact. Both recursive and literal-prefix
   source scenarios now replay in the corpus.
+- Imported five recursive filtering scenarios from zlob's frozen
+  `test_glibc.zig`, covering global and prefixed `**` C/header/text patterns.
+  The same source's flag-off `**` case exposed a remaining Path-List policy
+  task: zlob treats it as exactly one component, whereas Ferralk's direct
+  fallback currently crosses more broadly. That case remains outside the green
+  corpus until the policy is implemented rather than being silently altered.
