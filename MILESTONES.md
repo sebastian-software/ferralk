@@ -292,3 +292,6 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   emitted but is still descended, preventing a nested `.gitignore` from
   losing a later `!` re-inclusion. The fixture exercises that case for both
   collect and stream.
+- Added a per-traversal cache of parsed `.gitignore` matchers keyed by their
+  directory. It removes repeated parsing while preserving ancestor precedence;
+  the stronger immutable shared-parent node representation remains open.

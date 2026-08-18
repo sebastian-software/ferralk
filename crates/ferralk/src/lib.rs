@@ -8,8 +8,8 @@
 //! through UTF-8.
 
 use std::{
-    collections::HashSet,
     collections::VecDeque,
+    collections::{HashMap, HashSet},
     error::Error,
     fmt, fs,
     path::{Path, PathBuf},
@@ -293,6 +293,7 @@ impl Walker {
             walker: self,
             pending_entries: VecDeque::new(),
             visited_directories: HashSet::new(),
+            gitignore_cache: HashMap::new(),
             cancelled: false,
             stopped: false,
         }
@@ -372,6 +373,7 @@ pub struct WalkStream {
     pending_directories: Vec<PathBuf>,
     pending_entries: VecDeque<BackendEntry>,
     visited_directories: HashSet<PathBuf>,
+    gitignore_cache: HashMap<PathBuf, Gitignore>,
     cancelled: bool,
     stopped: bool,
 }
@@ -443,7 +445,12 @@ impl WalkStream {
         {
             return None;
         }
-        let git_ignored = is_git_ignored(&self.walker, &entry.path, entry.is_dir);
+        let git_ignored = is_git_ignored(
+            &self.walker,
+            &entry.path,
+            entry.is_dir,
+            &mut self.gitignore_cache,
+        );
         if git_ignored && !entry.is_dir {
             return None;
         }
@@ -519,6 +526,7 @@ struct WalkState<'walker> {
     entries: Vec<WalkEntry>,
     errors: Vec<WalkError>,
     visited_directories: HashSet<PathBuf>,
+    gitignore_cache: HashMap<PathBuf, Gitignore>,
     cancelled: bool,
 }
 
@@ -529,6 +537,7 @@ impl<'walker> WalkState<'walker> {
             entries: Vec::new(),
             errors: Vec::new(),
             visited_directories: HashSet::new(),
+            gitignore_cache: HashMap::new(),
             cancelled: false,
         }
     }
@@ -588,7 +597,12 @@ impl<'walker> WalkState<'walker> {
         {
             return Ok(());
         }
-        let git_ignored = is_git_ignored(self.walker, &entry.path, entry.is_dir);
+        let git_ignored = is_git_ignored(
+            self.walker,
+            &entry.path,
+            entry.is_dir,
+            &mut self.gitignore_cache,
+        );
         if git_ignored && !entry.is_dir {
             return Ok(());
         }
@@ -671,7 +685,12 @@ impl<'walker> WalkState<'walker> {
     }
 }
 
-fn is_git_ignored(walker: &Walker, path: &Path, is_dir: bool) -> bool {
+fn is_git_ignored(
+    walker: &Walker,
+    path: &Path,
+    is_dir: bool,
+    cache: &mut HashMap<PathBuf, Gitignore>,
+) -> bool {
     if !walker.respect_git_ignore {
         return false;
     }
@@ -688,7 +707,9 @@ fn is_git_ignored(walker: &Walker, path: &Path, is_dir: bool) -> bool {
     }
     let mut ignored = false;
     for directory in directories.into_iter().rev() {
-        let (rules, _) = Gitignore::new(directory.join(".gitignore"));
+        let rules = cache
+            .entry(directory.to_path_buf())
+            .or_insert_with(|| Gitignore::new(directory.join(".gitignore")).0);
         let matched = rules.matched_path_or_any_parents(path, is_dir);
         if !matched.is_none() {
             ignored = matched.is_ignore();
