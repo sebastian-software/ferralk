@@ -477,3 +477,10 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   macOS would make CI fail before Ferralk can observe the path. The M2 fixture
   aggregate remains open for a portable, deterministic public reproduction of
   the dirent-to-metadata disappearance race.
+- Added a second narrow immutable matcher IR fast path for patterns composed
+  solely of literals and separators. It avoids constructing a failed-state
+  matrix for each call while retaining case-folding and platform separator
+  semantics; an explicit fast-path-versus-general regression test covers both
+  outcomes. CodSpeed now records literal matching and non-matching calls; the
+  initial local ten-sample medians were about 18.8 ns and 16.4 ns. The broader
+  M1 immutable-IR refactor and cross-engine budget remain open.

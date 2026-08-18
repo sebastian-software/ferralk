@@ -52,6 +52,15 @@ fn matcher(c: &mut Criterion) {
     c.bench_function("common/ferralk_compiled/non_matching", |benchmark| {
         benchmark.iter(|| black_box(ferralk.is_match(black_box(common_non_matching))))
     });
+
+    let literal = Pattern::compile("src/deep/nested/main.rs", PatternOptions::default())
+        .expect("literal benchmark pattern is valid");
+    c.bench_function("literal/ferralk_compiled/matching", |benchmark| {
+        benchmark.iter(|| black_box(literal.is_match(black_box(common_matching))))
+    });
+    c.bench_function("literal/ferralk_compiled/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(literal.is_match(black_box(common_non_matching))))
+    });
     c.bench_function("common/globset_compiled/matching", |benchmark| {
         benchmark.iter(|| black_box(globset.is_match(black_box(common_matching))))
     });

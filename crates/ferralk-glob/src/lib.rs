@@ -431,11 +431,18 @@ struct Alternative {
 /// other pattern on the corpus-tested general path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FastPath {
+    LiteralTokens(Vec<Token>),
     RecursivePrefixSuffix { prefix: Vec<u8>, suffix: Vec<u8> },
 }
 
 impl FastPath {
     fn compile(tokens: &[Token], options: PatternOptions) -> Option<Self> {
+        if tokens
+            .iter()
+            .all(|token| matches!(token, Token::Literal(_) | Token::Separator))
+        {
+            return Some(Self::LiteralTokens(tokens.to_vec()));
+        }
         if options.case_insensitive {
             return None;
         }
@@ -457,6 +464,33 @@ impl FastPath {
 
     fn is_match(&self, path: &[u8], options: PatternOptions) -> bool {
         match self {
+            Self::LiteralTokens(tokens) => {
+                let mut path_index = 0;
+                for token in tokens {
+                    match token {
+                        Token::Literal(literal) => {
+                            let Some(candidate) = path.get(path_index..path_index + literal.len())
+                            else {
+                                return false;
+                            };
+                            if !literal.iter().zip(candidate).all(|(&expected, &actual)| {
+                                bytes_equal(expected, actual, options.case_insensitive)
+                            }) {
+                                return false;
+                            }
+                            path_index += literal.len();
+                        }
+                        Token::Separator => {
+                            if !path.get(path_index).is_some_and(|byte| is_separator(*byte)) {
+                                return false;
+                            }
+                            path_index += 1;
+                        }
+                        _ => unreachable!("literal fast path only stores literal tokens"),
+                    }
+                }
+                path_index == path.len()
+            }
             Self::RecursivePrefixSuffix { prefix, suffix } => {
                 let Some(remainder) = path
                     .strip_prefix(prefix.as_slice())
@@ -1074,7 +1108,7 @@ fn match_extglob_alternative_exact(
 
 #[cfg(test)]
 mod tests {
-    use super::{Pattern, PatternOptions};
+    use super::{FastPath, Pattern, PatternOptions};
 
     fn compile(pattern: &str) -> Pattern {
         Pattern::compile(pattern, PatternOptions::default()).unwrap()
@@ -1256,6 +1290,32 @@ mod tests {
             assert_eq!(
                 fast.is_match(&candidate),
                 general.is_match(&candidate),
+                "fast path differs for {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_fast_path_matches_the_general_matcher() {
+        let options = PatternOptions::default().case_insensitive(true);
+        let fast = Pattern::compile("Src/Readme", options).expect("pattern compiles");
+        assert!(matches!(
+            fast.alternatives[0].fast_path,
+            Some(FastPath::LiteralTokens(_))
+        ));
+        let mut general = fast.clone();
+        general.alternatives[0].fast_path = None;
+
+        for candidate in [
+            b"src/readme".as_slice(),
+            b"SRC/README".as_slice(),
+            b"src/readme.txt".as_slice(),
+            b"src/readme/".as_slice(),
+            b"other/readme".as_slice(),
+        ] {
+            assert_eq!(
+                fast.is_match(candidate),
+                general.is_match(candidate),
                 "fast path differs for {candidate:?}"
             );
         }
