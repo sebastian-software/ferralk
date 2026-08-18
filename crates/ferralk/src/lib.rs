@@ -12,6 +12,10 @@ use std::{
     error::Error,
     fmt, fs,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use ferralk_glob::{Pattern, PatternError, PatternOptions};
@@ -28,6 +32,25 @@ pub enum ErrorPolicy {
     /// Continue walking and return accumulated recoverable errors.
     #[default]
     Collect,
+}
+
+/// Cloneable cooperative cancellation handle for a walk.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    /// Requests that the walker stop before its next filesystem operation.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Reports whether cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
 }
 
 /// Behaviour switches for a Walker.
@@ -127,6 +150,7 @@ impl Error for WalkError {
 pub struct WalkResult {
     entries: Vec<WalkEntry>,
     errors: Vec<WalkError>,
+    cancelled: bool,
 }
 
 impl WalkResult {
@@ -147,6 +171,12 @@ impl WalkResult {
     pub fn into_parts(self) -> (Vec<WalkEntry>, Vec<WalkError>) {
         (self.entries, self.errors)
     }
+
+    /// Whether a cancellation request stopped traversal before completion.
+    #[must_use]
+    pub const fn was_cancelled(&self) -> bool {
+        self.cancelled
+    }
 }
 
 /// Builder for a portable serial traversal.
@@ -157,6 +187,7 @@ pub struct Walker {
     excludes: Vec<TraversalPattern>,
     options: WalkOptions,
     error_policy: ErrorPolicy,
+    cancellation: Option<CancellationToken>,
 }
 
 impl Walker {
@@ -169,6 +200,7 @@ impl Walker {
             excludes: Vec::new(),
             options: WalkOptions::default(),
             error_policy: ErrorPolicy::default(),
+            cancellation: None,
         }
     }
 
@@ -201,6 +233,13 @@ impl Walker {
         self
     }
 
+    /// Associates an externally owned cooperative cancellation handle.
+    #[must_use]
+    pub fn cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
     /// Runs the serial portable backend to completion.
     pub fn collect(self) -> Result<WalkResult, WalkError> {
         let backend = StdBackend;
@@ -214,6 +253,7 @@ impl Walker {
         Ok(WalkResult {
             entries: state.entries,
             errors: state.errors,
+            cancelled: state.cancelled,
         })
     }
 }
@@ -289,6 +329,7 @@ struct WalkState<'walker> {
     entries: Vec<WalkEntry>,
     errors: Vec<WalkError>,
     visited_directories: HashSet<PathBuf>,
+    cancelled: bool,
 }
 
 impl<'walker> WalkState<'walker> {
@@ -298,6 +339,7 @@ impl<'walker> WalkState<'walker> {
             entries: Vec::new(),
             errors: Vec::new(),
             visited_directories: HashSet::new(),
+            cancelled: false,
         }
     }
 
@@ -306,6 +348,9 @@ impl<'walker> WalkState<'walker> {
         backend: &impl DirectoryBackend,
         directory: PathBuf,
     ) -> Result<(), WalkError> {
+        if self.check_cancellation() {
+            return Ok(());
+        }
         if self.walker.options.follow_symlinks && !self.mark_directory(&directory)? {
             return Ok(());
         }
@@ -314,6 +359,9 @@ impl<'walker> WalkState<'walker> {
             Err(source) => return self.handle_error("read_dir", directory, source),
         };
         for entry in entries {
+            if self.check_cancellation() {
+                return Ok(());
+            }
             self.visit_entry(backend, entry)?;
         }
         Ok(())
@@ -334,6 +382,9 @@ impl<'walker> WalkState<'walker> {
         backend: &impl DirectoryBackend,
         mut entry: BackendEntry,
     ) -> Result<(), WalkError> {
+        if self.check_cancellation() {
+            return Ok(());
+        }
         let relative = entry
             .path
             .strip_prefix(&self.walker.root)
@@ -399,6 +450,15 @@ impl<'walker> WalkState<'walker> {
             }
         }
     }
+
+    fn check_cancellation(&mut self) -> bool {
+        self.cancelled |= self
+            .walker
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled);
+        self.cancelled
+    }
 }
 
 /// Crate version exposed for build and integration diagnostics.
@@ -413,7 +473,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{ErrorPolicy, TraversalPattern, WalkEntry, WalkOptions, Walker};
+    use super::{CancellationToken, ErrorPolicy, TraversalPattern, WalkEntry, WalkOptions, Walker};
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
@@ -527,6 +587,22 @@ mod tests {
                 .collect()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn cancellation_returns_a_partial_result_without_an_io_error() {
+        let fixture = Fixture::new();
+        fixture.write("src/main.rs");
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let result = Walker::new(&fixture.root)
+            .cancellation(cancellation)
+            .collect()
+            .expect("cancellation is a normal partial result");
+        assert!(result.was_cancelled());
+        assert!(result.entries().is_empty());
+        assert!(result.errors().is_empty());
     }
 
     #[cfg(unix)]
