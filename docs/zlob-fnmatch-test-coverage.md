@@ -27,6 +27,16 @@ markers only with `braces`, and extglob operators only with `extglob`. The
 harness and manual oracle run the dedicated preflight operation rather than
 pretending that an empty candidate is a full fnmatch assertion.
 
+## Path-list cases
+
+The five `matchPaths` assertions are represented by
+[`corpus/match-paths.jsonl`](../corpus/match-paths.jsonl) records and replayed
+through `Pattern::filter_paths`. The empty-list `NOCHECK` result is retained as
+a disputed corpus case: Ferralk returns no caller-owned paths, while zlob's
+frozen Zig suite returns the pattern. zlob 1.6.3's Rust FFI aborts for an empty
+list and exposes corrupted string data for this synthetic result, so its manual
+Rust oracle deliberately skips that one case while replaying the other four.
+
 ## Deliberate non-matcher exclusions
 
 The remaining assertions are not direct `fnmatch` semantics and have no
@@ -34,7 +44,6 @@ equivalent public Ferralk type today:
 
 | Source lines | zlob surface | Ferralk disposition |
 | --- | --- | --- |
-| 274–331 | `matchPaths` result shaping, including `NOCHECK` | Deferred walker result-policy review; Rust callers own result buffers and Ferralk deliberately has no C-style `NOCHECK` output shaping. |
 | 338–385 | `PatternContext` template classification | Internal zlob optimization detail; Ferralk exposes a compiled `Pattern`, not a template-inspection API. |
 | 438–448 | private SIMD index helpers | Implementation detail only; ADR-0008 reserves any equivalent optimization for profiling-backed work. |
 

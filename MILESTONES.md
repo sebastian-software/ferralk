@@ -485,3 +485,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   outcomes. CodSpeed now records literal matching and non-matching calls; the
   initial local ten-sample medians were about 18.8 ns and 16.4 ns. The broader
   M1 immutable-IR refactor and cross-engine budget remain open.
+- Imported zlob's five `matchPaths` assertions as ordered list-operation corpus
+  cases and added `Pattern::filter_paths` for the Rust-native, caller-owned
+  equivalent. The no-match `NOCHECK` assertion is retained as a disputed
+  source-backed divergence: zlob 1.6.3's Rust FFI aborts on its empty input and
+  returns corrupted synthetic result bytes with a fallback input, so the manual
+  Rust oracle skips only that FFI-defective case while verifying the other four.

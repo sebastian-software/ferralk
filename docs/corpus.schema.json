@@ -7,7 +7,10 @@
   "required": ["id", "pattern", "path", "expected", "source"],
   "properties": {
     "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
-    "kind": { "enum": ["matcher", "has_wildcards"], "default": "matcher" },
+    "kind": { "enum": ["matcher", "has_wildcards", "match_paths"], "default": "matcher" },
+    "paths": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "matches": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "oracle_matches": { "type": "array", "items": { "type": "string" } },
     "pattern": { "type": "string" },
     "path": { "type": "string" },
     "flags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "default": [] },

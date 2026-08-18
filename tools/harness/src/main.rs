@@ -55,6 +55,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         })?
                         .is_match(path),
                     CaseKind::HasWildcards => Pattern::has_wildcards(pattern, options),
+                    CaseKind::MatchPaths => {
+                        let paths = case
+                            .paths
+                            .iter()
+                            .map(|path| decode_bytes(path))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|error| {
+                                format!(
+                                    "{}:{}: invalid paths: {error}",
+                                    file.display(),
+                                    line_number + 1
+                                )
+                            })?;
+                        let expected = case
+                            .matches
+                            .iter()
+                            .map(|path| decode_bytes(path))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|error| {
+                                format!(
+                                    "{}:{}: invalid matches: {error}",
+                                    file.display(),
+                                    line_number + 1
+                                )
+                            })?;
+                        let matcher = Pattern::compile(pattern, options).map_err(|error| {
+                            format!("{}:{}: {error}", file.display(), line_number + 1)
+                        })?;
+                        let selected = matcher.filter_paths(&paths);
+                        if selected
+                            .iter()
+                            .map(|path| path.as_slice())
+                            .eq(expected.iter().map(Vec::as_slice))
+                        {
+                            case.expected
+                        } else {
+                            return Err(format!(
+                                "{}:{}: selected paths differ from corpus",
+                                file.display(),
+                                line_number + 1
+                            )
+                            .into());
+                        }
+                    }
                 };
                 if actual != case.expected {
                     return Err(format!(
@@ -88,6 +132,9 @@ fn options_from_flags(flags: &[String]) -> Result<PatternOptions, String> {
             "match_hidden" => options.match_hidden(true),
             "case_insensitive" => options.case_insensitive(true),
             "no_escape" => options.escape(false),
+            // zlob's result-shaping NOCHECK flag is recorded for the oracle;
+            // Ferralk's list filter deliberately returns no synthetic path.
+            "nocheck" => options,
             _ => return Err(format!("unknown matcher flag {flag:?}")),
         };
     }

@@ -13,7 +13,9 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | Field | Required | Meaning |
 |---|---:|---|
 | `id` | yes | Stable, topic-local identifier, for example `wildcard-001`. |
-| `kind` | no | `matcher` (default) for a full path verdict, or `has_wildcards` for syntax preflight. |
+| `kind` | no | `matcher` (default), `has_wildcards` for syntax preflight, or `match_paths` for list filtering. |
+| `paths` / `matches` | no | Input and Ferralk-selected path lists for `match_paths`, preserving input order. |
+| `oracle_matches` | no | zlob's selected list for a deliberate list-result divergence. |
 | `pattern` | yes | Glob or ignore expression using the byte codec below. |
 | `path` | yes | Candidate path using the byte codec below; empty for syntax-only records. |
 | `flags` | no | Ordered behaviour switches from the compatibility matrix. |
@@ -26,7 +28,7 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 
 The initial topic files are `fnmatch.jsonl`, `wildcards.jsonl`, `classes.jsonl`,
 `braces.jsonl`, `extglob.jsonl`, `options.jsonl`, `walk.jsonl`, `ignore.jsonl`,
-`fast-glob.jsonl`, and `preflight.jsonl`. Files are added when a topic gains a
+`fast-glob.jsonl`, `preflight.jsonl`, and `match-paths.jsonl`. Files are added when a topic gains a
 case. Case IDs do
 not change once published; a changed expected value is a new case plus an
 explanation in `note`.

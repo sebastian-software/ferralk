@@ -262,6 +262,19 @@ impl Pattern {
         })
     }
 
+    /// Returns the input paths accepted by this compiled pattern, in input
+    /// order. The returned references borrow the caller-owned path list.
+    #[must_use]
+    pub fn filter_paths<'a, T>(&self, paths: impl IntoIterator<Item = &'a T>) -> Vec<&'a T>
+    where
+        T: AsRef<[u8]> + ?Sized + 'a,
+    {
+        paths
+            .into_iter()
+            .filter(|path| self.is_match(path.as_ref()))
+            .collect()
+    }
+
     fn matches_from(
         &self,
         tokens: &[Token],
@@ -1319,6 +1332,16 @@ mod tests {
                 "fast path differs for {candidate:?}"
             );
         }
+    }
+
+    #[test]
+    fn filter_paths_preserves_input_order_and_borrows_inputs() {
+        let pattern = Pattern::compile("*.txt", PatternOptions::default()).unwrap();
+        let paths = ["first.txt", "skip.rs", "second.txt"];
+        assert_eq!(
+            pattern.filter_paths(&paths),
+            vec![&"first.txt", &"second.txt"]
+        );
     }
 
     #[test]

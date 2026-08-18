@@ -15,6 +15,15 @@ pub struct Case {
     /// matcher verdict for backwards-compatible JSONL decoding.
     #[serde(default)]
     pub kind: CaseKind,
+    /// Input candidates for a [`CaseKind::MatchPaths`] operation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// Ferralk's expected selected candidates for a list operation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matches: Vec<String>,
+    /// The external oracle's selected candidates when it intentionally differs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_matches: Option<Vec<String>>,
     /// Glob or ignore expression, encoded with [`decode_bytes`].
     pub pattern: String,
     /// Candidate path, encoded with [`decode_bytes`].
@@ -51,6 +60,8 @@ pub enum CaseKind {
     Matcher,
     /// Flag-sensitive preflight detection of active wildcard syntax.
     HasWildcards,
+    /// Filters a caller-owned list of candidate paths.
+    MatchPaths,
 }
 
 /// Provenance of a corpus result.

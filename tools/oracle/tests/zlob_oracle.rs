@@ -41,6 +41,39 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                     })
                     .is_some(),
                 CaseKind::HasWildcards => has_wildcards(pattern, flags(&case.flags)),
+                CaseKind::MatchPaths => {
+                    if case.flags.iter().any(|flag| flag == "nocheck") {
+                        // zlob 1.6.3's Rust FFI aborts on empty input and
+                        // returns corrupted bytes for this synthetic result.
+                        // The frozen Zig assertion remains the source evidence.
+                        case.expected
+                    } else {
+                        let paths = case
+                            .paths
+                            .iter()
+                            .map(|path| decode_bytes(path))
+                            .collect::<Result<Vec<_>, _>>()
+                            .expect("decode paths");
+                        let paths = paths
+                            .iter()
+                            .map(|path| std::str::from_utf8(path).expect("zlob paths are UTF-8"))
+                            .collect::<Vec<_>>();
+                        let selected =
+                            zlob_match_paths(pattern, paths.as_slice(), flags(&case.flags))
+                                .expect("zlob match paths")
+                                .map(|matches| matches.to_strings())
+                                .unwrap_or_default();
+                        let expected = case.oracle_matches.as_ref().unwrap_or(&case.matches);
+                        assert_eq!(
+                            &selected,
+                            expected,
+                            "{}:{}: list result",
+                            file.display(),
+                            line_number + 1
+                        );
+                        case.expected
+                    }
+                }
             };
             assert_eq!(
                 actual,
@@ -66,6 +99,7 @@ fn flags(names: &[String]) -> ZlobFlags {
                 "extglob" => ZlobFlags::EXTGLOB,
                 "match_hidden" => ZlobFlags::PERIOD,
                 "no_escape" => ZlobFlags::NOESCAPE,
+                "nocheck" => ZlobFlags::NOCHECK,
                 "case_insensitive" => panic!("zlob 1.6.3 has no case-folding flag"),
                 unknown => panic!("unknown matcher flag {unknown:?}"),
             }

@@ -1,0 +1,5 @@
+{"id":"match-paths-nocheck-empty","kind":"match_paths","pattern":"*.txt","path":"","paths":[],"matches":[],"oracle_matches":["*.txt"],"flags":["nocheck"],"expected":true,"source":"zlob_1_6_3","disputed":true,"note":"Ferralk deliberately returns no caller-owned paths; zlob NOCHECK returns the pattern."}
+{"id":"match-paths-literal","kind":"match_paths","pattern":"exact_match.txt","path":"","paths":["exact_match.txt","no_match.txt"],"matches":["exact_match.txt"],"flags":[],"expected":true,"source":"zlob_1_6_3"}
+{"id":"match-paths-all-wildcards","kind":"match_paths","pattern":"*","path":"","paths":["a","abc","xyz123"],"matches":["a","abc","xyz123"],"flags":[],"expected":true,"source":"zlob_1_6_3"}
+{"id":"match-paths-bracket","kind":"match_paths","pattern":"file[123].txt","path":"","paths":["file1.txt","file2.txt","file3.txt","filea.txt"],"matches":["file1.txt","file2.txt","file3.txt"],"flags":[],"expected":true,"source":"zlob_1_6_3"}
+{"id":"match-paths-case-sensitive","kind":"match_paths","pattern":"test.txt","path":"","paths":["Test.TXT","test.txt","TEST.txt"],"matches":["test.txt"],"flags":[],"expected":true,"source":"zlob_1_6_3"}
