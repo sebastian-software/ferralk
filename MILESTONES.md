@@ -53,7 +53,7 @@ matcher ≤1.5x zlob median, ≤1.25x `fast-glob` median on the common subset.
 - [ ] Matcher corpus green (all topic files except `ignore.jsonl`)
 - [ ] Run differential generation against the oracle; triage every
       disagreement into the corpus — ADR-0007
-- [ ] Property tests (literal-only patterns, subset/superset invariants)
+- [x] Property tests (literal-only patterns, subset/superset invariants)
 - [ ] Fuzzers for parser and matcher with seeded corpora
 - [ ] Refactor the ported code toward the immutable IR (after corpus green) —
       ADR-0002
@@ -247,3 +247,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   no-match, and long-alternative assertions. `braces.jsonl` now contains 57
   source-linked cases; the further brace tests are filesystem/API fixtures and
   remain queued for the M2 walker corpus layer.
+- Added deterministic exhaustive property tests for literal-only byte patterns
+  and for wildcard subset invariants (`?` and `a*` are subsets of `*`
+  with leading-period matching explicitly enabled). These complement, rather
+  than replace, the source-backed corpus tests.

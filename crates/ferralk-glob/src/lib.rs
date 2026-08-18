@@ -1062,10 +1062,63 @@ mod tests {
     }
 
     #[test]
+    fn literal_only_patterns_match_exactly_over_exhaustive_byte_words() {
+        let words = byte_words(b"abc", 3);
+        for pattern in &words {
+            let matcher = Pattern::compile(pattern, PatternOptions::default())
+                .expect("literal byte patterns compile");
+            for candidate in &words {
+                assert_eq!(
+                    matcher.is_match(candidate),
+                    pattern == candidate,
+                    "literal pattern {pattern:?} against {candidate:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wildcard_subset_invariants_hold_over_exhaustive_byte_words() {
+        let options = PatternOptions::default().match_hidden(true);
+        let any = Pattern::compile("?", options).expect("single wildcard compiles");
+        let star = Pattern::compile("*", options).expect("star wildcard compiles");
+        let prefixed = Pattern::compile("a*", options).expect("prefixed star compiles");
+        let words = byte_words(b"ab.", 4);
+        for candidate in &words {
+            assert!(
+                !any.is_match(candidate) || star.is_match(candidate),
+                "question-mark matches a path the star rejects: {candidate:?}"
+            );
+            assert!(
+                !prefixed.is_match(candidate) || star.is_match(candidate),
+                "prefixed star matches a path the unrestricted star rejects: {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_syntax_has_a_location() {
         let error = Pattern::compile("[abc", PatternOptions::default()).unwrap_err();
         assert_eq!(error.offset(), 0);
         assert_eq!(error.message(), "unclosed character class");
         assert!(compile("foo\\").is_match("foo\\"));
+    }
+
+    fn byte_words(alphabet: &[u8], max_length: usize) -> Vec<Vec<u8>> {
+        let mut words = vec![Vec::new()];
+        let mut current = vec![Vec::new()];
+        for _ in 0..max_length {
+            let mut next = Vec::new();
+            for prefix in current {
+                for &byte in alphabet {
+                    let mut word = prefix.clone();
+                    word.push(byte);
+                    next.push(word);
+                }
+            }
+            words.extend(next.iter().cloned());
+            current = next;
+        }
+        words
     }
 }
