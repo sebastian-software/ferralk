@@ -33,6 +33,12 @@ absolute paths, and `./` normalization. The harness executes the corresponding
 `Pattern::{filter_paths,filter_paths_at,filter_path_indices,filter_path_indices_at}`
 operations, and the manual oracle invokes the matching zlob Rust APIs.
 
+The root-independent compositional path-list forms from
+`test/test_absolute_paths.zig` are recorded in that same corpus: multiple
+brace components, brace-plus-suffix expansion, and brace-prefixed recursive
+selection. Filesystem-only fixture setup remains outside this in-memory API
+coverage boundary.
+
 The anchored, recursive, and allowlist examples from `test/test_gitignore.zig`
 are represented in [`corpus/ignore.jsonl`](../corpus/ignore.jsonl). Their
 source provenance remains zlob, but the `expected` value is deliberately

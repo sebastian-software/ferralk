@@ -603,3 +603,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   segments. Git's `check-ignore` and Ferralk's Walker now replay all thirteen
   corpus records; zlob's parser remains provenance rather than the normative
   ignore engine under ADR-0006.
+- Imported three compositional path-list cases from frozen
+  `test_absolute_paths.zig`: multi-branch brace components, brace-plus-suffix
+  expansion, and brace-prefixed recursive C-file selection. The normal
+  harness and pinned Rust oracle both replay the ordered results.
