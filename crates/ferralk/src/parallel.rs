@@ -330,6 +330,9 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
         .path
         .strip_prefix(&shared.walker.root)
         .unwrap_or(entry.path.as_path());
+    if !shared.walker.includes_depth(relative) {
+        return;
+    }
     let bytes = relative.as_os_str().as_encoded_bytes();
     if shared.walker.options.skip_hidden && has_hidden_component(bytes) {
         return;
@@ -372,7 +375,7 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
             .excludes
             .iter()
             .any(|pattern| pattern.covers_subtree(bytes))
-        && shared.walker.may_descend_into(bytes)
+        && shared.walker.may_descend_path(relative, bytes)
     {
         shared.schedule(&worker.queue, entry.path.clone());
     }

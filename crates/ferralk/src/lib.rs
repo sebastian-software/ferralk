@@ -68,6 +68,7 @@ pub struct WalkOptions {
     files_only: bool,
     skip_hidden: bool,
     keep_git_dir: bool,
+    max_depth: Option<usize>,
 }
 
 impl WalkOptions {
@@ -118,6 +119,14 @@ impl WalkOptions {
     #[must_use]
     pub const fn keep_git_dir(mut self, enabled: bool) -> Self {
         self.keep_git_dir = enabled;
+        self
+    }
+
+    /// Includes entries through `max_depth` components below the root without
+    /// descending into directories at that depth.
+    #[must_use]
+    pub const fn max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = Some(max_depth);
         self
     }
 }
@@ -368,6 +377,21 @@ impl Walker {
                 .includes
                 .iter()
                 .any(|pattern| pattern.could_match_descendant(relative))
+    }
+
+    fn may_descend_path(&self, relative: &Path, bytes: &[u8]) -> bool {
+        self.includes_depth(relative)
+            && self
+                .options
+                .max_depth
+                .is_none_or(|max_depth| relative.components().count() < max_depth)
+            && self.may_descend_into(bytes)
+    }
+
+    fn includes_depth(&self, relative: &Path) -> bool {
+        self.options
+            .max_depth
+            .is_none_or(|max_depth| relative.components().count() <= max_depth)
     }
 
     fn may_include_file(&self, relative: &[u8]) -> bool {
@@ -640,6 +664,9 @@ impl WalkStream {
             .path
             .strip_prefix(&self.walker.root)
             .unwrap_or(entry.path.as_path());
+        if !self.walker.includes_depth(relative) {
+            return None;
+        }
         let bytes = relative.as_os_str().as_encoded_bytes();
         if self.walker.options.skip_hidden && has_hidden_component(bytes) {
             return None;
@@ -679,7 +706,7 @@ impl WalkStream {
                 .excludes
                 .iter()
                 .any(|pattern| pattern.covers_subtree(bytes))
-            && self.walker.may_descend_into(bytes)
+            && self.walker.may_descend_path(relative, bytes)
         {
             self.pending_directories.push(entry.path.clone());
         }
@@ -808,6 +835,9 @@ impl<'walker> WalkState<'walker> {
             .path
             .strip_prefix(&self.walker.root)
             .unwrap_or(entry.path.as_path());
+        if !self.walker.includes_depth(relative) {
+            return Ok(());
+        }
         let bytes = relative.as_os_str().as_encoded_bytes();
         if self.walker.options.skip_hidden && has_hidden_component(bytes) {
             return Ok(());
@@ -850,7 +880,7 @@ impl<'walker> WalkState<'walker> {
                 .excludes
                 .iter()
                 .any(|pattern| pattern.covers_subtree(bytes))
-            && self.walker.may_descend_into(bytes)
+            && self.walker.may_descend_path(relative, bytes)
         {
             self.walk_directory(backend, entry.path.clone())?;
         }
@@ -1116,6 +1146,50 @@ mod tests {
         assert_eq!(relative_paths(parallel.entries(), &fixture.root), expected);
         assert_eq!(relative_paths(&streamed, &fixture.root), expected);
         assert!(streamed.iter().all(WalkEntry::is_dir));
+    }
+
+    #[test]
+    fn max_depth_keeps_boundary_entries_without_descending() {
+        let fixture = Fixture::new();
+        fixture.write("top.txt");
+        fixture.write("d1/mid.txt");
+        fixture.write("d1/d2/bottom.txt");
+
+        for (max_depth, expected) in [
+            (0, vec![]),
+            (1, vec![PathBuf::from("d1"), PathBuf::from("top.txt")]),
+            (
+                2,
+                vec![
+                    PathBuf::from("d1"),
+                    PathBuf::from("d1/d2"),
+                    PathBuf::from("d1/mid.txt"),
+                    PathBuf::from("top.txt"),
+                ],
+            ),
+        ] {
+            let options = WalkOptions::default().max_depth(max_depth).sort(true);
+            let serial = Walker::new(&fixture.root)
+                .threads(1)
+                .options(options)
+                .collect()
+                .expect("serial walk succeeds");
+            let parallel = Walker::new(&fixture.root)
+                .threads(4)
+                .options(options)
+                .collect()
+                .expect("parallel walk succeeds");
+            let mut streamed = Walker::new(&fixture.root)
+                .options(options)
+                .stream()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("stream succeeds");
+            streamed.sort_by(|left, right| left.path.cmp(&right.path));
+
+            assert_eq!(relative_paths(serial.entries(), &fixture.root), expected);
+            assert_eq!(relative_paths(parallel.entries(), &fixture.root), expected);
+            assert_eq!(relative_paths(&streamed, &fixture.root), expected);
+        }
     }
 
     #[test]

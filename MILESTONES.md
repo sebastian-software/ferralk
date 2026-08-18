@@ -550,10 +550,11 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   `test_path_matcher.zig`: recursive prefix/middle/terminal forms, repeated
   recursive segments, component-local `?` and classes, absolute paths,
   duplicate separators, and both hidden-path policies. They replay in the
-  Zig-free harness and the pinned Rust oracle. The remaining tests in that
-  file that exercise `matchPathsAt`, index-returning APIs, C-string chunking,
-  or private component-buffer limits are tracked as API/implementation work,
-  not as a frozen-reference blocker.
+  Zig-free harness and the pinned Rust oracle. Its base-relative and
+  index-returning public variants are now covered separately below. The
+  remaining tests in that file exercise C-string chunking or private
+  component-buffer limits; they are tracked as ABI/implementation work, not
+  as a frozen-reference blocker.
 - The absolute-path fixture suite exposed a zlob surface disagreement around
   empty Extglob branches: its filesystem glob excludes `.c` for `?(a|b).c`
   without `PERIOD`, but Rust `matchPaths` accepts it. Ferralk now rejects that
@@ -574,3 +575,31 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   order, and skips outside candidates. The normal harness and pinned zlob Rust
   API replay the trailing-slash, empty-base, literal, recursive, `./`, and
   no-match scenarios successfully.
+- Added `Pattern::{filter_path_indices,filter_path_indices_at}` and eight
+  source-backed index cases from the same frozen path-matcher suite. Results
+  are input positions in stable caller order, including the base-relative
+  variant. The corpus harness and pinned zlob Rust index API agree on basic,
+  empty, brace, recursive, and compiled-pattern-equivalent scenarios.
+- **Local signing incident:** the configured SSH signing path through
+  1Password repeatedly reported no loaded identities. The verified commits
+  `d2b027a` and `0cacba8` were therefore created with a one-command
+  `commit.gpgSign=false` override; neither repository nor user Git
+  configuration was changed. Code, harness, and oracle work remained
+  unblocked throughout.
+- Ported the walker depth boundary from frozen `test_walk.zig` as
+  `WalkOptions::max_depth`. It returns entries at the configured depth but
+  never opens their children; depth zero returns no root children. One fixture
+  asserts equivalent serial, parallel, and streaming results at depths zero,
+  one, and two.
+- Ran the local ten-sample Walker comparison on the checked-in 16×4 filtered
+  tree: Ferralk serial was about 1.37 ms, Ferralk parallel about 0.74 ms,
+  parallel `ignore` about 1.96 ms, and zlob parallel about 0.64 ms. On this
+  fixture Ferralk is about 1.15× zlob and faster than `ignore`; the M3
+  benchmark gate remains open until the full traversal corpus and CodSpeed
+  measurements establish the release-wide result.
+- Expanded the Git-normative ignore corpus with ten source-inspired scenarios
+  from frozen `test_gitignore.zig`: anchored paths, recursive directory and
+  suffix rules, the `*`/`!*.*`/`!/**/` allowlist idiom, and recursive middle
+  segments. Git's `check-ignore` and Ferralk's Walker now replay all thirteen
+  corpus records; zlob's parser remains provenance rather than the normative
+  ignore engine under ADR-0006.

@@ -25,6 +25,20 @@ that file's three path-list assertions added to `match-paths.jsonl`.
 The source-level Extglob path-list scenarios in `test/test_extglob.zig` are
 represented in [`corpus/extglob-suite.jsonl`](../corpus/extglob-suite.jsonl).
 
+The public in-memory API scenarios in `test/test_path_matcher.zig` are
+represented in [`corpus/path-matcher.jsonl`](../corpus/path-matcher.jsonl).
+They cover ordinary and base-relative path filtering, full-path preservation,
+input-order index results, brace and recursive patterns, leading-dot policy,
+absolute paths, and `./` normalization. The harness executes the corresponding
+`Pattern::{filter_paths,filter_paths_at,filter_path_indices,filter_path_indices_at}`
+operations, and the manual oracle invokes the matching zlob Rust APIs.
+
+The anchored, recursive, and allowlist examples from `test/test_gitignore.zig`
+are represented in [`corpus/ignore.jsonl`](../corpus/ignore.jsonl). Their
+source provenance remains zlob, but the `expected` value is deliberately
+recorded as `git_check_ignore`: ADR-0006 makes Git, rather than zlob's private
+GitIgnore implementation, Ferralk's normative ignore oracle.
+
 ## Syntax preflight cases
 
 The flag-sensitive `hasWildcards` assertions are represented by
@@ -56,6 +70,7 @@ equivalent public Ferralk type today:
 | --- | --- | --- |
 | 338–385 | `PatternContext` template classification | Internal zlob optimization detail; Ferralk exposes a compiled `Pattern`, not a template-inspection API. |
 | 438–448 | private SIMD index helpers | Implementation detail only; ADR-0008 reserves any equivalent optimization for profiling-backed work. |
+| `test/test_path_matcher.zig` C-string chunking and private component limits | ABI-owned output buffers and private fixed-capacity detail | Ferralk returns native `Vec` values and intentionally has no fixed zlob component limit; the public list and index contracts are corpus-covered. |
 
 These exclusions are intentionally not counted as corpus coverage. They keep
 the broad M0 “whole zlob test suite” item open until a compatible corpus model

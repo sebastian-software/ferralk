@@ -19,7 +19,7 @@ read the [compatibility guide](compatibility-guide.md).
 | `ZLOB_NOESCAPE` | `PatternOptions::escape` | Implemented (M1) | Higher-level boolean, not a bitflag. |
 | case folding | `PatternOptions::case_insensitive` | Implemented (M1) | Explicit opt-in on every platform. |
 | `has_wildcards` | `Pattern::has_wildcards` | Implemented (M1) | Byte-first, flag-sensitive preflight matching zlob's active syntax markers. |
-| `zlob_match_paths` / `_at` | `Pattern::filter_paths` / `filter_paths_at` | Implemented (M1) | Preserves caller order rather than zlob's default sort; `_at` matches after stripping a component-boundary base path while returning original full paths. Wildcard tokens after an explicit separator stay in that component, while `**` remains recursive. |
+| `zlob_match_paths` / `_at` and index variants | `Pattern::{filter_paths,filter_paths_at,filter_path_indices,filter_path_indices_at}` | Implemented (M1) | Path APIs preserve caller order rather than zlob's default sort; index APIs return input positions. `_at` matches after stripping a component-boundary base path while returning original full paths or indices. Wildcard tokens after an explicit separator stay in that component, while `**` remains recursive. |
 | `ZLOB_NOCHECK`, `ZLOB_NOMAGIC` | Walker no-match policy | Deferred (M4 review) | These are C/glob result-shaping semantics, not matcher semantics. |
 | `ZLOB_TILDE`, `ZLOB_TILDE_CHECK` | — | Deliberate divergence | Out of scope per RFC non-goals. |
 
@@ -34,10 +34,11 @@ read the [compatibility guide](compatibility-guide.md).
 | `ZLOB_FOLLOW_SYMLINKS` | `WalkOptions::follow_symlinks` | Implemented (M2) | Default off; canonical-path cycle guard when enabled. |
 | `ZLOB_ONLYDIR` | `WalkOptions::directories_only` | Implemented (M2) | Filters returned files without pruning traversal. |
 | `ZLOB_WALK_NO_REPORT_DIRS` | `WalkOptions::files_only` | Implemented (M2) | Filters returned directories without pruning traversal. |
+| walker `max_depth` | `WalkOptions::max_depth` | Implemented (M2) | Returns entries through the depth boundary while pruning any deeper descent in serial, parallel, and streaming modes. |
 | `ZLOB_MARK` | — | Deliberate divergence | Ferralk preserves native paths instead of appending display-only separators. |
 | `ZLOB_ERR` | `ErrorPolicy::{Abort,Skip,Collect}` | Implemented (M2) | `Collect` default. |
 | `ZLOB_APPEND`, `ZLOB_DOOFFS` | — | Deliberate divergence | C output-buffer ownership has no Rust equivalent. |
-| `zlob_at` | `Walker::new(path)` | Planned (M2) | Root is an explicit path. |
+| `zlob_at` | `Walker::new(path)` | Implemented (M2) | Root is an explicit path; Rust results avoid zlob's C output-buffer ownership. |
 | metadata masks | `WalkOptions::metadata` | Implemented (M2) | Opt-in `std::fs::Metadata` collection preserves the default no-extra-stat behaviour. |
 
 ## Inventory provenance
