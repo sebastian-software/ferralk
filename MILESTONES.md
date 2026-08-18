@@ -535,3 +535,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   task: zlob treats it as exactly one component, whereas Ferralk's direct
   fallback currently crosses more broadly. That case remains outside the green
   corpus until the policy is implemented rather than being silently altered.
+- Resolved the flag-off `**` Path-List divergence: the path-filter IR now
+  treats a non-recursive double-star pair as one component-local wildcard, as
+  zlob's glibc-compatible mode does. The formerly deferred source case is back
+  in the green corpus. The manual Rust oracle returns nested paths for that
+  same input, so the corpus records its result separately as a source-level
+  C/Rust zlob disagreement.

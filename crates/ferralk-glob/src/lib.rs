@@ -290,6 +290,9 @@ impl Pattern {
                 alternative.raw.drain(..2);
                 alternative.tokens.drain(..2);
             }
+            if !matcher.options.recursive_double_star {
+                alternative.tokens = path_list_tokens(std::mem::take(&mut alternative.tokens));
+            }
         }
         paths
             .into_iter()
@@ -346,6 +349,9 @@ impl Pattern {
                 failed,
                 !self.component_wildcard(tokens, token_index),
             ),
+            Token::PathStar => {
+                self.match_star(tokens, token_index, path_index, path, failed, false)
+            }
             Token::RecursiveStar | Token::RecursivePrefix => {
                 self.match_star(tokens, token_index, path_index, path, failed, true)
             }
@@ -479,7 +485,21 @@ enum Token {
     Star,
     RecursiveStar,
     RecursivePrefix,
+    PathStar,
     Class(Class),
+}
+
+fn path_list_tokens(tokens: Vec<Token>) -> Vec<Token> {
+    let mut normalized = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        if matches!(token, Token::Star) && matches!(normalized.last(), Some(Token::Star)) {
+            normalized.pop();
+            normalized.push(Token::PathStar);
+        } else {
+            normalized.push(token);
+        }
+    }
+    normalized
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1493,6 +1513,21 @@ mod tests {
             vec![&"lua/init.lua", &"nvim/lua/setup.lua"]
         );
         assert!(pattern.is_match("nvim/lua/sub/nested.lua"));
+    }
+
+    #[test]
+    fn filter_paths_treats_non_recursive_double_star_as_one_component() {
+        let pattern = Pattern::compile("**/*.c", PatternOptions::default()).unwrap();
+        let paths = [
+            "file1.c",
+            "dir1/file1.c",
+            "dir1/subdir1/file1.c",
+            "dir2/file1.c",
+        ];
+        assert_eq!(
+            pattern.filter_paths(&paths),
+            vec![&"dir1/file1.c", &"dir2/file1.c"]
+        );
     }
 
     #[test]
