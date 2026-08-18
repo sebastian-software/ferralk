@@ -472,3 +472,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   zlob 1.6.3 oracle both replay the new operation successfully. This removes
   the preflight rows from the direct fnmatch-suite exclusions, while the wider
   M0 suite port remains open for non-matcher subsystems.
+- Verified the public non-UTF-8 path fixture's Linux-only scope: APFS rejects
+  creation of the deliberate `0xFF` filename, so expanding that fixture to
+  macOS would make CI fail before Ferralk can observe the path. The M2 fixture
+  aggregate remains open for a portable, deterministic public reproduction of
+  the dirent-to-metadata disappearance race.

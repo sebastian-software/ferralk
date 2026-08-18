@@ -7,8 +7,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(target_os = "linux")]
-use ferralk::WalkOptions;
 use ferralk::{ErrorPolicy, WalkOptions, Walker};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
