@@ -621,3 +621,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   fixture: alternation, negation, repetition, and brace composition. They
   replay in the harness and Rust oracle; the fixture's empty-branch cases stay
   separately documented as C/Rust Zlob surface disagreements.
+- Added seven absolute-fixture hidden-name scenarios covering wildcard and
+  recursive `PERIOD` policy, explicit dot prefixes, literal hidden directories,
+  and a repeating Extglob without `PERIOD`. The frozen filesystem glob and
+  Rust `matchPaths` disagree not only on empty Extglob branches but also on
+  wildcard hidden-name filtering and hidden-directory recursion; all three
+  evidence pairs are retained as disputed corpus records rather than conflated.
