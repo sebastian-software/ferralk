@@ -33,6 +33,7 @@ pub struct PatternOptions {
     match_hidden: bool,
     case_insensitive: bool,
     escape: bool,
+    component_wildcards: bool,
 }
 
 impl Default for PatternOptions {
@@ -44,6 +45,7 @@ impl Default for PatternOptions {
             match_hidden: false,
             case_insensitive: false,
             escape: true,
+            component_wildcards: false,
         }
     }
 }
@@ -270,9 +272,14 @@ impl Pattern {
     where
         T: AsRef<[u8]> + ?Sized + 'a,
     {
+        let mut matcher = self.clone();
+        matcher.options.component_wildcards = true;
+        for alternative in &mut matcher.alternatives {
+            alternative.fast_path = None;
+        }
         paths
             .into_iter()
-            .filter(|path| self.is_match(path.as_ref()))
+            .filter(|path| matcher.is_match(path.as_ref()))
             .collect()
     }
 
@@ -305,9 +312,16 @@ impl Pattern {
                     class.matches(byte, self.options.case_insensitive)
                 })
             }
-            Token::Star => self.match_star(tokens, token_index, path_index, path, failed),
+            Token::Star => self.match_star(
+                tokens,
+                token_index,
+                path_index,
+                path,
+                failed,
+                !self.component_wildcard(tokens, token_index),
+            ),
             Token::RecursiveStar | Token::RecursivePrefix => {
-                self.match_star(tokens, token_index, path_index, path, failed)
+                self.match_star(tokens, token_index, path_index, path, failed, true)
             }
         };
 
@@ -315,6 +329,12 @@ impl Pattern {
             failed.remove(token_index, path_index);
         }
         matches
+    }
+
+    fn component_wildcard(&self, tokens: &[Token], token_index: usize) -> bool {
+        self.options.component_wildcards
+            && token_index > 0
+            && matches!(tokens[token_index - 1], Token::Separator)
     }
 
     fn match_literal(
@@ -355,6 +375,7 @@ impl Pattern {
     ) -> bool {
         path.get(path_index).is_some_and(|&byte| {
             accepts(byte)
+                && (!self.component_wildcard(tokens, token_index) || !is_separator(byte))
                 && (self.options.match_hidden
                     || byte != b'.'
                     || !at_component_start(path, path_index))
@@ -369,6 +390,7 @@ impl Pattern {
         path_index: usize,
         path: &[u8],
         failed: &mut FailedStates,
+        recursive: bool,
     ) -> bool {
         if self.matches_from(tokens, token_index + 1, path_index, path, failed) {
             return true;
@@ -376,6 +398,9 @@ impl Pattern {
         let Some(&byte) = path.get(path_index) else {
             return false;
         };
+        if !recursive && self.options.component_wildcards && is_separator(byte) {
+            return false;
+        }
         if !self.options.match_hidden && byte == b'.' && at_component_start(path, path_index) {
             return false;
         }
@@ -454,6 +479,9 @@ enum FastPath {
 
 impl FastPath {
     fn compile(tokens: &[Token], options: PatternOptions) -> Option<Self> {
+        if options.component_wildcards {
+            return None;
+        }
         if tokens
             .iter()
             .all(|token| matches!(token, Token::Literal(_) | Token::Separator))
@@ -1420,6 +1448,25 @@ mod tests {
             pattern.filter_paths(&paths),
             vec![&"first.txt", &"second.txt"]
         );
+    }
+
+    #[test]
+    fn filter_paths_keeps_wildcards_after_a_separator_in_one_component() {
+        let pattern = Pattern::compile(
+            "**/lua/*.lua",
+            PatternOptions::default().recursive_double_star(true),
+        )
+        .unwrap();
+        let paths = [
+            "lua/init.lua",
+            "nvim/lua/setup.lua",
+            "nvim/lua/sub/nested.lua",
+        ];
+        assert_eq!(
+            pattern.filter_paths(&paths),
+            vec![&"lua/init.lua", &"nvim/lua/setup.lua"]
+        );
+        assert!(pattern.is_match("nvim/lua/sub/nested.lua"));
     }
 
     #[test]

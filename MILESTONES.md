@@ -514,3 +514,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   recursive paths, brace composition, and disabled literal syntax through
   ordered `match_paths` scenarios. Remaining zlob test files are still tracked
   by the open M0 whole-suite item.
+- Split direct matcher and path-list wildcard policy to match zlob's two
+  surfaces: `Pattern::is_match` retains direct fnmatch's separator behaviour,
+  while `Pattern::filter_paths` limits wildcards following an explicit
+  separator to one component and keeps recursive `**` crossing components. A
+  regression test covers the `**/lua/*.lua` nested-file boundary before the
+  remaining basic path-list corpus block is imported.
