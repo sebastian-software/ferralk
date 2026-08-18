@@ -1,8 +1,11 @@
-# RFC: A Zig-Free Rust Port of zlob
+# RFC: ferralk — A Zig-Free Rust Port of zlob
 
-- **Status:** Accepted (2026-08-18)
+- **Status:** Accepted (2026-08-18); all open design questions resolved in the
+  end-to-end design review of 2026-08-18
 - **Date:** 2026-08-18
-- **Working name:** `zlob-rs` (name and upstream ownership are undecided)
+- **Name:** `ferralk` — independent crate family (`ferralk-glob` matcher,
+  `ferralk` walker) under sebastian-software
+- **License:** MIT (zlob's MIT attribution retained in ported modules)
 - **Reference implementation:** zlob 1.6.3
 - **Audience:** Rust tooling maintainers who need fast, portable glob matching and filesystem traversal
 
@@ -17,8 +20,8 @@ differentiate zlob.
 “Zig-free” does not mean “syscall-free” or “entirely safe Rust.” Matching,
 scheduling, ignore evaluation, and the public API should be safe Rust. Optional
 optimized filesystem backends may contain small, audited `unsafe` modules for
-Linux, macOS, and Windows. A portable `std::fs` backend remains available on all
-targets.
+macOS and Linux. A portable `std::fs` backend remains available on all targets
+and is the only backend on Windows.
 
 The delivery order is compatibility first, portable traversal second,
 parallelism third, and platform-specific fast paths last. The implementation
@@ -72,7 +75,8 @@ The implementation MUST:
    directory walking.
 3. Define a documented compatibility profile against zlob 1.6.3.
 4. Preserve native filesystem paths without unchecked UTF-8 conversion.
-5. Support Linux, macOS, and Windows as first-class targets.
+5. Support Linux and macOS as first-class targets; support Windows through the
+   portable backend (built and tested in CI, no performance gates).
 6. Provide deterministic optional sorting and an allocation-conscious unsorted
    mode.
 7. Support early include/exclude pruning and nested Git-style ignore rules.
@@ -84,8 +88,10 @@ The implementation MUST:
 
 The implementation SHOULD:
 
-- offer a migration layer close to the existing Rust API;
-- keep the minimum supported Rust version explicit and tested;
+- document the mapping from zlob's Rust API in a compatibility guide;
+- keep the minimum supported Rust version explicit and tested (policy: current
+  stable minus two releases, declared via `rust-version`, verified by a
+  dedicated CI job; bumps are minor-version events during 0.x);
 - permit consumers to disable walking or native fast paths;
 - make thread count, symlink policy, ordering, metadata collection, and error
   policy explicit;
@@ -102,7 +108,10 @@ The first stable release does not need to:
 - implement tilde expansion or shell-specific behavior before its semantics and
   security implications are specified;
 - replace mature Rust crates merely to avoid dependencies;
-- expose platform syscall details through the public API.
+- expose platform syscall details through the public API;
+- provide a native Windows filesystem backend or Windows-specific performance
+  guarantees;
+- ship a C ABI or a zlob Rust-API migration facade.
 
 ## Compatibility target
 
@@ -136,7 +145,7 @@ The public API should use builders and typed options instead of carrying C ABI
 constraints into the rewrite.
 
 ```rust
-use zlob::{Pattern, PatternOptions};
+use ferralk_glob::{Pattern, PatternOptions};
 
 let pattern = Pattern::compile(
     "**/*.{js,jsx,ts,tsx}",
@@ -150,7 +159,7 @@ assert!(pattern.is_match("src/main.ts"));
 ```
 
 ```rust
-use zlob::{ErrorPolicy, WalkOptions, Walker};
+use ferralk::{ErrorPolicy, WalkOptions, Walker};
 
 let entries = Walker::new(".")
     .include("**/*.{js,jsx,ts,tsx}")?
@@ -165,6 +174,12 @@ let entries = Walker::new(".")
 The iterator form SHOULD support streaming and cancellation. `collect()` MAY use
 per-worker result shards and merge once traversal completes. The API MUST not
 promise deterministic order unless sorting is requested.
+
+Defaults follow POSIX glob semantics; anything behavior-changing is explicit
+opt-in: symlinks are not followed, gitignore evaluation is off, `*` does not
+match leading-period names, results are unsorted, the error policy is
+`Collect`, and the thread count defaults to `available_parallelism()` once the
+parallel scheduler exists.
 
 ## Architecture
 
@@ -185,10 +200,17 @@ the differential corpus first and refactored toward the IR described above
 second; the transliterated structure is scaffolding, not the release
 architecture.
 
-The matcher begins with portable byte/character loops and stable dependencies
-such as `memchr` where appropriate. Architecture-specific SIMD can be introduced
-only after profiles identify a hot loop. Runtime feature detection is preferred
-over producing binaries that require a new CPU baseline.
+The port covers the scalar semantic core only. zlob's `@Vector` SIMD paths are
+not transliterated — they have no stable-Rust equivalent. Following the
+in-house Ferroni playbook (a pure-Rust Oniguruma port that beats the C original
+without a single hand-written intrinsic), hot paths use `memchr`/`memmem`
+primitives, which supply SIMD with runtime feature detection and no unsafe
+code; `aho-corasick` is a candidate for multi-pattern literal prefilters.
+Hand-written intrinsics are considered only if profiling proves a gap these
+primitives cannot close. `ferralk-glob` compiles under
+`#![forbid(unsafe_code)]`; matching operates on bytes (`&[u8]`) with a `&str`
+convenience layer on top. Ported modules carry a module-level provenance header
+naming the zlob source file and the v1.6.3 commit.
 
 ### 2. Prune planner
 
@@ -236,12 +258,15 @@ documented policy.
 Delivery starts with a portable `std::fs::read_dir` backend. Optimized backends
 are optional and selected at compile time plus runtime capability checks:
 
-- **Linux:** batched `getdents64`, with `statx` only when required;
-- **macOS:** `getdirentries64` for names/types and `getattrlistbulk` when batch
-  metadata is beneficial, with a portable fallback for unsupported filesystems;
-- **Windows:** `NtQueryDirectoryFile` or a documented Win32 batch API, with
-  careful version and structure validation;
+- **macOS** (first native backend): `getdirentries64` for names/types and
+  `getattrlistbulk` when batch metadata is beneficial, with a portable fallback
+  for unsupported filesystems;
+- **Linux** (second): batched `getdents64`, with `statx` only when required;
+- **Windows:** portable backend only (tier 2); no native backend is planned;
 - **Other targets:** portable backend.
+
+Native backends are post-1.0 features behind feature flags; 1.0 ships portable
+on all platforms.
 
 Raw records MUST be bounds-checked before field access. Each unsafe backend
 requires module-level invariants, focused tests, fuzzable record parsers where
@@ -249,8 +274,10 @@ possible, and a safe adapter boundary.
 
 ### 6. Ignore engine
 
-The first implementation SHOULD reuse the `ignore` crate's mature Gitignore
-matching unless differential tests show an incompatible hot path. Per-directory
+Git itself is normative: `git check-ignore` verdicts are the corpus oracle for
+ignore semantics. The `ignore` crate's Gitignore rule matcher is the engine
+(its parallel walker is not reused), and known divergences from Git are
+documented and decided case by case. Per-directory
 ignore matchers are immutable nodes linked to their parent rule set. Workers may
 share parsed nodes through reference-counted ownership and a path-keyed cache.
 
@@ -260,11 +287,13 @@ is preserved.
 
 ### 7. Path representation
 
-The public walker accepts and returns `Path`/`PathBuf`. On Unix, matching can use
-`OsStrExt::as_bytes()` without UTF-8 assumptions. On Windows, the implementation
-must define whether matching operates over WTF-8, UTF-16 code units, or a
-lossless internal encoding and then test separators, case folding, and invalid
-surrogates accordingly.
+The public walker accepts and returns `Path`/`PathBuf`. Matching operates over
+bytes on every platform: raw bytes via `OsStrExt::as_bytes()` on Unix, and the
+lossless WTF-8 representation via `OsStr::as_encoded_bytes()` (stable since
+Rust 1.74) on Windows, so a single byte matcher serves all targets and unpaired
+surrogates survive round-trips. On Windows both `/` and `\` act as separators;
+patterns are written with `/`. Matching is case-sensitive by default on all
+platforms, with explicit opt-in case folding.
 
 No public convenience function may use `from_utf8_unchecked` for filesystem
 results. String-only matching remains available as a separate API.
@@ -283,7 +312,8 @@ pub enum ErrorPolicy {
 ```
 
 Errors include the operation, path, platform error, and whether traversal can
-continue. `Collect` returns entries plus errors. Pattern syntax errors are always
+continue. `Collect` returns entries plus errors and is the default policy.
+Pattern syntax errors are always
 returned before traversal. Resource exhaustion and internal invariant failures
 always abort.
 
@@ -298,17 +328,20 @@ unsafe module documents:
 - fallback behavior when a syscall is unavailable;
 - links to the relevant operating-system ABI documentation.
 
-The default feature set should be small. Candidate dependencies include
-`bitflags`, `crossbeam-deque`, `ignore`, and `memchr`; each must justify its
-compile-time and maintenance cost. Rayon is not required if its global-pool
-semantics conflict with per-walk thread limits and cancellation.
+The default feature set should be small. `ferralk-glob` depends on `memchr`
+only (with `aho-corasick` as a prefilter candidate). `ferralk` adds `ignore`
+(gitignore rule matcher only), `crossbeam-deque` for the scheduler, and
+`bitflags` if needed; each dependency must justify its compile-time and
+maintenance cost. Rayon is rejected: its global-pool semantics conflict with
+per-walk thread limits and cancellation.
 
 ## Performance requirements
 
 Benchmarks must report matcher-only and complete-walk costs separately. Every
 measurement records operating system, filesystem, CPU, Rust version, thread
 count, cache state, tree shape, match rate, exclude rate, metadata mode, and
-sorting mode.
+sorting mode. Benchmarks use `criterion` with CodSpeed integration in CI for
+continuous regression tracking, mirroring the Ferroni setup.
 
 Required corpora:
 
@@ -326,10 +359,12 @@ Initial release budgets:
   corpus;
 - portable matcher on the common syntax subset (no extglob): within 1.25x of
   the `fast-glob` median on patterns both dialects support;
-- portable walker: faster than serial `ignore + globset` on all traversal
-  corpora and within 2x zlob on dependency-heavy warm-cache walks;
-- optimized native backend: within 20% of zlob's median on each supported
-  operating system, with no p95 regression larger than 35%;
+- portable walker (1.0 gate): faster than parallel `ignore` with subtree
+  pruning on all traversal corpora, and within 2x zlob on dependency-heavy
+  warm-cache walks;
+- optimized native backends (post-1.0, macOS and Linux only): within 20% of
+  zlob's median on that operating system, with no p95 regression larger than
+  35%;
 - no correctness or error-reporting relaxation to meet a performance target.
 
 These are release gates, not promises that every filesystem will behave alike.
@@ -342,10 +377,22 @@ Run generated and curated pattern/path pairs through zlob 1.6.3, `fast-glob`
 (oxc), and the Rust implementation as a three-way harness. zlob 1.6.3 is the
 semantic oracle for the full dialect; `fast-glob` is a second reference for the
 common subset (`*`, `?`, `**`, character classes, braces), where any
-zlob/`fast-glob` disagreement is itself a valuable corpus case. Both references
-are test-only dev-dependencies, and the Zig toolchain is confined to a single
-CI job. Store cases and expected behavior in a language-neutral corpus so both
-oracles can eventually be removed from normal CI.
+zlob/`fast-glob` disagreement is itself a valuable corpus case. For ignore
+semantics the oracle is `git check-ignore`.
+
+The corpus is seeded by porting zlob's own test suite 1:1, then extended by
+differential generation. The live zlob oracle is a development-time tool only:
+it runs locally or in a manually triggered workflow (an unpublished `oracle`
+workspace member with zlob as dev-dependency, excluded from default members),
+never on a schedule — the frozen 1.6.3 reference cannot produce new answers.
+Normal CI replays the checked-in corpus without any Zig toolchain. Every
+disagreement the oracle uncovers is checked in as a permanent case; after 1.0
+the oracle retires and the corpus is the test suite.
+
+Cases are stored as JSON Lines, one file per topic (`braces.jsonl`,
+`extglob.jsonl`, `ignore.jsonl`, …), one case per line carrying pattern, path,
+flags, expected result, source, and note. Non-UTF-8 bytes use a `\xNN` escape
+convention with a small codec per consuming language.
 
 ### Property tests
 
@@ -383,8 +430,14 @@ can execute, and cross-compilation checks.
 
 - inventory the Rust and C APIs and all flags;
 - write the compatibility matrix;
-- extract differential fixtures from zlob 1.6.3;
-- decide licensing, repository, crate name, and upstream collaboration model.
+- port zlob's own test suite 1:1 into the corpus;
+- extract further differential fixtures from zlob 1.6.3;
+- scaffold the workspace and the Ferroni-style repository blueprint
+  (release-please, renovate, codecov, CodSpeed).
+
+Licensing (MIT), repository (`sebastian-software/ferralk`), crate names, and
+the collaboration model (independent, upstream courtesy notice) are already
+decided.
 
 Exit criterion: disputed or undefined semantics are documented as open cases.
 
@@ -424,20 +477,21 @@ native syscalls.
 Exit criterion: single- and multi-thread results are identical across the
 corpus; no hangs or lost errors under stress.
 
-### Phase 4: Native backends — 6–12 weeks
+### Phase 4: Native backends (post-1.0) — 6–12 weeks
 
-- Linux backend first;
-- macOS and Windows backends independently reviewable;
+- macOS backend first, Linux second, each independently reviewable;
+- no Windows backend (portable only);
 - runtime fallbacks and backend differential tests;
 - platform benchmark gates.
 
-Exit criterion: each backend independently meets safety, parity, and performance
-gates. A platform may ship portable-only until its backend is ready.
+Exit criterion: each backend independently meets safety, parity, and
+performance gates. 1.0 does not wait for this phase; backends ship as
+feature-gated 1.x releases.
 
-### Phase 5: Compatibility release — 2–4 weeks
+### Phase 5: Stabilization and 1.0 — 2–4 weeks
 
-- migration facade and documentation;
-- downstream trials in at least two consumers;
+- compatibility guide documenting the zlob mapping and deliberate divergences;
+- downstream trial in Palamedes;
 - MSRV and feature audit;
 - release candidate, security review, and benchmark publication.
 
@@ -446,20 +500,16 @@ some operating-system work proceeding in parallel.
 
 ## Migration and release strategy
 
-Two ownership models are viable:
+Decided: ferralk is an independent crate family under its own name. The zlob
+maintainer receives a courtesy notice; no naming, endorsement, or upstream
+agreement is required or implied. Compatibility with zlob is a documented
+profile ("compatible with X, documented divergences Y"), never a drop-in
+claim.
 
-1. **Upstream rewrite:** contribute the Rust engine to the existing zlob project
-   and eventually make it the implementation behind the existing Rust crate.
-2. **Independent crate:** publish under a distinct name and provide an optional
-   compatibility module.
-
-Using the `zlob` crate name or claiming drop-in compatibility requires agreement
-with the current maintainer. Until that agreement exists, documentation must use
-the working name `zlob-rs` and avoid implying endorsement.
-
-The first release should be `0.x`. Compatibility claims are made per API area:
-matcher, walker, ignores, and legacy glob behavior. Native fast paths remain
-feature-gated until they have platform-specific production use.
+Releases start at `0.x`; 1.0 requires a stable API and the portable
+performance gate on all platforms. Compatibility claims are made per API area:
+matcher, walker, and ignores. Native fast paths ship as feature-gated 1.x
+releases and remain opt-in until they have production use on their platform.
 
 ## Alternatives considered
 
@@ -520,18 +570,25 @@ from the start.
 - Reusing `ignore` may constrain exact zlob precedence or performance.
 - A new crate may fragment maintenance unless coordinated upstream.
 
-## Open questions
+## Resolved questions (design review 2026-08-18)
 
-1. Will the zlob maintainer accept a Rust engine or compatibility corpus
-   upstream?
-2. Which Rust API surface and flags are contractually stable today?
-3. What MSRV is required by intended consumers?
-4. What exact Windows matching representation should be normative?
-5. Should Gitignore compatibility target Git, ripgrep/`ignore`, or current zlob
-   when they differ?
-6. Is the C API in scope after the Rust implementation stabilizes?
-7. Should native fast paths be enabled by default or opt-in?
-8. Which consumers beyond Palamedes justify maintaining the full feature set?
+1. Upstream acceptance — moot: ferralk is independent; the zlob maintainer
+   receives a courtesy notice.
+2. Contractual zlob API stability — not applicable; compatibility is a
+   documented profile, not a contract.
+3. MSRV — current stable minus two releases, declared via `rust-version` and
+   CI-tested; bumps are minor-version events during 0.x.
+4. Windows matching representation — WTF-8 bytes via
+   `OsStr::as_encoded_bytes()`; `/` and `\` both act as separators;
+   case-sensitive by default everywhere with opt-in folding.
+5. Gitignore reference — Git itself (`git check-ignore` as corpus oracle); the
+   `ignore` crate's rule matcher is the engine; divergences are documented and
+   decided case by case.
+6. C API — out of scope.
+7. Native fast paths — opt-in feature flags, post-1.0, macOS first then Linux;
+   no Windows backend.
+8. Consumers — Palamedes is the first consumer; the two-consumer gate was
+   superseded by the acceptance decision.
 
 ## Decision
 
@@ -547,6 +604,16 @@ because the mechanical port cannot be judged correct without it. The earlier
 gate requiring two committed consumers before a full rewrite is superseded by
 this decision.
 
+The end-to-end design review of 2026-08-18 resolved all remaining open
+questions (see "Resolved questions"). Headline decisions: independent
+`ferralk` workspace (matcher crate `ferralk-glob`, walker crate `ferralk`),
+MIT license, MSRV stable−2, Git-normative ignore semantics, byte/WTF-8
+matching on all platforms, the Ferroni SIMD playbook (memchr primitives,
+`forbid(unsafe_code)` in the matcher), an own work-stealing scheduler, a
+portable-only 1.0 with native macOS→Linux backends as feature-gated 1.x
+releases, Windows as a tier-2 portable-only target, and the Ferroni repository
+blueprint (criterion + CodSpeed, codecov, release-please, renovate).
+
 ## References
 
 - [zlob repository](https://github.com/dmtrKovalenko/zlob)
@@ -555,5 +622,6 @@ this decision.
 - [zlob 1.6.3 Rust build script](https://github.com/dmtrKovalenko/zlob/blob/v1.6.3/rust/build.rs)
 - [fast-glob (oxc) repository](https://github.com/oxc-project/fast-glob)
 - [glob-match repository](https://github.com/devongovett/glob-match)
+- [Ferroni — in-house pure-Rust Oniguruma port](https://github.com/sebastian-software/ferroni)
 - [Palamedes source-discovery optimization issue #875](https://github.com/sebastian-software/palamedes/issues/875)
 - [Local source-discovery benchmark notes](palamedes/benchmarks/source-discovery-prototype/NOTES.md)
