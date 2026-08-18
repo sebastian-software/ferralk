@@ -152,6 +152,68 @@ fn skip_hidden_excludes_hidden_files_and_subtrees_across_collect_and_stream() {
     assert_eq!(parallel_relative, collected_relative);
 }
 
+#[test]
+fn files_only_excludes_directories_without_pruning_their_contents() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("root.txt"), b"fixture").expect("write root file");
+    fs::create_dir_all(fixture.root.join("nested")).expect("create nested fixture directory");
+    fs::write(fixture.root.join("nested/child.txt"), b"fixture").expect("write nested file");
+
+    let options = WalkOptions::default().files_only(true).sort(true);
+    let collected = Walker::new(&fixture.root)
+        .threads(1)
+        .options(options)
+        .collect()
+        .expect("collect succeeds");
+    let collected_relative = collected
+        .entries()
+        .iter()
+        .map(|entry| {
+            entry
+                .path()
+                .strip_prefix(&fixture.root)
+                .expect("entry is rooted in fixture")
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        collected_relative,
+        vec![PathBuf::from("nested/child.txt"), PathBuf::from("root.txt")]
+    );
+
+    let mut streamed_relative = Walker::new(&fixture.root)
+        .options(options)
+        .stream()
+        .map(|entry| {
+            entry
+                .expect("stream succeeds")
+                .path()
+                .strip_prefix(&fixture.root)
+                .expect("entry is rooted in fixture")
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    streamed_relative.sort();
+    assert_eq!(streamed_relative, collected_relative);
+
+    let parallel_relative = Walker::new(&fixture.root)
+        .threads(4)
+        .options(options)
+        .collect()
+        .expect("parallel collect succeeds")
+        .entries()
+        .iter()
+        .map(|entry| {
+            entry
+                .path()
+                .strip_prefix(&fixture.root)
+                .expect("entry is rooted in fixture")
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(parallel_relative, collected_relative);
+}
+
 #[cfg(unix)]
 #[test]
 fn collect_retains_an_unreadable_directory_error() {

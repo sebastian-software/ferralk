@@ -450,3 +450,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   work in serial, parallel, and streaming traversal. A public portable fixture
   checks all three modes; the M2 fixture aggregate remains open only for the
   still-unrepresentable public dirent-to-metadata disappearance case.
+- Ported `ZLOB_WALK_NO_REPORT_DIRS` as `WalkOptions::files_only(true)`. It
+  filters returned directories only after their traversal has been scheduled,
+  so nested files remain visible in serial, parallel, and streaming walks. A
+  public fixture exercises that invariant in all three modes.

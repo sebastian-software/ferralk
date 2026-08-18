@@ -387,6 +387,9 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
     if shared.walker.options.directories_only && !entry.is_dir {
         return;
     }
+    if shared.walker.options.files_only && entry.is_dir {
+        return;
+    }
     let metadata = if shared.walker.options.metadata {
         match std::fs::symlink_metadata(&entry.path) {
             Ok(metadata) => Some(metadata),

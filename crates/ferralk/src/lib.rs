@@ -65,6 +65,7 @@ pub struct WalkOptions {
     sort: bool,
     metadata: bool,
     directories_only: bool,
+    files_only: bool,
     skip_hidden: bool,
 }
 
@@ -94,6 +95,13 @@ impl WalkOptions {
     #[must_use]
     pub const fn directories_only(mut self, enabled: bool) -> Self {
         self.directories_only = enabled;
+        self
+    }
+
+    /// Returns only files while continuing to traverse through directories.
+    #[must_use]
+    pub const fn files_only(mut self, enabled: bool) -> Self {
+        self.files_only = enabled;
         self
     }
 
@@ -679,6 +687,9 @@ impl WalkStream {
         if self.walker.options.directories_only && !entry.is_dir {
             return None;
         }
+        if self.walker.options.files_only && entry.is_dir {
+            return None;
+        }
         let metadata = if self.walker.options.metadata {
             match fs::symlink_metadata(&entry.path) {
                 Ok(metadata) => Some(metadata),
@@ -828,6 +839,10 @@ impl<'walker> WalkState<'walker> {
             && self.walker.may_descend_into(bytes)
         {
             self.walk_directory(backend, entry.path.clone())?;
+        }
+
+        if self.walker.options.files_only && entry.is_dir {
+            return Ok(());
         }
 
         let metadata = if self.walker.options.metadata {

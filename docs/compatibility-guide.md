@@ -65,6 +65,7 @@ let result = Walker::new(".")
 | `ZLOB_FOLLOW_SYMLINKS` | `WalkOptions::follow_symlinks(true)` |
 | `ZLOB_ERR` | `ErrorPolicy::{Abort, Skip, Collect}` |
 | `ZLOB_ONLYDIR` | `WalkOptions::directories_only(true)` |
+| `ZLOB_WALK_NO_REPORT_DIRS` | `WalkOptions::files_only(true)` |
 | thread count | `Walker::threads(n)`; `collect()` defaults to available parallelism |
 | metadata requests | `WalkOptions::metadata(true)` |
 | streaming | `Walker::stream()` returns entry-or-error items incrementally |
