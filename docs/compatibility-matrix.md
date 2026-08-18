@@ -24,11 +24,11 @@ its rationale.
 
 | zlob capability / flag | ferralk API | Status | Notes |
 |---|---|---|---|
-| path traversal | `Walker::new` | Planned (M2) | Portable `std::fs` backend first. |
+| path traversal | `Walker::new` | In progress (M2) | Portable serial `std::fs` backend; parallelism remains M3. |
 | `ZLOB_GITIGNORE` | `Walker::respect_git_ignore` | Planned (M3) | Git, not zlob, is normative. |
-| `ZLOB_FOLLOW_SYMLINKS` | `WalkOptions::follow_symlinks` | Planned (M2) | Default off; cycle detection required. |
+| `ZLOB_FOLLOW_SYMLINKS` | `WalkOptions::follow_symlinks` | Implemented (M2) | Default off; canonical-path cycle guard when enabled. |
 | `ZLOB_MARK`, `ZLOB_ONLYDIR` | entry filter / display policy | Planned (M2) | No path-string mutation in core API. |
-| `ZLOB_ERR` | `ErrorPolicy::{Abort,Skip,Collect}` | Planned (M2) | `Collect` default. |
+| `ZLOB_ERR` | `ErrorPolicy::{Abort,Skip,Collect}` | Implemented (M2) | `Collect` default. |
 | `ZLOB_APPEND`, `ZLOB_DOOFFS` | — | Deliberate divergence | C output-buffer ownership has no Rust equivalent. |
 | `zlob_at` | `Walker::new(path)` | Planned (M2) | Root is an explicit path. |
 | metadata masks | `WalkOptions` metadata selection | Planned (M2) | Portable abstraction first. |

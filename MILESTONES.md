@@ -67,15 +67,15 @@ matcher ≤1.5x zlob median, ≤1.25x `fast-glob` median on the common subset.
 **Exit criterion:** production-usable serial walker on `std::fs`, native path
 preservation, structured errors.
 
-- [ ] Backend trait + portable `std::fs::read_dir` backend
-- [ ] `Walker` builder: include/exclude, `WalkOptions`, POSIX-conservative
+- [x] Backend trait + portable `std::fs::read_dir` backend
+- [x] `Walker` builder: include/exclude, `WalkOptions`, POSIX-conservative
       defaults — ADR-0011
 - [ ] Conservative prune planner: literal roots, whole-subtree excludes,
       extension filters, negation guard
-- [ ] Native path preservation end-to-end (`Path`/`PathBuf`, no lossy
+- [x] Native path preservation end-to-end (`Path`/`PathBuf`, no lossy
       conversion) — ADR-0005
-- [ ] Error model: `ErrorPolicy::{Abort,Skip,Collect}` with `Collect` default
-- [ ] Symlink policy and cycle detection
+- [x] Error model: `ErrorPolicy::{Abort,Skip,Collect}` with `Collect` default
+- [x] Symlink policy and cycle detection
 - [ ] Optional sorting and metadata collection
 - [ ] Streaming iterator with cancellation; `collect()` result shape
 - [ ] Filesystem fixture builders + integration tests (unreadable dirs,
@@ -224,3 +224,13 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   literals. The complete upstream extglob block is now source-line-addressable
   in `fnmatch.jsonl`; it brings that file to 175 assertions and passes both
   the Zig-free harness and the pinned zlob oracle.
+- Started M2 with a safe serial `std::fs::read_dir` backend behind an internal
+  backend trait. `Walker` now has include/exclude compilation, explicit
+  sorting and symlink options, root-relative byte matching, and
+  `ErrorPolicy::{Abort,Skip,Collect}` (`Collect` by default). It preserves
+  public `PathBuf` values and has fixture tests for filtering, error policy,
+  sorting, symlink cycle de-duplication, and non-UTF-8 names on Linux.
+- **Platform test note:** the current macOS fixture filesystem rejected an
+  invalid UTF-8 filename with `EPERM`; the native-name integration assertion
+  is therefore Linux-gated, where that representation is supported. This does
+  not block the portable byte-preserving implementation or Linux CI coverage.
