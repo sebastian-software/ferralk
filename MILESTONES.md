@@ -504,3 +504,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   behaviours are covered by corpus blocks and the manual oracle. The
   implementation remains an independent safe-Rust representation, as required
   by ADR-0002.
+- Imported the full direct-matcher and path-list block from zlob's frozen
+  `test_edge_cases.zig`: reversed ranges, bracket punctuation, escaped
+  backslashes, mixed backtracking, and three path-list cases. The M0 whole
+  suite item remains open for other source files and private implementation
+  assertions, but this independent semantic block now replays in both harness
+  and oracle.

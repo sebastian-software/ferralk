@@ -18,6 +18,10 @@ deduplicated.
 The manual oracle verifies those cases against the pinned zlob crate. The
 normal harness verifies them without Zig.
 
+The additional direct matcher assertions in `test/test_edge_cases.zig` are
+represented in [`corpus/edge-cases.jsonl`](../corpus/edge-cases.jsonl), with
+that file's three path-list assertions added to `match-paths.jsonl`.
+
 ## Syntax preflight cases
 
 The flag-sensitive `hasWildcards` assertions are represented by
@@ -36,6 +40,9 @@ a disputed corpus case: Ferralk returns no caller-owned paths, while zlob's
 frozen Zig suite returns the pattern. zlob 1.6.3's Rust FFI aborts for an empty
 list and exposes corrupted string data for this synthetic result, so its manual
 Rust oracle deliberately skips that one case while replaying the other four.
+Ferralk's list API intentionally preserves caller input order, while zlob's
+default `matchPaths` result is sorted; the affected edge case records both
+orders explicitly.
 
 ## Deliberate non-matcher exclusions
 
