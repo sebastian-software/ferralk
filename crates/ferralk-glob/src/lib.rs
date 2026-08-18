@@ -181,14 +181,15 @@ impl Pattern {
                     index = next;
                 }
                 b'\\' if options.escape => {
-                    let Some(&escaped) = pattern.get(index + 1) else {
-                        return Err(PatternError {
-                            offset: index,
-                            message: "trailing escape",
-                        });
-                    };
-                    literals.push(escaped);
-                    index += 2;
+                    if let Some(&escaped) = pattern.get(index + 1) {
+                        literals.push(escaped);
+                        index += 2;
+                    } else {
+                        // zlob's fnmatch core treats a trailing backslash as
+                        // a literal backslash instead of rejecting the pattern.
+                        literals.push(b'\\');
+                        index += 1;
+                    }
                 }
                 byte => {
                     literals.push(byte);
@@ -239,11 +240,9 @@ impl Pattern {
                 path.get(path_index).is_some_and(|byte| is_separator(*byte))
                     && self.matches_from(token_index + 1, path_index + 1, path, failed)
             }
-            Token::Any => self.match_one(token_index, path_index, path, failed, |byte| {
-                !is_separator(byte)
-            }),
+            Token::Any => self.match_one(token_index, path_index, path, failed, |_| true),
             Token::Class(class) => self.match_one(token_index, path_index, path, failed, |byte| {
-                !is_separator(byte) && class.matches(byte, self.options.case_insensitive)
+                class.matches(byte, self.options.case_insensitive)
             }),
             Token::Star => self.match_star(token_index, path_index, path, failed, false),
             Token::RecursiveStar | Token::RecursivePrefix => {
@@ -300,7 +299,7 @@ impl Pattern {
         path_index: usize,
         path: &[u8],
         failed: &mut HashSet<(usize, usize)>,
-        recursive: bool,
+        _recursive: bool,
     ) -> bool {
         if self.matches_from(token_index + 1, path_index, path, failed) {
             return true;
@@ -308,9 +307,7 @@ impl Pattern {
         let Some(&byte) = path.get(path_index) else {
             return false;
         };
-        if (!recursive && is_separator(byte))
-            || (!self.options.match_hidden && byte == b'.' && at_component_start(path, path_index))
-        {
+        if !self.options.match_hidden && byte == b'.' && at_component_start(path, path_index) {
             return false;
         }
         self.matches_from(token_index, path_index + 1, path, failed)
@@ -468,7 +465,7 @@ mod tests {
     fn matches_literals_and_component_wildcards() {
         assert!(compile("src/*.rs").is_match("src/lib.rs"));
         assert!(compile("src/?.rs").is_match("src/a.rs"));
-        assert!(!compile("src/*.rs").is_match("src/bin/main.rs"));
+        assert!(compile("src/*.rs").is_match("src/bin/main.rs"));
         assert!(compile("*.rs").is_match("lib.rs"));
     }
 
@@ -491,7 +488,7 @@ mod tests {
         assert!(pattern.is_match("src/bin/main.rs"));
         assert!(!pattern.is_match("src/.private.rs"));
         assert!(compile("**/*.rs").is_match("src/main.rs"));
-        assert!(!compile("**/*.rs").is_match("src/bin/main.rs"));
+        assert!(compile("**/*.rs").is_match("src/bin/main.rs"));
     }
 
     #[test]
@@ -521,6 +518,6 @@ mod tests {
         let error = Pattern::compile("[abc", PatternOptions::default()).unwrap_err();
         assert_eq!(error.offset(), 0);
         assert_eq!(error.message(), "unclosed character class");
-        assert!(Pattern::compile("foo\\", PatternOptions::default()).is_err());
+        assert!(compile("foo\\").is_match("foo\\"));
     }
 }

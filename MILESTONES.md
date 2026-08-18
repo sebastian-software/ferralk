@@ -172,3 +172,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   extglobs, byte-platform parity, and corpus verification are complete.
 - The harness now replays non-disputed matcher cases, not just their JSON
   structure. It validates duplicate IDs and rejects unknown feature flags.
+- The first source-backed replay corrected a bootstrap assumption: zlob's
+  in-memory matching lets `*` cross separators, while its leading-period rule
+  still applies at every component boundary. A trailing escape is a literal
+  backslash. Both behaviours now have source provenance in the corpus.

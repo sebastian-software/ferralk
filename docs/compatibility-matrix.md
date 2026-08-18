@@ -9,7 +9,7 @@ its rationale.
 
 | zlob capability / flag | ferralk API | Status | Notes |
 |---|---|---|---|
-| `*`, `?`, separators | `Pattern::compile` / `Pattern::is_match` | Planned (M1) | POSIX-leading-period default. |
+| `*`, `?`, separators | `Pattern::compile` / `Pattern::is_match` | In progress (M1) | In-memory `*`/`?` are separator-agnostic; leading periods remain opt-in. |
 | `**` | `PatternOptions::recursive_double_star` | Planned (M1) | Explicit option. |
 | bracket classes, ranges, `[!...]`, `[^...]` | `Pattern::compile` | Planned (M1) | Byte-first. |
 | `ZLOB_BRACE` | `PatternOptions::braces` | Planned (M1) | Nested alternatives. |
