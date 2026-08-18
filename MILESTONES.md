@@ -78,7 +78,7 @@ preservation, structured errors.
 - [x] Symlink policy and cycle detection
 - [x] Optional sorting and metadata collection
 - [x] Streaming iterator with cancellation; `collect()` result shape
-- [ ] Filesystem fixture builders + integration tests (unreadable dirs,
+- [x] Filesystem fixture builders + integration tests (unreadable dirs,
       disappearing files, non-UTF-8 names)
 - [ ] Publish `ferralk` 0.1 (serial)
 
@@ -475,8 +475,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 - Verified the public non-UTF-8 path fixture's Linux-only scope: APFS rejects
   creation of the deliberate `0xFF` filename, so expanding that fixture to
   macOS would make CI fail before Ferralk can observe the path. The M2 fixture
-  aggregate remains open for a portable, deterministic public reproduction of
-  the dirent-to-metadata disappearance race.
+  milestone is complete: public integration fixtures cover disappearing roots,
+  unreadable directories, and Linux non-UTF-8 names; a deterministic internal
+  backend test additionally covers a dirent-to-metadata disappearance race.
 - Added a second narrow immutable matcher IR fast path for patterns composed
   solely of literals and separators. It avoids constructing a failed-state
   matrix for each call while retaining case-folding and platform separator
