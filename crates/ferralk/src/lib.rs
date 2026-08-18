@@ -391,11 +391,13 @@ impl TraversalPattern {
 }
 
 fn literal_pattern_root(pattern: &[u8]) -> Option<Vec<u8>> {
-    let magic = pattern.iter().position(|byte| {
-        matches!(
-            byte,
-            b'*' | b'?' | b'[' | b'{' | b'\\' | b'(' | b')' | b'@' | b'+' | b'!'
-        )
+    let magic = pattern.iter().enumerate().position(|(index, byte)| {
+        matches!(byte, b'*' | b'?' | b'[')
+            || (*byte == b'\\')
+            || (*byte == b'{' && has_closing_brace(pattern, index))
+            || (matches!(byte, b'@' | b'+' | b'!')
+                && pattern.get(index + 1) == Some(&b'(')
+                && has_closing_parenthesis(pattern, index + 1))
     });
     let prefix = &pattern[..magic.unwrap_or(pattern.len())];
     let root = if magic.is_some() {
@@ -411,6 +413,52 @@ fn literal_pattern_root(pattern: &[u8]) -> Option<Vec<u8>> {
         prefix
     };
     (!root.is_empty()).then(|| root.to_vec())
+}
+
+fn has_closing_brace(pattern: &[u8], open: usize) -> bool {
+    let mut depth = 0_usize;
+    let mut index = open;
+    while index < pattern.len() {
+        if pattern[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        match pattern[index] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+fn has_closing_parenthesis(pattern: &[u8], open: usize) -> bool {
+    let mut depth = 0_usize;
+    let mut index = open;
+    while index < pattern.len() {
+        if pattern[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        match pattern[index] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
 }
 
 trait DirectoryBackend {
@@ -1134,6 +1182,14 @@ mod tests {
         );
         assert_eq!(literal_pattern_root(b"src/foo*.rs"), Some(b"src".to_vec()));
         assert_eq!(literal_pattern_root(b"**/*.rs"), None);
+        assert_eq!(
+            literal_pattern_root(b"foo+bar/**/*.rs"),
+            Some(b"foo+bar".to_vec())
+        );
+        assert_eq!(
+            literal_pattern_root(b"foo@(bar/**/*.rs"),
+            Some(b"foo@(bar".to_vec())
+        );
     }
 
     #[test]
