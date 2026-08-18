@@ -429,3 +429,10 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   for the matching case versus about 35.6 ns for zlob and 39.1 ns for globset.
   The 1.5x budget is therefore not met; retain all benchmark checkboxes and
   prioritize the immutable-IR and hot-path work before attempting a gate.
+- Replaced the matcher's per-call `HashSet` failure memo with a dense
+  token×path-indexed state matrix. The full 260-case matcher corpus and the
+  workspace suite remain green; the same local smoke reduced the common
+  matching case from about 3.26 µs to 175 ns (and non-matching from 5.33 µs
+  to 287 ns). That is material progress, but still roughly 4.9x zlob on the
+  matching case, so neither the immutable-IR nor release-budget item is
+  checked off.

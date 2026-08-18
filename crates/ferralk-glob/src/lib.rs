@@ -223,7 +223,7 @@ impl Pattern {
             if self.options.extglob && contains_extglob(&alternative.raw, self.options.escape) {
                 match_extglob(&alternative.raw, path, self.options)
             } else {
-                let mut failed = HashSet::new();
+                let mut failed = FailedStates::new(&alternative.tokens, path);
                 self.matches_from(&alternative.tokens, 0, 0, path, &mut failed)
             }
         })
@@ -235,12 +235,12 @@ impl Pattern {
         token_index: usize,
         path_index: usize,
         path: &[u8],
-        failed: &mut HashSet<(usize, usize)>,
+        failed: &mut FailedStates,
     ) -> bool {
         if token_index == tokens.len() {
             return path_index == path.len();
         }
-        if !failed.insert((token_index, path_index)) {
+        if !failed.insert(token_index, path_index) {
             return false;
         }
 
@@ -265,7 +265,7 @@ impl Pattern {
         };
 
         if matches {
-            failed.remove(&(token_index, path_index));
+            failed.remove(token_index, path_index);
         }
         matches
     }
@@ -276,7 +276,7 @@ impl Pattern {
         token_index: usize,
         path_index: usize,
         path: &[u8],
-        failed: &mut HashSet<(usize, usize)>,
+        failed: &mut FailedStates,
         literal: &[u8],
     ) -> bool {
         let Some(candidate) = path.get(path_index..path_index + literal.len()) else {
@@ -303,7 +303,7 @@ impl Pattern {
         token_index: usize,
         path_index: usize,
         path: &[u8],
-        failed: &mut HashSet<(usize, usize)>,
+        failed: &mut FailedStates,
         accepts: impl FnOnce(u8) -> bool,
     ) -> bool {
         path.get(path_index).is_some_and(|&byte| {
@@ -321,7 +321,7 @@ impl Pattern {
         token_index: usize,
         path_index: usize,
         path: &[u8],
-        failed: &mut HashSet<(usize, usize)>,
+        failed: &mut FailedStates,
     ) -> bool {
         if self.matches_from(tokens, token_index + 1, path_index, path, failed) {
             return true;
@@ -333,6 +333,40 @@ impl Pattern {
             return false;
         }
         self.matches_from(tokens, token_index, path_index + 1, path, failed)
+    }
+}
+
+/// Memoized failed token/path pairs for one matcher invocation.
+///
+/// The state space is dense by construction: token and path indices are both
+/// bounded by the input slices. A flat matrix avoids hashing and allocation per
+/// recursive probe while keeping the original backtracking semantics.
+struct FailedStates {
+    width: usize,
+    states: Vec<bool>,
+}
+
+impl FailedStates {
+    fn new(tokens: &[Token], path: &[u8]) -> Self {
+        let width = path.len() + 1;
+        Self {
+            width,
+            states: vec![false; tokens.len() * width],
+        }
+    }
+
+    fn insert(&mut self, token_index: usize, path_index: usize) -> bool {
+        let state = &mut self.states[token_index * self.width + path_index];
+        if *state {
+            false
+        } else {
+            *state = true;
+            true
+        }
+    }
+
+    fn remove(&mut self, token_index: usize, path_index: usize) {
+        self.states[token_index * self.width + path_index] = false;
     }
 }
 
