@@ -148,8 +148,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 ### 2026-08-18 — M0 foundation established
 
 - Completed the workspace boundary, license/NOTICE, repository automation, and
-  corpus contract. `cargo test --workspace`, `cargo run -p harness -- corpus`,
-  and formatting checks pass locally.
+  corpus contract. The normal Zig-free member tests, `cargo run -p harness --
+  corpus`, and formatting checks pass locally.
 - Added a living compatibility matrix seeded from zlob's public README. It is
   deliberately labelled provisional until the frozen source is verified.
 - Resolved the zlob reference: annotated tag `v1.6.3`
@@ -173,9 +173,10 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 - The harness now replays non-disputed matcher cases, not just their JSON
   structure. It validates duplicate IDs and rejects unknown feature flags.
 - The first source-backed replay corrected a bootstrap assumption: zlob's
-  in-memory matching lets `*` cross separators, while its leading-period rule
-  still applies at every component boundary. A trailing escape is a literal
-  backslash. Both behaviours now have source provenance in the corpus.
+  in-memory matching lets `*` cross separators and treats a trailing escape as
+  a literal backslash. Ferralk's distinct leading-period policy is recorded as
+  a deliberate divergence below; every behaviour has source provenance in the
+  corpus.
 - Nested and empty brace alternatives are compiled into immutable matcher
   branches. The implementation is covered by direct unit tests and initial
   source-provenanced corpus cases; the mechanical-port checkpoint stays open
