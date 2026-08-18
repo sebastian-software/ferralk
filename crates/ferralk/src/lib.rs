@@ -443,7 +443,8 @@ impl WalkStream {
         {
             return None;
         }
-        if is_git_ignored(&self.walker, &entry.path, entry.is_dir) {
+        let git_ignored = is_git_ignored(&self.walker, &entry.path, entry.is_dir);
+        if git_ignored && !entry.is_dir {
             return None;
         }
         if entry.is_symlink && self.walker.options.follow_symlinks {
@@ -468,6 +469,9 @@ impl WalkStream {
                 .iter()
                 .any(|pattern| pattern.is_match(bytes))
         {
+            return None;
+        }
+        if git_ignored {
             return None;
         }
         let metadata = if self.walker.options.metadata {
@@ -584,7 +588,8 @@ impl<'walker> WalkState<'walker> {
         {
             return Ok(());
         }
-        if is_git_ignored(self.walker, &entry.path, entry.is_dir) {
+        let git_ignored = is_git_ignored(self.walker, &entry.path, entry.is_dir);
+        if git_ignored && !entry.is_dir {
             return Ok(());
         }
         if entry.is_symlink && self.walker.options.follow_symlinks {
@@ -627,6 +632,9 @@ impl<'walker> WalkState<'walker> {
                 .iter()
                 .any(|pattern| pattern.is_match(bytes))
         {
+            if git_ignored {
+                return Ok(());
+            }
             self.entries.push(WalkEntry {
                 path: entry.path,
                 is_dir: entry.is_dir,
@@ -815,10 +823,16 @@ mod tests {
         fixture.write("keep.tmp");
         fixture.write("src/main.rs");
         fixture.write("src/keep.tmp");
-        fs::write(fixture.root.join(".gitignore"), b"*.tmp\n!keep.tmp\n")
-            .expect("write root gitignore");
+        fixture.write("build/keep.txt");
+        fs::write(
+            fixture.root.join(".gitignore"),
+            b"*.tmp\n!keep.tmp\nbuild/\n",
+        )
+        .expect("write root gitignore");
         fs::write(fixture.root.join("src/.gitignore"), b"!keep.tmp\n")
             .expect("write nested gitignore");
+        fs::write(fixture.root.join("build/.gitignore"), b"!keep.txt\n")
+            .expect("write nested re-include");
 
         let collected = Walker::new(&fixture.root)
             .respect_git_ignore(true)
@@ -829,6 +843,8 @@ mod tests {
         assert!(!collected_paths.contains(&PathBuf::from("generated.tmp")));
         assert!(collected_paths.contains(&PathBuf::from("keep.tmp")));
         assert!(collected_paths.contains(&PathBuf::from("src/keep.tmp")));
+        assert!(collected_paths.contains(&PathBuf::from("build/keep.txt")));
+        assert!(!collected_paths.contains(&PathBuf::from("build")));
 
         let streamed = Walker::new(&fixture.root)
             .respect_git_ignore(true)
@@ -839,6 +855,8 @@ mod tests {
         assert!(!streamed_paths.contains(&PathBuf::from("generated.tmp")));
         assert!(streamed_paths.contains(&PathBuf::from("keep.tmp")));
         assert!(streamed_paths.contains(&PathBuf::from("src/keep.tmp")));
+        assert!(streamed_paths.contains(&PathBuf::from("build/keep.txt")));
+        assert!(!streamed_paths.contains(&PathBuf::from("build")));
     }
 
     #[test]

@@ -90,7 +90,7 @@ faster than parallel `ignore` + pruning on all traversal corpora.
 
 - [ ] Nested ignore chains via the `ignore` crate's rule matcher;
       per-directory nodes with shared-parent caching — ADR-0006
-- [ ] Negation-aware pruning guard (never prune when a later rule may
+- [x] Negation-aware pruning guard (never prune when a later rule may
       re-include)
 - [ ] `ignore.jsonl` corpus green against `git check-ignore`
 - [ ] Scheduler: `crossbeam-deque` work stealing, lazy worker spawn,
@@ -288,3 +288,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   order, so a nested `!` rule can re-include a file excluded by the root.
   The fixture covers both collect and stream. This correctness-first form
   rebuilds matchers on demand; shared-parent caching remains open M3 work.
+- Added the M3 negation-aware prune guard: a Git-ignored directory is not
+  emitted but is still descended, preventing a nested `.gitignore` from
+  losing a later `!` re-inclusion. The fixture exercises that case for both
+  collect and stream.
