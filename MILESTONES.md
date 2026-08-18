@@ -491,3 +491,10 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   source-backed divergence: zlob 1.6.3's Rust FFI aborts on its empty input and
   returns corrupted synthetic result bytes with a fallback input, so the manual
   Rust oracle skips only that FFI-defective case while verifying the other four.
+- Added immutable fast paths for `*`, `prefix*`, and `*suffix`, avoiding the
+  general failed-state matrix for common single-star patterns while preserving
+  leading-period handling across nested components. Exhaustive generated-input
+  comparisons retain equivalence with the general matcher; new CodSpeed rows
+  measured local ten-sample medians of about 7.34 ns for a `*.rs` match and
+  4.46 ns for its non-match. The broader M1 IR refactor and release budget
+  remain open.

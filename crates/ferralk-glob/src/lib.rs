@@ -445,6 +445,9 @@ struct Alternative {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FastPath {
     LiteralTokens(Vec<Token>),
+    Star,
+    PrefixStar { prefix: Vec<u8> },
+    StarSuffix { suffix: Vec<u8> },
     RecursivePrefixSuffix { prefix: Vec<u8>, suffix: Vec<u8> },
 }
 
@@ -455,6 +458,20 @@ impl FastPath {
             .all(|token| matches!(token, Token::Literal(_) | Token::Separator))
         {
             return Some(Self::LiteralTokens(tokens.to_vec()));
+        }
+        match tokens {
+            [Token::Star] => return Some(Self::Star),
+            [Token::Literal(prefix), Token::Star] => {
+                return Some(Self::PrefixStar {
+                    prefix: prefix.clone(),
+                });
+            }
+            [Token::Star, Token::Literal(suffix)] => {
+                return Some(Self::StarSuffix {
+                    suffix: suffix.clone(),
+                });
+            }
+            _ => {}
         }
         if options.case_insensitive {
             return None;
@@ -504,6 +521,21 @@ impl FastPath {
                 }
                 path_index == path.len()
             }
+            Self::Star => options.match_hidden || !contains_hidden_component(path),
+            Self::PrefixStar { prefix } => {
+                let Some(variable) = strip_literal_prefix(path, prefix, options.case_insensitive)
+                else {
+                    return false;
+                };
+                options.match_hidden || !contains_hidden_component(variable)
+            }
+            Self::StarSuffix { suffix } => {
+                let Some(variable) = strip_literal_suffix(path, suffix, options.case_insensitive)
+                else {
+                    return false;
+                };
+                options.match_hidden || !contains_hidden_component(variable)
+            }
             Self::RecursivePrefixSuffix { prefix, suffix } => {
                 let Some(remainder) = path
                     .strip_prefix(prefix.as_slice())
@@ -518,6 +550,32 @@ impl FastPath {
             }
         }
     }
+}
+
+fn strip_literal_prefix<'a>(
+    path: &'a [u8],
+    literal: &[u8],
+    case_insensitive: bool,
+) -> Option<&'a [u8]> {
+    let candidate = path.get(..literal.len())?;
+    literal
+        .iter()
+        .zip(candidate)
+        .all(|(&expected, &actual)| bytes_equal(expected, actual, case_insensitive))
+        .then_some(&path[literal.len()..])
+}
+
+fn strip_literal_suffix<'a>(
+    path: &'a [u8],
+    literal: &[u8],
+    case_insensitive: bool,
+) -> Option<&'a [u8]> {
+    let start = path.len().checked_sub(literal.len())?;
+    literal
+        .iter()
+        .zip(&path[start..])
+        .all(|(&expected, &actual)| bytes_equal(expected, actual, case_insensitive))
+        .then_some(&path[..start])
 }
 
 fn contains_hidden_component(path: &[u8]) -> bool {
@@ -1331,6 +1389,25 @@ mod tests {
                 general.is_match(candidate),
                 "fast path differs for {candidate:?}"
             );
+        }
+    }
+
+    #[test]
+    fn single_star_fast_paths_match_the_general_matcher() {
+        let candidates = byte_words(b"ab./rs", 4);
+        for pattern in ["*", "src*", "*.rs"] {
+            let fast =
+                Pattern::compile(pattern, PatternOptions::default()).expect("pattern compiles");
+            assert!(fast.alternatives[0].fast_path.is_some());
+            let mut general = fast.clone();
+            general.alternatives[0].fast_path = None;
+            for candidate in &candidates {
+                assert_eq!(
+                    fast.is_match(candidate),
+                    general.is_match(candidate),
+                    "fast path differs for {pattern:?} against {candidate:?}"
+                );
+            }
         }
     }
 
