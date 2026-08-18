@@ -72,6 +72,7 @@ let result = Walker::new(".")
 | walker `max_depth` | `WalkOptions::max_depth(depth)` |
 | walker entry depth | `WalkEntry::depth()` counts relative components below the root |
 | walker entry basename | `WalkEntry::basename()` preserves the native `OsStr` name |
+| walker entry kind | `WalkEntry::{kind,is_symlink}` exposes file, directory, or symlink identity |
 | thread count | `Walker::threads(n)`; `collect()` defaults to available parallelism |
 | metadata requests | `WalkOptions::metadata(true)` |
 | streaming | `Walker::stream()` returns entry-or-error items incrementally |

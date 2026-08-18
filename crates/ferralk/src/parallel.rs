@@ -412,6 +412,7 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
     worker.entries.push(WalkEntry {
         path: entry.path,
         is_dir: entry.is_dir,
+        is_symlink: entry.is_symlink,
         depth,
         metadata,
     });

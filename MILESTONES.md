@@ -656,3 +656,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   The same source-backed tree fixture now checks basenames, directory kinds,
   and depths without introducing a lossy UTF-8 conversion or duplicate string
   allocation.
+- Added `WalkEntryKind` plus `WalkEntry::{kind,is_symlink}`. The public
+  classification preserves a symlink's identity even when following it for
+  traversal; the existing Unix cycle fixture asserts both the reported symlink
+  kind and the deduplicated target traversal.

@@ -131,11 +131,23 @@ impl WalkOptions {
     }
 }
 
+/// Filesystem kind observed for one walked entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkEntryKind {
+    /// A regular non-directory, non-symlink entry.
+    File,
+    /// A directory entry.
+    Directory,
+    /// A symbolic link, including one followed for traversal.
+    Symlink,
+}
+
 /// One matching filesystem entry.
 #[derive(Debug)]
 pub struct WalkEntry {
     path: PathBuf,
     is_dir: bool,
+    is_symlink: bool,
     depth: usize,
     metadata: Option<fs::Metadata>,
 }
@@ -151,6 +163,24 @@ impl WalkEntry {
     #[must_use]
     pub const fn is_dir(&self) -> bool {
         self.is_dir
+    }
+
+    /// Whether this entry was observed as a symbolic link.
+    #[must_use]
+    pub const fn is_symlink(&self) -> bool {
+        self.is_symlink
+    }
+
+    /// Filesystem kind observed for this entry.
+    #[must_use]
+    pub const fn kind(&self) -> WalkEntryKind {
+        if self.is_symlink {
+            WalkEntryKind::Symlink
+        } else if self.is_dir {
+            WalkEntryKind::Directory
+        } else {
+            WalkEntryKind::File
+        }
     }
 
     /// Number of path components between the walk root and this entry.
@@ -753,6 +783,7 @@ impl WalkStream {
         Some(Ok(WalkEntry {
             path: entry.path,
             is_dir: entry.is_dir,
+            is_symlink: entry.is_symlink,
             depth,
             metadata,
         }))
@@ -931,6 +962,7 @@ impl<'walker> WalkState<'walker> {
             self.entries.push(WalkEntry {
                 path: entry.path,
                 is_dir: entry.is_dir,
+                is_symlink: entry.is_symlink,
                 depth,
                 metadata,
             });
@@ -1059,8 +1091,8 @@ mod tests {
     };
 
     use super::{
-        CancellationToken, ErrorPolicy, TraversalPattern, WalkEntry, WalkOptions, Walker,
-        gitignore_node, literal_extension, literal_pattern_root,
+        CancellationToken, ErrorPolicy, TraversalPattern, WalkEntry, WalkEntryKind, WalkOptions,
+        Walker, gitignore_node, literal_extension, literal_pattern_root,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -1258,6 +1290,7 @@ mod tests {
             .find(|entry| entry.basename() == Some(std::ffi::OsStr::new("a.txt")))
             .expect("a.txt is present");
         assert!(!a.is_dir());
+        assert_eq!(a.kind(), WalkEntryKind::File);
         assert_eq!(a.depth(), 1);
 
         let src = serial
@@ -1266,6 +1299,7 @@ mod tests {
             .find(|entry| entry.basename() == Some(std::ffi::OsStr::new("src")))
             .expect("src is present");
         assert!(src.is_dir());
+        assert_eq!(src.kind(), WalkEntryKind::Directory);
         assert_eq!(src.depth(), 1);
 
         let c = serial
@@ -1274,6 +1308,7 @@ mod tests {
             .find(|entry| entry.basename() == Some(std::ffi::OsStr::new("c.txt")))
             .expect("c.txt is present");
         assert!(!c.is_dir());
+        assert_eq!(c.kind(), WalkEntryKind::File);
         assert_eq!(c.depth(), 3);
     }
 
@@ -1766,6 +1801,13 @@ mod tests {
             !relative_paths(without_following.entries(), &fixture.root)
                 .contains(&PathBuf::from("linked/inside.txt"))
         );
+        let link = without_following
+            .entries()
+            .iter()
+            .find(|entry| entry.basename() == Some(std::ffi::OsStr::new("linked")))
+            .expect("symlink is reported");
+        assert!(link.is_symlink());
+        assert_eq!(link.kind(), WalkEntryKind::Symlink);
 
         let with_following = Walker::new(&fixture.root)
             .options(WalkOptions::default().follow_symlinks(true).sort(true))
