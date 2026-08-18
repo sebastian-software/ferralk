@@ -652,11 +652,24 @@ enum FastPath {
     LiteralTokens(Vec<Token>),
     DeterministicTokens(Vec<Token>),
     Star,
-    PrefixStar { prefix: Vec<u8> },
-    StarSuffix { suffix: Vec<u8> },
-    InfixStar { prefix: Vec<u8>, suffix: Vec<u8> },
-    RecursiveTerminalPrefix { prefix: Vec<u8> },
-    RecursivePrefixSuffix { prefix: Vec<u8>, suffix: Vec<u8> },
+    PrefixStar {
+        prefix: Vec<u8>,
+    },
+    StarSuffix {
+        suffix: Vec<u8>,
+    },
+    InfixStar {
+        prefix: Vec<u8>,
+        suffix: Vec<u8>,
+    },
+    RecursiveTerminalPrefix {
+        prefix: Vec<u8>,
+    },
+    RecursivePrefixSuffix {
+        prefix: Vec<u8>,
+        suffix: Vec<u8>,
+        suffix_last: u8,
+    },
 }
 
 impl FastPath {
@@ -726,6 +739,7 @@ impl FastPath {
         Some(Self::RecursivePrefixSuffix {
             prefix: prefix_with_separator,
             suffix: suffix.clone(),
+            suffix_last: *suffix.last().expect("literal token is non-empty"),
         })
     }
 
@@ -863,11 +877,22 @@ impl FastPath {
                                 path.len(),
                             ))
             }
-            Self::RecursivePrefixSuffix { prefix, suffix } => {
-                let Some(remainder) = path.strip_prefix(prefix.as_slice()) else {
+            Self::RecursivePrefixSuffix {
+                prefix,
+                suffix,
+                suffix_last,
+            } => {
+                if path.last() != Some(suffix_last) {
+                    return false;
+                }
+                let Some(suffix_start) = path.len().checked_sub(suffix.len()) else {
                     return false;
                 };
-                let Some(variable) = remainder.strip_suffix(suffix.as_slice()) else {
+                if path[suffix_start..path.len() - 1] != suffix[..suffix.len() - 1] {
+                    return false;
+                }
+                let prefix_and_variable = &path[..suffix_start];
+                let Some(variable) = prefix_and_variable.strip_prefix(prefix.as_slice()) else {
                     return false;
                 };
                 let variable_start = prefix.len();
@@ -1728,6 +1753,11 @@ mod tests {
         general.alternatives[0].fast_path = None;
 
         let mut candidates = vec![
+            b"".to_vec(),
+            b"src".to_vec(),
+            b"src/".to_vec(),
+            b"src/.r".to_vec(),
+            b"src/rs".to_vec(),
             b"src/.rs".to_vec(),
             b"src/.hidden.rs".to_vec(),
             b"src/visible.rs".to_vec(),

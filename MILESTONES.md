@@ -669,6 +669,12 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   Ferralk clears the matching and fast-glob comparisons, but the non-match is
   still about 4.5× zlob; keep the M1 benchmark checkbox open until that path
   and the external CodSpeed series satisfy the full release criterion.
+- Added a compiled final-suffix-byte reject before the recursive common path's
+  full suffix comparison. This deliberately trades the matching median from
+  about 13.4 ns to 14.3 ns for a non-match reduction from 11.2 ns to 5.3 ns;
+  short candidates, matching suffixes, and hidden paths remain checked against
+  the general matcher. The result is still above zlob's 2.51 ns non-match
+  reference, so the M1 gate remains open.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no
