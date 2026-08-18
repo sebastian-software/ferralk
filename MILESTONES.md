@@ -652,3 +652,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   root. Serial, parallel, and streaming walks derive the same value without
   extra path storage; a source-backed basic-tree fixture checks depths one,
   two, and three alongside entry kinds and paths.
+- Added `WalkEntry::basename()` as a native `OsStr` view over the stored path.
+  The same source-backed tree fixture now checks basenames, directory kinds,
+  and depths without introducing a lossy UTF-8 conversion or duplicate string
+  allocation.

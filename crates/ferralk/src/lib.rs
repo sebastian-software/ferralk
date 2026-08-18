@@ -159,6 +159,12 @@ impl WalkEntry {
         self.depth
     }
 
+    /// Native basename of this entry, when the path has a final component.
+    #[must_use]
+    pub fn basename(&self) -> Option<&std::ffi::OsStr> {
+        self.path.file_name()
+    }
+
     /// Metadata collected when WalkOptions metadata is enabled.
     #[must_use]
     pub fn metadata(&self) -> Option<&fs::Metadata> {
@@ -1245,6 +1251,30 @@ mod tests {
             relative_paths_and_depths(&streamed, &fixture.root),
             expected
         );
+
+        let a = serial
+            .entries()
+            .iter()
+            .find(|entry| entry.basename() == Some(std::ffi::OsStr::new("a.txt")))
+            .expect("a.txt is present");
+        assert!(!a.is_dir());
+        assert_eq!(a.depth(), 1);
+
+        let src = serial
+            .entries()
+            .iter()
+            .find(|entry| entry.basename() == Some(std::ffi::OsStr::new("src")))
+            .expect("src is present");
+        assert!(src.is_dir());
+        assert_eq!(src.depth(), 1);
+
+        let c = serial
+            .entries()
+            .iter()
+            .find(|entry| entry.basename() == Some(std::ffi::OsStr::new("c.txt")))
+            .expect("c.txt is present");
+        assert!(!c.is_dir());
+        assert_eq!(c.depth(), 3);
     }
 
     #[test]
