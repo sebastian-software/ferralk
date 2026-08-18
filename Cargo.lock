@@ -136,6 +136,7 @@ name = "ferralk"
 version = "0.1.0"
 dependencies = [
  "corpus",
+ "crossbeam-deque",
  "ferralk-glob",
  "ignore",
  "serde_json",
