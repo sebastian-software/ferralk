@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+zlob-oracle = ["dep:zlob"]
+
+[dependencies]
+zlob = { version = "=1.6.3", optional = true }
+
 [dev-dependencies]
 codspeed-criterion-compat = "5.0.1"
 ferralk = { path = "../../crates/ferralk" }
@@ -20,6 +26,11 @@ harness = false
 [[bench]]
 name = "walker"
 harness = false
+
+[[bench]]
+name = "walker_zlob"
+harness = false
+required-features = ["zlob-oracle"]
 
 [lints]
 workspace = true

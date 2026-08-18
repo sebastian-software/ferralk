@@ -415,3 +415,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   and an `**/*.rs` override. A local smoke run completed all three; zlob's
   walker is still only available through the pinned manual Zig-oracle setup,
   so the cross-engine gate and its budget remain open.
+- Added the corresponding zlob walker benchmark behind Bench's
+  `zlob-oracle` feature, keeping normal CI Zig-free. The manual
+  `zlob-benchmark.yml` CodSpeed workflow installs pinned Zig 0.16.0 and runs
+  the identical 16-branch, four-worker, `**/*.rs` fixture through zlob's
+  `WalkBuilder`; the local smoke median was about 1.02 ms. The M3 benchmark
+  checkbox remains open until CodSpeed records the cross-engine budget.
