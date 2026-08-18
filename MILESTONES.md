@@ -546,3 +546,11 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   779 ns for a four-entry recursive component-sensitive filter; these are
   baselines for the still-open broader immutable-IR and cross-engine budget
   work.
+- Imported fifteen further path-list assertions from zlob's frozen
+  `test_path_matcher.zig`: recursive prefix/middle/terminal forms, repeated
+  recursive segments, component-local `?` and classes, absolute paths,
+  duplicate separators, and both hidden-path policies. They replay in the
+  Zig-free harness and the pinned Rust oracle. The remaining tests in that
+  file that exercise `matchPathsAt`, index-returning APIs, C-string chunking,
+  or private component-buffer limits are tracked as API/implementation work,
+  not as a frozen-reference blocker.
