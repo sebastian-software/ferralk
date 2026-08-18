@@ -373,3 +373,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   against the PR base revision. The existing Rust 1.93 MSRV job remains the
   compile gate; the workspace currently defines no Cargo feature sets, which
   was confirmed by the feature audit.
+- Added a transparent CI dependency/unsafe-audit job: it installs and runs
+  `cargo-audit --locked` and rejects every Rust `unsafe` occurrence before the
+  native-backend milestone. The local source scan is clean; the checkbox stays
+  open until the RustSec dependency result is observed from CI or a completed
+  local audit run.

@@ -49,6 +49,21 @@ jobs:
           package: ferralk-glob,ferralk
           baseline-rev: ${{ github.event.pull_request.base.sha }}
 
+  security-audit:
+    name: dependency and unsafe audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+      - name: Forbid unsafe Rust before native backends
+        run: |
+          if rg -n '\bunsafe\b' --glob '*.rs' --glob '!target/**' .; then
+            echo 'unsafe Rust is reserved for the post-1.0 native backend milestone.'
+            exit 1
+          fi
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest
