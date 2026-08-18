@@ -201,3 +201,13 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 - Pinned Oxc's `fast-glob` 1.1.0 as the second matcher reference and replayed
   an explicitly scoped common subset in the harness. Its independent oracle
   expectation shares the same corpus mechanism used for zlob divergences.
+- Began a line-addressable 1:1 import of `test/test_fnmatch.zig` into
+  `fnmatch.jsonl`. Case IDs retain upstream line numbers, so each imported
+  assertion has a stable source location; the remaining upstream groups are
+  deliberately still open under the corpus-import item.
+- The first import block additionally found two public-API differences in
+  zlob itself: `zlob_match_paths` does not mirror the internal
+  `fnmatchFull` tests for an escaped backslash or an escape before a regular
+  literal. Both source assertions remain Ferralk's expected results; their
+  direct-API results are retained as explicitly disputed oracle expectations,
+  rather than being silently normalized away.

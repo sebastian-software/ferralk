@@ -23,7 +23,7 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | `disputed` | no | `true` if evidence is recorded but ferralk policy is unsettled. |
 | `note` | no | Short explanation or cross-oracle disagreement. |
 
-The initial topic files are `wildcards.jsonl`, `classes.jsonl`,
+The initial topic files are `fnmatch.jsonl`, `wildcards.jsonl`, `classes.jsonl`,
 `braces.jsonl`, `extglob.jsonl`, `options.jsonl`, `walk.jsonl`, `ignore.jsonl`,
 and `fast-glob.jsonl`. Files are added when a topic gains a case. Case IDs do
 not change once published; a changed expected value is a new case plus an
