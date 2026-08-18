@@ -612,7 +612,8 @@ matching on all platforms, the Ferroni SIMD playbook (memchr primitives,
 `forbid(unsafe_code)` in the matcher), an own work-stealing scheduler, a
 portable-only 1.0 with native macOS→Linux backends as feature-gated 1.x
 releases, Windows as a tier-2 portable-only target, and the Ferroni repository
-blueprint (criterion + CodSpeed, codecov, release-please, renovate).
+blueprint (criterion + CodSpeed, codecov, release-please, renovate). Each
+decision is recorded individually under [docs/adr/](docs/adr/README.md).
 
 ## References
 
