@@ -36,7 +36,7 @@ pub(super) fn collect(walker: Walker) -> Result<WalkResult, WalkError> {
 
     let pending = shared.pending.load(Ordering::Acquire);
     if pending == 0 {
-        return finish(shared);
+        return finish(shared, caller.entries);
     }
     let helper_count = walker
         .threads
@@ -44,7 +44,7 @@ pub(super) fn collect(walker: Walker) -> Result<WalkResult, WalkError> {
         .min(pending.saturating_sub(1));
     if helper_count == 0 {
         run_worker(&shared, &mut caller, &[]);
-        return finish(shared);
+        return finish(shared, caller.entries);
     }
 
     let mut helpers = (0..helper_count)
@@ -54,33 +54,36 @@ pub(super) fn collect(walker: Walker) -> Result<WalkResult, WalkError> {
     stealers.push(caller.queue.stealer());
     stealers.extend(helpers.iter().map(|worker| worker.queue.stealer()));
 
-    thread::scope(|scope| {
+    let entries = thread::scope(|scope| {
         let mut joins = Vec::with_capacity(helper_count);
         for mut helper in helpers.drain(..) {
             let shared = Arc::clone(&shared);
             let stealers = &stealers;
-            joins.push(
-                scope.spawn(move || run_worker_catching_panics(&shared, &mut helper, stealers)),
-            );
+            joins.push(scope.spawn(move || {
+                run_worker_catching_panics(&shared, &mut helper, stealers);
+                helper
+            }));
         }
         run_worker_catching_panics(&shared, &mut caller, &stealers);
+        let mut entries = std::mem::take(&mut caller.entries);
         for join in joins {
             // Panics are captured inside the worker so joining only waits for
             // completion and cannot bypass the shared cancellation state.
-            join.join().expect("worker panic is captured before join");
+            let mut helper = join.join().expect("worker panic is captured before join");
+            entries.append(&mut helper.entries);
         }
+        entries
     });
-    finish(shared)
+    finish(shared, entries)
 }
 
-fn finish(shared: Arc<Shared>) -> Result<WalkResult, WalkError> {
+fn finish(shared: Arc<Shared>, mut entries: Vec<WalkEntry>) -> Result<WalkResult, WalkError> {
     if let Some(payload) = lock(&shared.panic).take() {
         resume_unwind(payload);
     }
     if let Some(error) = lock(&shared.abort_error).take() {
         return Err(error);
     }
-    let mut entries = std::mem::take(&mut *lock(&shared.entries));
     if shared.walker.options.sort {
         entries.sort_by(|left, right| left.path.cmp(&right.path));
     }
@@ -98,7 +101,6 @@ struct Shared {
     cancellation: super::CancellationToken,
     wake_lock: Mutex<()>,
     wake: Condvar,
-    entries: Mutex<Vec<WalkEntry>>,
     errors: Mutex<Vec<WalkError>>,
     abort_error: Mutex<Option<WalkError>>,
     panic: Mutex<Option<Box<dyn Any + Send + 'static>>>,
@@ -115,7 +117,6 @@ impl Shared {
             cancellation,
             wake_lock: Mutex::new(()),
             wake: Condvar::new(),
-            entries: Mutex::new(Vec::new()),
             errors: Mutex::new(Vec::new()),
             abort_error: Mutex::new(None),
             panic: Mutex::new(None),
@@ -172,6 +173,7 @@ impl Shared {
 struct WorkerScratch {
     queue: Worker<PathBuf>,
     gitignore_cache: HashMap<PathBuf, Arc<GitIgnoreNode>>,
+    entries: Vec<WalkEntry>,
 }
 
 impl WorkerScratch {
@@ -179,6 +181,7 @@ impl WorkerScratch {
         Self {
             queue: Worker::new_fifo(),
             gitignore_cache: HashMap::new(),
+            entries: Vec::new(),
         }
     }
 
@@ -349,7 +352,7 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
     } else {
         None
     };
-    lock(&shared.entries).push(WalkEntry {
+    worker.entries.push(WalkEntry {
         path: entry.path,
         is_dir: entry.is_dir,
         metadata,
