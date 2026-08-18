@@ -541,3 +541,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   in the green corpus. The manual Rust oracle returns nested paths for that
   same input, so the corpus records its result separately as a source-level
   C/Rust zlob disagreement.
+- Added CodSpeed matcher rows for path-list filtering. The initial local
+  ten-sample medians are about 62.5 ns for a four-entry root filter and
+  779 ns for a four-entry recursive component-sensitive filter; these are
+  baselines for the still-open broader immutable-IR and cross-engine budget
+  work.

@@ -70,6 +70,33 @@ fn matcher(c: &mut Criterion) {
     c.bench_function("single_star/ferralk_compiled/non_matching", |benchmark| {
         benchmark.iter(|| black_box(suffix_star.is_match(black_box(common_non_matching))))
     });
+
+    let root_filter = Pattern::compile("*.rs", PatternOptions::default())
+        .expect("root filter benchmark pattern is valid");
+    let root_paths = ["lib.rs", "main.rs", "README.md", "src/nested.rs"];
+    c.bench_function("path_filter/root", |benchmark| {
+        benchmark.iter(|| black_box(root_filter.filter_paths(black_box(&root_paths)).len()))
+    });
+    let component_filter = Pattern::compile(
+        "**/lua/*.lua",
+        PatternOptions::default().recursive_double_star(true),
+    )
+    .expect("component filter benchmark pattern is valid");
+    let component_paths = [
+        "lua/init.lua",
+        "nvim/lua/setup.lua",
+        "nvim/lua/sub/nested.lua",
+        "src/main.rs",
+    ];
+    c.bench_function("path_filter/component", |benchmark| {
+        benchmark.iter(|| {
+            black_box(
+                component_filter
+                    .filter_paths(black_box(&component_paths))
+                    .len(),
+            )
+        })
+    });
     c.bench_function("common/globset_compiled/matching", |benchmark| {
         benchmark.iter(|| black_box(globset.is_match(black_box(common_matching))))
     });
