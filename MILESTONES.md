@@ -215,3 +215,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   real-world pattern sections. The checked-in `fnmatch.jsonl` now contains
   98 individually source-line-addressable assertions, replayed by both the
   Zig-free harness and the manual zlob oracle.
+- Added the full POSIX class block plus `noescape` option coverage, bringing
+  `fnmatch.jsonl` to 127 source-line-addressable assertions. The strict byte
+  codec rejected two malformed JSON escapes during import; both were corrected
+  before replay and are covered by the existing codec validation path.
