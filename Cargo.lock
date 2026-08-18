@@ -57,6 +57,7 @@ dependencies = [
  "codspeed-criterion-compat",
  "ferralk",
  "ferralk-glob",
+ "ignore",
 ]
 
 [[package]]

@@ -2,13 +2,14 @@
 
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use codspeed_criterion_compat::{Criterion, black_box, criterion_group, criterion_main};
 use ferralk::{WalkOptions, Walker};
+use ignore::{WalkBuilder, WalkState, overrides::OverrideBuilder};
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
@@ -74,6 +75,27 @@ fn walker(c: &mut Criterion) {
                     .collect()
                     .expect("benchmark walk succeeds"),
             )
+        })
+    });
+    c.bench_function("walker/ignore_parallel_filtered", |benchmark| {
+        benchmark.iter(|| black_box(ignore_parallel_filtered(&fixture.root)))
+    });
+}
+
+fn ignore_parallel_filtered(root: &Path) {
+    let mut overrides = OverrideBuilder::new(root);
+    overrides
+        .add("**/*.rs")
+        .expect("benchmark include is valid");
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .threads(4)
+        .standard_filters(false)
+        .overrides(overrides.build().expect("benchmark override builds"));
+    builder.build_parallel().run(|| {
+        Box::new(|entry| {
+            black_box(entry.expect("benchmark walk succeeds"));
+            WalkState::Continue
         })
     });
 }

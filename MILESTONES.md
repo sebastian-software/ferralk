@@ -409,3 +409,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   now become a structured `spawn_worker` error that cancels the shared token.
   The walker has no public visitor callback, so the panic test exercises the
   actual worker catch point that would contain callback execution.
+- Added the first apples-to-apples M3 baseline in the CodSpeed walker bench:
+  the same 16-branch filtered fixture now runs Ferralk serial, Ferralk with
+  four workers, and `ignore::WalkBuilder::build_parallel` with four workers
+  and an `**/*.rs` override. A local smoke run completed all three; zlob's
+  walker is still only available through the pinned manual Zig-oracle setup,
+  so the cross-engine gate and its budget remain open.
