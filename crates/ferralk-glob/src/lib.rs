@@ -201,6 +201,7 @@ impl Pattern {
         Ok(Self {
             alternatives: vec![Alternative {
                 raw: pattern.to_vec(),
+                fast_path: FastPath::compile(&tokens, options),
                 tokens,
             }],
             options,
@@ -222,6 +223,8 @@ impl Pattern {
         self.alternatives.iter().any(|alternative| {
             if self.options.extglob && contains_extglob(&alternative.raw, self.options.escape) {
                 match_extglob(&alternative.raw, path, self.options)
+            } else if let Some(fast_path) = &alternative.fast_path {
+                fast_path.is_match(path, self.options)
             } else {
                 let mut failed = FailedStates::new(&alternative.tokens, path);
                 self.matches_from(&alternative.tokens, 0, 0, path, &mut failed)
@@ -387,7 +390,64 @@ enum Token {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Alternative {
     raw: Vec<u8>,
+    fast_path: Option<FastPath>,
     tokens: Vec<Token>,
+}
+
+/// An allocation-free matcher for a common recursive-prefix/suffix shape.
+///
+/// It is deliberately narrower than the full token matcher. Keeping it as a
+/// compiled variant makes the optimization opt-in by syntax and leaves every
+/// other pattern on the corpus-tested general path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FastPath {
+    RecursivePrefixSuffix { prefix: Vec<u8>, suffix: Vec<u8> },
+}
+
+impl FastPath {
+    fn compile(tokens: &[Token], options: PatternOptions) -> Option<Self> {
+        if options.case_insensitive {
+            return None;
+        }
+        let [
+            Token::Literal(prefix),
+            Token::Separator,
+            Token::RecursivePrefix,
+            Token::Star,
+            Token::Literal(suffix),
+        ] = tokens
+        else {
+            return None;
+        };
+        Some(Self::RecursivePrefixSuffix {
+            prefix: prefix.clone(),
+            suffix: suffix.clone(),
+        })
+    }
+
+    fn is_match(&self, path: &[u8], options: PatternOptions) -> bool {
+        match self {
+            Self::RecursivePrefixSuffix { prefix, suffix } => {
+                let Some(remainder) = path
+                    .strip_prefix(prefix.as_slice())
+                    .and_then(|path| path.strip_prefix(b"/"))
+                else {
+                    return false;
+                };
+                let Some(variable) = remainder.strip_suffix(suffix.as_slice()) else {
+                    return false;
+                };
+                options.match_hidden || !contains_hidden_component(variable)
+            }
+        }
+    }
+}
+
+fn contains_hidden_component(path: &[u8]) -> bool {
+    path.first() == Some(&b'.')
+        || path
+            .windows(2)
+            .any(|pair| is_separator(pair[0]) && pair[1] == b'.')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1131,6 +1191,36 @@ mod tests {
             assert!(
                 !prefixed.is_match(candidate) || star.is_match(candidate),
                 "prefixed star matches a path the unrestricted star rejects: {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_prefix_suffix_fast_path_matches_the_general_matcher() {
+        let options = PatternOptions::default().recursive_double_star(true);
+        let fast = Pattern::compile("src/**/*.rs", options).expect("pattern compiles");
+        assert!(fast.alternatives[0].fast_path.is_some());
+        let mut general = fast.clone();
+        general.alternatives[0].fast_path = None;
+
+        let mut candidates = vec![
+            b"src/.rs".to_vec(),
+            b"src/.hidden.rs".to_vec(),
+            b"src/visible.rs".to_vec(),
+            b"src/nested/.hidden.rs".to_vec(),
+            b"src/nested/visible.rs".to_vec(),
+            b"other/visible.rs".to_vec(),
+        ];
+        candidates.extend(
+            byte_words(b"ab./rs", 4)
+                .into_iter()
+                .map(|suffix| [b"src/".as_slice(), suffix.as_slice()].concat()),
+        );
+        for candidate in candidates {
+            assert_eq!(
+                fast.is_match(&candidate),
+                general.is_match(&candidate),
+                "fast path differs for {candidate:?}"
             );
         }
     }

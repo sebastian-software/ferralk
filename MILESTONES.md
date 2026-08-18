@@ -436,3 +436,11 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   to 287 ns). That is material progress, but still roughly 4.9x zlob on the
   matching case, so neither the immutable-IR nor release-budget item is
   checked off.
+- Added a deliberately narrow immutable fast-path IR for the compiled token
+  shape `literal / **/ * literal`, with an allocation-free prefix/suffix
+  matcher and explicit leading-period handling. It is exhaustively checked
+  against the general matcher over generated candidates and falls back for
+  every other syntax form. The local common matching case is now about
+  23.8 ns (ahead of zlob's 35.6 ns and globset's 39.1 ns); the non-matching
+  case is still about 11.8 ns versus zlob's 2.57 ns, so the complete M1 gate
+  and wider immutable-IR refactor remain open.
