@@ -265,3 +265,6 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   A cancellation request yields a clearly flagged partial `WalkResult`
   without manufacturing an I/O error; the streaming iterator portion of the
   M2 cancellation item remains open.
+- Imported zlob's nested, deeply nested, and mixed brace-expansion assertions.
+  `braces.jsonl` now contains 68 source-linked cases and passes both the
+  Zig-free harness and the pinned zlob oracle.

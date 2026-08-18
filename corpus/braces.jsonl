@@ -55,3 +55,14 @@
 {"id":"brace-l0319","pattern":"very_long_alternative_name_{one,two,three}.txt","path":"very_long_alternative_name_one.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
 {"id":"brace-l0320","pattern":"very_long_alternative_name_{one,two,three}.txt","path":"very_long_alternative_name_two.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
 {"id":"brace-l0321","pattern":"very_long_alternative_name_{one,two,three}.txt","path":"very_long_alternative_name_three.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l1335","pattern":"{a,{b,c}}.txt","path":"a.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l1336","pattern":"{a,{b,c}}.txt","path":"b.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l1337","pattern":"{a,{b,c}}.txt","path":"c.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l1354","pattern":"{{a,b},{c,d}}.txt","path":"a.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l1355","pattern":"{{a,b},{c,d}}.txt","path":"b.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l1356","pattern":"{{a,b},{c,d}}.txt","path":"c.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l1357","pattern":"{{a,b},{c,d}}.txt","path":"d.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l1374","pattern":"{a,b,{c,d}}.txt","path":"a.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l1375","pattern":"{a,b,{c,d}}.txt","path":"b.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l1376","pattern":"{a,b,{c,d}}.txt","path":"c.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l1377","pattern":"{a,b,{c,d}}.txt","path":"d.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
