@@ -663,6 +663,12 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   the common `src/**/*.rs` local ten-sample medians improved from about 16.0 ns
   to 13.4 ns for a match and from 13.7 ns to 11.2 ns for a non-match. The
   broader IR and cross-engine release-budget gates remain open.
+- Re-ran the apples-to-apples local common-syntax comparison after the IR work:
+  Ferralk measured about 13.4/11.2 ns (match/non-match), pinned zlob
+  34.6/2.51 ns, globset 37.3/36.9 ns, and interpreted fast-glob 96.5/105.6 ns.
+  Ferralk clears the matching and fast-glob comparisons, but the non-match is
+  still about 4.5× zlob; keep the M1 benchmark checkbox open until that path
+  and the external CodSpeed series satisfy the full release criterion.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no
