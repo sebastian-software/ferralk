@@ -10,6 +10,8 @@ use std::{
 #[cfg(target_os = "linux")]
 use ferralk::WalkOptions;
 use ferralk::{ErrorPolicy, Walker};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 
@@ -77,6 +79,34 @@ fn stream_yields_a_disappearing_root_error() {
         .expect_err("missing root is an error event");
     assert_eq!(error.operation(), "read_dir");
     assert!(stream.next().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn collect_retains_an_unreadable_directory_error() {
+    let fixture = Fixture::new();
+    let locked = fixture.root.join("locked");
+    fs::create_dir(&locked).expect("create locked fixture directory");
+    let original_permissions = fs::metadata(&locked)
+        .expect("read fixture metadata")
+        .permissions();
+    let mut unreadable_permissions = original_permissions.clone();
+    unreadable_permissions.set_mode(0o000);
+    fs::set_permissions(&locked, unreadable_permissions).expect("make fixture unreadable");
+
+    let result = Walker::new(&fixture.root)
+        .threads(1)
+        .error_policy(ErrorPolicy::Collect)
+        .collect();
+    fs::set_permissions(&locked, original_permissions).expect("restore fixture permissions");
+    let result = result.expect("collect returns partial result");
+
+    assert!(
+        result
+            .errors()
+            .iter()
+            .any(|error| error.operation() == "read_dir" && error.path() == locked)
+    );
 }
 
 #[cfg(target_os = "linux")]

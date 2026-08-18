@@ -342,3 +342,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   remaining zlob-only result-shaping and private helper assertions, so the
   larger full-suite item remains explicitly open rather than silently
   conflating those APIs with matcher semantics.
+- Added a Unix public-API fixture that makes a child directory unreadable,
+  verifies its `Collect`-mode `read_dir` error, and restores permissions before
+  cleanup. The broader M2 fixture item remains open for a deterministic
+  disappearing-*file* strategy and cross-platform coverage.
