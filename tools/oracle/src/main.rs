@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
+//! The oracle is an ignored integration test, not a normal executable.
+//!
+//! Run `cargo test -p oracle --test zlob_oracle -- --ignored` only after
+//! installing the pinned zlob build prerequisites (Zig 0.16 and libclang).
 fn main() {
-    eprintln!(
-        "oracle adapter is blocked pending verification of zlob 1.6.3 source and crate coordinates; see MILESTONES.md"
-    );
-    std::process::exit(2);
+    eprintln!("run `cargo test -p oracle --test zlob_oracle -- --ignored`");
 }

@@ -14,7 +14,7 @@ its rationale.
 | bracket classes, ranges, `[!...]`, `[^...]` | `Pattern::compile` | Planned (M1) | Byte-first. |
 | `ZLOB_BRACE` | `PatternOptions::braces` | Implemented (M1) | Nested and empty alternatives; source-backed corpus import continues. |
 | `ZLOB_EXTGLOB` | `PatternOptions::extglob` | Planned (M1) | Bash operators. |
-| `ZLOB_PERIOD` | `PatternOptions::match_hidden` | Planned (M1) | Default remains off. |
+| `ZLOB_PERIOD` | `PatternOptions::match_hidden` | Implemented (M1) | Deliberate in-memory divergence: Ferralk defaults to off; zlob's direct matcher accepts leading periods by default. |
 | `ZLOB_NOESCAPE` | `PatternOptions::escape` | Planned (M1) | Higher-level boolean, not a bitflag. |
 | case folding | `PatternOptions::case_insensitive` | Planned (M1) | Explicit opt-in on every platform. |
 | `ZLOB_NOCHECK`, `ZLOB_NOMAGIC` | Walker no-match policy | Deferred (M4 review) | These are C/glob result-shaping semantics, not matcher semantics. |

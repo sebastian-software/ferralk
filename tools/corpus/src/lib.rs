@@ -20,6 +20,10 @@ pub struct Case {
     pub flags: Vec<String>,
     /// Whether the expression accepts the candidate path.
     pub expected: bool,
+    /// Result produced by the named external oracle when it intentionally
+    /// differs from ferralk's documented policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_expected: Option<bool>,
     /// Evidence used to establish the expected result.
     pub source: Source,
     /// Marks a recorded behaviour that has not been adopted as ferralk policy.

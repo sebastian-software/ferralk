@@ -1,4 +1,4 @@
 {"id":"wildcard-001","pattern":"*.rs","path":"lib.rs","flags":[],"expected":true,"source":"handwritten","note":"Bootstrap regression; replaced or confirmed by the zlob 1.6.3 seed during corpus import."}
 {"id":"wildcard-002","pattern":"*.rs","path":"src/lib.rs","flags":[],"expected":true,"source":"zlob_1_6_3","note":"Ported from rust/src/pattern.rs: compile_simple_suffix; in-memory matching is separator-agnostic for a suffix star."}
 {"id":"wildcard-003","pattern":"**/*.rs","path":"src/bin/main.rs","flags":["recursive_double_star"],"expected":true,"source":"handwritten","note":"The recursive option lets double-star cross component boundaries."}
-{"id":"wildcard-004","pattern":"*","path":".gitignore","flags":[],"expected":false,"source":"handwritten","note":"POSIX-leading-period default."}
+{"id":"wildcard-004","pattern":"*","path":".gitignore","flags":[],"expected":false,"oracle_expected":true,"source":"zlob_1_6_3","disputed":true,"note":"Ferralk follows ADR-0011's POSIX-leading-period default; zlob 1.6.3 zlob_match_paths accepts this path without ZLOB_PERIOD."}

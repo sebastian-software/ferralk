@@ -17,6 +17,7 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | `path` | yes | Candidate path using the byte codec below. |
 | `flags` | no | Ordered behaviour switches from the compatibility matrix. |
 | `expected` | yes | Whether the expression accepts the candidate. |
+| `oracle_expected` | no | The external-oracle result when it deliberately differs from `expected`. |
 | `source` | yes | `zlob_1_6_3`, `fast_glob`, `git_check_ignore`, or `handwritten`. |
 | `disputed` | no | `true` if evidence is recorded but ferralk policy is unsettled. |
 | `note` | no | Short explanation or cross-oracle disagreement. |
@@ -52,5 +53,7 @@ errors are validation failures, never silently interpreted as paths.
 where its syntax overlaps. `git_check_ignore` is normative for ignore topics.
 Handwritten records are allowed for a documented policy decision or a reduced
 regression case. A disagreement is retained with `disputed: true` until an ADR
-or compatibility-guide entry resolves it; neither the harness nor a future
-matcher may discard it.
+or compatibility-guide entry resolves it. `expected` is always the ferralk
+contract and still runs in the harness; `oracle_expected` holds the diverging
+reference result and runs only in the appropriate oracle adapter. Neither the
+harness nor a future matcher may discard disputed cases.

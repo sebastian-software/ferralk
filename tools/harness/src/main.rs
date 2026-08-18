@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     line_number + 1
                 )
             })?;
-            if !case.disputed && !is_ignore_topic {
+            if !is_ignore_topic {
                 let options = options_from_flags(&case.flags)
                     .map_err(|error| format!("{}:{}: {error}", file.display(), line_number + 1))?;
                 let actual = Pattern::compile(pattern, options)

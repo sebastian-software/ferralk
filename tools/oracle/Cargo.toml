@@ -7,8 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
-# The zlob 1.6.3 adapter is intentionally held until its exact crates.io
-# release and source revision are verified; see MILESTONES.md.
+[dev-dependencies]
+corpus = { path = "../corpus" }
+serde_json.workspace = true
+zlob = "=1.6.3"
 
 [lints]
 workspace = true

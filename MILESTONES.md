@@ -26,12 +26,12 @@ disputed or undefined zlob semantics are captured as flagged corpus cases.
 - [x] Inventory the zlob 1.6.3 Rust and C APIs and all flags; write the
       compatibility matrix document
 - [ ] Port zlob's own test suite 1:1 into the corpus — ADR-0007
-- [ ] Build the `oracle` crate (zlob 1.6.3 as dev-dependency) with a manually
+- [x] Build the `oracle` crate (zlob 1.6.3 as dev-dependency) with a manually
       triggered corpus-regen workflow — ADR-0007
 - [ ] Wire `fast-glob` (oxc) into the harness as second reference for the
       common syntax subset — ADR-0007
 - [ ] Build the `git check-ignore` oracle runner for ignore cases — ADR-0006
-- [ ] Record disputed/undefined semantics as corpus cases with a `disputed`
+- [x] Record disputed/undefined semantics as corpus cases with a `disputed`
       flag
 - [ ] Send the courtesy notice to the zlob maintainer — ADR-0001
 
@@ -181,3 +181,11 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   source-provenanced corpus cases; the mechanical-port checkpoint stays open
   until its provenance review and the remaining upstream brace cases are
   imported under the corpus-port item.
+- The manually executed zlob 1.6.3 oracle established the first deliberate
+  divergence: its direct `*` matcher includes `.gitignore` without
+  `ZLOB_PERIOD`; ferralk's default excludes it under ADR-0011. The corpus now
+  records both expectations (`expected` and `oracle_expected`) and replays
+  each with the proper engine.
+- The manual Oracle workflow now installs Zig 0.16 and runs an ignored test
+  against the pinned `zlob = 1.6.3` dev-dependency. It is verified locally;
+  normal CI never compiles that dependency and remains Zig-free.

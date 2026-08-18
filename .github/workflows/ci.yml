@@ -22,7 +22,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace
+      - run: cargo test
+      - run: cargo test -p corpus -p harness -p bench
       - run: cargo run -p harness -- corpus
 
   msrv:
@@ -31,7 +32,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93
-      - run: cargo check --workspace
+      - run: cargo check
+      - run: cargo check -p corpus -p harness -p bench
 
   coverage:
     name: coverage

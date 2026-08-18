@@ -18,5 +18,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run adapter
-        run: cargo run -p oracle
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Replay checked-in matcher corpus against zlob
+        run: cargo test -p oracle --test zlob_oracle -- --ignored

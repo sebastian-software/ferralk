@@ -11,6 +11,7 @@
     "path": { "type": "string" },
     "flags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "default": [] },
     "expected": { "type": "boolean" },
+    "oracle_expected": { "type": "boolean" },
     "source": { "enum": ["zlob_1_6_3", "fast_glob", "git_check_ignore", "handwritten"] },
     "disputed": { "type": "boolean", "default": false },
     "note": { "type": "string" }
