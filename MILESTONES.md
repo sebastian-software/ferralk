@@ -319,3 +319,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   collection. A sorted, imbalanced-tree fixture proves the one-worker and
   four-worker result multisets agree. Result shards, loom models, and the
   broader stress suite remain open.
+- Added a repeated scheduler stress fixture for empty, shallow, and strongly
+  imbalanced directory trees. Thirty-two eight-worker traversals each match a
+  serial sorted baseline; worker-start-failure and panic cases remain tracked
+  separately before the aggregate stress-test milestone can close.

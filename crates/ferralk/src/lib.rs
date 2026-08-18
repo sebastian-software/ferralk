@@ -909,6 +909,44 @@ mod tests {
     }
 
     #[test]
+    fn parallel_collect_stress_covers_empty_shallow_and_imbalanced_trees() {
+        let empty = Fixture::new();
+        assert!(
+            Walker::new(&empty.root)
+                .threads(8)
+                .collect()
+                .expect("empty parallel walk succeeds")
+                .entries()
+                .is_empty()
+        );
+
+        let fixture = Fixture::new();
+        fixture.write("shallow.txt");
+        for branch in 0..8 {
+            fixture.write(format!("wide/{branch}/leaf.txt"));
+        }
+        for depth in 0..20 {
+            fixture.write(format!("deep/{depth}/next/leaf.txt"));
+        }
+
+        let serial = Walker::new(&fixture.root)
+            .threads(1)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("serial walk succeeds");
+        let expected = relative_paths(serial.entries(), &fixture.root);
+        for _ in 0..32 {
+            let actual = Walker::new(&fixture.root)
+                .threads(8)
+                .options(WalkOptions::default().sort(true))
+                .collect()
+                .expect("parallel stress walk succeeds");
+            assert_eq!(relative_paths(actual.entries(), &fixture.root), expected);
+            assert!(actual.errors().is_empty());
+        }
+    }
+
+    #[test]
     fn metadata_collection_is_explicit_and_preserves_file_size() {
         let fixture = Fixture::new();
         fixture.write("src/main.rs");
