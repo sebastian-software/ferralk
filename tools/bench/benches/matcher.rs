@@ -22,6 +22,17 @@ fn matcher(c: &mut Criterion) {
     c.bench_function("compiled_matcher/non_matching", |benchmark| {
         benchmark.iter(|| black_box(pattern.is_match(black_box(non_matching))))
     });
+    c.bench_function("compile/posix_classes_and_braces", |benchmark| {
+        benchmark.iter(|| {
+            black_box(
+                Pattern::compile(
+                    "src/{lib,bin}/[[:alpha:]][[:digit:]]*.{rs,toml}",
+                    PatternOptions::default().braces(true),
+                )
+                .expect("compile benchmark pattern is valid"),
+            )
+        })
+    });
 
     let common_pattern = "src/**/*.rs";
     let common_options = PatternOptions::default().recursive_double_star(true);

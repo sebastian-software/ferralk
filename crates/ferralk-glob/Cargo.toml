@@ -10,5 +10,8 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[dependencies]
+memchr = "2.8.3"
+
 [lints]
 workspace = true

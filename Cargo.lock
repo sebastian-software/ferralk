@@ -351,6 +351,9 @@ dependencies = [
 [[package]]
 name = "ferralk-glob"
 version = "0.1.0"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "find-msvc-tools"

@@ -14,6 +14,8 @@
 
 use std::{collections::HashSet, error::Error, fmt};
 
+use memchr::{memchr, memmem};
+
 /// A compiled glob pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern {
@@ -444,10 +446,15 @@ impl FastPath {
 }
 
 fn contains_hidden_component(path: &[u8]) -> bool {
-    path.first() == Some(&b'.')
-        || path
-            .windows(2)
-            .any(|pair| is_separator(pair[0]) && pair[1] == b'.')
+    let mut offset = 0;
+    while let Some(found) = memchr(b'.', &path[offset..]) {
+        let index = offset + found;
+        if index == 0 || is_separator(path[index - 1]) {
+            return true;
+        }
+        offset = index + 1;
+    }
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -561,9 +568,7 @@ fn parse_class(
         }
         if byte == b'['
             && pattern.get(index + 1) == Some(&b':')
-            && let Some(end) = pattern[index + 2..]
-                .windows(2)
-                .position(|pair| pair == b":]")
+            && let Some(end) = memmem::find(&pattern[index + 2..], b":]")
             && let Some(class) = parse_posix_class(&pattern[index + 2..index + 2 + end])
         {
             let name_end = index + 2 + end;
@@ -656,6 +661,9 @@ fn expand_braces(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8>>, PatternE
 }
 
 fn first_unescaped_brace(pattern: &[u8], escapes: bool) -> Option<usize> {
+    if !escapes {
+        return memchr(b'{', pattern);
+    }
     let mut index = 0;
     while index < pattern.len() {
         if escapes && pattern[index] == b'\\' {

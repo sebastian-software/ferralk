@@ -57,7 +57,7 @@ matcher ≤1.5x zlob median, ≤1.25x `fast-glob` median on the common subset.
 - [x] Fuzzers for parser and matcher with seeded corpora
 - [ ] Refactor the ported code toward the immutable IR (after corpus green) —
       ADR-0002
-- [ ] Profile, then apply memchr/memmem hot-path primitives — ADR-0008
+- [x] Profile, then apply memchr/memmem hot-path primitives — ADR-0008
 - [ ] Matcher benchmarks vs zlob, `fast-glob`, and `globset` in CodSpeed;
       verify both budgets — ADR-0013
 - [ ] Publish `ferralk-glob` 0.1
@@ -459,3 +459,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   `WalkOptions::keep_git_dir(true)` explicitly restores it. The public fixture
   covers default and opt-in behavior through serial, parallel, and streaming
   traversal.
+- Completed ADR-0008's stable-Rust byte-scan step. `ferralk-glob` now uses
+  `memmem` for POSIX-class terminators and `memchr` for unescaped brace and
+  hot-path hidden-component scans; CodSpeed's matcher bench also tracks the
+  relevant compile workload. The local common matching case improved from
+  about 23.8 ns to 14.8 ns with the full corpus still green. Cross-engine
+  release budgets remain a distinct M1 gate.
