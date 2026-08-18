@@ -657,6 +657,12 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   descendants in serial, parallel, and stream walks. C-shaped result buffers,
   root `.`/`..` entries, and trailing-slash result shaping remain deliberately
   outside Ferralk's Walker API.
+- Folded the mandatory separator into the compiled recursive
+  `literal/**/star+suffix` prefix. It removes a second runtime prefix check
+  while retaining the general matcher as the exhaustive equivalence oracle;
+  the common `src/**/*.rs` local ten-sample medians improved from about 16.0 ns
+  to 13.4 ns for a match and from 13.7 ns to 11.2 ns for a non-match. The
+  broader IR and cross-engine release-budget gates remain open.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no

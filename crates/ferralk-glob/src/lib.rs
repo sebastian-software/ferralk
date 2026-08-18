@@ -721,8 +721,10 @@ impl FastPath {
         else {
             return None;
         };
+        let mut prefix_with_separator = prefix.clone();
+        prefix_with_separator.push(b'/');
         Some(Self::RecursivePrefixSuffix {
-            prefix: prefix.clone(),
+            prefix: prefix_with_separator,
             suffix: suffix.clone(),
         })
     }
@@ -862,16 +864,13 @@ impl FastPath {
                             ))
             }
             Self::RecursivePrefixSuffix { prefix, suffix } => {
-                let Some(remainder) = path
-                    .strip_prefix(prefix.as_slice())
-                    .and_then(|path| path.strip_prefix(b"/"))
-                else {
+                let Some(remainder) = path.strip_prefix(prefix.as_slice()) else {
                     return false;
                 };
                 let Some(variable) = remainder.strip_suffix(suffix.as_slice()) else {
                     return false;
                 };
-                let variable_start = path.len() - remainder.len();
+                let variable_start = prefix.len();
                 options.match_hidden
                     || !contains_hidden_component_in(
                         path,
