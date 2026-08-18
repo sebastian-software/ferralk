@@ -47,10 +47,10 @@ matcher ≤1.5x zlob median, ≤1.25x `fast-glob` median on the common subset.
       escapes)
 - [ ] Mechanical port: brace expansion (nested alternatives)
 - [x] Mechanical port: extglob operators
-- [ ] Leading-period rules, case-folding option, escape handling
-- [ ] Public API: `Pattern::compile`, `PatternOptions`, `is_match`,
+- [x] Leading-period rules, case-folding option, escape handling
+- [x] Public API: `Pattern::compile`, `PatternOptions`, `is_match`,
       `validate`; byte-first with `&str` convenience — ADR-0005
-- [ ] Matcher corpus green (all topic files except `ignore.jsonl`)
+- [x] Matcher corpus green (all topic files except `ignore.jsonl`)
 - [x] Run differential generation against the oracle; triage every
       disagreement into the corpus — ADR-0007
 - [x] Property tests (literal-only patterns, subset/superset invariants)
