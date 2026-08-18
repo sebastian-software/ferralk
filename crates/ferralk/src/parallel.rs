@@ -57,12 +57,26 @@ pub(super) fn collect(walker: Walker) -> Result<WalkResult, WalkError> {
     let entries = thread::scope(|scope| {
         let mut joins = Vec::with_capacity(helper_count);
         for mut helper in helpers.drain(..) {
-            let shared = Arc::clone(&shared);
+            #[cfg(test)]
+            if should_fail_next_worker_spawn() {
+                shared.record_startup_error(std::io::Error::other("injected worker start failure"));
+                break;
+            }
+            let worker_shared = Arc::clone(&shared);
             let stealers = &stealers;
-            joins.push(scope.spawn(move || {
-                run_worker_catching_panics(&shared, &mut helper, stealers);
-                helper
-            }));
+            let spawn = thread::Builder::new()
+                .name("ferralk-worker".into())
+                .spawn_scoped(scope, move || {
+                    run_worker_catching_panics(&worker_shared, &mut helper, stealers);
+                    helper
+                });
+            match spawn {
+                Ok(join) => joins.push(join),
+                Err(source) => {
+                    shared.record_startup_error(source);
+                    break;
+                }
+            }
         }
         run_worker_catching_panics(&shared, &mut caller, &stealers);
         let mut entries = std::mem::take(&mut caller.entries);
@@ -80,6 +94,9 @@ pub(super) fn collect(walker: Walker) -> Result<WalkResult, WalkError> {
 fn finish(shared: Arc<Shared>, mut entries: Vec<WalkEntry>) -> Result<WalkResult, WalkError> {
     if let Some(payload) = lock(&shared.panic).take() {
         resume_unwind(payload);
+    }
+    if let Some(error) = lock(&shared.startup_error).take() {
+        return Err(error);
     }
     if let Some(error) = lock(&shared.abort_error).take() {
         return Err(error);
@@ -103,6 +120,7 @@ struct Shared {
     wake: Condvar,
     errors: Mutex<Vec<WalkError>>,
     abort_error: Mutex<Option<WalkError>>,
+    startup_error: Mutex<Option<WalkError>>,
     panic: Mutex<Option<Box<dyn Any + Send + 'static>>>,
     visited_directories: Mutex<HashSet<PathBuf>>,
 }
@@ -119,6 +137,7 @@ impl Shared {
             wake: Condvar::new(),
             errors: Mutex::new(Vec::new()),
             abort_error: Mutex::new(None),
+            startup_error: Mutex::new(None),
             panic: Mutex::new(None),
             visited_directories: Mutex::new(HashSet::new()),
         }
@@ -157,6 +176,19 @@ impl Shared {
             }
             ErrorPolicy::Skip => {}
             ErrorPolicy::Collect => lock(&self.errors).push(error),
+        }
+    }
+
+    fn record_startup_error(&self, source: std::io::Error) {
+        let mut startup_error = lock(&self.startup_error);
+        if startup_error.is_none() {
+            *startup_error = Some(WalkError::new(
+                "spawn_worker",
+                self.walker.root.clone(),
+                source,
+            ));
+            self.cancellation.cancel();
+            self.wake.notify_all();
         }
     }
 
@@ -377,13 +409,31 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 #[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_WORKER_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_worker_spawn() {
+    FAIL_NEXT_WORKER_SPAWN.with(|failure| failure.set(true));
+}
+
+#[cfg(test)]
+fn should_fail_next_worker_spawn() -> bool {
+    FAIL_NEXT_WORKER_SPAWN.with(std::cell::Cell::take)
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
+        fs,
         panic::{AssertUnwindSafe, catch_unwind},
+        path::PathBuf,
         sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{Shared, Walker, catch_worker_panic, finish};
+    use super::{Shared, Walker, catch_worker_panic, fail_next_worker_spawn, finish};
     use crate::CancellationToken;
 
     #[test]
@@ -395,5 +445,32 @@ mod tests {
         catch_worker_panic(&shared, || panic!("injected worker panic"));
         assert!(cancellation.is_cancelled());
         assert!(catch_unwind(AssertUnwindSafe(|| finish(shared, Vec::new()))).is_err());
+    }
+
+    #[test]
+    fn worker_start_failure_returns_a_structured_error_and_cancels() {
+        let root = std::env::temp_dir().join(format!(
+            "ferralk-worker-start-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("left")).expect("create left fixture");
+        fs::create_dir_all(root.join("right")).expect("create right fixture");
+        let cancellation = CancellationToken::default();
+        fail_next_worker_spawn();
+
+        let error = Walker::new(&root)
+            .threads(4)
+            .cancellation(cancellation.clone())
+            .collect()
+            .expect_err("injected worker start failure is returned");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(error.operation(), "spawn_worker");
+        assert_eq!(error.path(), PathBuf::from(&root));
+        assert!(cancellation.is_cancelled());
     }
 }

@@ -98,7 +98,7 @@ faster than parallel `ignore` + pruning on all traversal corpora.
 - [x] Single cancellation state, lossless error channel, documented panic
       propagation
 - [x] Loom models for queue and completion state
-- [ ] Stress tests: empty/shallow/imbalanced trees, visitor panic,
+- [x] Stress tests: empty/shallow/imbalanced trees, worker panic,
       worker-start failure
 - [x] Invariant test: parallel == serial result multiset
 - [ ] Walker benchmarks vs parallel `ignore` and zlob in CodSpeed; verify the
@@ -403,3 +403,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   corpus, harness, and bench CI commands replay all 260 matcher cases without
   building the `oracle`, zlob, or Zig. The pinned zlob differential suite
   remains available only through the manual workflow.
+- Completed the M3 stress checkpoint. Empty, shallow, and imbalanced trees
+  repeatedly match the serial baseline; a worker panic cancels siblings and
+  resumes on the caller; and `thread::Builder::spawn_scoped` startup failures
+  now become a structured `spawn_worker` error that cancels the shared token.
+  The walker has no public visitor callback, so the panic test exercises the
+  actual worker catch point that would contain callback execution.
