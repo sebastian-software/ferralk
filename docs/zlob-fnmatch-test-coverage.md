@@ -37,8 +37,10 @@ The root-independent compositional path-list forms from
 `test/test_absolute_paths.zig` are recorded in that same corpus: multiple
 brace components, brace-plus-suffix expansion, and brace-prefixed recursive
 selection. Its root-independent wildcard, class, brace, recursive, and literal
-component forms are included as well. Filesystem-only fixture setup remains
-outside this in-memory API coverage boundary.
+component forms are included as well, along with non-empty-branch Extglob
+composition. Filesystem-only fixture setup remains outside this in-memory API
+coverage boundary; the two documented empty-branch C/Rust disagreements stay
+flagged in the corpus.
 
 `test/test_internal.zig` additionally supplies eleven public `matchPaths`
 scenarios in the same corpus, covering wildcards, classes, literal and empty

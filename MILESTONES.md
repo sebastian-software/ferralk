@@ -617,3 +617,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   recursive selection, and literal directory/file components. The fixture's
   temporary absolute prefix is intentionally factored out; all of these cases
   replay in the harness and pinned Rust oracle with caller-order results.
+- Added the four non-empty-branch Extglob assertions from the same absolute
+  fixture: alternation, negation, repetition, and brace composition. They
+  replay in the harness and Rust oracle; the fixture's empty-branch cases stay
+  separately documented as C/Rust Zlob surface disagreements.

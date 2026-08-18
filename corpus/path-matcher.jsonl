@@ -68,3 +68,7 @@
 {"id":"absolute-path-literal-directory","kind":"match_paths","pattern":"src/*.c","path":"","paths":["src/a.c","src/b.c","lib/c.c"],"matches":["src/a.c","src/b.c"],"flags":[],"expected":true,"source":"zlob_1_6_3"}
 {"id":"absolute-path-nested-literal-directory","kind":"match_paths","pattern":"src/sub/*.c","path":"","paths":["src/sub/a.c","src/sub/b.c","src/other/c.c"],"matches":["src/sub/a.c","src/sub/b.c"],"flags":[],"expected":true,"source":"zlob_1_6_3"}
 {"id":"absolute-path-literal-file","kind":"match_paths","pattern":"Cargo.toml","path":"","paths":["Cargo.toml","Cargo.lock"],"matches":["Cargo.toml"],"flags":[],"expected":true,"source":"zlob_1_6_3"}
+{"id":"absolute-path-extglob-alternation","kind":"match_paths","pattern":"@(foo|bar).c","path":"","paths":["foo.c","bar.c","baz.c"],"matches":["foo.c","bar.c"],"flags":["extglob"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"absolute-path-extglob-negation","kind":"match_paths","pattern":"!(foo).c","path":"","paths":["foo.c","bar.c","baz.c"],"matches":["bar.c","baz.c"],"flags":["extglob"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"absolute-path-extglob-one-or-more","kind":"match_paths","pattern":"+(ab).c","path":"","paths":[".c","ab.c","abab.c","abc.c"],"matches":["ab.c","abab.c"],"flags":["extglob"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"absolute-path-extglob-brace","kind":"match_paths","pattern":"{src,lib}/*.!(h)","path":"","paths":["src/main.c","src/main.h","lib/util.c","lib/util.h"],"matches":["src/main.c","lib/util.c"],"flags":["braces","extglob"],"expected":true,"source":"zlob_1_6_3"}
