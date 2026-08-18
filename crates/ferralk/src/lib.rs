@@ -58,6 +58,7 @@ impl CancellationToken {
 pub struct WalkOptions {
     follow_symlinks: bool,
     sort: bool,
+    metadata: bool,
 }
 
 impl WalkOptions {
@@ -74,13 +75,21 @@ impl WalkOptions {
         self.sort = enabled;
         self
     }
+
+    /// Collects filesystem metadata for every returned entry.
+    #[must_use]
+    pub const fn metadata(mut self, enabled: bool) -> Self {
+        self.metadata = enabled;
+        self
+    }
 }
 
 /// One matching filesystem entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct WalkEntry {
     path: PathBuf,
     is_dir: bool,
+    metadata: Option<fs::Metadata>,
 }
 
 impl WalkEntry {
@@ -94,6 +103,12 @@ impl WalkEntry {
     #[must_use]
     pub const fn is_dir(&self) -> bool {
         self.is_dir
+    }
+
+    /// Metadata collected when WalkOptions metadata is enabled.
+    #[must_use]
+    pub fn metadata(&self) -> Option<&fs::Metadata> {
+        self.metadata.as_ref()
     }
 }
 
@@ -419,6 +434,18 @@ impl<'walker> WalkState<'walker> {
             self.walk_directory(backend, entry.path.clone())?;
         }
 
+        let metadata = if self.walker.options.metadata {
+            match fs::symlink_metadata(&entry.path) {
+                Ok(metadata) => Some(metadata),
+                Err(source) => {
+                    self.handle_error("symlink_metadata", entry.path.clone(), source)?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+
         if self.walker.includes.is_empty()
             || self
                 .walker
@@ -429,6 +456,7 @@ impl<'walker> WalkState<'walker> {
             self.entries.push(WalkEntry {
                 path: entry.path,
                 is_dir: entry.is_dir,
+                metadata,
             });
         }
         Ok(())
@@ -545,6 +573,39 @@ mod tests {
             vec![PathBuf::from("src/main.rs")]
         );
         assert!(result.errors().is_empty());
+    }
+
+    #[test]
+    fn metadata_collection_is_explicit_and_preserves_file_size() {
+        let fixture = Fixture::new();
+        fixture.write("src/main.rs");
+
+        let without_metadata = Walker::new(&fixture.root)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("walk succeeds");
+        assert!(
+            without_metadata
+                .entries()
+                .iter()
+                .all(|entry| entry.metadata().is_none())
+        );
+
+        let with_metadata = Walker::new(&fixture.root)
+            .options(WalkOptions::default().sort(true).metadata(true))
+            .collect()
+            .expect("walk succeeds");
+        assert_eq!(
+            with_metadata
+                .entries()
+                .iter()
+                .find(|entry| entry.path().ends_with("main.rs"))
+                .expect("fixture file is returned")
+                .metadata()
+                .expect("metadata is requested")
+                .len(),
+            7
+        );
     }
 
     #[test]

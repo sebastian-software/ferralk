@@ -76,7 +76,7 @@ preservation, structured errors.
       conversion) — ADR-0005
 - [x] Error model: `ErrorPolicy::{Abort,Skip,Collect}` with `Collect` default
 - [x] Symlink policy and cycle detection
-- [ ] Optional sorting and metadata collection
+- [x] Optional sorting and metadata collection
 - [ ] Streaming iterator with cancellation; `collect()` result shape
 - [ ] Filesystem fixture builders + integration tests (unreadable dirs,
       disappearing files, non-UTF-8 names)
@@ -268,3 +268,6 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 - Imported zlob's nested, deeply nested, and mixed brace-expansion assertions.
   `braces.jsonl` now contains 68 source-linked cases and passes both the
   Zig-free harness and the pinned zlob oracle.
+- Added opt-in metadata collection to `WalkOptions`. Returned entries retain
+  `std::fs::Metadata` only when requested, so the default traversal incurs no
+  metadata syscall; sorted fixture tests verify both modes and file length.
