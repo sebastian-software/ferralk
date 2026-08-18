@@ -421,3 +421,11 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   the identical 16-branch, four-worker, `**/*.rs` fixture through zlob's
   `WalkBuilder`; the local smoke median was about 1.02 ms. The M3 benchmark
   checkbox remains open until CodSpeed records the cross-engine budget.
+- Added a M1 common-syntax matcher suite for `src/**/*.rs`: compiled Ferralk
+  and globset, interpreted `fast-glob` (which has no compile API), and a
+  feature-gated compiled zlob reference in the manual CodSpeed workflow. The
+  initial ten-sample local smoke is intentionally not a release measurement,
+  but it exposes the current optimization blocker: Ferralk was about 3.26 µs
+  for the matching case versus about 35.6 ns for zlob and 39.1 ns for globset.
+  The 1.5x budget is therefore not met; retain all benchmark checkboxes and
+  prioritize the immutable-IR and hot-path work before attempting a gate.

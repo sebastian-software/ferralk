@@ -17,6 +17,8 @@ zlob = { version = "=1.6.3", optional = true }
 codspeed-criterion-compat = "5.0.1"
 ferralk = { path = "../../crates/ferralk" }
 ferralk-glob = { path = "../../crates/ferralk-glob" }
+fast-glob = "=1.1.0"
+globset = "=0.4.20"
 ignore = "0.4"
 
 [[bench]]
@@ -29,6 +31,11 @@ harness = false
 
 [[bench]]
 name = "walker_zlob"
+harness = false
+required-features = ["zlob-oracle"]
+
+[[bench]]
+name = "matcher_zlob"
 harness = false
 required-features = ["zlob-oracle"]
 

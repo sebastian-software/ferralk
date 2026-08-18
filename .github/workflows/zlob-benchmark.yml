@@ -22,4 +22,4 @@ jobs:
           version: 0.16.0
       - uses: CodSpeedHQ/action@v4
         with:
-          run: cargo bench -p bench --bench walker_zlob --features zlob-oracle
+          run: cargo bench -p bench --bench walker_zlob --bench matcher_zlob --features zlob-oracle
