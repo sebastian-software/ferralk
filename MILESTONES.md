@@ -643,6 +643,12 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   equivalence checks cover case folding, empty and nested remainders, and
   leading-dot paths. New local ten-sample medians are about 9.2 ns for a
   matching descendant and 4.7 ns for a non-match; broader IR work remains open.
+- Added an immutable `literal*literal` IR path and corrected the existing
+  single-star hidden-component checks to retain each wildcard's original path
+  offset. Exhaustive equivalence tests cover case folding, nested separators,
+  and literal-adjacent periods; local ten-sample medians are about 8.8 ns for a
+  match and 6.6 ns for a non-match. The broader IR and release-budget gates
+  remain open.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no

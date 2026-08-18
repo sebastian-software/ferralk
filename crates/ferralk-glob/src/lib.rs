@@ -647,6 +647,7 @@ enum FastPath {
     Star,
     PrefixStar { prefix: Vec<u8> },
     StarSuffix { suffix: Vec<u8> },
+    InfixStar { prefix: Vec<u8>, suffix: Vec<u8> },
     RecursiveTerminalPrefix { prefix: Vec<u8> },
     RecursivePrefixSuffix { prefix: Vec<u8>, suffix: Vec<u8> },
 }
@@ -679,6 +680,12 @@ impl FastPath {
             }
             [Token::Star, Token::Literal(suffix)] => {
                 return Some(Self::StarSuffix {
+                    suffix: suffix.clone(),
+                });
+            }
+            [Token::Literal(prefix), Token::Star, Token::Literal(suffix)] => {
+                return Some(Self::InfixStar {
+                    prefix: prefix.clone(),
                     suffix: suffix.clone(),
                 });
             }
@@ -797,20 +804,41 @@ impl FastPath {
                 }
                 path_index == path.len()
             }
-            Self::Star => options.match_hidden || !contains_hidden_component(path),
+            Self::Star => {
+                options.match_hidden || !contains_hidden_component_in(path, 0, path.len())
+            }
             Self::PrefixStar { prefix } => {
                 let Some(variable) = strip_literal_prefix(path, prefix, options.case_insensitive)
                 else {
                     return false;
                 };
-                options.match_hidden || !contains_hidden_component(variable)
+                options.match_hidden
+                    || !contains_hidden_component_in(path, path.len() - variable.len(), path.len())
             }
             Self::StarSuffix { suffix } => {
                 let Some(variable) = strip_literal_suffix(path, suffix, options.case_insensitive)
                 else {
                     return false;
                 };
-                options.match_hidden || !contains_hidden_component(variable)
+                options.match_hidden || !contains_hidden_component_in(path, 0, variable.len())
+            }
+            Self::InfixStar { prefix, suffix } => {
+                let Some(remainder) = strip_literal_prefix(path, prefix, options.case_insensitive)
+                else {
+                    return false;
+                };
+                let Some(variable) =
+                    strip_literal_suffix(remainder, suffix, options.case_insensitive)
+                else {
+                    return false;
+                };
+                let variable_start = path.len() - remainder.len();
+                options.match_hidden
+                    || !contains_hidden_component_in(
+                        path,
+                        variable_start,
+                        variable_start + variable.len(),
+                    )
             }
             Self::RecursiveTerminalPrefix { prefix } => {
                 let Some(remainder) = strip_literal_prefix(path, prefix, options.case_insensitive)
@@ -819,7 +847,12 @@ impl FastPath {
                 };
                 remainder.is_empty()
                     || remainder.first().is_some_and(|byte| is_separator(*byte))
-                        && (options.match_hidden || !contains_hidden_component(&remainder[1..]))
+                        && (options.match_hidden
+                            || !contains_hidden_component_in(
+                                path,
+                                path.len() - remainder.len() + 1,
+                                path.len(),
+                            ))
             }
             Self::RecursivePrefixSuffix { prefix, suffix } => {
                 let Some(remainder) = path
@@ -831,7 +864,13 @@ impl FastPath {
                 let Some(variable) = remainder.strip_suffix(suffix.as_slice()) else {
                     return false;
                 };
-                options.match_hidden || !contains_hidden_component(variable)
+                let variable_start = path.len() - remainder.len();
+                options.match_hidden
+                    || !contains_hidden_component_in(
+                        path,
+                        variable_start,
+                        variable_start + variable.len(),
+                    )
             }
         }
     }
@@ -863,9 +902,12 @@ fn strip_literal_suffix<'a>(
         .then_some(&path[..start])
 }
 
-fn contains_hidden_component(path: &[u8]) -> bool {
-    let mut offset = 0;
-    while let Some(found) = memchr(b'.', &path[offset..]) {
+fn contains_hidden_component_in(path: &[u8], start: usize, end: usize) -> bool {
+    let Some(segment) = path.get(start..end) else {
+        return false;
+    };
+    let mut offset = start;
+    while let Some(found) = memchr(b'.', &segment[offset - start..]) {
         let index = offset + found;
         if index == 0 || is_separator(path[index - 1]) {
             return true;
@@ -1796,8 +1838,42 @@ mod tests {
     }
 
     #[test]
+    fn infix_star_fast_path_matches_the_general_matcher() {
+        let options = PatternOptions::default().case_insensitive(true);
+        let fast = Pattern::compile("Src*.rs", options).expect("pattern compiles");
+        assert!(matches!(
+            fast.alternatives[0].fast_path,
+            Some(FastPath::InfixStar { .. })
+        ));
+        let mut general = fast.clone();
+        general.alternatives[0].fast_path = None;
+
+        let mut candidates = vec![
+            b"src.rs".to_vec(),
+            b"srcMain.RS".to_vec(),
+            b"src/nested/main.rs".to_vec(),
+            b"src/.hidden.rs".to_vec(),
+            b"other.rs".to_vec(),
+            b"src.txt".to_vec(),
+        ];
+        candidates.extend(
+            byte_words(b"src./RS", 5)
+                .into_iter()
+                .map(|middle| [b"src".as_slice(), middle.as_slice(), b".rs"].concat()),
+        );
+        for candidate in candidates {
+            assert_eq!(
+                fast.is_match(&candidate),
+                general.is_match(&candidate),
+                "fast path differs for {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
     fn single_star_fast_paths_match_the_general_matcher() {
-        let candidates = byte_words(b"ab./rs", 4);
+        let mut candidates = byte_words(b"ab./rs", 4);
+        candidates.extend([b"src..rs".to_vec(), b"src/.hidden".to_vec()]);
         for pattern in ["*", "src*", "*.rs"] {
             let fast =
                 Pattern::compile(pattern, PatternOptions::default()).expect("pattern compiles");

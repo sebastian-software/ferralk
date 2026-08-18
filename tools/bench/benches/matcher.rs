@@ -94,6 +94,15 @@ fn matcher(c: &mut Criterion) {
         },
     );
 
+    let infix_star = Pattern::compile("src*.rs", PatternOptions::default())
+        .expect("infix-star benchmark pattern is valid");
+    c.bench_function("infix_star/ferralk_compiled/matching", |benchmark| {
+        benchmark.iter(|| black_box(infix_star.is_match(black_box("src/deep/main.rs"))))
+    });
+    c.bench_function("infix_star/ferralk_compiled/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(infix_star.is_match(black_box("src/deep/main.txt"))))
+    });
+
     let suffix_star = Pattern::compile("*.rs", PatternOptions::default())
         .expect("suffix-star benchmark pattern is valid");
     c.bench_function("single_star/ferralk_compiled/matching", |benchmark| {
