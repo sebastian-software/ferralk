@@ -1288,8 +1288,12 @@ mod tests {
         assert_eq!(paths_for("./aaa"), vec![PathBuf::from("aaa")]);
         assert_eq!(paths_for("aaa/"), vec![PathBuf::from("aaa")]);
         assert!(paths_for("aaa/tomato/tomato.txt/").is_empty());
+        assert!(paths_for("nope").is_empty());
+        assert_eq!(paths_for("a*"), vec![PathBuf::from("aaa")]);
         assert_eq!(paths_for("a*a"), vec![PathBuf::from("aaa")]);
         assert_eq!(paths_for("*a*a*a*"), vec![PathBuf::from("aaa")]);
+        assert_eq!(paths_for("aaa/apple"), vec![PathBuf::from("aaa/apple")]);
+        assert_eq!(paths_for("./*"), paths_for("*"));
         assert_eq!(
             paths_for("???/"),
             vec![

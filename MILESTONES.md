@@ -703,6 +703,10 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   wildcard component-local, including the root; `filter_paths` keeps its
   established source-compatible semantics. The frozen `test_rust_glob.zig`
   multiple-star and `???/` directory cases now replay through the Walker.
+- Completed the remaining root-relative literal and ordinary-wildcard examples
+  from that frozen Rust-glob fixture in the same public regression: no-match,
+  prefix-star, exact nested path, and `./*` equivalence now have direct
+  assertions rather than relying on broader pattern cases.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no
