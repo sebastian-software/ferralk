@@ -336,6 +336,14 @@ impl Walker {
                 .iter()
                 .any(|pattern| pattern.could_match_descendant(relative))
     }
+
+    fn may_include_file(&self, relative: &[u8]) -> bool {
+        self.includes.is_empty()
+            || self
+                .includes
+                .iter()
+                .any(|pattern| pattern.matches_extension(relative))
+    }
 }
 
 fn traversal_pattern_options() -> PatternOptions {
@@ -350,6 +358,7 @@ struct TraversalPattern {
     matcher: Pattern,
     subtree_root: Option<Pattern>,
     literal_root: Option<Vec<u8>>,
+    extension: Option<Vec<u8>>,
 }
 
 impl TraversalPattern {
@@ -363,6 +372,7 @@ impl TraversalPattern {
             matcher: Pattern::compile(pattern, options)?,
             subtree_root,
             literal_root: literal_pattern_root(pattern),
+            extension: literal_extension(pattern),
         })
     }
 
@@ -387,6 +397,13 @@ impl TraversalPattern {
             || path
                 .strip_prefix(root.as_slice())
                 .is_some_and(|suffix| suffix.starts_with(b"/"))
+    }
+
+    fn matches_extension(&self, path: &[u8]) -> bool {
+        let Some(extension) = &self.extension else {
+            return true;
+        };
+        final_extension(path).is_some_and(|candidate| candidate == extension)
     }
 }
 
@@ -413,6 +430,31 @@ fn literal_pattern_root(pattern: &[u8]) -> Option<Vec<u8>> {
         prefix
     };
     (!root.is_empty()).then(|| root.to_vec())
+}
+
+fn literal_extension(pattern: &[u8]) -> Option<Vec<u8>> {
+    let extension = final_extension(pattern)?;
+    if extension.is_empty()
+        || extension.iter().any(|byte| {
+            matches!(
+                byte,
+                b'*' | b'?' | b'[' | b']' | b'{' | b'}' | b'\\' | b'(' | b')' | b'|'
+            )
+        })
+    {
+        return None;
+    }
+    Some(extension.to_vec())
+}
+
+fn final_extension(path: &[u8]) -> Option<&[u8]> {
+    let name = path.rsplit(is_path_separator).next().unwrap_or(path);
+    let dot = name.iter().rposition(|byte| *byte == b'.')?;
+    name.get(dot + 1..)
+}
+
+fn is_path_separator(byte: &u8) -> bool {
+    *byte == b'/' || (cfg!(windows) && *byte == b'\\')
 }
 
 fn has_closing_brace(pattern: &[u8], open: usize) -> bool {
@@ -584,6 +626,9 @@ impl WalkStream {
                 Err(source) => return self.error("metadata", entry.path, source),
             }
         }
+        if !entry.is_dir && !self.walker.may_include_file(bytes) {
+            return None;
+        }
         if entry.is_dir
             && !self
                 .walker
@@ -739,6 +784,9 @@ impl<'walker> WalkState<'walker> {
                     return Ok(());
                 }
             }
+        }
+        if !entry.is_dir && !self.walker.may_include_file(bytes) {
+            return Ok(());
         }
         if entry.is_dir
             && !self
@@ -898,7 +946,7 @@ mod tests {
 
     use super::{
         CancellationToken, ErrorPolicy, TraversalPattern, WalkEntry, WalkOptions, Walker,
-        gitignore_node, literal_pattern_root,
+        gitignore_node, literal_extension, literal_pattern_root,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -1190,6 +1238,12 @@ mod tests {
             literal_pattern_root(b"foo@(bar/**/*.rs"),
             Some(b"foo@(bar".to_vec())
         );
+
+        let rust_sources = TraversalPattern::compile(b"src/**/*.rs").expect("valid suffix");
+        assert!(rust_sources.matches_extension(b"src/lib.rs"));
+        assert!(!rust_sources.matches_extension(b"src/lib.txt"));
+        assert_eq!(literal_extension(b"src/**/*.{rs,ts}"), None);
+        assert_eq!(literal_extension(b"src/**/*.rs"), Some(b"rs".to_vec()));
     }
 
     #[test]

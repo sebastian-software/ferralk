@@ -70,7 +70,7 @@ preservation, structured errors.
 - [x] Backend trait + portable `std::fs::read_dir` backend
 - [x] `Walker` builder: include/exclude, `WalkOptions`, POSIX-conservative
       defaults — ADR-0011
-- [ ] Conservative prune planner: literal roots, whole-subtree excludes,
+- [x] Conservative prune planner: literal roots, whole-subtree excludes,
       extension filters, negation guard
 - [x] Native path preservation end-to-end (`Path`/`PathBuf`, no lossy
       conversion) — ADR-0005
@@ -354,5 +354,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 - Added conservative literal-root planning for include patterns. `src/**/*.rs`
   now avoids opening unrelated sibling directories in serial, streaming, and
   parallel traversal; wildcard-, escape-, and otherwise ambiguous prefixes
-  deliberately stay unpruned. Extension prefilters remain open before the
-  aggregate M2 pruning checkpoint can close.
+  deliberately stay unpruned.
+- Added an all-includes extension prefilter: when every include has an
+  unambiguous literal suffix, nonmatching files skip full matcher evaluation.
+  Braces, classes, escapes, and variable suffixes disable the optimization.
+  Together with literal roots, whole-subtree excludes, and the existing
+  negation-aware guard, this closes the M2 conservative-pruning checkpoint.

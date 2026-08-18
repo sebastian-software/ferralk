@@ -320,6 +320,9 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
             }
         }
     }
+    if !entry.is_dir && !shared.walker.may_include_file(bytes) {
+        return;
+    }
     if entry.is_dir
         && !shared
             .walker
