@@ -382,3 +382,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   tasks. It verifies that the returned structured error and the caller's
   shared cancellation token agree, complementing the existing lossless
   `Collect`-channel comparison.
+- Added `WalkOptions::directories_only` as the non-mutating `ZLOB_ONLYDIR`
+  mapping. It filters returned files while preserving descent into directories
+  across serial, parallel, and streaming walks; `ZLOB_MARK` remains the
+  explicit native-path-preservation divergence.

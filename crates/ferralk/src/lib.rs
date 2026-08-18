@@ -64,6 +64,7 @@ pub struct WalkOptions {
     follow_symlinks: bool,
     sort: bool,
     metadata: bool,
+    directories_only: bool,
 }
 
 impl WalkOptions {
@@ -85,6 +86,13 @@ impl WalkOptions {
     #[must_use]
     pub const fn metadata(mut self, enabled: bool) -> Self {
         self.metadata = enabled;
+        self
+    }
+
+    /// Returns only directories while continuing to traverse through them.
+    #[must_use]
+    pub const fn directories_only(mut self, enabled: bool) -> Self {
+        self.directories_only = enabled;
         self
     }
 }
@@ -651,6 +659,9 @@ impl WalkStream {
         if git_ignored {
             return None;
         }
+        if self.walker.options.directories_only && !entry.is_dir {
+            return None;
+        }
         let metadata = if self.walker.options.metadata {
             match fs::symlink_metadata(&entry.path) {
                 Ok(metadata) => Some(metadata),
@@ -811,12 +822,13 @@ impl<'walker> WalkState<'walker> {
             None
         };
 
-        if self.walker.includes.is_empty()
-            || self
-                .walker
-                .includes
-                .iter()
-                .any(|pattern| pattern.matches(bytes))
+        if (!self.walker.options.directories_only || entry.is_dir)
+            && (self.walker.includes.is_empty()
+                || self
+                    .walker
+                    .includes
+                    .iter()
+                    .any(|pattern| pattern.matches(bytes)))
         {
             if git_ignored {
                 return Ok(());
@@ -1019,6 +1031,36 @@ mod tests {
             vec![PathBuf::from("src/main.rs")]
         );
         assert!(result.errors().is_empty());
+    }
+
+    #[test]
+    fn directories_only_filters_results_without_pruning_descendants() {
+        let fixture = Fixture::new();
+        fixture.write("src/main.rs");
+        fixture.write("src/nested/lib.rs");
+        let options = WalkOptions::default().directories_only(true).sort(true);
+
+        let serial = Walker::new(&fixture.root)
+            .threads(1)
+            .options(options)
+            .collect()
+            .expect("serial walk succeeds");
+        let parallel = Walker::new(&fixture.root)
+            .threads(4)
+            .options(options)
+            .collect()
+            .expect("parallel walk succeeds");
+        let streamed = Walker::new(&fixture.root)
+            .options(options)
+            .stream()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream succeeds");
+        let expected = vec![PathBuf::from("src"), PathBuf::from("src/nested")];
+
+        assert_eq!(relative_paths(serial.entries(), &fixture.root), expected);
+        assert_eq!(relative_paths(parallel.entries(), &fixture.root), expected);
+        assert_eq!(relative_paths(&streamed, &fixture.root), expected);
+        assert!(streamed.iter().all(WalkEntry::is_dir));
     }
 
     #[test]

@@ -63,6 +63,7 @@ let result = Walker::new(".")
 | `ZLOB_GITIGNORE` | `Walker::respect_git_ignore(true)` |
 | `ZLOB_FOLLOW_SYMLINKS` | `WalkOptions::follow_symlinks(true)` |
 | `ZLOB_ERR` | `ErrorPolicy::{Abort, Skip, Collect}` |
+| `ZLOB_ONLYDIR` | `WalkOptions::directories_only(true)` |
 | thread count | `Walker::threads(n)`; `collect()` defaults to available parallelism |
 | metadata requests | `WalkOptions::metadata(true)` |
 | streaming | `Walker::stream()` returns entry-or-error items incrementally |
@@ -84,8 +85,8 @@ deliver entries incrementally.
   owned vectors, not caller-managed C buffers.
 - `ZLOB_NOCHECK` and `ZLOB_NOMAGIC` are result-shaping policies, not matcher
   syntax. They remain deferred rather than being silently approximated.
-- `ZLOB_MARK` and `ZLOB_ONLYDIR` are not currently implemented. Ferralk keeps
-  native paths unmodified; callers can filter on `WalkEntry::is_dir()`.
+- `ZLOB_MARK` is deliberately unsupported. Ferralk keeps native paths
+  unmodified instead of appending display-only separators.
 - `zlob_at` maps naturally to `Walker::new(root)`, but there is no separate
   descriptor-relative entry point yet.
 
