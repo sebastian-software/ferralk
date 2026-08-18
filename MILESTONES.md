@@ -28,7 +28,7 @@ disputed or undefined zlob semantics are captured as flagged corpus cases.
 - [ ] Port zlob's own test suite 1:1 into the corpus — ADR-0007
 - [x] Build the `oracle` crate (zlob 1.6.3 as dev-dependency) with a manually
       triggered corpus-regen workflow — ADR-0007
-- [ ] Wire `fast-glob` (oxc) into the harness as second reference for the
+- [x] Wire `fast-glob` (oxc) into the harness as second reference for the
       common syntax subset — ADR-0007
 - [x] Build the `git check-ignore` oracle runner for ignore cases — ADR-0006
 - [x] Record disputed/undefined semantics as corpus cases with a `disputed`
@@ -197,3 +197,6 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   `ignore.jsonl` with ordinary, negated, and directory-rule cases. Its normal
   harness integration verifies that Git remains the normative source before
   the M3 `ignore`-crate matcher is introduced.
+- Pinned Oxc's `fast-glob` 1.1.0 as the second matcher reference and replayed
+  an explicitly scoped common subset in the harness. Its independent oracle
+  expectation shares the same corpus mechanism used for zlob divergences.

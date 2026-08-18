@@ -1,0 +1,3 @@
+{"id":"fastglob-001","pattern":"src/*.rs","path":"src/lib.rs","flags":[],"expected":true,"source":"fast_glob","note":"Common wildcard subset against Oxc fast-glob 1.1.0."}
+{"id":"fastglob-002","pattern":"file[0-9].rs","path":"file7.rs","flags":[],"expected":true,"source":"fast_glob","note":"Common bracket-class subset against Oxc fast-glob 1.1.0."}
+{"id":"fastglob-003","pattern":"{src,lib}/*.rs","path":"lib/main.rs","flags":["braces"],"expected":true,"source":"fast_glob","note":"Common nested-free brace subset against Oxc fast-glob 1.1.0."}

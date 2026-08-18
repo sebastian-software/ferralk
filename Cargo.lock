@@ -12,6 +12,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "bench"
 version = "0.1.0"
 
@@ -82,6 +88,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 
 [[package]]
+name = "fast-glob"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3cc9868289ee02952b341465ce66e67adec151227afedacf9137c0adb1e53943"
+dependencies = [
+ "arrayvec",
+]
+
+[[package]]
 name = "ferralk"
 version = "0.1.0"
 dependencies = [
@@ -103,6 +118,7 @@ name = "harness"
 version = "0.1.0"
 dependencies = [
  "corpus",
+ "fast-glob",
  "ferralk-glob",
  "serde_json",
 ]
