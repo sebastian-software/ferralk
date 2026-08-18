@@ -13,7 +13,7 @@ its rationale.
 | `**` | `PatternOptions::recursive_double_star` | Implemented (M1) | Explicit option; corpus import continues. |
 | bracket classes, ranges, `[!...]`, `[^...]` | `Pattern::compile` | Implemented (M1) | Byte-first, including ASCII POSIX classes. |
 | `ZLOB_BRACE` | `PatternOptions::braces` | Implemented (M1) | Nested and empty alternatives; source-backed corpus import continues. |
-| `ZLOB_EXTGLOB` | `PatternOptions::extglob` | Planned (M1) | Bash operators. |
+| `ZLOB_EXTGLOB` | `PatternOptions::extglob` | Implemented (M1) | `@()`, `?()`, `*()`, `+()`, `!()`; matches zlob's non-nested scope. |
 | `ZLOB_PERIOD` | `PatternOptions::match_hidden` | Implemented (M1) | Deliberate in-memory divergence: Ferralk defaults to off; zlob's direct matcher accepts leading periods by default. |
 | `ZLOB_NOESCAPE` | `PatternOptions::escape` | Implemented (M1) | Higher-level boolean, not a bitflag. |
 | case folding | `PatternOptions::case_insensitive` | Implemented (M1) | Explicit opt-in on every platform. |

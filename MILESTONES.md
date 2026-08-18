@@ -46,7 +46,7 @@ matcher ≤1.5x zlob median, ≤1.25x `fast-glob` median on the common subset.
 - [ ] Mechanical port: character classes (incl. `[!...]`/`[^...]`, ranges,
       escapes)
 - [ ] Mechanical port: brace expansion (nested alternatives)
-- [ ] Mechanical port: extglob operators
+- [x] Mechanical port: extglob operators
 - [ ] Leading-period rules, case-folding option, escape handling
 - [ ] Public API: `Pattern::compile`, `PatternOptions`, `is_match`,
       `validate`; byte-first with `&str` convenience — ADR-0005
@@ -219,3 +219,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   `fnmatch.jsonl` to 127 source-line-addressable assertions. The strict byte
   codec rejected two malformed JSON escapes during import; both were corrected
   before replay and are covered by the existing codec validation path.
+- Ported zlob's non-nested extglob evaluator for `@()`, `?()`, `*()`,
+  `+()`, and `!()`-style negation, preserving malformed extglobs as
+  literals. The complete upstream extglob block is now source-line-addressable
+  in `fnmatch.jsonl`; it brings that file to 175 assertions and passes both
+  the Zig-free harness and the pinned zlob oracle.

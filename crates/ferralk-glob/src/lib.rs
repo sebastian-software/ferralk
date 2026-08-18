@@ -4,15 +4,15 @@
 //! Compiled, byte-first glob patterns with explicit behaviour-changing options.
 //!
 //! The M1 implementation currently covers literals, `*`, `?`, `**`, character
-//! classes, escapes, leading-period handling, ASCII case folding, and nested
-//! brace expansion. Extglobs remain deliberately unimplemented.
+//! classes, escapes, leading-period handling, ASCII case folding, nested brace
+//! expansion, and Bash-style extglobs.
 
 use std::{collections::HashSet, error::Error, fmt};
 
 /// A compiled glob pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern {
-    alternatives: Vec<Vec<Token>>,
+    alternatives: Vec<Alternative>,
     options: PatternOptions,
 }
 
@@ -55,7 +55,7 @@ impl PatternOptions {
         self
     }
 
-    /// Enables Bash-style extglobs. Parsing is added in a later M1 step.
+    /// Enables Bash-style extglobs.
     #[must_use]
     pub const fn extglob(mut self, enabled: bool) -> Self {
         self.extglob = enabled;
@@ -137,21 +137,6 @@ impl Pattern {
                 options,
             });
         }
-        if options.extglob
-            && pattern
-                .windows(2)
-                .any(|pair| matches!(pair[0], b'@' | b'!' | b'?' | b'*' | b'+') && pair[1] == b'(')
-        {
-            return Err(PatternError {
-                offset: pattern
-                    .windows(2)
-                    .position(|pair| {
-                        matches!(pair[0], b'@' | b'!' | b'?' | b'*' | b'+') && pair[1] == b'('
-                    })
-                    .expect("the checked pattern contains an extglob"),
-                message: "extglob is not implemented",
-            });
-        }
         let mut tokens = Vec::new();
         let mut literals = Vec::new();
         let mut index = 0;
@@ -209,7 +194,10 @@ impl Pattern {
         flush_literals(&mut tokens, &mut literals);
 
         Ok(Self {
-            alternatives: vec![tokens],
+            alternatives: vec![Alternative {
+                raw: pattern.to_vec(),
+                tokens,
+            }],
             options,
         })
     }
@@ -226,9 +214,13 @@ impl Pattern {
     #[must_use]
     pub fn is_match(&self, path: impl AsRef<[u8]>) -> bool {
         let path = path.as_ref();
-        self.alternatives.iter().any(|tokens| {
-            let mut failed = HashSet::new();
-            self.matches_from(tokens, 0, 0, path, &mut failed)
+        self.alternatives.iter().any(|alternative| {
+            if self.options.extglob && contains_extglob(&alternative.raw, self.options.escape) {
+                match_extglob(&alternative.raw, path, self.options)
+            } else {
+                let mut failed = HashSet::new();
+                self.matches_from(&alternative.tokens, 0, 0, path, &mut failed)
+            }
         })
     }
 
@@ -351,6 +343,12 @@ enum Token {
     RecursiveStar,
     RecursivePrefix,
     Class(Class),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Alternative {
+    raw: Vec<u8>,
+    tokens: Vec<Token>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -640,6 +638,305 @@ fn fold_ascii(byte: u8, case_insensitive: bool) -> u8 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtglobKind {
+    Optional,
+    ZeroOrMore,
+    OneOrMore,
+    ExactlyOne,
+    Negated,
+}
+
+fn contains_extglob(pattern: &[u8], escapes: bool) -> bool {
+    let mut index = 0;
+    while index + 1 < pattern.len() {
+        if escapes && pattern[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        if detect_extglob_at(pattern, index).is_some() {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+fn detect_extglob_at(pattern: &[u8], index: usize) -> Option<ExtglobKind> {
+    if pattern.get(index + 1) != Some(&b'(') {
+        return None;
+    }
+    match pattern[index] {
+        b'?' => Some(ExtglobKind::Optional),
+        b'*' => Some(ExtglobKind::ZeroOrMore),
+        b'+' => Some(ExtglobKind::OneOrMore),
+        b'@' => Some(ExtglobKind::ExactlyOne),
+        b'!' => Some(ExtglobKind::Negated),
+        _ => None,
+    }
+}
+
+fn closing_extglob_parenthesis(pattern: &[u8], open: usize, escapes: bool) -> Option<usize> {
+    if pattern.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 1_usize;
+    let mut index = open + 1;
+    while index < pattern.len() {
+        if escapes && pattern[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        match pattern[index] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn split_extglob_alternatives(content: &[u8], escapes: bool) -> Vec<&[u8]> {
+    let mut alternatives = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_usize;
+    let mut index = 0;
+    while index < content.len() {
+        if escapes && content[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        match content[index] {
+            b'(' => depth += 1,
+            b')' if depth > 0 => depth -= 1,
+            b'|' if depth == 0 => {
+                alternatives.push(&content[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    alternatives.push(&content[start..]);
+    alternatives
+}
+
+fn match_extglob(pattern: &[u8], path: &[u8], options: PatternOptions) -> bool {
+    match_extglob_from(pattern, path, 0, 0, options)
+}
+
+fn match_extglob_from(
+    pattern: &[u8],
+    path: &[u8],
+    mut pattern_index: usize,
+    mut path_index: usize,
+    options: PatternOptions,
+) -> bool {
+    let mut star_pattern_index = 0_usize;
+    let mut star_path_index = 0_usize;
+    let mut has_star = false;
+
+    while path_index < path.len() || pattern_index < pattern.len() {
+        if pattern_index < pattern.len() {
+            if let Some(kind) = detect_extglob_at(pattern, pattern_index) {
+                let open = pattern_index + 1;
+                if let Some(close) = closing_extglob_parenthesis(pattern, open, options.escape) {
+                    let alternatives =
+                        split_extglob_alternatives(&pattern[open + 1..close], options.escape);
+                    if match_extglob_group(
+                        kind,
+                        &alternatives,
+                        &pattern[close + 1..],
+                        path,
+                        path_index,
+                        options,
+                    ) {
+                        return true;
+                    }
+                    if has_star && star_path_index < path.len() {
+                        pattern_index = star_pattern_index;
+                        star_path_index += 1;
+                        path_index = star_path_index;
+                        continue;
+                    }
+                    return false;
+                }
+            }
+
+            match pattern[pattern_index] {
+                b'*' => {
+                    pattern_index += 1;
+                    while pattern.get(pattern_index) == Some(&b'*') {
+                        pattern_index += 1;
+                    }
+                    star_pattern_index = pattern_index;
+                    star_path_index = path_index;
+                    has_star = true;
+                    continue;
+                }
+                b'?' if path.get(path_index).is_some_and(|&byte| {
+                    options.match_hidden || byte != b'.' || !at_component_start(path, path_index)
+                }) =>
+                {
+                    pattern_index += 1;
+                    path_index += 1;
+                    continue;
+                }
+                b'[' if let Ok((class, next)) =
+                    parse_class(pattern, pattern_index, options.escape)
+                    && path.get(path_index).is_some_and(|&byte| {
+                        (options.match_hidden
+                            || byte != b'.'
+                            || !at_component_start(path, path_index))
+                            && class.matches(byte, options.case_insensitive)
+                    }) =>
+                {
+                    pattern_index = next;
+                    path_index += 1;
+                    continue;
+                }
+                b'\\'
+                    if options.escape
+                        && pattern_index + 1 < pattern.len()
+                        && path.get(path_index).is_some_and(|&byte| {
+                            bytes_equal(pattern[pattern_index + 1], byte, options.case_insensitive)
+                        }) =>
+                {
+                    pattern_index += 2;
+                    path_index += 1;
+                    continue;
+                }
+                byte if path
+                    .get(path_index)
+                    .is_some_and(|&actual| bytes_equal(byte, actual, options.case_insensitive)) =>
+                {
+                    pattern_index += 1;
+                    path_index += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        if has_star && star_path_index < path.len() {
+            pattern_index = star_pattern_index;
+            star_path_index += 1;
+            path_index = star_path_index;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+fn match_extglob_group(
+    kind: ExtglobKind,
+    alternatives: &[&[u8]],
+    rest: &[u8],
+    path: &[u8],
+    path_index: usize,
+    options: PatternOptions,
+) -> bool {
+    match kind {
+        ExtglobKind::ExactlyOne => {
+            match_extglob_alternative(alternatives, rest, path, path_index, options)
+        }
+        ExtglobKind::Optional => {
+            match_extglob_from(rest, path, 0, path_index, options)
+                || match_extglob_alternative(alternatives, rest, path, path_index, options)
+        }
+        ExtglobKind::ZeroOrMore => {
+            match_extglob_from(rest, path, 0, path_index, options)
+                || match_extglob_repeated(
+                    alternatives,
+                    rest,
+                    path,
+                    path_index,
+                    options,
+                    &mut HashSet::new(),
+                )
+        }
+        ExtglobKind::OneOrMore => match_extglob_repeated(
+            alternatives,
+            rest,
+            path,
+            path_index,
+            options,
+            &mut HashSet::new(),
+        ),
+        ExtglobKind::Negated => {
+            for end in path_index..=path.len() {
+                if alternatives.iter().all(|alternative| {
+                    !match_extglob_alternative_exact(alternative, &path[path_index..end], options)
+                }) && match_extglob_from(rest, path, 0, end, options)
+                {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+fn match_extglob_alternative(
+    alternatives: &[&[u8]],
+    rest: &[u8],
+    path: &[u8],
+    path_index: usize,
+    options: PatternOptions,
+) -> bool {
+    alternatives.iter().any(|alternative| {
+        (path_index..=path.len()).any(|end| {
+            match_extglob_alternative_exact(alternative, &path[path_index..end], options)
+                && match_extglob_from(rest, path, 0, end, options)
+        })
+    })
+}
+
+fn match_extglob_repeated(
+    alternatives: &[&[u8]],
+    rest: &[u8],
+    path: &[u8],
+    path_index: usize,
+    options: PatternOptions,
+    visited: &mut HashSet<usize>,
+) -> bool {
+    if !visited.insert(path_index) {
+        return false;
+    }
+    for alternative in alternatives {
+        for end in path_index..=path.len() {
+            if match_extglob_alternative_exact(alternative, &path[path_index..end], options)
+                && (match_extglob_from(rest, path, 0, end, options)
+                    || (end > path_index
+                        && match_extglob_repeated(alternatives, rest, path, end, options, visited)))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn match_extglob_alternative_exact(
+    alternative: &[u8],
+    path: &[u8],
+    options: PatternOptions,
+) -> bool {
+    let options = PatternOptions {
+        braces: false,
+        extglob: false,
+        ..options
+    };
+    Pattern::compile(alternative, options).is_ok_and(|pattern| pattern.is_match(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Pattern, PatternOptions};
@@ -721,6 +1018,46 @@ mod tests {
             )
             .unwrap()
             .is_match("readme.MD")
+        );
+    }
+
+    #[test]
+    fn extglobs_support_alternation_repetition_and_negation() {
+        let options = PatternOptions::default().extglob(true);
+        assert!(
+            Pattern::compile("@(foo|bar)", options)
+                .unwrap()
+                .is_match("foo")
+        );
+        assert!(
+            Pattern::compile("file?(.bak).txt", options)
+                .unwrap()
+                .is_match("file.txt")
+        );
+        assert!(
+            Pattern::compile("a*(X)b", options)
+                .unwrap()
+                .is_match("aXXXb")
+        );
+        assert!(
+            Pattern::compile("+(a|b)", options)
+                .unwrap()
+                .is_match("abba")
+        );
+        assert!(
+            Pattern::compile("*.!(js)", options)
+                .unwrap()
+                .is_match("file.txt")
+        );
+        assert!(
+            !Pattern::compile("*.!(js)", options)
+                .unwrap()
+                .is_match("file.js")
+        );
+        assert!(
+            !Pattern::compile("@(foo|bar)", PatternOptions::default())
+                .unwrap()
+                .is_match("foo")
         );
     }
 
