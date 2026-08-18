@@ -113,7 +113,7 @@ CI green — ADR-0010.
 - [ ] Downstream trial: integrate into Palamedes, fold feedback back
 - [x] MSRV and feature audit; API review (cargo-semver-checks in CI)
 - [ ] Dependency and unsafe audit (expected: zero unsafe before M5)
-- [ ] Oracle retirement check: corpus is self-sufficient, Zig-free CI
+- [x] Oracle retirement check: corpus is self-sufficient, Zig-free CI
       confirmed — ADR-0007
 - [ ] Publish benchmarks
 - [ ] Release `ferralk-glob` 1.0 and `ferralk` 1.0
@@ -386,3 +386,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   mapping. It filters returned files while preserving descent into directories
   across serial, parallel, and streaming walks; `ZLOB_MARK` remains the
   explicit native-path-preservation divergence.
+- Confirmed the retirement boundary: default-member tests plus the explicit
+  corpus, harness, and bench CI commands replay all 260 matcher cases without
+  building the `oracle`, zlob, or Zig. The pinned zlob differential suite
+  remains available only through the manual workflow.
