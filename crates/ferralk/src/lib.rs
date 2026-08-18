@@ -468,6 +468,10 @@ struct TraversalPattern {
 
 impl TraversalPattern {
     fn compile(pattern: &[u8]) -> Result<Self, PatternError> {
+        // Walker candidates are always root-relative, so retain zlob glob's
+        // conventional leading `./` spelling without making it part of the
+        // candidate path representation.
+        let pattern = pattern.strip_prefix(b"./").unwrap_or(pattern);
         let options = traversal_pattern_options();
         let subtree_root = pattern
             .strip_suffix(b"/**")
@@ -482,7 +486,7 @@ impl TraversalPattern {
     }
 
     fn matches(&self, path: &[u8]) -> bool {
-        self.matcher.is_match(path)
+        self.matcher.is_match_path(path)
     }
 
     fn covers_subtree(&self, path: &[u8]) -> bool {
@@ -1236,6 +1240,112 @@ mod tests {
         assert_eq!(
             relative_paths(brace.entries(), &fixture.root),
             vec![PathBuf::from("docs/d.md"), PathBuf::from("src/b.txt")]
+        );
+    }
+
+    #[test]
+    fn source_rust_glob_patterns_replay_as_walker_filters() {
+        // Ported from the root-relative pattern cases in
+        // zlob/test/test_rust_glob.zig. The Walker deliberately returns its
+        // own entries instead of zlob's C-shaped glob result buffer.
+        let fixture = Fixture::new();
+        for path in [
+            "xyz/x",
+            "xyz/y",
+            "xyz/z",
+            "aaa/tomato/tomato.txt",
+            "aaa/tomato/tomoto.txt",
+            "bbb/specials/[",
+            "bbb/specials/!",
+            "bbb/specials/]",
+        ] {
+            fixture.write(path);
+        }
+        for path in ["aaa/apple", "aaa/orange"] {
+            fs::create_dir_all(fixture.root.join(path)).expect("create source fixture directory");
+        }
+
+        let paths_for = |pattern: &str| {
+            let result = Walker::new(&fixture.root)
+                .threads(1)
+                .include(pattern)
+                .expect("valid source pattern")
+                .options(WalkOptions::default().sort(true))
+                .collect()
+                .expect("source walk succeeds");
+            relative_paths(result.entries(), &fixture.root)
+        };
+
+        assert_eq!(paths_for("aaa"), vec![PathBuf::from("aaa")]);
+        assert_eq!(paths_for("./aaa"), vec![PathBuf::from("aaa")]);
+        assert_eq!(paths_for("a*a"), vec![PathBuf::from("aaa")]);
+        assert_eq!(
+            paths_for("xyz/?"),
+            vec![
+                PathBuf::from("xyz/x"),
+                PathBuf::from("xyz/y"),
+                PathBuf::from("xyz/z"),
+            ]
+        );
+        assert_eq!(
+            paths_for("aaa/tomato/tom?to.txt"),
+            vec![
+                PathBuf::from("aaa/tomato/tomato.txt"),
+                PathBuf::from("aaa/tomato/tomoto.txt"),
+            ]
+        );
+        assert_eq!(
+            paths_for("aaa/*"),
+            vec![
+                PathBuf::from("aaa/apple"),
+                PathBuf::from("aaa/orange"),
+                PathBuf::from("aaa/tomato"),
+            ]
+        );
+        let component_local = paths_for("aaa/*");
+        let parallel = Walker::new(&fixture.root)
+            .threads(4)
+            .include("aaa/*")
+            .expect("valid source pattern")
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("parallel source walk succeeds");
+        assert_eq!(
+            relative_paths(parallel.entries(), &fixture.root),
+            component_local
+        );
+        let mut streamed = Walker::new(&fixture.root)
+            .include("aaa/*")
+            .expect("valid source pattern")
+            .stream()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream source walk succeeds");
+        streamed.sort_by(|left, right| left.path().cmp(right.path()));
+        assert_eq!(relative_paths(&streamed, &fixture.root), component_local);
+        assert_eq!(
+            paths_for("*/*/*.txt"),
+            vec![
+                PathBuf::from("aaa/tomato/tomato.txt"),
+                PathBuf::from("aaa/tomato/tomoto.txt"),
+            ]
+        );
+        assert_eq!(paths_for("aa[a]"), vec![PathBuf::from("aaa")]);
+        assert_eq!(paths_for("aa[!b]"), vec![PathBuf::from("aaa")]);
+        assert!(paths_for("aa[b]").is_empty());
+        assert_eq!(
+            paths_for("*/*/t[aob]m?to[.]t[!y]t"),
+            vec![
+                PathBuf::from("aaa/tomato/tomato.txt"),
+                PathBuf::from("aaa/tomato/tomoto.txt"),
+            ]
+        );
+        assert_eq!(
+            paths_for("bbb/specials/[[]"),
+            vec![PathBuf::from("bbb/specials/["),]
+        );
+        assert_eq!(
+            paths_for("bbb/specials/[]]"),
+            vec![PathBuf::from("bbb/specials/]"),]
         );
     }
 

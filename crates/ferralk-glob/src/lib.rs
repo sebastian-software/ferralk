@@ -283,8 +283,15 @@ impl Pattern {
     {
         paths
             .into_iter()
-            .filter(|path| self.matches_path_filter(path.as_ref()))
+            .filter(|path| self.is_match_path(path.as_ref()))
             .collect()
+    }
+
+    /// Matches one root-relative path with the same component-local wildcard
+    /// policy used by [`Pattern::filter_paths`].
+    #[must_use]
+    pub fn is_match_path(&self, path: impl AsRef<[u8]>) -> bool {
+        self.matches_path_filter(path.as_ref())
     }
 
     /// Returns the input paths accepted relative to `base_path`, preserving
@@ -304,7 +311,7 @@ impl Pattern {
             .into_iter()
             .filter(|path| {
                 path_after_base(base_path, path.as_ref())
-                    .is_some_and(|relative| self.matches_path_filter(relative))
+                    .is_some_and(|relative| self.is_match_path(relative))
             })
             .collect()
     }
@@ -319,7 +326,7 @@ impl Pattern {
         paths
             .into_iter()
             .enumerate()
-            .filter_map(|(index, path)| self.matches_path_filter(path.as_ref()).then_some(index))
+            .filter_map(|(index, path)| self.is_match_path(path.as_ref()).then_some(index))
             .collect()
     }
 
@@ -340,7 +347,7 @@ impl Pattern {
             .enumerate()
             .filter_map(|(index, path)| {
                 path_after_base(base_path, path.as_ref())
-                    .is_some_and(|relative| self.matches_path_filter(relative))
+                    .is_some_and(|relative| self.is_match_path(relative))
                     .then_some(index)
             })
             .collect()
@@ -1917,6 +1924,8 @@ mod tests {
             vec![&"lua/init.lua", &"nvim/lua/setup.lua"]
         );
         assert!(pattern.is_match("nvim/lua/sub/nested.lua"));
+        assert!(pattern.is_match_path("nvim/lua/setup.lua"));
+        assert!(!pattern.is_match_path("nvim/lua/sub/nested.lua"));
     }
 
     #[test]

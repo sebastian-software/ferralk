@@ -649,6 +649,14 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   and literal-adjacent periods; local ten-sample medians are about 8.8 ns for a
   match and 6.6 ns for a non-match. The broader IR and release-budget gates
   remain open.
+- Ported the root-relative literal, wildcard, class, nested, special-character,
+  and `./` scenarios from frozen `test_rust_glob.zig` into a public Walker
+  regression fixture. This exposed and fixed a traversal boundary: includes
+  now use `Pattern::is_match_path`, the allocation-free component-local
+  single-path counterpart to `filter_paths`, so `aaa/*` excludes nested
+  descendants in serial, parallel, and stream walks. C-shaped result buffers,
+  root `.`/`..` entries, and trailing-slash result shaping remain deliberately
+  outside Ferralk's Walker API.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no
