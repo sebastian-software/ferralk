@@ -1,6 +1,6 @@
 # RFC: A Zig-Free Rust Port of zlob
 
-- **Status:** Draft
+- **Status:** Accepted (2026-08-18)
 - **Date:** 2026-08-18
 - **Working name:** `zlob-rs` (name and upstream ownership are undecided)
 - **Reference implementation:** zlob 1.6.3
@@ -20,10 +20,15 @@ optimized filesystem backends may contain small, audited `unsafe` modules for
 Linux, macOS, and Windows. A portable `std::fs` backend remains available on all
 targets.
 
-The proposed delivery order is compatibility first, portable traversal second,
-parallelism third, and platform-specific fast paths last. A full rewrite should
-only proceed if at least two real consumers need capabilities that cannot be met
-by `ignore` plus early subtree pruning.
+The delivery order is compatibility first, portable traversal second,
+parallelism third, and platform-specific fast paths last. The implementation
+strategy is deliberately hybrid: the matcher core is ported mechanically from
+zlob's Zig source to capture its dialect semantics faithfully, then refactored
+toward the IR architecture described below, while the walker, scheduler, and
+filesystem backends are designed fresh around Rust ownership and error models.
+zlob 1.6.3 remains the semantic oracle; `fast-glob` (oxc) serves as the matcher
+performance baseline and as a second differential reference on the common
+syntax subset.
 
 ## Motivation
 
@@ -171,6 +176,15 @@ character classes, brace alternatives, and extglob operations. Compilation
 performs validation and safe simplifications such as literal-prefix extraction,
 suffix grouping, and alternative deduplication.
 
+The matcher core starts as a scoped, behavior-faithful port of zlob's Zig
+matcher. This is the one component where transliteration is cheap and low-risk:
+it consists of pure functions with no syscalls, no C ABI, and no Zig-specific
+memory management, and the POSIX/extglob/brace dialect is precisely the part
+that should not be reinvented from memory. The ported code is validated against
+the differential corpus first and refactored toward the IR described above
+second; the transliterated structure is scaffolding, not the release
+architecture.
+
 The matcher begins with portable byte/character loops and stable dependencies
 such as `memchr` where appropriate. Architecture-specific SIMD can be introduced
 only after profiles identify a hot loop. Runtime feature detection is preferred
@@ -310,6 +324,8 @@ Initial release budgets:
 
 - portable matcher: no more than 1.5x zlob 1.6.3 median on the agreed matcher
   corpus;
+- portable matcher on the common syntax subset (no extglob): within 1.25x of
+  the `fast-glob` median on patterns both dialects support;
 - portable walker: faster than serial `ignore + globset` on all traversal
   corpora and within 2x zlob on dependency-heavy warm-cache walks;
 - optimized native backend: within 20% of zlob's median on each supported
@@ -322,9 +338,14 @@ These are release gates, not promises that every filesystem will behave alike.
 
 ### Differential tests
 
-Run generated and curated pattern/path pairs through zlob 1.6.3 and the Rust
-implementation. Store cases and expected behavior in a language-neutral corpus
-so the Zig oracle can eventually be removed from normal CI.
+Run generated and curated pattern/path pairs through zlob 1.6.3, `fast-glob`
+(oxc), and the Rust implementation as a three-way harness. zlob 1.6.3 is the
+semantic oracle for the full dialect; `fast-glob` is a second reference for the
+common subset (`*`, `?`, `**`, character classes, braces), where any
+zlob/`fast-glob` disagreement is itself a valuable corpus case. Both references
+are test-only dev-dependencies, and the Zig toolchain is confined to a single
+CI job. Store cases and expected behavior in a language-neutral corpus so both
+oracles can eventually be removed from normal CI.
 
 ### Property tests
 
@@ -369,7 +390,11 @@ Exit criterion: disputed or undefined semantics are documented as open cases.
 
 ### Phase 1: Pattern engine — 3–5 weeks
 
-- parser and immutable IR;
+- three-way differential harness (zlob 1.6.3 oracle, `fast-glob`
+  cross-reference) as the first piece of infrastructure;
+- mechanical, behavior-faithful port of zlob's matcher core, validated against
+  the corpus;
+- refactor of the ported matcher into the parser and immutable IR;
 - core wildcard, recursive, class, brace, and extglob semantics;
 - reusable compiled pattern API;
 - differential/property/fuzz tests;
@@ -462,12 +487,26 @@ Wax provides expressive Rust-native glob walking and effective exclusion
 pruning. It is a strong off-the-shelf choice when its semantics fit, but it is
 not a zlob-compatible high-performance backend.
 
+### Use `fast-glob` (oxc)
+
+`fast-glob` is a matcher-only crate forked from `glob-match`, with correctness
+fixes and substantially faster matching. It supports `*`, `?`, `**`, character
+classes, and nested braces, but provides no extglob, no filesystem walking, no
+gitignore handling, and deliberately does not report invalid patterns. It
+cannot be the engine, but it is adopted as the matcher performance baseline and
+as a second reference implementation in the differential harness for the common
+syntax subset.
+
 ### Port the Zig source line by line
 
-A transliteration would preserve incidental architecture and ABI constraints,
-make review difficult, and risk reproducing undefined assumptions. Differential
-behavior should be ported; implementation structure should follow Rust ownership
-and error models.
+**Adopted for the matcher core only.** The matcher is pure computation — no
+syscalls, no C ABI, no Zig-specific memory management — so transliteration is
+cheap, low-risk, and the fastest way to capture the full dialect semantics; the
+ported structure is then refactored toward the IR architecture. For the walker,
+scheduler, and native backends a transliteration would preserve incidental
+architecture and ABI constraints, make review difficult, and risk reproducing
+undefined assumptions; those components follow Rust ownership and error models
+from the start.
 
 ## Risks
 
@@ -494,12 +533,19 @@ and error models.
 7. Should native fast paths be enabled by default or opt-in?
 8. Which consumers beyond Palamedes justify maintaining the full feature set?
 
-## Decision requested
+## Decision
 
-Approve Phase 0 only: freeze the zlob 1.6.3 compatibility contract, publish the
-differential corpus, and establish upstream ownership. Do not approve the full
-rewrite until Phase 0 identifies at least two committed consumers and confirms
-that `ignore`/`wax` cannot meet their required semantics or packaging goals.
+Accepted on 2026-08-18: proceed with the port using the hybrid strategy above.
+The matcher core is ported mechanically from zlob's Zig source and then
+refactored toward the IR; the walker, scheduler, and filesystem backends are
+designed fresh for Rust. `fast-glob` (oxc) serves as the matcher performance
+baseline and as a second differential reference on the common syntax subset;
+zlob 1.6.3 remains the semantic oracle.
+
+Phase 0 is not skipped: the differential corpus is built before matcher code,
+because the mechanical port cannot be judged correct without it. The earlier
+gate requiring two committed consumers before a full rewrite is superseded by
+this decision.
 
 ## References
 
@@ -507,5 +553,7 @@ that `ignore`/`wax` cannot meet their required semantics or packaging goals.
 - [zlob 1.6.3 release](https://github.com/dmtrKovalenko/zlob/releases/tag/v1.6.3)
 - [zlob 1.6.3 Rust manifest](https://github.com/dmtrKovalenko/zlob/blob/v1.6.3/rust/Cargo.toml)
 - [zlob 1.6.3 Rust build script](https://github.com/dmtrKovalenko/zlob/blob/v1.6.3/rust/build.rs)
+- [fast-glob (oxc) repository](https://github.com/oxc-project/fast-glob)
+- [glob-match repository](https://github.com/devongovett/glob-match)
 - [Palamedes source-discovery optimization issue #875](https://github.com/sebastian-software/palamedes/issues/875)
 - [Local source-discovery benchmark notes](palamedes/benchmarks/source-discovery-prototype/NOTES.md)
