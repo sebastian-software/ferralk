@@ -88,7 +88,7 @@ preservation, structured errors.
 multisets across the corpus; no hangs or lost errors under stress; walker
 faster than parallel `ignore` + pruning on all traversal corpora.
 
-- [ ] Nested ignore chains via the `ignore` crate's rule matcher;
+- [x] Nested ignore chains via the `ignore` crate's rule matcher;
       per-directory nodes with shared-parent caching — ADR-0006
 - [x] Negation-aware pruning guard (never prune when a later rule may
       re-include)
@@ -308,3 +308,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   worker spawning, directory task fan-out, result shards, and all multi-thread
   correctness invariants remain open; the scheduler checkbox is intentionally
   not marked complete.
+- Replaced the flat per-directory GitIgnore cache with immutable directory
+  nodes that retain and share their cached parent chain. Nested precedence and
+  re-inclusion continue to replay through the corpus, while a direct unit test
+  verifies that sibling nodes reuse the same parent allocation.

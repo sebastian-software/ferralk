@@ -384,7 +384,7 @@ pub struct WalkStream {
     pending_directories: Vec<PathBuf>,
     pending_entries: VecDeque<BackendEntry>,
     visited_directories: HashSet<PathBuf>,
-    gitignore_cache: HashMap<PathBuf, Gitignore>,
+    gitignore_cache: HashMap<PathBuf, Arc<GitIgnoreNode>>,
     cancelled: bool,
     stopped: bool,
 }
@@ -537,7 +537,7 @@ struct WalkState<'walker> {
     entries: Vec<WalkEntry>,
     errors: Vec<WalkError>,
     visited_directories: HashSet<PathBuf>,
-    gitignore_cache: HashMap<PathBuf, Gitignore>,
+    gitignore_cache: HashMap<PathBuf, Arc<GitIgnoreNode>>,
     cancelled: bool,
 }
 
@@ -700,33 +700,70 @@ fn is_git_ignored(
     walker: &Walker,
     path: &Path,
     is_dir: bool,
-    cache: &mut HashMap<PathBuf, Gitignore>,
+    cache: &mut HashMap<PathBuf, Arc<GitIgnoreNode>>,
 ) -> bool {
     if !walker.respect_git_ignore {
         return false;
     }
-    let mut directories = Vec::new();
-    let mut current = path
+    let directory = path
         .parent()
         .filter(|parent| parent.starts_with(&walker.root));
-    while let Some(directory) = current {
-        directories.push(directory);
-        if directory == walker.root {
-            break;
-        }
-        current = directory.parent();
+    directory
+        .is_some_and(|directory| gitignore_node(walker, directory, cache).is_ignored(path, is_dir))
+}
+
+/// One directory's parsed ignore rules plus its immutable inherited chain.
+/// Nodes are cached per walk, so siblings reuse the same parent evaluation.
+struct GitIgnoreNode {
+    rules: Gitignore,
+    parent: Option<Arc<Self>>,
+}
+
+impl fmt::Debug for GitIgnoreNode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitIgnoreNode")
+            .field("has_parent", &self.parent.is_some())
+            .finish_non_exhaustive()
     }
-    let mut ignored = false;
-    for directory in directories.into_iter().rev() {
-        let rules = cache
-            .entry(directory.to_path_buf())
-            .or_insert_with(|| Gitignore::new(directory.join(".gitignore")).0);
-        let matched = rules.matched_path_or_any_parents(path, is_dir);
+}
+
+impl GitIgnoreNode {
+    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        let mut ignored = self
+            .parent
+            .as_ref()
+            .is_some_and(|parent| parent.is_ignored(path, is_dir));
+        let matched = self.rules.matched_path_or_any_parents(path, is_dir);
         if !matched.is_none() {
             ignored = matched.is_ignore();
         }
+        ignored
     }
-    ignored
+}
+
+fn gitignore_node(
+    walker: &Walker,
+    directory: &Path,
+    cache: &mut HashMap<PathBuf, Arc<GitIgnoreNode>>,
+) -> Arc<GitIgnoreNode> {
+    if let Some(node) = cache.get(directory) {
+        return Arc::clone(node);
+    }
+    let parent = (directory != walker.root)
+        .then(|| {
+            directory
+                .parent()
+                .filter(|parent| parent.starts_with(&walker.root))
+        })
+        .flatten()
+        .map(|parent| gitignore_node(walker, parent, cache));
+    let node = Arc::new(GitIgnoreNode {
+        rules: Gitignore::new(directory.join(".gitignore")).0,
+        parent,
+    });
+    cache.insert(directory.to_path_buf(), Arc::clone(&node));
+    node
 }
 
 /// Crate version exposed for build and integration diagnostics.
@@ -735,13 +772,20 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{CancellationToken, ErrorPolicy, TraversalPattern, WalkEntry, WalkOptions, Walker};
+    use super::{
+        CancellationToken, ErrorPolicy, TraversalPattern, WalkEntry, WalkOptions, Walker,
+        gitignore_node,
+    };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
@@ -889,6 +933,20 @@ mod tests {
         assert!(streamed_paths.contains(&PathBuf::from("src/keep.tmp")));
         assert!(streamed_paths.contains(&PathBuf::from("build/keep.txt")));
         assert!(!streamed_paths.contains(&PathBuf::from("build")));
+    }
+
+    #[test]
+    fn gitignore_nodes_share_their_immutable_parent_chain() {
+        let fixture = Fixture::new();
+        let walker = Walker::new(&fixture.root).respect_git_ignore(true);
+        let mut cache = HashMap::new();
+        let left = gitignore_node(&walker, &fixture.root.join("left/nested"), &mut cache);
+        let right = gitignore_node(&walker, &fixture.root.join("left/sibling"), &mut cache);
+
+        let left_parent = left.parent.as_ref().expect("nested left parent");
+        let right_parent = right.parent.as_ref().expect("nested right parent");
+        assert!(Arc::ptr_eq(left_parent, right_parent));
+        assert_eq!(cache.len(), 4, "root, left, and two child nodes are cached");
     }
 
     #[test]
