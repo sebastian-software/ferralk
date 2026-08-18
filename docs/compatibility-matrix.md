@@ -10,13 +10,13 @@ its rationale.
 | zlob capability / flag | ferralk API | Status | Notes |
 |---|---|---|---|
 | `*`, `?`, separators | `Pattern::compile` / `Pattern::is_match` | In progress (M1) | In-memory `*`/`?` are separator-agnostic; leading periods remain opt-in. |
-| `**` | `PatternOptions::recursive_double_star` | Planned (M1) | Explicit option. |
-| bracket classes, ranges, `[!...]`, `[^...]` | `Pattern::compile` | Planned (M1) | Byte-first. |
+| `**` | `PatternOptions::recursive_double_star` | Implemented (M1) | Explicit option; corpus import continues. |
+| bracket classes, ranges, `[!...]`, `[^...]` | `Pattern::compile` | Implemented (M1) | Byte-first, including ASCII POSIX classes. |
 | `ZLOB_BRACE` | `PatternOptions::braces` | Implemented (M1) | Nested and empty alternatives; source-backed corpus import continues. |
 | `ZLOB_EXTGLOB` | `PatternOptions::extglob` | Planned (M1) | Bash operators. |
 | `ZLOB_PERIOD` | `PatternOptions::match_hidden` | Implemented (M1) | Deliberate in-memory divergence: Ferralk defaults to off; zlob's direct matcher accepts leading periods by default. |
-| `ZLOB_NOESCAPE` | `PatternOptions::escape` | Planned (M1) | Higher-level boolean, not a bitflag. |
-| case folding | `PatternOptions::case_insensitive` | Planned (M1) | Explicit opt-in on every platform. |
+| `ZLOB_NOESCAPE` | `PatternOptions::escape` | Implemented (M1) | Higher-level boolean, not a bitflag. |
+| case folding | `PatternOptions::case_insensitive` | Implemented (M1) | Explicit opt-in on every platform. |
 | `ZLOB_NOCHECK`, `ZLOB_NOMAGIC` | Walker no-match policy | Deferred (M4 review) | These are C/glob result-shaping semantics, not matcher semantics. |
 | `ZLOB_TILDE`, `ZLOB_TILDE_CHECK` | — | Deliberate divergence | Out of scope per RFC non-goals. |
 
