@@ -1499,6 +1499,32 @@ mod tests {
         assert_eq!(parallel.errors().len(), 2);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn parallel_abort_returns_an_error_and_cancels_the_shared_token() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        fixture.write("left/ok.txt");
+        fixture.write("right/ok.txt");
+        symlink("missing-left", fixture.root.join("left/dangling"))
+            .expect("create left dangling symlink");
+        symlink("missing-right", fixture.root.join("right/dangling"))
+            .expect("create right dangling symlink");
+        let cancellation = CancellationToken::default();
+
+        let error = Walker::new(&fixture.root)
+            .threads(4)
+            .options(WalkOptions::default().follow_symlinks(true))
+            .error_policy(ErrorPolicy::Abort)
+            .cancellation(cancellation.clone())
+            .collect()
+            .expect_err("abort policy returns the first metadata error");
+
+        assert_eq!(error.operation(), "metadata");
+        assert!(cancellation.is_cancelled());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn preserves_non_utf8_native_paths() {

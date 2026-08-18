@@ -378,3 +378,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   native-backend milestone. The local source scan is clean; the checkbox stays
   open until the RustSec dependency result is observed from CI or a completed
   local audit run.
+- Added a parallel `Abort`-policy fixture with independently failing worker
+  tasks. It verifies that the returned structured error and the caller's
+  shared cancellation token agree, complementing the existing lossless
+  `Collect`-channel comparison.
