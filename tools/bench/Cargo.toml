@@ -7,5 +7,18 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[dev-dependencies]
+codspeed-criterion-compat = "5.0.1"
+ferralk = { path = "../../crates/ferralk" }
+ferralk-glob = { path = "../../crates/ferralk-glob" }
+
+[[bench]]
+name = "matcher"
+harness = false
+
+[[bench]]
+name = "walker"
+harness = false
+
 [lints]
 workspace = true

@@ -346,3 +346,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   verifies its `Collect`-mode `read_dir` error, and restores permissions before
   cleanup. The broader M2 fixture item remains open for a deterministic
   disappearing-*file* strategy and cross-platform coverage.
+- Replaced the empty CodSpeed placeholder with executable Criterion-compatible
+  matcher and serial/parallel walker benchmarks, and updated the workflow to
+  invoke `cargo bench -p bench`. Local short-run smoke measurements execute;
+  cross-engine comparisons, committed baselines, and the external CodSpeed
+  budget gates remain open.

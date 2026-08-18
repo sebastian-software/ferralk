@@ -16,4 +16,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: CodSpeedHQ/action@v4
         with:
-          run: cargo test -p bench
+          run: cargo bench -p bench
