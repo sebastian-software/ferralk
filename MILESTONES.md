@@ -40,12 +40,12 @@ disputed or undefined zlob semantics are captured as flagged corpus cases.
 **Exit criterion:** `ferralk-glob` passes the full matcher corpus; portable
 matcher ≤1.5x zlob median, ≤1.25x `fast-glob` median on the common subset.
 
-- [ ] Mechanical port: pattern tokenizer/parser (provenance headers) —
+- [x] Mechanical port: pattern tokenizer/parser (provenance headers) —
       ADR-0002
-- [ ] Mechanical port: core wildcard and `**` matching
-- [ ] Mechanical port: character classes (incl. `[!...]`/`[^...]`, ranges,
+- [x] Mechanical port: core wildcard and `**` matching
+- [x] Mechanical port: character classes (incl. `[!...]`/`[^...]`, ranges,
       escapes)
-- [ ] Mechanical port: brace expansion (nested alternatives)
+- [x] Mechanical port: brace expansion (nested alternatives)
 - [x] Mechanical port: extglob operators
 - [x] Leading-period rules, case-folding option, escape handling
 - [x] Public API: `Pattern::compile`, `PatternOptions`, `is_match`,
@@ -498,3 +498,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   measured local ten-sample medians of about 7.34 ns for a `*.rs` match and
   4.46 ns for its non-match. The broader M1 IR refactor and release budget
   remain open.
+- Completed the M1 mechanical-port checklist: `ferralk-glob` now names all
+  frozen zlob 1.6.3 matcher sources in its module provenance header, while the
+  tokenizer, wildcard/recursive wildcard, bracket-class, and nested-brace
+  behaviours are covered by corpus blocks and the manual oracle. The
+  implementation remains an independent safe-Rust representation, as required
+  by ADR-0002.

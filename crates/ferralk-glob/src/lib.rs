@@ -9,7 +9,8 @@
 //!
 //! Provenance: semantics are ported and differentially checked against zlob
 //! v1.6.3, source commit 4bc4da2cbc823d3911b4a1436448687c398977dd, primarily
-//! src/fnmatch.zig and test/test_fnmatch.zig. Deliberate differences live in
+//! `zig-src/fnmatch.zig`, `zig-src/pattern_context.zig`, and
+//! `test/test_fnmatch.zig`. Deliberate differences live in
 //! the checked-in corpus and compatibility matrix.
 
 use std::{collections::HashSet, error::Error, fmt};
