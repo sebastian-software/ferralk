@@ -234,3 +234,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   invalid UTF-8 filename with `EPERM`; the native-name integration assertion
   is therefore Linux-gated, where that representation is supported. This does
   not block the portable byte-preserving implementation or Linux CI coverage.
+- Extended the M0 1:1 corpus import with the direct brace-expansion assertions
+  from `test/test_brace.zig`. `braces.jsonl` now has 41 source-linked cases
+  across basic, wildcard, recursive, empty, literal, and multi-group brace
+  forms; both the harness and pinned zlob oracle replay the new block.

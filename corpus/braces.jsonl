@@ -1,3 +1,41 @@
 {"id":"brace-001","pattern":"{a,b,c}.txt","path":"b.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3","note":"Ported from test/test_brace.zig: ZLOB_BRACE - basic brace expansion."}
 {"id":"brace-002","pattern":"{a,{b,c}}.txt","path":"c.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3","note":"Ported from test/test_brace.zig: ZLOB_BRACE - nested braces {a,{b,c}}.txt."}
 {"id":"brace-003","pattern":"test{,_suffix}.txt","path":"test.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3","note":"Ported from test/test_brace.zig: ZLOB_BRACE - empty alternatives."}
+{"id":"brace-l0022","pattern":"{a,b,c}.txt","path":"a.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0023","pattern":"{a,b,c}.txt","path":"b.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0024","pattern":"{a,b,c}.txt","path":"c.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0025","pattern":"{a,b,c}.txt","path":"d.txt","flags":["braces"],"expected":false,"source":"zlob_1_6_3"}
+{"id":"brace-l0042","pattern":"{foo,bar}.*","path":"foo.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0043","pattern":"{foo,bar}.*","path":"foo.log","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0044","pattern":"{foo,bar}.*","path":"bar.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0045","pattern":"{foo,bar}.*","path":"bar.log","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0064","pattern":"test.{txt,log,md}","path":"test.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0065","pattern":"test.{txt,log,md}","path":"test.log","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0066","pattern":"test.{txt,log,md}","path":"test.md","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0082","pattern":"**/*.{md,log}","path":"dir1/test.log","flags":["braces","recursive_double_star"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0082b","pattern":"**/*.{md,log}","path":"dir2/test.md","flags":["braces","recursive_double_star"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0102","pattern":"*.{txt,log,md}","path":"test.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0102b","pattern":"*.{txt,log,md}","path":"test.log","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0102c","pattern":"*.{txt,log,md}","path":"test.md","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0118","pattern":"main.{c,h}","path":"main.c","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0119","pattern":"main.{c,h}","path":"main.h","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0133","pattern":"test.{txt}","path":"test.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0150","pattern":"{a,b}/{x,y}.txt","path":"a/x.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0151","pattern":"{a,b}/{x,y}.txt","path":"a/y.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0152","pattern":"{a,b}/{x,y}.txt","path":"b/x.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0153","pattern":"{a,b}/{x,y}.txt","path":"b/y.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0170","pattern":"{a,b}.txt","path":"{a,b}.txt","flags":[],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0186","pattern":"prefix_{a,b,c}_suffix.txt","path":"prefix_a_suffix.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0187","pattern":"prefix_{a,b,c}_suffix.txt","path":"prefix_b_suffix.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0188","pattern":"prefix_{a,b,c}_suffix.txt","path":"prefix_c_suffix.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0189","pattern":"prefix_{a,b,c}_suffix.txt","path":"prefix_d_suffix.txt","flags":["braces"],"expected":false,"source":"zlob_1_6_3"}
+{"id":"brace-l0206","pattern":"{src,lib}/*.zig","path":"src/main.zig","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0207","pattern":"{src,lib}/*.zig","path":"src/test.zig","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0208","pattern":"{src,lib}/*.zig","path":"lib/main.zig","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0209","pattern":"{src,lib}/*.zig","path":"lib/test.zig","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0225","pattern":"file{1,2,3}.txt","path":"file1.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0226","pattern":"file{1,2,3}.txt","path":"file2.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0227","pattern":"file{1,2,3}.txt","path":"file3.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0228","pattern":"file{1,2,3}.txt","path":"file4.txt","flags":["braces"],"expected":false,"source":"zlob_1_6_3"}
+{"id":"brace-l0244","pattern":"test{,_suffix}.txt","path":"test.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"brace-l0245","pattern":"test{,_suffix}.txt","path":"test_suffix.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3"}
