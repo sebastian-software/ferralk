@@ -2,8 +2,8 @@
 
 use std::{fs, path::Path};
 
-use corpus::{Case, decode_bytes};
-use zlob::{ZlobFlags, zlob_match_paths};
+use corpus::{Case, CaseKind, decode_bytes};
+use zlob::{ZlobFlags, has_wildcards, zlob_match_paths};
 
 #[test]
 #[ignore = "requires Zig 0.16 and libclang; run only from the manual oracle workflow"]
@@ -34,9 +34,14 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
             let path_bytes = decode_bytes(&case.path).expect("decode path");
             let path = std::str::from_utf8(&path_bytes)
                 .expect("zlob Rust API cannot represent a non-UTF-8 path");
-            let actual = zlob_match_paths(pattern, &[path], flags(&case.flags))
-                .unwrap_or_else(|error| panic!("{}:{}: {error}", file.display(), line_number + 1))
-                .is_some();
+            let actual = match case.kind {
+                CaseKind::Matcher => zlob_match_paths(pattern, &[path], flags(&case.flags))
+                    .unwrap_or_else(|error| {
+                        panic!("{}:{}: {error}", file.display(), line_number + 1)
+                    })
+                    .is_some(),
+                CaseKind::HasWildcards => has_wildcards(pattern, flags(&case.flags)),
+            };
             assert_eq!(
                 actual,
                 case.oracle_expected.unwrap_or(case.expected),

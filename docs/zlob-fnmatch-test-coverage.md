@@ -18,6 +18,15 @@ deduplicated.
 The manual oracle verifies those cases against the pinned zlob crate. The
 normal harness verifies them without Zig.
 
+## Syntax preflight cases
+
+The flag-sensitive `hasWildcards` assertions are represented by
+[`corpus/preflight.jsonl`](../corpus/preflight.jsonl) records with
+`"kind":"has_wildcards"`. They cover always-active basic markers, brace
+markers only with `braces`, and extglob operators only with `extglob`. The
+harness and manual oracle run the dedicated preflight operation rather than
+pretending that an empty candidate is a full fnmatch assertion.
+
 ## Deliberate non-matcher exclusions
 
 The remaining assertions are not direct `fnmatch` semantics and have no
@@ -27,7 +36,6 @@ equivalent public Ferralk type today:
 | --- | --- | --- |
 | 274–331 | `matchPaths` result shaping, including `NOCHECK` | Deferred walker result-policy review; Rust callers own result buffers and Ferralk deliberately has no C-style `NOCHECK` output shaping. |
 | 338–385 | `PatternContext` template classification | Internal zlob optimization detail; Ferralk exposes a compiled `Pattern`, not a template-inspection API. |
-| 390–435 | `hasWildcards` / flag-sensitive preflight helpers | No public Ferralk analogue; `Pattern::compile` and `validate` are the supported preflight API. |
 | 438–448 | private SIMD index helpers | Implementation detail only; ADR-0008 reserves any equivalent optimization for profiling-backed work. |
 
 These exclusions are intentionally not counted as corpus coverage. They keep

@@ -2,7 +2,7 @@
 
 use std::{collections::HashSet, env, fs, path::Path};
 
-use corpus::{Case, decode_bytes};
+use corpus::{Case, CaseKind, decode_bytes};
 use ferralk_glob::{Pattern, PatternOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -48,9 +48,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !is_ignore_topic {
                 let options = options_from_flags(&case.flags)
                     .map_err(|error| format!("{}:{}: {error}", file.display(), line_number + 1))?;
-                let actual = Pattern::compile(pattern, options)
-                    .map_err(|error| format!("{}:{}: {error}", file.display(), line_number + 1))?
-                    .is_match(path);
+                let actual = match case.kind {
+                    CaseKind::Matcher => Pattern::compile(pattern, options)
+                        .map_err(|error| {
+                            format!("{}:{}: {error}", file.display(), line_number + 1)
+                        })?
+                        .is_match(path),
+                    CaseKind::HasWildcards => Pattern::has_wildcards(pattern, options),
+                };
                 if actual != case.expected {
                     return Err(format!(
                         "{}:{}: expected {}, got {} for {} against {}",
@@ -69,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("validated {cases} corpus cases; replayed {replayed} matcher cases from {root}");
+    println!("validated {cases} corpus cases; replayed {replayed} operation cases from {root}");
     Ok(())
 }
 

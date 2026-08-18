@@ -7,6 +7,7 @@
   "required": ["id", "pattern", "path", "expected", "source"],
   "properties": {
     "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "kind": { "enum": ["matcher", "has_wildcards"], "default": "matcher" },
     "pattern": { "type": "string" },
     "path": { "type": "string" },
     "flags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "default": [] },

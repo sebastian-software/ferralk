@@ -34,6 +34,7 @@ assert!(pattern.is_match("src/lib.rs"));
 | `ZLOB_NOESCAPE` | `PatternOptions::escape(false)` |
 | case-insensitive matching | `PatternOptions::case_insensitive(true)` |
 | syntax validation | `Pattern::validate` |
+| syntax preflight | `Pattern::has_wildcards` |
 
 Ferralk accepts raw bytes (`AsRef<[u8]>`) for patterns and candidate paths, so
 callers do not need lossy UTF-8 conversion.

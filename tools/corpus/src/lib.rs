@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 pub struct Case {
     /// Stable, topic-local identifier.
     pub id: String,
+    /// Operation described by this record. Existing records default to a full
+    /// matcher verdict for backwards-compatible JSONL decoding.
+    #[serde(default)]
+    pub kind: CaseKind,
     /// Glob or ignore expression, encoded with [`decode_bytes`].
     pub pattern: String,
     /// Candidate path, encoded with [`decode_bytes`].
@@ -36,6 +40,17 @@ pub struct Case {
     /// Human-readable context, especially for disagreements between oracles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+/// The operation a corpus record verifies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaseKind {
+    /// A complete pattern/path match.
+    #[default]
+    Matcher,
+    /// Flag-sensitive preflight detection of active wildcard syntax.
+    HasWildcards,
 }
 
 /// Provenance of a corpus result.
@@ -186,7 +201,7 @@ fn push_escape(result: &mut String, byte: u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_bytes, encode_bytes};
+    use super::{Case, CaseKind, decode_bytes, encode_bytes};
 
     #[test]
     fn byte_codec_round_trips_mixed_utf8_and_non_utf8() {
@@ -201,5 +216,15 @@ mod tests {
         assert!(decode_bytes("one\\two").is_err());
         assert!(decode_bytes("\\x0G").is_err());
         assert!(decode_bytes("\\x0").is_err());
+    }
+
+    #[test]
+    fn missing_kind_defaults_to_matcher_for_existing_corpora() {
+        let case: Case = serde_json::from_str(
+            r#"{"id":"legacy","pattern":"*.rs","path":"lib.rs","expected":true,"source":"handwritten"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(case.kind, CaseKind::Matcher);
     }
 }

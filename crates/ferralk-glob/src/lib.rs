@@ -14,7 +14,7 @@
 
 use std::{collections::HashSet, error::Error, fmt};
 
-use memchr::{memchr, memmem};
+use memchr::{memchr, memchr3, memmem};
 
 /// A compiled glob pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +119,34 @@ impl fmt::Display for PatternError {
 impl Error for PatternError {}
 
 impl Pattern {
+    /// Reports whether the enabled syntax options make a pattern non-literal.
+    ///
+    /// This is a byte-first preflight helper. Like zlob's `hasWildcards`, it
+    /// deliberately reports syntax markers even when an escape option would
+    /// later make a particular marker literal.
+    #[must_use]
+    pub fn has_wildcards(pattern: impl AsRef<[u8]>, options: PatternOptions) -> bool {
+        let pattern = pattern.as_ref();
+        if memchr3(b'*', b'?', b'[', pattern).is_some() {
+            return true;
+        }
+        if options.braces && memchr(b'{', pattern).is_some() {
+            return true;
+        }
+        if !options.extglob {
+            return false;
+        }
+        let mut offset = 0;
+        while let Some(found) = memchr(b'(', &pattern[offset..]) {
+            let index = offset + found;
+            if index > 0 && matches!(pattern[index - 1], b'?' | b'*' | b'+' | b'@' | b'!') {
+                return true;
+            }
+            offset = index + 1;
+        }
+        false
+    }
+
     /// Compiles a pattern once for repeated matching against raw path bytes.
     pub fn compile(
         pattern: impl AsRef<[u8]>,
@@ -1239,6 +1267,28 @@ mod tests {
         assert_eq!(error.offset(), 0);
         assert_eq!(error.message(), "unclosed character class");
         assert!(compile("foo\\").is_match("foo\\"));
+    }
+
+    #[test]
+    fn has_wildcards_respects_brace_and_extglob_options() {
+        let plain = PatternOptions::default();
+        assert!(!Pattern::has_wildcards("literal", plain));
+        assert!(Pattern::has_wildcards("file?.rs", plain));
+        assert!(Pattern::has_wildcards("[[:alpha:]]", plain));
+        assert!(!Pattern::has_wildcards("{src,lib}", plain));
+        assert!(Pattern::has_wildcards(
+            "{src,lib}",
+            PatternOptions::default().braces(true)
+        ));
+        assert!(!Pattern::has_wildcards("@(src|lib)", plain));
+        assert!(Pattern::has_wildcards(
+            "@(src|lib)",
+            PatternOptions::default().extglob(true)
+        ));
+        assert!(!Pattern::has_wildcards(
+            "literal(",
+            PatternOptions::default().extglob(true)
+        ));
     }
 
     fn byte_words(alphabet: &[u8], max_length: usize) -> Vec<Vec<u8>> {

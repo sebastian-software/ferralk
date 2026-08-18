@@ -465,3 +465,10 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   relevant compile workload. The local common matching case improved from
   about 23.8 ns to 14.8 ns with the full corpus still green. Cross-engine
   release budgets remain a distinct M1 gate.
+- Added `Pattern::has_wildcards`, Ferralk's byte-first preflight equivalent to
+  zlob's `hasWildcards`. `corpus/preflight.jsonl` records eleven literal,
+  basic, brace, extglob, and escape-sensitive cases; legacy corpus records
+  retain the matcher operation by default. The regular harness and the pinned
+  zlob 1.6.3 oracle both replay the new operation successfully. This removes
+  the preflight rows from the direct fnmatch-suite exclusions, while the wider
+  M0 suite port remains open for non-matcher subsystems.

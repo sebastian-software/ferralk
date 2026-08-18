@@ -13,8 +13,9 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | Field | Required | Meaning |
 |---|---:|---|
 | `id` | yes | Stable, topic-local identifier, for example `wildcard-001`. |
+| `kind` | no | `matcher` (default) for a full path verdict, or `has_wildcards` for syntax preflight. |
 | `pattern` | yes | Glob or ignore expression using the byte codec below. |
-| `path` | yes | Candidate path using the byte codec below. |
+| `path` | yes | Candidate path using the byte codec below; empty for syntax-only records. |
 | `flags` | no | Ordered behaviour switches from the compatibility matrix. |
 | `ignore_rules` | no | Lines written to a synthetic `.gitignore` for an ignore case. |
 | `expected` | yes | Whether the expression accepts the candidate. |
@@ -25,7 +26,8 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 
 The initial topic files are `fnmatch.jsonl`, `wildcards.jsonl`, `classes.jsonl`,
 `braces.jsonl`, `extglob.jsonl`, `options.jsonl`, `walk.jsonl`, `ignore.jsonl`,
-and `fast-glob.jsonl`. Files are added when a topic gains a case. Case IDs do
+`fast-glob.jsonl`, and `preflight.jsonl`. Files are added when a topic gains a
+case. Case IDs do
 not change once published; a changed expected value is a new case plus an
 explanation in `note`.
 
