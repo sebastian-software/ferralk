@@ -95,7 +95,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 })?;
                                 matcher.filter_paths_at(base_path, &paths)
                             }
-                            CaseKind::Matcher | CaseKind::HasWildcards => unreachable!(),
+                            CaseKind::Matcher
+                            | CaseKind::HasWildcards
+                            | CaseKind::MatchPathIndices
+                            | CaseKind::MatchPathIndicesAt => unreachable!(),
                         };
                         if selected
                             .iter()
@@ -111,6 +114,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .into());
                         }
+                    }
+                    CaseKind::MatchPathIndices | CaseKind::MatchPathIndicesAt => {
+                        let paths = case
+                            .paths
+                            .iter()
+                            .map(|path| decode_bytes(path))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|error| {
+                                format!(
+                                    "{}:{}: invalid paths: {error}",
+                                    file.display(),
+                                    line_number + 1
+                                )
+                            })?;
+                        let matcher = Pattern::compile(pattern, options).map_err(|error| {
+                            format!("{}:{}: {error}", file.display(), line_number + 1)
+                        })?;
+                        let selected = match case.kind {
+                            CaseKind::MatchPathIndices => matcher.filter_path_indices(&paths),
+                            CaseKind::MatchPathIndicesAt => {
+                                let base_path = decode_bytes(&case.base_path).map_err(|error| {
+                                    format!(
+                                        "{}:{}: invalid base path: {error}",
+                                        file.display(),
+                                        line_number + 1
+                                    )
+                                })?;
+                                matcher.filter_path_indices_at(base_path, &paths)
+                            }
+                            CaseKind::Matcher
+                            | CaseKind::HasWildcards
+                            | CaseKind::MatchPaths
+                            | CaseKind::MatchPathsAt => unreachable!(),
+                        };
+                        if selected != case.indices {
+                            return Err(format!(
+                                "{}:{}: selected indices differ from corpus",
+                                file.display(),
+                                line_number + 1
+                            )
+                            .into());
+                        }
+                        case.expected
                     }
                 };
                 if actual != case.expected {

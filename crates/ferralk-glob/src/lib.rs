@@ -309,6 +309,43 @@ impl Pattern {
             .collect()
     }
 
+    /// Returns the indices of input paths accepted by this compiled pattern,
+    /// in their original input order.
+    #[must_use]
+    pub fn filter_path_indices<'a, T>(&self, paths: impl IntoIterator<Item = &'a T>) -> Vec<usize>
+    where
+        T: AsRef<[u8]> + ?Sized + 'a,
+    {
+        paths
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, path)| self.matches_path_filter(path.as_ref()).then_some(index))
+            .collect()
+    }
+
+    /// Returns the indices of full input paths accepted relative to
+    /// `base_path`, in their original input order.
+    #[must_use]
+    pub fn filter_path_indices_at<'a, T>(
+        &self,
+        base_path: impl AsRef<[u8]>,
+        paths: impl IntoIterator<Item = &'a T>,
+    ) -> Vec<usize>
+    where
+        T: AsRef<[u8]> + ?Sized + 'a,
+    {
+        let base_path = base_path.as_ref();
+        paths
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, path)| {
+                path_after_base(base_path, path.as_ref())
+                    .is_some_and(|relative| self.matches_path_filter(relative))
+                    .then_some(index)
+            })
+            .collect()
+    }
+
     fn matches_path_filter(&self, path: &[u8]) -> bool {
         let Some(alternatives) = &self.path_filter_alternatives else {
             return self.is_match(path);
@@ -1725,6 +1762,38 @@ mod tests {
                 &"/home/user/project/src/main.c",
                 &"/home/user/project/lib/utils.c"
             ]
+        );
+    }
+
+    #[test]
+    fn filter_path_indices_preserve_input_order_and_support_a_base() {
+        let suffix =
+            Pattern::compile("*.rs", PatternOptions::default()).expect("suffix pattern compiles");
+        assert_eq!(
+            suffix.filter_path_indices(&["foo.rs", "bar.txt", "baz.rs", "qux.md"]),
+            vec![0, 2]
+        );
+        assert_eq!(
+            suffix.filter_path_indices(&["z.rs", "a.rs", "m.rs"]),
+            vec![0, 1, 2]
+        );
+
+        let recursive = Pattern::compile(
+            "src/**/*.rs",
+            PatternOptions::default().recursive_double_star(true),
+        )
+        .expect("recursive pattern compiles");
+        assert_eq!(
+            recursive.filter_path_indices_at(
+                "/home/me/proj",
+                &[
+                    "/home/me/proj/src/main.rs",
+                    "/home/me/proj/src/lib/util.rs",
+                    "/home/me/proj/tests/test.rs",
+                    "/home/me/proj/Cargo.toml",
+                ],
+            ),
+            vec![0, 1]
         );
     }
 

@@ -3,7 +3,10 @@
 use std::{fs, path::Path};
 
 use corpus::{Case, CaseKind, decode_bytes};
-use zlob::{ZlobFlags, has_wildcards, zlob_match_paths, zlob_match_paths_at};
+use zlob::{
+    ZlobFlags, has_wildcards, zlob_match_paths, zlob_match_paths_at, zlob_match_paths_indices,
+    zlob_match_paths_indices_at,
+};
 
 #[test]
 #[ignore = "requires Zig 0.16 and libclang; run only from the manual oracle workflow"]
@@ -74,7 +77,10 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                                     flags(&case.flags),
                                 )
                             }
-                            CaseKind::Matcher | CaseKind::HasWildcards => unreachable!(),
+                            CaseKind::Matcher
+                            | CaseKind::HasWildcards
+                            | CaseKind::MatchPathIndices
+                            | CaseKind::MatchPathIndicesAt => unreachable!(),
                         }
                         .expect("zlob match paths")
                         .map(|matches| matches.to_strings())
@@ -93,6 +99,52 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                         );
                         case.expected
                     }
+                }
+                CaseKind::MatchPathIndices | CaseKind::MatchPathIndicesAt => {
+                    let paths = case
+                        .paths
+                        .iter()
+                        .map(|path| decode_bytes(path))
+                        .collect::<Result<Vec<_>, _>>()
+                        .expect("decode paths");
+                    let paths = paths
+                        .iter()
+                        .map(|path| std::str::from_utf8(path).expect("zlob paths are UTF-8"))
+                        .collect::<Vec<_>>();
+                    let selected = match case.kind {
+                        CaseKind::MatchPathIndices => {
+                            zlob_match_paths_indices(pattern, paths.as_slice(), flags(&case.flags))
+                        }
+                        CaseKind::MatchPathIndicesAt => {
+                            let base_path =
+                                decode_bytes(&case.base_path).expect("decode base path");
+                            let base_path =
+                                std::str::from_utf8(&base_path).expect("zlob base path is UTF-8");
+                            zlob_match_paths_indices_at(
+                                base_path,
+                                pattern,
+                                paths.as_slice(),
+                                flags(&case.flags),
+                            )
+                        }
+                        CaseKind::Matcher
+                        | CaseKind::HasWildcards
+                        | CaseKind::MatchPaths
+                        | CaseKind::MatchPathsAt => unreachable!(),
+                    }
+                    .expect("zlob match path indices")
+                    .as_slice()
+                    .to_vec();
+                    assert_eq!(
+                        selected,
+                        case.oracle_indices
+                            .clone()
+                            .unwrap_or_else(|| case.indices.clone()),
+                        "{}:{}: index result",
+                        file.display(),
+                        line_number + 1
+                    );
+                    case.expected
                 }
             };
             assert_eq!(

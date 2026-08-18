@@ -28,6 +28,12 @@ pub struct Case {
     /// [`CaseKind::MatchPathsAt`] operation.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base_path: String,
+    /// Ferralk-selected input positions for an index-list operation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indices: Vec<usize>,
+    /// The external oracle's selected indices when it intentionally differs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_indices: Option<Vec<usize>>,
     /// Glob or ignore expression, encoded with [`decode_bytes`].
     pub pattern: String,
     /// Candidate path, encoded with [`decode_bytes`].
@@ -68,6 +74,10 @@ pub enum CaseKind {
     MatchPaths,
     /// Filters full candidate paths after stripping an explicit base directory.
     MatchPathsAt,
+    /// Returns the positions of accepted input paths.
+    MatchPathIndices,
+    /// Returns accepted input positions after stripping an explicit base directory.
+    MatchPathIndicesAt,
 }
 
 /// Provenance of a corpus result.

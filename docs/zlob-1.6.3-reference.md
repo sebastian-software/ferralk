@@ -23,7 +23,7 @@ peeled source commit above in their import metadata.
 | Area | zlob 1.6.3 public surface | ferralk direction |
 |---|---|---|
 | Filesystem glob | `zlob`, `zlob_at`, `Zlob`, `ZlobIter` | `Walker`; no C-shaped output buffer. |
-| In-memory paths | `zlob_match_paths`, `_at`, `_indices`, `_indices_at`, `ZlobMatch`, `ZlobIndicies`, `AsZlobPaths` | `Pattern::{filter_paths,filter_paths_at}` preserve borrowed caller paths; index-returning and C-shaped output APIs remain separate evaluation work. |
+| In-memory paths | `zlob_match_paths`, `_at`, `_indices`, `_indices_at`, `ZlobMatch`, `ZlobIndicies`, `AsZlobPaths` | `Pattern::{filter_paths,filter_paths_at,filter_path_indices,filter_path_indices_at}` preserve caller paths or return input positions; C-shaped output ownership remains separate evaluation work. |
 | Compiled pattern | `ZlobPattern::{compile,matches,matches_default,match_paths,match_indices}` | `Pattern::{compile,is_match,validate}`; immutable, byte-first. |
 | Syntax detection | `has_wildcards` | Planned helper after syntax parity. |
 | Errors | `ZlobError` | Typed compile error now; typed walker errors in M2. |
