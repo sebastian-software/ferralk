@@ -211,3 +211,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   literal. Both source assertions remain Ferralk's expected results; their
   direct-API results are retained as explicitly disputed oracle expectations,
   rather than being silently normalized away.
+- Extended that import through the simple class, combined wildcard, and
+  real-world pattern sections. The checked-in `fnmatch.jsonl` now contains
+  98 individually source-line-addressable assertions, replayed by both the
+  Zig-free harness and the manual zlob oracle.
