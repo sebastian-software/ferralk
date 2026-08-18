@@ -20,6 +20,7 @@ use std::{
 };
 
 use ferralk_glob::{Pattern, PatternError, PatternOptions};
+use ignore::gitignore::Gitignore;
 
 pub use ferralk_glob;
 
@@ -204,6 +205,7 @@ pub struct Walker {
     options: WalkOptions,
     error_policy: ErrorPolicy,
     cancellation: Option<CancellationToken>,
+    respect_git_ignore: bool,
 }
 
 impl Walker {
@@ -217,6 +219,7 @@ impl Walker {
             options: WalkOptions::default(),
             error_policy: ErrorPolicy::default(),
             cancellation: None,
+            respect_git_ignore: false,
         }
     }
 
@@ -256,10 +259,17 @@ impl Walker {
         self
     }
 
+    /// Applies the root .gitignore with Git-compatible matching semantics.
+    #[must_use]
+    pub const fn respect_git_ignore(mut self, enabled: bool) -> Self {
+        self.respect_git_ignore = enabled;
+        self
+    }
+
     /// Runs the serial portable backend to completion.
     pub fn collect(self) -> Result<WalkResult, WalkError> {
         let backend = StdBackend;
-        let mut state = WalkState::new(&self);
+        let mut state = WalkState::new(&self, root_gitignore(&self));
         state.walk_directory(&backend, self.root.clone())?;
         if self.options.sort {
             state
@@ -278,11 +288,13 @@ impl Walker {
     /// is intentionally a collect-only global operation.
     #[must_use]
     pub fn stream(self) -> WalkStream {
+        let gitignore = root_gitignore(&self);
         WalkStream {
             pending_directories: vec![self.root.clone()],
             walker: self,
             pending_entries: VecDeque::new(),
             visited_directories: HashSet::new(),
+            gitignore,
             cancelled: false,
             stopped: false,
         }
@@ -362,6 +374,7 @@ pub struct WalkStream {
     pending_directories: Vec<PathBuf>,
     pending_entries: VecDeque<BackendEntry>,
     visited_directories: HashSet<PathBuf>,
+    gitignore: Option<Gitignore>,
     cancelled: bool,
     stopped: bool,
 }
@@ -433,6 +446,13 @@ impl WalkStream {
         {
             return None;
         }
+        if self.gitignore.as_ref().is_some_and(|rules| {
+            rules
+                .matched_path_or_any_parents(&entry.path, entry.is_dir)
+                .is_ignore()
+        }) {
+            return None;
+        }
         if entry.is_symlink && self.walker.options.follow_symlinks {
             match fs::metadata(&entry.path) {
                 Ok(metadata) => entry.is_dir = metadata.is_dir(),
@@ -502,16 +522,18 @@ struct WalkState<'walker> {
     entries: Vec<WalkEntry>,
     errors: Vec<WalkError>,
     visited_directories: HashSet<PathBuf>,
+    gitignore: Option<Gitignore>,
     cancelled: bool,
 }
 
 impl<'walker> WalkState<'walker> {
-    fn new(walker: &'walker Walker) -> Self {
+    fn new(walker: &'walker Walker, gitignore: Option<Gitignore>) -> Self {
         Self {
             walker,
             entries: Vec::new(),
             errors: Vec::new(),
             visited_directories: HashSet::new(),
+            gitignore,
             cancelled: false,
         }
     }
@@ -569,6 +591,13 @@ impl<'walker> WalkState<'walker> {
             .iter()
             .any(|pattern| pattern.matches(bytes))
         {
+            return Ok(());
+        }
+        if self.gitignore.as_ref().is_some_and(|rules| {
+            rules
+                .matched_path_or_any_parents(&entry.path, entry.is_dir)
+                .is_ignore()
+        }) {
             return Ok(());
         }
         if entry.is_symlink && self.walker.options.follow_symlinks {
@@ -645,6 +674,12 @@ impl<'walker> WalkState<'walker> {
             .is_some_and(CancellationToken::is_cancelled);
         self.cancelled
     }
+}
+
+fn root_gitignore(walker: &Walker) -> Option<Gitignore> {
+    walker
+        .respect_git_ignore
+        .then(|| Gitignore::new(walker.root.join(".gitignore")).0)
 }
 
 /// Crate version exposed for build and integration diagnostics.
@@ -764,6 +799,34 @@ mod tests {
                 .len(),
             7
         );
+    }
+
+    #[test]
+    fn root_gitignore_rules_and_negation_apply_to_collect_and_stream() {
+        let fixture = Fixture::new();
+        fixture.write("generated.tmp");
+        fixture.write("keep.tmp");
+        fixture.write("src/main.rs");
+        fs::write(fixture.root.join(".gitignore"), b"*.tmp\n!keep.tmp\n")
+            .expect("write root gitignore");
+
+        let collected = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("walk succeeds");
+        let collected_paths = relative_paths(collected.entries(), &fixture.root);
+        assert!(!collected_paths.contains(&PathBuf::from("generated.tmp")));
+        assert!(collected_paths.contains(&PathBuf::from("keep.tmp")));
+
+        let streamed = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .stream()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream has no I/O errors");
+        let streamed_paths = relative_paths(&streamed, &fixture.root);
+        assert!(!streamed_paths.contains(&PathBuf::from("generated.tmp")));
+        assert!(streamed_paths.contains(&PathBuf::from("keep.tmp")));
     }
 
     #[test]

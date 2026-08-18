@@ -280,3 +280,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   whose `Gitignore` matcher is the normative engine selected by ADR-0006.
   Nested rule-chain propagation and negation-aware pruning remain deliberately
   open until their precedence can be tested end-to-end against the Git corpus.
+- Added opt-in root `.gitignore` matching to both `collect()` and
+  `stream()`, backed directly by `ignore::Gitignore`. A fixture verifies
+  ordinary ignore and `!` re-inclusion; nested per-directory chains and their
+  pruning guard remain open M3 work.
