@@ -525,3 +525,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   path lists, no-match, and empty-list handling. The `./` normalization cases
   are tracked separately because they exercise a distinct path-normalization
   policy.
+- Completed the in-memory `./` normalization portion of `test_basic.zig`:
+  `filter_paths` normalizes a leading dot-slash before component matching while
+  the direct matcher remains byte-exact. Both recursive and literal-prefix
+  source scenarios now replay in the corpus.

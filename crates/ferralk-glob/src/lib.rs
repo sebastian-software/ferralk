@@ -276,6 +276,12 @@ impl Pattern {
         matcher.options.component_wildcards = true;
         for alternative in &mut matcher.alternatives {
             alternative.fast_path = None;
+            let leading_dot_slash = alternative.raw.starts_with(b"./")
+                && matches!(alternative.tokens.as_slice(), [Token::Literal(dot), Token::Separator, ..] if dot == b".");
+            if leading_dot_slash {
+                alternative.raw.drain(..2);
+                alternative.tokens.drain(..2);
+            }
         }
         paths
             .into_iter()
@@ -1467,6 +1473,21 @@ mod tests {
             vec![&"lua/init.lua", &"nvim/lua/setup.lua"]
         );
         assert!(pattern.is_match("nvim/lua/sub/nested.lua"));
+    }
+
+    #[test]
+    fn filter_paths_normalizes_a_leading_dot_slash() {
+        let options = PatternOptions::default().recursive_double_star(true);
+        let bare = Pattern::compile("**/*.lua", options).unwrap();
+        let dotted = Pattern::compile("./**/*.lua", options).unwrap();
+        let paths = [
+            "init.lua",
+            "lua/setup.lua",
+            "nested/deep/plugin.lua",
+            "src/main.zig",
+        ];
+        assert_eq!(dotted.filter_paths(&paths), bare.filter_paths(&paths));
+        assert!(!dotted.is_match("nested/deep/plugin.lua"));
     }
 
     #[test]
