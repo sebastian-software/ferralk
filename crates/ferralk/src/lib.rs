@@ -154,7 +154,7 @@ impl WalkResult {
 pub struct Walker {
     root: PathBuf,
     includes: Vec<Pattern>,
-    excludes: Vec<Pattern>,
+    excludes: Vec<TraversalPattern>,
     options: WalkOptions,
     error_policy: ErrorPolicy,
 }
@@ -183,7 +183,7 @@ impl Walker {
     /// Adds an OR-ed exclude pattern. Excluded directories are not descended.
     pub fn exclude(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
         self.excludes
-            .push(Pattern::compile(pattern, traversal_pattern_options())?);
+            .push(TraversalPattern::compile(pattern.as_ref())?);
         Ok(self)
     }
 
@@ -223,6 +223,36 @@ fn traversal_pattern_options() -> PatternOptions {
         .braces(true)
         .recursive_double_star(true)
         .extglob(true)
+}
+
+#[derive(Debug, Clone)]
+struct TraversalPattern {
+    matcher: Pattern,
+    subtree_root: Option<Pattern>,
+}
+
+impl TraversalPattern {
+    fn compile(pattern: &[u8]) -> Result<Self, PatternError> {
+        let options = traversal_pattern_options();
+        let subtree_root = pattern
+            .strip_suffix(b"/**")
+            .map(|root| Pattern::compile(root, options))
+            .transpose()?;
+        Ok(Self {
+            matcher: Pattern::compile(pattern, options)?,
+            subtree_root,
+        })
+    }
+
+    fn matches(&self, path: &[u8]) -> bool {
+        self.matcher.is_match(path)
+    }
+
+    fn covers_subtree(&self, path: &[u8]) -> bool {
+        self.subtree_root
+            .as_ref()
+            .is_some_and(|root| root.is_match(path))
+    }
 }
 
 trait DirectoryBackend {
@@ -313,7 +343,7 @@ impl<'walker> WalkState<'walker> {
             .walker
             .excludes
             .iter()
-            .any(|pattern| pattern.is_match(bytes))
+            .any(|pattern| pattern.matches(bytes))
         {
             return Ok(());
         }
@@ -327,6 +357,14 @@ impl<'walker> WalkState<'walker> {
             }
         }
         if entry.is_dir {
+            if self
+                .walker
+                .excludes
+                .iter()
+                .any(|pattern| pattern.covers_subtree(bytes))
+            {
+                return Ok(());
+            }
             self.walk_directory(backend, entry.path.clone())?;
         }
 
@@ -375,7 +413,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{ErrorPolicy, WalkEntry, WalkOptions, Walker};
+    use super::{ErrorPolicy, TraversalPattern, WalkEntry, WalkOptions, Walker};
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
@@ -447,6 +485,21 @@ mod tests {
             vec![PathBuf::from("src/main.rs")]
         );
         assert!(result.errors().is_empty());
+    }
+
+    #[test]
+    fn prune_planner_only_accepts_explicit_whole_subtree_excludes() {
+        let subtree = TraversalPattern::compile(b"src/**").expect("valid subtree pattern");
+        assert!(subtree.covers_subtree(b"src"));
+        assert!(!subtree.covers_subtree(b"src/nested"));
+
+        let suffix = TraversalPattern::compile(b"*.tmp").expect("valid suffix pattern");
+        assert!(!suffix.covers_subtree(b"cache"));
+
+        let nested =
+            TraversalPattern::compile(b"**/target/**").expect("valid recursive subtree pattern");
+        assert!(nested.covers_subtree(b"target"));
+        assert!(nested.covers_subtree(b"crates/ferralk/target"));
     }
 
     #[test]

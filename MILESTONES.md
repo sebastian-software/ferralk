@@ -238,3 +238,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   from `test/test_brace.zig`. `braces.jsonl` now has 41 source-linked cases
   across basic, wildcard, recursive, empty, literal, and multi-group brace
   forms; both the harness and pinned zlob oracle replay the new block.
+- Added the first conservative M2 prune rule: only excludes ending in `/**`
+  may close a directory subtree, and only when their derived root matcher
+  accepts that directory. Ordinary suffix or wildcard excludes never prune.
+  Literal include roots, extension prefilters, and the M3 ignore-negation guard
+  remain explicit open work under the prune-planner item.
