@@ -189,3 +189,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 - The manual Oracle workflow now installs Zig 0.16 and runs an ignored test
   against the pinned `zlob = 1.6.3` dev-dependency. It is verified locally;
   normal CI never compiles that dependency and remains Zig-free.
+- Added ASCII POSIX character classes (`[:alpha:]`, `[:digit:]`, and the
+  remaining standard byte classes) to the compiled matcher. Initial imported
+  cases pass both the Zig-free harness and the zlob oracle; the mechanical-port
+  checklist entry remains open pending the complete upstream class suite.

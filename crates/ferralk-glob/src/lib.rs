@@ -369,6 +369,7 @@ impl Class {
                 let end = fold_ascii(*end, case_insensitive);
                 start <= byte && byte <= end
             }
+            ClassMember::Posix(class) => class.matches(byte, case_insensitive),
         });
         included != self.negated
     }
@@ -378,6 +379,47 @@ impl Class {
 enum ClassMember {
     Byte(u8),
     Range(u8, u8),
+    Posix(PosixClass),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PosixClass {
+    Alnum,
+    Alpha,
+    Ascii,
+    Blank,
+    Cntrl,
+    Digit,
+    Graph,
+    Lower,
+    Print,
+    Punct,
+    Space,
+    Upper,
+    Word,
+    Xdigit,
+}
+
+impl PosixClass {
+    fn matches(self, byte: u8, case_insensitive: bool) -> bool {
+        let folded = fold_ascii(byte, case_insensitive);
+        match self {
+            Self::Alnum => folded.is_ascii_alphanumeric(),
+            Self::Alpha => folded.is_ascii_alphabetic(),
+            Self::Ascii => byte.is_ascii(),
+            Self::Blank => matches!(byte, b' ' | b'\t'),
+            Self::Cntrl => byte.is_ascii_control(),
+            Self::Digit => byte.is_ascii_digit(),
+            Self::Graph => byte.is_ascii_graphic(),
+            Self::Lower => folded.is_ascii_lowercase(),
+            Self::Print => byte.is_ascii_graphic() || byte == b' ',
+            Self::Punct => byte.is_ascii_punctuation(),
+            Self::Space => byte.is_ascii_whitespace(),
+            Self::Upper => folded.is_ascii_uppercase(),
+            Self::Word => folded.is_ascii_alphanumeric() || folded == b'_',
+            Self::Xdigit => byte.is_ascii_hexdigit(),
+        }
+    }
 }
 
 fn parse_class(
@@ -396,13 +438,14 @@ fn parse_class(
     }
 
     let mut values = Vec::new();
+    let mut members = Vec::new();
     if pattern.get(index) == Some(&b']') {
         values.push(b']');
         index += 1;
     }
     while let Some(&byte) = pattern.get(index) {
         if byte == b']' {
-            if values.is_empty() {
+            if values.is_empty() && members.is_empty() {
                 return Err(PatternError {
                     offset: start,
                     message: "empty character class",
@@ -411,10 +454,26 @@ fn parse_class(
             return Ok((
                 Class {
                     negated,
-                    members: class_members(values),
+                    members: {
+                        members.extend(class_members(values));
+                        members
+                    },
                 },
                 index + 1,
             ));
+        }
+        if byte == b'['
+            && pattern.get(index + 1) == Some(&b':')
+            && let Some(end) = pattern[index + 2..]
+                .windows(2)
+                .position(|pair| pair == b":]")
+            && let Some(class) = parse_posix_class(&pattern[index + 2..index + 2 + end])
+        {
+            let name_end = index + 2 + end;
+            members.extend(class_members(std::mem::take(&mut values)));
+            members.push(ClassMember::Posix(class));
+            index = name_end + 2;
+            continue;
         }
         if byte == b'\\' && escapes {
             let Some(&escaped) = pattern.get(index + 1) else {
@@ -435,6 +494,26 @@ fn parse_class(
         offset: start,
         message: "unclosed character class",
     })
+}
+
+fn parse_posix_class(name: &[u8]) -> Option<PosixClass> {
+    match name {
+        b"alnum" => Some(PosixClass::Alnum),
+        b"alpha" => Some(PosixClass::Alpha),
+        b"ascii" => Some(PosixClass::Ascii),
+        b"blank" => Some(PosixClass::Blank),
+        b"cntrl" => Some(PosixClass::Cntrl),
+        b"digit" => Some(PosixClass::Digit),
+        b"graph" => Some(PosixClass::Graph),
+        b"lower" => Some(PosixClass::Lower),
+        b"print" => Some(PosixClass::Print),
+        b"punct" => Some(PosixClass::Punct),
+        b"space" => Some(PosixClass::Space),
+        b"upper" => Some(PosixClass::Upper),
+        b"word" => Some(PosixClass::Word),
+        b"xdigit" => Some(PosixClass::Xdigit),
+        _ => None,
+    }
 }
 
 fn class_members(values: Vec<u8>) -> Vec<ClassMember> {
@@ -605,6 +684,15 @@ mod tests {
         assert!(compile("file[!0-9].rs").is_match("filex.rs"));
         assert!(compile("file[^0-9].rs").is_match("filex.rs"));
         assert!(!compile("file[!0-9].rs").is_match("file7.rs"));
+    }
+
+    #[test]
+    fn character_classes_support_posix_named_sets() {
+        assert!(compile("[[:alpha:]]").is_match("a"));
+        assert!(!compile("[[:alpha:]]").is_match("7"));
+        assert!(compile("[[:digit:]]").is_match("7"));
+        assert!(compile("[[:word:]]").is_match("_"));
+        assert!(compile("[![:space:]]").is_match("x"));
     }
 
     #[test]

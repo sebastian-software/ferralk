@@ -1,2 +1,4 @@
 {"id":"class-001","pattern":"file[0-9].rs","path":"file7.rs","flags":[],"expected":true,"source":"handwritten","note":"Inclusive byte range."}
 {"id":"class-002","pattern":"file[!0-9].rs","path":"filex.rs","flags":[],"expected":true,"source":"handwritten","note":"POSIX negated class."}
+{"id":"class-003","pattern":"[[:alpha:]]","path":"a","flags":[],"expected":true,"source":"zlob_1_6_3","note":"Ported from test/test_fnmatch.zig POSIX character class coverage."}
+{"id":"class-004","pattern":"[[:digit:]]","path":"7","flags":[],"expected":true,"source":"zlob_1_6_3","note":"Ported from test/test_fnmatch.zig POSIX character class coverage."}
