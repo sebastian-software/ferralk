@@ -7,7 +7,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -87,7 +87,7 @@ fn finish(shared: Arc<Shared>) -> Result<WalkResult, WalkError> {
     Ok(WalkResult {
         entries,
         errors: std::mem::take(&mut *lock(&shared.errors)),
-        cancelled: shared.cancelled.load(Ordering::Acquire),
+        cancelled: shared.cancellation.is_cancelled(),
     })
 }
 
@@ -95,8 +95,7 @@ struct Shared {
     walker: Arc<Walker>,
     scheduler: Scheduler<PathBuf>,
     pending: AtomicUsize,
-    stopped: AtomicBool,
-    cancelled: AtomicBool,
+    cancellation: super::CancellationToken,
     wake_lock: Mutex<()>,
     wake: Condvar,
     entries: Mutex<Vec<WalkEntry>>,
@@ -108,12 +107,12 @@ struct Shared {
 
 impl Shared {
     fn new(walker: Arc<Walker>) -> Self {
+        let cancellation = walker.cancellation.clone().unwrap_or_default();
         Self {
             walker,
             scheduler: Scheduler::new(),
             pending: AtomicUsize::new(0),
-            stopped: AtomicBool::new(false),
-            cancelled: AtomicBool::new(false),
+            cancellation,
             wake_lock: Mutex::new(()),
             wake: Condvar::new(),
             entries: Mutex::new(Vec::new()),
@@ -141,16 +140,7 @@ impl Shared {
     }
 
     fn should_stop(&self) -> bool {
-        if self
-            .walker
-            .cancellation
-            .as_ref()
-            .is_some_and(super::CancellationToken::is_cancelled)
-        {
-            self.cancelled.store(true, Ordering::Release);
-            self.stopped.store(true, Ordering::Release);
-        }
-        self.stopped.load(Ordering::Acquire)
+        self.cancellation.is_cancelled()
     }
 
     fn record_error(&self, operation: &'static str, path: PathBuf, source: std::io::Error) {
@@ -160,7 +150,7 @@ impl Shared {
                 let mut abort_error = lock(&self.abort_error);
                 if abort_error.is_none() {
                     *abort_error = Some(error);
-                    self.stopped.store(true, Ordering::Release);
+                    self.cancellation.cancel();
                     self.wake.notify_all();
                 }
             }
@@ -173,7 +163,7 @@ impl Shared {
         let mut panic = lock(&self.panic);
         if panic.is_none() {
             *panic = Some(payload);
-            self.stopped.store(true, Ordering::Release);
+            self.cancellation.cancel();
             self.wake.notify_all();
         }
     }

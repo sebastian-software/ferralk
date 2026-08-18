@@ -95,7 +95,7 @@ faster than parallel `ignore` + pruning on all traversal corpora.
 - [x] `ignore.jsonl` corpus green against `git check-ignore`
 - [ ] Scheduler: `crossbeam-deque` work stealing, lazy worker spawn,
       per-worker scratch and result shards — ADR-0009
-- [ ] Single cancellation state, lossless error channel, documented panic
+- [x] Single cancellation state, lossless error channel, documented panic
       propagation
 - [x] Loom models for queue and completion state
 - [ ] Stress tests: empty/shallow/imbalanced trees, visitor panic,
@@ -327,3 +327,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   completion transition. They ensure a helper cannot mistake an empty queue
   for completion while the root is creating a child task, and that exactly one
   worker observes the final completion transition.
+- Unified parallel cancellation around the caller-provided
+  `CancellationToken` (or one private token when none is supplied), including
+  I/O-abort and panic cleanup. Worker panics are joined and resumed on the
+  caller thread; concurrent dangling-symlink metadata failures are retained
+  and checked against the serial error set.

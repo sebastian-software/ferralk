@@ -1185,6 +1185,55 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn parallel_collect_retains_concurrent_metadata_errors() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        fixture.write("left/ok.txt");
+        fixture.write("right/ok.txt");
+        symlink("missing-left", fixture.root.join("left/dangling"))
+            .expect("create left dangling symlink");
+        symlink("missing-right", fixture.root.join("right/dangling"))
+            .expect("create right dangling symlink");
+
+        let options = WalkOptions::default().follow_symlinks(true).sort(true);
+        let serial = Walker::new(&fixture.root)
+            .threads(1)
+            .options(options)
+            .error_policy(ErrorPolicy::Collect)
+            .collect()
+            .expect("serial walk retains errors");
+        let parallel = Walker::new(&fixture.root)
+            .threads(4)
+            .options(options)
+            .error_policy(ErrorPolicy::Collect)
+            .collect()
+            .expect("parallel walk retains errors");
+
+        let error_paths = |result: &super::WalkResult| {
+            let mut errors = result
+                .errors()
+                .iter()
+                .map(|error| {
+                    (
+                        error.operation(),
+                        error
+                            .path()
+                            .strip_prefix(&fixture.root)
+                            .expect("error is rooted in fixture")
+                            .to_path_buf(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            errors.sort_unstable();
+            errors
+        };
+        assert_eq!(error_paths(&parallel), error_paths(&serial));
+        assert_eq!(parallel.errors().len(), 2);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn preserves_non_utf8_native_paths() {
