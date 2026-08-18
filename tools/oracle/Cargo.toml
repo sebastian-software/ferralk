@@ -9,6 +9,7 @@ publish = false
 
 [dev-dependencies]
 corpus = { path = "../corpus" }
+ferralk-glob = { path = "../../crates/ferralk-glob" }
 serde_json.workspace = true
 zlob = "=1.6.3"
 

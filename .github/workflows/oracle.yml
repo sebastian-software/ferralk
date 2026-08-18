@@ -21,5 +21,5 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - name: Replay checked-in matcher corpus against zlob
-        run: cargo test -p oracle --test zlob_oracle -- --ignored
+      - name: Replay corpus and generated common subset against zlob
+        run: cargo test -p oracle --test zlob_oracle --test generated_subset -- --ignored

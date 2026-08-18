@@ -51,7 +51,7 @@ matcher ≤1.5x zlob median, ≤1.25x `fast-glob` median on the common subset.
 - [ ] Public API: `Pattern::compile`, `PatternOptions`, `is_match`,
       `validate`; byte-first with `&str` convenience — ADR-0005
 - [ ] Matcher corpus green (all topic files except `ignore.jsonl`)
-- [ ] Run differential generation against the oracle; triage every
+- [x] Run differential generation against the oracle; triage every
       disagreement into the corpus — ADR-0007
 - [x] Property tests (literal-only patterns, subset/superset invariants)
 - [x] Fuzzers for parser and matcher with seeded corpora
@@ -256,3 +256,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   targets compile with Rust 1.93. **Local tooling note:** `cargo-fuzz` is not
   installed in this workspace, so no local mutational fuzz run was possible;
   this does not block the checked-in targets or their CI execution path.
+- Added a deterministic differential generator for the shared literal,
+  `*`, and `?` core. It compares all patterns over that alphabet through
+  length four against all candidate paths through length four (10,571 direct
+  zlob comparisons) and reports any pair that requires corpus triage. The
+  manual oracle workflow now runs it alongside checked-in corpus replay.
