@@ -9,7 +9,7 @@ use std::{
 
 #[cfg(target_os = "linux")]
 use ferralk::WalkOptions;
-use ferralk::{ErrorPolicy, Walker};
+use ferralk::{ErrorPolicy, WalkOptions, Walker};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "linux")]
@@ -79,6 +79,77 @@ fn stream_yields_a_disappearing_root_error() {
         .expect_err("missing root is an error event");
     assert_eq!(error.operation(), "read_dir");
     assert!(stream.next().is_none());
+}
+
+#[test]
+fn skip_hidden_excludes_hidden_files_and_subtrees_across_collect_and_stream() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("visible.txt"), b"fixture").expect("write visible file");
+    fs::write(fixture.root.join(".hidden.txt"), b"fixture").expect("write hidden file");
+    fs::create_dir_all(fixture.root.join(".cache")).expect("create hidden fixture directory");
+    fs::write(fixture.root.join(".cache/inside.txt"), b"fixture")
+        .expect("write hidden subtree file");
+    fs::create_dir_all(fixture.root.join("nested")).expect("create visible fixture directory");
+    fs::write(fixture.root.join("nested/visible.txt"), b"fixture")
+        .expect("write nested visible file");
+
+    let options = WalkOptions::default().skip_hidden(true).sort(true);
+    let collected = Walker::new(&fixture.root)
+        .threads(1)
+        .options(options)
+        .collect()
+        .expect("collect succeeds");
+    let collected_relative = collected
+        .entries()
+        .iter()
+        .map(|entry| {
+            entry
+                .path()
+                .strip_prefix(&fixture.root)
+                .expect("entry is rooted in fixture")
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        collected_relative,
+        vec![
+            PathBuf::from("nested"),
+            PathBuf::from("nested/visible.txt"),
+            PathBuf::from("visible.txt"),
+        ]
+    );
+
+    let mut streamed_relative = Walker::new(&fixture.root)
+        .options(options)
+        .stream()
+        .map(|entry| {
+            entry
+                .expect("stream succeeds")
+                .path()
+                .strip_prefix(&fixture.root)
+                .expect("entry is rooted in fixture")
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    streamed_relative.sort();
+    assert_eq!(streamed_relative, collected_relative);
+
+    let parallel_relative = Walker::new(&fixture.root)
+        .threads(4)
+        .options(options)
+        .collect()
+        .expect("parallel collect succeeds")
+        .entries()
+        .iter()
+        .map(|entry| {
+            entry
+                .path()
+                .strip_prefix(&fixture.root)
+                .expect("entry is rooted in fixture")
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(parallel_relative, collected_relative);
 }
 
 #[cfg(unix)]

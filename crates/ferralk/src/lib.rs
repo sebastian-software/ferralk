@@ -65,6 +65,7 @@ pub struct WalkOptions {
     sort: bool,
     metadata: bool,
     directories_only: bool,
+    skip_hidden: bool,
 }
 
 impl WalkOptions {
@@ -93,6 +94,14 @@ impl WalkOptions {
     #[must_use]
     pub const fn directories_only(mut self, enabled: bool) -> Self {
         self.directories_only = enabled;
+        self
+    }
+
+    /// Excludes entries with a leading-period path component and does not
+    /// descend into hidden directories.
+    #[must_use]
+    pub const fn skip_hidden(mut self, enabled: bool) -> Self {
+        self.skip_hidden = enabled;
         self
     }
 }
@@ -354,6 +363,11 @@ impl Walker {
     }
 }
 
+fn has_hidden_component(path: &[u8]) -> bool {
+    path.split(is_path_separator)
+        .any(|component| component.first() == Some(&b'.'))
+}
+
 fn traversal_pattern_options() -> PatternOptions {
     PatternOptions::default()
         .braces(true)
@@ -611,6 +625,9 @@ impl WalkStream {
             .strip_prefix(&self.walker.root)
             .unwrap_or(entry.path.as_path());
         let bytes = relative.as_os_str().as_encoded_bytes();
+        if self.walker.options.skip_hidden && has_hidden_component(bytes) {
+            return None;
+        }
         if self
             .walker
             .excludes
@@ -770,6 +787,9 @@ impl<'walker> WalkState<'walker> {
             .strip_prefix(&self.walker.root)
             .unwrap_or(entry.path.as_path());
         let bytes = relative.as_os_str().as_encoded_bytes();
+        if self.walker.options.skip_hidden && has_hidden_component(bytes) {
+            return Ok(());
+        }
         if self
             .walker
             .excludes

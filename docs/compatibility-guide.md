@@ -61,6 +61,7 @@ let result = Walker::new(".")
 | zlob concept | Ferralk mapping |
 | --- | --- |
 | `ZLOB_GITIGNORE` | `Walker::respect_git_ignore(true)` |
+| `ZLOB_SKIP_HIDDEN` | `WalkOptions::skip_hidden(true)` |
 | `ZLOB_FOLLOW_SYMLINKS` | `WalkOptions::follow_symlinks(true)` |
 | `ZLOB_ERR` | `ErrorPolicy::{Abort, Skip, Collect}` |
 | `ZLOB_ONLYDIR` | `WalkOptions::directories_only(true)` |

@@ -17,7 +17,7 @@ use crossbeam_deque::{Steal, Stealer, Worker};
 
 use super::{
     BackendEntry, DirectoryBackend, ErrorPolicy, GitIgnoreNode, StdBackend, WalkEntry, WalkError,
-    WalkResult, Walker, is_git_ignored, scheduler::Scheduler,
+    WalkResult, Walker, has_hidden_component, is_git_ignored, scheduler::Scheduler,
 };
 
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -330,6 +330,9 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
         .strip_prefix(&shared.walker.root)
         .unwrap_or(entry.path.as_path());
     let bytes = relative.as_os_str().as_encoded_bytes();
+    if shared.walker.options.skip_hidden && has_hidden_component(bytes) {
+        return;
+    }
     if shared
         .walker
         .excludes

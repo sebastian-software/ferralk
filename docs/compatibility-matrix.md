@@ -27,6 +27,7 @@ read the [compatibility guide](compatibility-guide.md).
 |---|---|---|---|
 | path traversal | `Walker::new` / `Walker::threads` | In progress (M3) | Portable `std::fs` backend; `collect()` uses a lazy work-stealing parallel scheduler while `stream()` remains incremental and single-threaded. |
 | `ZLOB_GITIGNORE` | `Walker::respect_git_ignore` | Implemented (M3) | Nested .gitignore chains, negation-aware descent, and shared-parent caching use `ignore`'s matcher. |
+| `ZLOB_SKIP_HIDDEN` | `WalkOptions::skip_hidden` | Implemented (M2) | Explicit opt-in; suppresses hidden files and whole hidden subtrees. |
 | `ZLOB_FOLLOW_SYMLINKS` | `WalkOptions::follow_symlinks` | Implemented (M2) | Default off; canonical-path cycle guard when enabled. |
 | `ZLOB_ONLYDIR` | `WalkOptions::directories_only` | Implemented (M2) | Filters returned files without pruning traversal. |
 | `ZLOB_MARK` | — | Deliberate divergence | Ferralk preserves native paths instead of appending display-only separators. |

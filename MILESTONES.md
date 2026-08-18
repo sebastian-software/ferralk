@@ -444,3 +444,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   23.8 ns (ahead of zlob's 35.6 ns and globset's 39.1 ns); the non-matching
   case is still about 11.8 ns versus zlob's 2.57 ns, so the complete M1 gate
   and wider immutable-IR refactor remain open.
+- Ported zlob's `SKIP_HIDDEN` walker policy as the explicit
+  `WalkOptions::skip_hidden(true)` opt-in. It excludes leading-period files
+  and prevents descent into hidden directories before matching or metadata
+  work in serial, parallel, and streaming traversal. A public portable fixture
+  checks all three modes; the M2 fixture aggregate remains open only for the
+  still-unrepresentable public dirent-to-metadata disappearance case.
