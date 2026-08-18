@@ -299,3 +299,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   writes the same rule chain that the existing `git check-ignore` oracle
   validates, then asserts the Walker's returned-path verdict, tying the Git
   corpus directly to M3 traversal behaviour.
+- Added public M2 integration fixtures for disappearing roots in both
+  `collect()` and `stream()`, plus a Linux-gated non-UTF-8 path assertion.
+  Unreadable-directory behaviour is still pending a permission-stable fixture
+  strategy across CI platforms.
