@@ -336,3 +336,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   them after every helper joins. The scheduler now satisfies its queue,
   stealing, lazy-spawn, worker-scratch, and result-shard checkpoint; the
   central synchronized channel is intentionally reserved for errors.
+- Completed the direct `fnmatchFull`/`matchExtglob` assertion import from the
+  frozen zlob test file, including six previously omitted duplicate and
+  negative escape cases. `docs/zlob-fnmatch-test-coverage.md` maps the
+  remaining zlob-only result-shaping and private helper assertions, so the
+  larger full-suite item remains explicitly open rather than silently
+  conflating those APIs with matcher semantics.
