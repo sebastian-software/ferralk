@@ -214,6 +214,111 @@ fn files_only_excludes_directories_without_pruning_their_contents() {
     assert_eq!(parallel_relative, collected_relative);
 }
 
+#[test]
+fn gitignore_hides_dot_git_unless_keep_git_dir_is_enabled() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.root.join(".git")).expect("create git fixture directory");
+    fs::write(fixture.root.join(".git/config"), b"fixture").expect("write git config fixture");
+    fs::write(fixture.root.join("visible.txt"), b"fixture").expect("write visible fixture");
+
+    let hidden = Walker::new(&fixture.root)
+        .threads(1)
+        .respect_git_ignore(true)
+        .options(WalkOptions::default().sort(true))
+        .collect()
+        .expect("collect succeeds");
+    let hidden_relative = hidden
+        .entries()
+        .iter()
+        .map(|entry| {
+            entry
+                .path()
+                .strip_prefix(&fixture.root)
+                .expect("entry is rooted in fixture")
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(hidden_relative, vec![PathBuf::from("visible.txt")]);
+
+    let hidden_parallel = Walker::new(&fixture.root)
+        .threads(4)
+        .respect_git_ignore(true)
+        .options(WalkOptions::default().sort(true))
+        .collect()
+        .expect("parallel collect succeeds");
+    let hidden_parallel_relative = hidden_parallel
+        .entries()
+        .iter()
+        .map(|entry| {
+            entry
+                .path()
+                .strip_prefix(&fixture.root)
+                .expect("entry is rooted in fixture")
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(hidden_parallel_relative, hidden_relative);
+
+    let mut hidden_streamed_relative = Walker::new(&fixture.root)
+        .respect_git_ignore(true)
+        .options(WalkOptions::default().sort(true))
+        .stream()
+        .map(|entry| {
+            entry
+                .expect("stream succeeds")
+                .path()
+                .strip_prefix(&fixture.root)
+                .expect("entry is rooted in fixture")
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    hidden_streamed_relative.sort();
+    assert_eq!(hidden_streamed_relative, hidden_relative);
+
+    let options = WalkOptions::default().keep_git_dir(true).sort(true);
+    let kept = Walker::new(&fixture.root)
+        .threads(4)
+        .respect_git_ignore(true)
+        .options(options)
+        .collect()
+        .expect("parallel collect succeeds");
+    let kept_relative = kept
+        .entries()
+        .iter()
+        .map(|entry| {
+            entry
+                .path()
+                .strip_prefix(&fixture.root)
+                .expect("entry is rooted in fixture")
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kept_relative,
+        vec![
+            PathBuf::from(".git"),
+            PathBuf::from(".git/config"),
+            PathBuf::from("visible.txt"),
+        ]
+    );
+
+    let mut streamed_relative = Walker::new(&fixture.root)
+        .respect_git_ignore(true)
+        .options(options)
+        .stream()
+        .map(|entry| {
+            entry
+                .expect("stream succeeds")
+                .path()
+                .strip_prefix(&fixture.root)
+                .expect("entry is rooted in fixture")
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    streamed_relative.sort();
+    assert_eq!(streamed_relative, kept_relative);
+}
+
 #[cfg(unix)]
 #[test]
 fn collect_retains_an_unreadable_directory_error() {

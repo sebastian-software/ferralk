@@ -454,3 +454,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   filters returned directories only after their traversal has been scheduled,
   so nested files remain visible in serial, parallel, and streaming walks. A
   public fixture exercises that invariant in all three modes.
+- Completed the `.git` portion of the `GITIGNORE` walker policy: an enabled
+  Gitignore walk now skips `.git` before scheduling its subtree, while
+  `WalkOptions::keep_git_dir(true)` explicitly restores it. The public fixture
+  covers default and opt-in behavior through serial, parallel, and streaming
+  traversal.

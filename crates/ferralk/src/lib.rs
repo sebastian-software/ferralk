@@ -67,6 +67,7 @@ pub struct WalkOptions {
     directories_only: bool,
     files_only: bool,
     skip_hidden: bool,
+    keep_git_dir: bool,
 }
 
 impl WalkOptions {
@@ -110,6 +111,13 @@ impl WalkOptions {
     #[must_use]
     pub const fn skip_hidden(mut self, enabled: bool) -> Self {
         self.skip_hidden = enabled;
+        self
+    }
+
+    /// Keeps `.git` directories when Gitignore matching is enabled.
+    #[must_use]
+    pub const fn keep_git_dir(mut self, enabled: bool) -> Self {
+        self.keep_git_dir = enabled;
         self
     }
 }
@@ -636,6 +644,9 @@ impl WalkStream {
         if self.walker.options.skip_hidden && has_hidden_component(bytes) {
             return None;
         }
+        if should_skip_git_directory(&self.walker, &entry.path) {
+            return None;
+        }
         if self
             .walker
             .excludes
@@ -801,6 +812,9 @@ impl<'walker> WalkState<'walker> {
         if self.walker.options.skip_hidden && has_hidden_component(bytes) {
             return Ok(());
         }
+        if should_skip_git_directory(self.walker, &entry.path) {
+            return Ok(());
+        }
         if self
             .walker
             .excludes
@@ -918,6 +932,12 @@ fn is_git_ignored(
         .filter(|parent| parent.starts_with(&walker.root));
     directory
         .is_some_and(|directory| gitignore_node(walker, directory, cache).is_ignored(path, is_dir))
+}
+
+fn should_skip_git_directory(walker: &Walker, path: &Path) -> bool {
+    walker.respect_git_ignore
+        && !walker.options.keep_git_dir
+        && path.file_name().is_some_and(|name| name == ".git")
 }
 
 /// One directory's parsed ignore rules plus its immutable inherited chain.
