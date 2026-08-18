@@ -74,6 +74,26 @@ fn matcher(c: &mut Criterion) {
         benchmark.iter(|| black_box(deterministic.is_match(black_box("src/zz.rs"))))
     });
 
+    let terminal_recursive = Pattern::compile(
+        "src/**",
+        PatternOptions::default().recursive_double_star(true),
+    )
+    .expect("terminal recursive benchmark pattern is valid");
+    c.bench_function(
+        "recursive_terminal/ferralk_compiled/matching",
+        |benchmark| {
+            benchmark.iter(|| {
+                black_box(terminal_recursive.is_match(black_box("src/deep/nested/main.rs")))
+            })
+        },
+    );
+    c.bench_function(
+        "recursive_terminal/ferralk_compiled/non_matching",
+        |benchmark| {
+            benchmark.iter(|| black_box(terminal_recursive.is_match(black_box("lib/main.rs"))))
+        },
+    );
+
     let suffix_star = Pattern::compile("*.rs", PatternOptions::default())
         .expect("suffix-star benchmark pattern is valid");
     c.bench_function("single_star/ferralk_compiled/matching", |benchmark| {

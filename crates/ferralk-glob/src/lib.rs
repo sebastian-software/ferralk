@@ -647,6 +647,7 @@ enum FastPath {
     Star,
     PrefixStar { prefix: Vec<u8> },
     StarSuffix { suffix: Vec<u8> },
+    RecursiveTerminalPrefix { prefix: Vec<u8> },
     RecursivePrefixSuffix { prefix: Vec<u8>, suffix: Vec<u8> },
 }
 
@@ -682,6 +683,16 @@ impl FastPath {
                 });
             }
             _ => {}
+        }
+        if let [
+            Token::Literal(prefix),
+            Token::Separator,
+            Token::RecursiveStar,
+        ] = tokens
+        {
+            return Some(Self::RecursiveTerminalPrefix {
+                prefix: prefix.clone(),
+            });
         }
         if options.case_insensitive {
             return None;
@@ -800,6 +811,15 @@ impl FastPath {
                     return false;
                 };
                 options.match_hidden || !contains_hidden_component(variable)
+            }
+            Self::RecursiveTerminalPrefix { prefix } => {
+                let Some(remainder) = strip_literal_prefix(path, prefix, options.case_insensitive)
+                else {
+                    return false;
+                };
+                remainder.is_empty()
+                    || remainder.first().is_some_and(|byte| is_separator(*byte))
+                        && (options.match_hidden || !contains_hidden_component(&remainder[1..]))
             }
             Self::RecursivePrefixSuffix { prefix, suffix } => {
                 let Some(remainder) = path
@@ -1671,6 +1691,42 @@ mod tests {
             byte_words(b"ab./rs", 4)
                 .into_iter()
                 .map(|suffix| [b"src/".as_slice(), suffix.as_slice()].concat()),
+        );
+        for candidate in candidates {
+            assert_eq!(
+                fast.is_match(&candidate),
+                general.is_match(&candidate),
+                "fast path differs for {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_terminal_fast_path_matches_the_general_matcher() {
+        let options = PatternOptions::default()
+            .recursive_double_star(true)
+            .case_insensitive(true);
+        let fast = Pattern::compile("Src/**", options).expect("pattern compiles");
+        assert!(matches!(
+            fast.alternatives[0].fast_path,
+            Some(FastPath::RecursiveTerminalPrefix { .. })
+        ));
+        let mut general = fast.clone();
+        general.alternatives[0].fast_path = None;
+
+        let mut candidates = vec![
+            b"src".to_vec(),
+            b"SRC/".to_vec(),
+            b"src/file.rs".to_vec(),
+            b"src/nested/file.rs".to_vec(),
+            b"src/.hidden".to_vec(),
+            b"src/.hidden/file.rs".to_vec(),
+            b"source/file.rs".to_vec(),
+        ];
+        candidates.extend(
+            byte_words(b"src./", 5)
+                .into_iter()
+                .map(|suffix| [b"src".as_slice(), suffix.as_slice()].concat()),
         );
         for candidate in candidates {
             assert_eq!(

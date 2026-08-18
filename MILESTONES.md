@@ -638,3 +638,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   the general matcher as the semantic reference. New CodSpeed rows measured
   local ten-sample medians of about 26.1 ns for a matching class pattern and
   13.2 ns for its non-match. The broad IR and cross-engine gates remain open.
+- Added an immutable terminal-recursive IR path for `literal/**`, including
+  its zero-component root match and hidden-component policy. Exhaustive
+  equivalence checks cover case folding, empty and nested remainders, and
+  leading-dot paths. New local ten-sample medians are about 9.2 ns for a
+  matching descendant and 4.7 ns for a non-match; broader IR work remains open.
