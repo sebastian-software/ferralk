@@ -12,6 +12,7 @@ categories.workspace = true
 
 [dependencies]
 ferralk-glob = { path = "../ferralk-glob", version = "0.1.0" }
+ignore = "0.4"
 
 [lints]
 workspace = true

@@ -276,3 +276,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   error policy, and cooperative cancellation as `collect()`. Streaming errors
   are yielded as items under `Collect`; global sorting intentionally remains a
   collect-only operation.
+- Began M3's ignore-engine foundation by adding the Rust `ignore` crate,
+  whose `Gitignore` matcher is the normative engine selected by ADR-0006.
+  Nested rule-chain propagation and negation-aware pruning remain deliberately
+  open until their precedence can be tested end-to-end against the Git corpus.
