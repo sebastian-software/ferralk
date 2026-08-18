@@ -78,7 +78,10 @@ fn walker(c: &mut Criterion) {
         })
     });
     c.bench_function("walker/ignore_parallel_filtered", |benchmark| {
-        benchmark.iter(|| black_box(ignore_parallel_filtered(&fixture.root)))
+        benchmark.iter(|| {
+            ignore_parallel_filtered(&fixture.root);
+            black_box(())
+        })
     });
 }
 
