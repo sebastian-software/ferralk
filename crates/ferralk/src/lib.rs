@@ -1598,9 +1598,11 @@ mod tests {
     }
 
     #[test]
-    fn metadata_collection_is_explicit_and_preserves_file_size() {
+    fn source_walk_metadata_preserves_portable_and_unix_fields() {
+        // Ported from zlob/test/test_walk.zig's metadata scenario. Ferralk
+        // exposes std::fs::Metadata directly instead of a validity bitset.
         let fixture = Fixture::new();
-        fixture.write("src/main.rs");
+        fs::write(fixture.root.join("five.bin"), b"12345").expect("write metadata fixture");
 
         let without_metadata = Walker::new(&fixture.root)
             .options(WalkOptions::default().sort(true))
@@ -1617,17 +1619,23 @@ mod tests {
             .options(WalkOptions::default().sort(true).metadata(true))
             .collect()
             .expect("walk succeeds");
-        assert_eq!(
-            with_metadata
-                .entries()
-                .iter()
-                .find(|entry| entry.path().ends_with("main.rs"))
-                .expect("fixture file is returned")
-                .metadata()
-                .expect("metadata is requested")
-                .len(),
-            7
-        );
+        let metadata = with_metadata
+            .entries()
+            .iter()
+            .find(|entry| entry.path().ends_with("five.bin"))
+            .expect("fixture file is returned")
+            .metadata()
+            .expect("metadata is requested");
+        assert_eq!(metadata.len(), 5);
+        assert!(metadata.is_file());
+        assert!(metadata.modified().is_ok());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            assert_ne!(metadata.ino(), 0);
+            assert_ne!(metadata.mode() & 0o400, 0);
+        }
     }
 
     #[test]

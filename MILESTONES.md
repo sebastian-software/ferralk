@@ -694,6 +694,10 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   omitted under the explicit Gitignore opt-in. The source fixture now asserts
   the same result multiset in serial, parallel, and stream modes, plus the
   unfiltered opt-out boundary.
+- Ported the public metadata assertions from frozen `test_walk.zig` onto
+  Ferralk's native `std::fs::Metadata` surface: metadata remains opt-in, the
+  five-byte fixture preserves its length, type, and modification timestamp,
+  and Unix additionally verifies a nonzero inode plus owner-readable mode.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no
