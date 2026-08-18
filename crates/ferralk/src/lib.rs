@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
-#![doc = "Portable, serial filesystem walking."]
+#![doc = "Portable filesystem walking."]
 
-//! A safe std::fs walker used as the portable M2 baseline.
+//! A safe std::fs walker with a portable `std::fs` backend.
 //!
 //! Paths stay as PathBuf throughout the public API. Patterns are matched
 //! against root-relative encoded path bytes; no filesystem result is converted
@@ -24,6 +24,7 @@ use ignore::gitignore::Gitignore;
 
 pub use ferralk_glob;
 
+mod parallel;
 mod scheduler;
 
 /// Controls what a walk does after a recoverable filesystem error.
@@ -208,6 +209,7 @@ pub struct Walker {
     error_policy: ErrorPolicy,
     cancellation: Option<CancellationToken>,
     respect_git_ignore: bool,
+    threads: usize,
 }
 
 impl Walker {
@@ -222,6 +224,9 @@ impl Walker {
             error_policy: ErrorPolicy::default(),
             cancellation: None,
             respect_git_ignore: false,
+            threads: std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1),
         }
     }
 
@@ -268,8 +273,22 @@ impl Walker {
         self
     }
 
-    /// Runs the serial portable backend to completion.
+    /// Limits `collect()` to this many workers. Zero is clamped to one;
+    /// `stream()` remains single-threaded to preserve incremental delivery.
+    #[must_use]
+    pub const fn threads(mut self, threads: usize) -> Self {
+        self.threads = if threads == 0 { 1 } else { threads };
+        self
+    }
+
+    /// Runs the portable backend to completion, using the configured workers.
+    ///
+    /// A panic inside a worker stops the sibling workers and is resumed on the
+    /// calling thread after they have been joined.
     pub fn collect(self) -> Result<WalkResult, WalkError> {
+        if self.threads > 1 {
+            return parallel::collect(self);
+        }
         let backend = StdBackend;
         let mut state = WalkState::new(&self);
         // Use the same injector-to-worker transfer as the forthcoming parallel
@@ -857,6 +876,36 @@ mod tests {
             vec![PathBuf::from("src/main.rs")]
         );
         assert!(result.errors().is_empty());
+    }
+
+    #[test]
+    fn parallel_collect_matches_the_serial_result_multiset() {
+        let fixture = Fixture::new();
+        fixture.write("wide/a.txt");
+        fixture.write("wide/b.txt");
+        fixture.write("deep/one/two/three/leaf.txt");
+        fixture.write("ignored.tmp");
+        fs::write(fixture.root.join(".gitignore"), b"*.tmp\n").expect("write gitignore");
+
+        let serial = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .threads(1)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("serial walk succeeds");
+        let parallel = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .threads(4)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("parallel walk succeeds");
+
+        assert_eq!(
+            relative_paths(parallel.entries(), &fixture.root),
+            relative_paths(serial.entries(), &fixture.root)
+        );
+        assert!(parallel.errors().is_empty());
+        assert!(serial.errors().is_empty());
     }
 
     #[test]

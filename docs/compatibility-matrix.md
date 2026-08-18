@@ -24,7 +24,7 @@ its rationale.
 
 | zlob capability / flag | ferralk API | Status | Notes |
 |---|---|---|---|
-| path traversal | `Walker::new` | In progress (M2) | Portable serial `std::fs` backend; parallelism remains M3. |
+| path traversal | `Walker::new` / `Walker::threads` | In progress (M3) | Portable `std::fs` backend; `collect()` uses a lazy work-stealing parallel scheduler while `stream()` remains incremental and single-threaded. |
 | `ZLOB_GITIGNORE` | `Walker::respect_git_ignore` | Implemented (M3) | Nested .gitignore chains, negation-aware descent, and shared-parent caching use `ignore`'s matcher. |
 | `ZLOB_FOLLOW_SYMLINKS` | `WalkOptions::follow_symlinks` | Implemented (M2) | Default off; canonical-path cycle guard when enabled. |
 | `ZLOB_MARK`, `ZLOB_ONLYDIR` | entry filter / display policy | Planned (M2) | No path-string mutation in core API. |

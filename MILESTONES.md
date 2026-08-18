@@ -100,7 +100,7 @@ faster than parallel `ignore` + pruning on all traversal corpora.
 - [ ] Loom models for queue and completion state
 - [ ] Stress tests: empty/shallow/imbalanced trees, visitor panic,
       worker-start failure
-- [ ] Invariant test: parallel == serial result multiset
+- [x] Invariant test: parallel == serial result multiset
 - [ ] Walker benchmarks vs parallel `ignore` and zlob in CodSpeed; verify the
       1.0 gate
 
@@ -312,3 +312,10 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   nodes that retain and share their cached parent chain. Nested precedence and
   re-inclusion continue to replay through the corpus, while a direct unit test
   verifies that sibling nodes reuse the same parent allocation.
+- Added an opt-in `Walker::threads` limit and a portable parallel `collect()`
+  path. The caller processes the root first, then lazily starts helpers only
+  when directory work exists; workers use local FIFO queues, the shared
+  injector, stealing, shared cancellation, and lossless mutex-protected error
+  collection. A sorted, imbalanced-tree fixture proves the one-worker and
+  four-worker result multisets agree. Result shards, loom models, and the
+  broader stress suite remain open.
