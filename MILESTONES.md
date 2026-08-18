@@ -303,3 +303,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   `collect()` and `stream()`, plus a Linux-gated non-UTF-8 path assertion.
   Unreadable-directory behaviour is still pending a permission-stable fixture
   strategy across CI platforms.
+- Began the M3 scheduler with a tested `crossbeam_deque::Injector` transfer
+  into a worker-local FIFO queue, now used by the serial walk dispatcher. Lazy
+  worker spawning, directory task fan-out, result shards, and all multi-thread
+  correctness invariants remain open; the scheduler checkbox is intentionally
+  not marked complete.

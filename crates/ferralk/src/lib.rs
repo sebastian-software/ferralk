@@ -24,6 +24,8 @@ use ignore::gitignore::Gitignore;
 
 pub use ferralk_glob;
 
+mod scheduler;
+
 /// Controls what a walk does after a recoverable filesystem error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ErrorPolicy {
@@ -270,7 +272,16 @@ impl Walker {
     pub fn collect(self) -> Result<WalkResult, WalkError> {
         let backend = StdBackend;
         let mut state = WalkState::new(&self);
-        state.walk_directory(&backend, self.root.clone())?;
+        // Use the same injector-to-worker transfer as the forthcoming parallel
+        // backend. The serial baseline owns one local queue and deliberately
+        // drains it before returning; worker creation and task fan-out remain
+        // M3 work.
+        let scheduler = scheduler::Scheduler::new();
+        scheduler.push(self.root.clone());
+        let worker = scheduler.worker();
+        while let Some(directory) = scheduler.steal_into(&worker).or_else(|| worker.pop()) {
+            state.walk_directory(&backend, directory)?;
+        }
         if self.options.sort {
             state
                 .entries
