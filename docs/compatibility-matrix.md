@@ -12,7 +12,7 @@ its rationale.
 | `*`, `?`, separators | `Pattern::compile` / `Pattern::is_match` | In progress (M1) | In-memory `*`/`?` are separator-agnostic; leading periods remain opt-in. |
 | `**` | `PatternOptions::recursive_double_star` | Planned (M1) | Explicit option. |
 | bracket classes, ranges, `[!...]`, `[^...]` | `Pattern::compile` | Planned (M1) | Byte-first. |
-| `ZLOB_BRACE` | `PatternOptions::braces` | Planned (M1) | Nested alternatives. |
+| `ZLOB_BRACE` | `PatternOptions::braces` | Implemented (M1) | Nested and empty alternatives; source-backed corpus import continues. |
 | `ZLOB_EXTGLOB` | `PatternOptions::extglob` | Planned (M1) | Bash operators. |
 | `ZLOB_PERIOD` | `PatternOptions::match_hidden` | Planned (M1) | Default remains off. |
 | `ZLOB_NOESCAPE` | `PatternOptions::escape` | Planned (M1) | Higher-level boolean, not a bitflag. |

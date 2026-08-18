@@ -176,3 +176,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   in-memory matching lets `*` cross separators, while its leading-period rule
   still applies at every component boundary. A trailing escape is a literal
   backslash. Both behaviours now have source provenance in the corpus.
+- Nested and empty brace alternatives are compiled into immutable matcher
+  branches. The implementation is covered by direct unit tests and initial
+  source-provenanced corpus cases; the mechanical-port checkpoint stays open
+  until its provenance review and the remaining upstream brace cases are
+  imported under the corpus-port item.

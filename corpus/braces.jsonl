@@ -1,0 +1,3 @@
+{"id":"brace-001","pattern":"{a,b,c}.txt","path":"b.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3","note":"Ported from test/test_brace.zig: ZLOB_BRACE - basic brace expansion."}
+{"id":"brace-002","pattern":"{a,{b,c}}.txt","path":"c.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3","note":"Ported from test/test_brace.zig: ZLOB_BRACE - nested braces {a,{b,c}}.txt."}
+{"id":"brace-003","pattern":"test{,_suffix}.txt","path":"test.txt","flags":["braces"],"expected":true,"source":"zlob_1_6_3","note":"Ported from test/test_brace.zig: ZLOB_BRACE - empty alternatives."}

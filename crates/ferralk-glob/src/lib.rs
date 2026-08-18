@@ -4,16 +4,15 @@
 //! Compiled, byte-first glob patterns with explicit behaviour-changing options.
 //!
 //! The M1 implementation currently covers literals, `*`, `?`, `**`, character
-//! classes, escapes, leading-period handling, and ASCII case folding. Brace
-//! expansion and extglobs remain deliberately unimplemented while the frozen
-//! zlob 1.6.3 source contract is being verified.
+//! classes, escapes, leading-period handling, ASCII case folding, and nested
+//! brace expansion. Extglobs remain deliberately unimplemented.
 
 use std::{collections::HashSet, error::Error, fmt};
 
 /// A compiled glob pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern {
-    tokens: Vec<Token>,
+    alternatives: Vec<Vec<Token>>,
     options: PatternOptions,
 }
 
@@ -42,7 +41,7 @@ impl Default for PatternOptions {
 }
 
 impl PatternOptions {
-    /// Enables nested brace alternatives. Parsing is added in a later M1 step.
+    /// Enables nested brace alternatives.
     #[must_use]
     pub const fn braces(mut self, enabled: bool) -> Self {
         self.braces = enabled;
@@ -119,13 +118,23 @@ impl Pattern {
         options: PatternOptions,
     ) -> Result<Self, PatternError> {
         let pattern = pattern.as_ref();
-        if options.braces && pattern.iter().any(|byte| matches!(byte, b'{' | b'}')) {
-            return Err(PatternError {
-                offset: pattern
-                    .iter()
-                    .position(|byte| matches!(byte, b'{' | b'}'))
-                    .expect("the checked pattern contains a brace"),
-                message: "brace expansion is not implemented",
+        if options.braces {
+            let parse_options = PatternOptions {
+                braces: false,
+                ..options
+            };
+            let alternatives = expand_braces(pattern, options.escape)?
+                .into_iter()
+                .map(|alternative| {
+                    Self::compile(alternative, parse_options).map(|pattern| pattern.alternatives)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            return Ok(Self {
+                alternatives,
+                options,
             });
         }
         if options.extglob
@@ -199,7 +208,10 @@ impl Pattern {
         }
         flush_literals(&mut tokens, &mut literals);
 
-        Ok(Self { tokens, options })
+        Ok(Self {
+            alternatives: vec![tokens],
+            options,
+        })
     }
 
     /// Reports whether a pattern is syntactically valid without retaining it.
@@ -214,39 +226,44 @@ impl Pattern {
     #[must_use]
     pub fn is_match(&self, path: impl AsRef<[u8]>) -> bool {
         let path = path.as_ref();
-        let mut failed = HashSet::new();
-        self.matches_from(0, 0, path, &mut failed)
+        self.alternatives.iter().any(|tokens| {
+            let mut failed = HashSet::new();
+            self.matches_from(tokens, 0, 0, path, &mut failed)
+        })
     }
 
     fn matches_from(
         &self,
+        tokens: &[Token],
         token_index: usize,
         path_index: usize,
         path: &[u8],
         failed: &mut HashSet<(usize, usize)>,
     ) -> bool {
-        if token_index == self.tokens.len() {
+        if token_index == tokens.len() {
             return path_index == path.len();
         }
         if !failed.insert((token_index, path_index)) {
             return false;
         }
 
-        let matches = match &self.tokens[token_index] {
+        let matches = match &tokens[token_index] {
             Token::Literal(literal) => {
-                self.match_literal(token_index, path_index, path, failed, literal)
+                self.match_literal(tokens, token_index, path_index, path, failed, literal)
             }
             Token::Separator => {
                 path.get(path_index).is_some_and(|byte| is_separator(*byte))
-                    && self.matches_from(token_index + 1, path_index + 1, path, failed)
+                    && self.matches_from(tokens, token_index + 1, path_index + 1, path, failed)
             }
-            Token::Any => self.match_one(token_index, path_index, path, failed, |_| true),
-            Token::Class(class) => self.match_one(token_index, path_index, path, failed, |byte| {
-                class.matches(byte, self.options.case_insensitive)
-            }),
-            Token::Star => self.match_star(token_index, path_index, path, failed, false),
+            Token::Any => self.match_one(tokens, token_index, path_index, path, failed, |_| true),
+            Token::Class(class) => {
+                self.match_one(tokens, token_index, path_index, path, failed, |byte| {
+                    class.matches(byte, self.options.case_insensitive)
+                })
+            }
+            Token::Star => self.match_star(tokens, token_index, path_index, path, failed),
             Token::RecursiveStar | Token::RecursivePrefix => {
-                self.match_star(token_index, path_index, path, failed, true)
+                self.match_star(tokens, token_index, path_index, path, failed)
             }
         };
 
@@ -258,6 +275,7 @@ impl Pattern {
 
     fn match_literal(
         &self,
+        tokens: &[Token],
         token_index: usize,
         path_index: usize,
         path: &[u8],
@@ -270,7 +288,13 @@ impl Pattern {
         if literal.iter().zip(candidate).all(|(&expected, &actual)| {
             bytes_equal(expected, actual, self.options.case_insensitive)
         }) {
-            self.matches_from(token_index + 1, path_index + literal.len(), path, failed)
+            self.matches_from(
+                tokens,
+                token_index + 1,
+                path_index + literal.len(),
+                path,
+                failed,
+            )
         } else {
             false
         }
@@ -278,6 +302,7 @@ impl Pattern {
 
     fn match_one(
         &self,
+        tokens: &[Token],
         token_index: usize,
         path_index: usize,
         path: &[u8],
@@ -289,19 +314,19 @@ impl Pattern {
                 && (self.options.match_hidden
                     || byte != b'.'
                     || !at_component_start(path, path_index))
-                && self.matches_from(token_index + 1, path_index + 1, path, failed)
+                && self.matches_from(tokens, token_index + 1, path_index + 1, path, failed)
         })
     }
 
     fn match_star(
         &self,
+        tokens: &[Token],
         token_index: usize,
         path_index: usize,
         path: &[u8],
         failed: &mut HashSet<(usize, usize)>,
-        _recursive: bool,
     ) -> bool {
-        if self.matches_from(token_index + 1, path_index, path, failed) {
+        if self.matches_from(tokens, token_index + 1, path_index, path, failed) {
             return true;
         }
         let Some(&byte) = path.get(path_index) else {
@@ -310,7 +335,7 @@ impl Pattern {
         if !self.options.match_hidden && byte == b'.' && at_component_start(path, path_index) {
             return false;
         }
-        self.matches_from(token_index, path_index + 1, path, failed)
+        self.matches_from(tokens, token_index, path_index + 1, path, failed)
     }
 }
 
@@ -433,6 +458,89 @@ fn flush_literals(tokens: &mut Vec<Token>, literals: &mut Vec<u8>) {
     }
 }
 
+fn expand_braces(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8>>, PatternError> {
+    let Some(open) = first_unescaped_brace(pattern, escapes) else {
+        return Ok(vec![pattern.to_vec()]);
+    };
+    let Some(close) = matching_brace(pattern, open, escapes) else {
+        // zlob treats an unmatched brace as ordinary text.
+        return Ok(vec![pattern.to_vec()]);
+    };
+
+    let alternatives = split_brace_alternatives(&pattern[open + 1..close], escapes);
+    let mut expanded = Vec::new();
+    for alternative in alternatives {
+        let mut combined = Vec::with_capacity(open + alternative.len() + pattern.len() - close - 1);
+        combined.extend_from_slice(&pattern[..open]);
+        combined.extend_from_slice(alternative);
+        combined.extend_from_slice(&pattern[close + 1..]);
+        expanded.extend(expand_braces(&combined, escapes)?);
+    }
+    Ok(expanded)
+}
+
+fn first_unescaped_brace(pattern: &[u8], escapes: bool) -> Option<usize> {
+    let mut index = 0;
+    while index < pattern.len() {
+        if escapes && pattern[index] == b'\\' {
+            index += 2;
+        } else if pattern[index] == b'{' {
+            return Some(index);
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+fn matching_brace(pattern: &[u8], open: usize, escapes: bool) -> Option<usize> {
+    let mut depth = 0_usize;
+    let mut index = open;
+    while index < pattern.len() {
+        if escapes && pattern[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        match pattern[index] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn split_brace_alternatives(content: &[u8], escapes: bool) -> Vec<&[u8]> {
+    let mut alternatives = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_usize;
+    let mut index = 0;
+    while index < content.len() {
+        if escapes && content[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        match content[index] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                alternatives.push(&content[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    alternatives.push(&content[start..]);
+    alternatives
+}
+
 fn is_separator(byte: u8) -> bool {
     byte == b'/' || (cfg!(windows) && byte == b'\\')
 }
@@ -497,6 +605,21 @@ mod tests {
         assert!(compile("file[!0-9].rs").is_match("filex.rs"));
         assert!(compile("file[^0-9].rs").is_match("filex.rs"));
         assert!(!compile("file[!0-9].rs").is_match("file7.rs"));
+    }
+
+    #[test]
+    fn braces_expand_nested_and_empty_alternatives() {
+        let options = PatternOptions::default().braces(true);
+        let pattern = Pattern::compile("{src,{lib,bin}}/*.{rs,toml}", options).unwrap();
+        assert!(pattern.is_match("src/main.rs"));
+        assert!(pattern.is_match("lib/Cargo.toml"));
+        assert!(pattern.is_match("bin/main.rs"));
+        assert!(!pattern.is_match("tests/main.rs"));
+        assert!(
+            Pattern::compile("test{,_suffix}.txt", options)
+                .unwrap()
+                .is_match("test_suffix.txt")
+        );
     }
 
     #[test]
