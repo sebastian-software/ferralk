@@ -1,0 +1,144 @@
+# ferralk Milestone Plan
+
+Working backlog for the port. Check items off as they land; one item should
+roughly correspond to one PR. A milestone is done when every box is checked
+and its exit criterion holds. Architecture: [RFC](RFC-zig-free-zlob-port.md);
+individual decisions: [ADRs](docs/adr/README.md).
+
+Milestones M0–M4 are sequential; M5 starts only after 1.0 (ADR-0010).
+
+---
+
+## M0 — Foundation (RFC Phase 0, ~1–2 weeks)
+
+**Exit criterion:** the corpus replays in CI without a Zig toolchain, and
+disputed or undefined zlob semantics are captured as flagged corpus cases.
+
+- [ ] Scaffold the Cargo workspace: `ferralk-glob`, `ferralk`, plus
+      unpublished `corpus`, `harness`, `bench`, and `oracle` (excluded from
+      default members) — ADR-0003
+- [ ] Add LICENSE (MIT) and NOTICE with zlob attribution — ADR-0001
+- [ ] Set up the Ferroni repo blueprint: CI for Linux/macOS/Windows, dedicated
+      MSRV job, release-please, renovate, codecov, CodSpeed — ADR-0004,
+      ADR-0012
+- [ ] Define the corpus schema: JSONL layout, `\xNN` byte-escape codec
+      (encoder/decoder in Rust), JSON Schema documentation — ADR-0007
+- [ ] Inventory the zlob 1.6.3 Rust and C APIs and all flags; write the
+      compatibility matrix document
+- [ ] Port zlob's own test suite 1:1 into the corpus — ADR-0007
+- [ ] Build the `oracle` crate (zlob 1.6.3 as dev-dependency) with a manually
+      triggered corpus-regen workflow — ADR-0007
+- [ ] Wire `fast-glob` (oxc) into the harness as second reference for the
+      common syntax subset — ADR-0007
+- [ ] Build the `git check-ignore` oracle runner for ignore cases — ADR-0006
+- [ ] Record disputed/undefined semantics as corpus cases with a `disputed`
+      flag
+- [ ] Send the courtesy notice to the zlob maintainer — ADR-0001
+
+## M1 — Matcher port (RFC Phase 1, ~3–5 weeks)
+
+**Exit criterion:** `ferralk-glob` passes the full matcher corpus; portable
+matcher ≤1.5x zlob median, ≤1.25x `fast-glob` median on the common subset.
+
+- [ ] Mechanical port: pattern tokenizer/parser (provenance headers) —
+      ADR-0002
+- [ ] Mechanical port: core wildcard and `**` matching
+- [ ] Mechanical port: character classes (incl. `[!...]`/`[^...]`, ranges,
+      escapes)
+- [ ] Mechanical port: brace expansion (nested alternatives)
+- [ ] Mechanical port: extglob operators
+- [ ] Leading-period rules, case-folding option, escape handling
+- [ ] Public API: `Pattern::compile`, `PatternOptions`, `is_match`,
+      `validate`; byte-first with `&str` convenience — ADR-0005
+- [ ] Matcher corpus green (all topic files except `ignore.jsonl`)
+- [ ] Run differential generation against the oracle; triage every
+      disagreement into the corpus — ADR-0007
+- [ ] Property tests (literal-only patterns, subset/superset invariants)
+- [ ] Fuzzers for parser and matcher with seeded corpora
+- [ ] Refactor the ported code toward the immutable IR (after corpus green) —
+      ADR-0002
+- [ ] Profile, then apply memchr/memmem hot-path primitives — ADR-0008
+- [ ] Matcher benchmarks vs zlob, `fast-glob`, and `globset` in CodSpeed;
+      verify both budgets — ADR-0013
+- [ ] Publish `ferralk-glob` 0.1
+
+## M2 — Portable walker (RFC Phase 2, ~3–4 weeks)
+
+**Exit criterion:** production-usable serial walker on `std::fs`, native path
+preservation, structured errors.
+
+- [ ] Backend trait + portable `std::fs::read_dir` backend
+- [ ] `Walker` builder: include/exclude, `WalkOptions`, POSIX-conservative
+      defaults — ADR-0011
+- [ ] Conservative prune planner: literal roots, whole-subtree excludes,
+      extension filters, negation guard
+- [ ] Native path preservation end-to-end (`Path`/`PathBuf`, no lossy
+      conversion) — ADR-0005
+- [ ] Error model: `ErrorPolicy::{Abort,Skip,Collect}` with `Collect` default
+- [ ] Symlink policy and cycle detection
+- [ ] Optional sorting and metadata collection
+- [ ] Streaming iterator with cancellation; `collect()` result shape
+- [ ] Filesystem fixture builders + integration tests (unreadable dirs,
+      disappearing files, non-UTF-8 names)
+- [ ] Publish `ferralk` 0.1 (serial)
+
+## M3 — Ignore semantics & parallel scheduler (RFC Phase 3, ~3–5 weeks)
+
+**Exit criterion:** single- and multi-thread walks produce identical result
+multisets across the corpus; no hangs or lost errors under stress; walker
+faster than parallel `ignore` + pruning on all traversal corpora.
+
+- [ ] Nested ignore chains via the `ignore` crate's rule matcher;
+      per-directory nodes with shared-parent caching — ADR-0006
+- [ ] Negation-aware pruning guard (never prune when a later rule may
+      re-include)
+- [ ] `ignore.jsonl` corpus green against `git check-ignore`
+- [ ] Scheduler: `crossbeam-deque` work stealing, lazy worker spawn,
+      per-worker scratch and result shards — ADR-0009
+- [ ] Single cancellation state, lossless error channel, documented panic
+      propagation
+- [ ] Loom models for queue and completion state
+- [ ] Stress tests: empty/shallow/imbalanced trees, visitor panic,
+      worker-start failure
+- [ ] Invariant test: parallel == serial result multiset
+- [ ] Walker benchmarks vs parallel `ignore` and zlob in CodSpeed; verify the
+      1.0 gate
+
+## M4 — Stabilization & 1.0 (RFC Phase 5, ~2–4 weeks)
+
+**Exit criterion:** 1.0 published, portable on all platforms, Windows tier-2
+CI green — ADR-0010.
+
+- [ ] Compatibility guide: zlob API mapping and all deliberate divergences
+- [ ] Downstream trial: integrate into Palamedes, fold feedback back
+- [ ] MSRV and feature audit; API review (cargo-semver-checks in CI)
+- [ ] Dependency and unsafe audit (expected: zero unsafe before M5)
+- [ ] Oracle retirement check: corpus is self-sufficient, Zig-free CI
+      confirmed — ADR-0007
+- [ ] Publish benchmarks
+- [ ] Release `ferralk-glob` 1.0 and `ferralk` 1.0
+
+## M5 — Native backends (RFC Phase 4, post-1.0, ~6–12 weeks)
+
+**Exit criterion per backend:** safety review passed, portable/native parity
+on the corpus, within 20% of zlob median on that platform, p95 regression
+≤35% — ADR-0010. Backends ship as feature-gated 1.x releases.
+
+### macOS (first)
+
+- [ ] `getdirentries64` backend behind a feature flag
+- [ ] `getattrlistbulk` batch metadata with capability detection and portable
+      fallback (SMB/FUSE)
+- [ ] Bounds-checked record parsing with module-level invariants; fuzz the
+      record decoder
+- [ ] Differential tests portable vs native; sanitizers in CI
+- [ ] Benchmark gate on macOS
+
+### Linux (second)
+
+- [ ] Batched `getdents64` backend behind a feature flag
+- [ ] `statx` only where metadata is requested
+- [ ] Bounds-checked record parsing; fuzz the record decoder; Miri where
+      executable
+- [ ] Differential tests portable vs native; sanitizers in CI
+- [ ] Benchmark gate on Linux
