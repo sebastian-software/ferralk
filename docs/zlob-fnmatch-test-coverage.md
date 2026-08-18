@@ -39,6 +39,11 @@ brace components, brace-plus-suffix expansion, and brace-prefixed recursive
 selection. Filesystem-only fixture setup remains outside this in-memory API
 coverage boundary.
 
+`test/test_internal.zig` additionally supplies eleven public `matchPaths`
+scenarios in the same corpus, covering wildcards, classes, literal and empty
+inputs, component paths, and filename punctuation. Its SIMD-helper assertions
+remain implementation-private and are excluded below.
+
 The anchored, recursive, and allowlist examples from `test/test_gitignore.zig`
 are represented in [`corpus/ignore.jsonl`](../corpus/ignore.jsonl). Their
 source provenance remains zlob, but the `expected` value is deliberately

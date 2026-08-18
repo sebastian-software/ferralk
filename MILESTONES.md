@@ -607,3 +607,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   `test_absolute_paths.zig`: multi-branch brace components, brace-plus-suffix
   expansion, and brace-prefixed recursive C-file selection. The normal
   harness and pinned Rust oracle both replay the ordered results.
+- Imported all eleven public in-memory `matchPaths` assertions from frozen
+  `test_internal.zig`. They cover wildcard, class, literal, empty, directory,
+  and punctuation inputs; source-side result sorting is documented while
+  Ferralk continues to preserve caller input order. The file's SIMD helpers
+  remain excluded as private implementation detail.
