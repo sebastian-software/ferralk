@@ -554,3 +554,11 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   file that exercise `matchPathsAt`, index-returning APIs, C-string chunking,
   or private component-buffer limits are tracked as API/implementation work,
   not as a frozen-reference blocker.
+- The absolute-path fixture suite exposed a zlob surface disagreement around
+  empty Extglob branches: its filesystem glob excludes `.c` for `?(a|b).c`
+  without `PERIOD`, but Rust `matchPaths` accepts it. Ferralk now rejects that
+  wildcard-only hidden-component match unless `match_hidden` is enabled; the
+  corpus retains the Rust output in `oracle_matches` as a disputed case.
+  The same suite's `*(ab).c` filesystem assertion is also retained with its
+  Rust `matchPaths` no-result output, rather than allowing that independent
+  FFI/API discrepancy to weaken the Path-List contract.

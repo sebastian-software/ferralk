@@ -1060,6 +1060,12 @@ fn match_extglob_from(
     while path_index < path.len() || pattern_index < pattern.len() {
         if pattern_index < pattern.len() {
             if let Some(kind) = detect_extglob_at(pattern, pattern_index) {
+                if !options.match_hidden
+                    && path.get(path_index) == Some(&b'.')
+                    && at_component_start(path, path_index)
+                {
+                    return false;
+                }
                 let open = pattern_index + 1;
                 if let Some(close) = closing_extglob_parenthesis(pattern, open, options.escape) {
                     let alternatives =
@@ -1140,6 +1146,12 @@ fn match_extglob_from(
         }
 
         if has_star && star_path_index < path.len() {
+            if !options.match_hidden
+                && path.get(star_path_index) == Some(&b'.')
+                && at_component_start(path, star_path_index)
+            {
+                return false;
+            }
             pattern_index = star_pattern_index;
             star_path_index += 1;
             path_index = star_path_index;
@@ -1374,6 +1386,26 @@ mod tests {
                 .unwrap()
                 .is_match("foo")
         );
+    }
+
+    #[test]
+    fn extglob_zero_width_forms_honor_leading_period_policy() {
+        let optional = Pattern::compile("?(a|b).c", PatternOptions::default().extglob(true))
+            .expect("optional extglob compiles");
+        assert!(!optional.is_match(".c"));
+        assert!(optional.is_match("a.c"));
+
+        let repeating = Pattern::compile("*(ab).c", PatternOptions::default().extglob(true))
+            .expect("repeating extglob compiles");
+        assert!(!repeating.is_match(".c"));
+        assert!(repeating.is_match("ab.c"));
+
+        let hidden = Pattern::compile(
+            "?(a|b).c",
+            PatternOptions::default().extglob(true).match_hidden(true),
+        )
+        .expect("period-enabled optional extglob compiles");
+        assert!(hidden.is_match(".c"));
     }
 
     #[test]
