@@ -660,3 +660,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   classification preserves a symlink's identity even when following it for
   traversal; the existing Unix cycle fixture asserts both the reported symlink
   kind and the deduplicated target traversal.
+- Added `docs/zlob-test-suite-audit.md`, a frozen-source inventory that
+  separates replayed public semantics from deliberate C ABI, loader, and
+  system-runtime exclusions. It makes the still-open M0 whole-suite item a
+  concrete scope decision rather than an unspecified blocker.

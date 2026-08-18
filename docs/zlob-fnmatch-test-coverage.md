@@ -53,6 +53,9 @@ scenarios in the same corpus, covering wildcards, classes, literal and empty
 inputs, component paths, and filename punctuation. Its SIMD-helper assertions
 remain implementation-private and are excluded below.
 
+[`zlob-test-suite-audit.md`](zlob-test-suite-audit.md) records the wider frozen
+test-tree boundary, including C ABI, loader, and system-runtime exclusions.
+
 The anchored, recursive, and allowlist examples from `test/test_gitignore.zig`
 are represented in [`corpus/ignore.jsonl`](../corpus/ignore.jsonl). Their
 source provenance remains zlob, but the `expected` value is deliberately
