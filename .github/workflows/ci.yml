@@ -35,6 +35,20 @@ jobs:
       - run: cargo check
       - run: cargo check -p corpus -p harness -p bench
 
+  semver:
+    name: public API compatibility
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check published crate APIs against the PR base
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: ferralk-glob,ferralk
+          baseline-rev: ${{ github.event.pull_request.base.sha }}
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest

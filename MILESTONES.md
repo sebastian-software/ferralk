@@ -111,7 +111,7 @@ CI green — ADR-0010.
 
 - [x] Compatibility guide: zlob API mapping and all deliberate divergences
 - [ ] Downstream trial: integrate into Palamedes, fold feedback back
-- [ ] MSRV and feature audit; API review (cargo-semver-checks in CI)
+- [x] MSRV and feature audit; API review (cargo-semver-checks in CI)
 - [ ] Dependency and unsafe audit (expected: zero unsafe before M5)
 - [ ] Oracle retirement check: corpus is self-sufficient, Zig-free CI
       confirmed — ADR-0007
@@ -369,3 +369,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   matrix. It maps the supported matcher and walker APIs and calls out every
   deliberate compatibility difference, deferred result-shaping policy, and
   currently unsupported walker flag.
+- Added a pull-request-only SemVer API gate for `ferralk-glob` and `ferralk`
+  against the PR base revision. The existing Rust 1.93 MSRV job remains the
+  compile gate; the workspace currently defines no Cargo feature sets, which
+  was confirmed by the feature audit.
