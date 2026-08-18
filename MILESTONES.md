@@ -562,3 +562,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   The same suite's `*(ab).c` filesystem assertion is also retained with its
   Rust `matchPaths` no-result output, rather than allowing that independent
   FFI/API discrepancy to weaken the Path-List contract.
+- `Pattern::compile` now builds a second immutable representation only for
+  component-sensitive path-list patterns. `filter_paths` selects it without
+  cloning or retokenizing per call, while root-only patterns keep their direct
+  fast path. The local ten-sample component-filter median improved from about
+  779 ns to 632 ns (roughly 19%); the root filter measured about 56 ns. The
+  broader immutable-IR refactor and cross-engine release budgets remain open.

@@ -21,6 +21,7 @@ use memchr::{memchr, memchr3, memmem};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern {
     alternatives: Vec<Alternative>,
+    path_filter_alternatives: Option<Vec<Alternative>>,
     options: PatternOptions,
 }
 
@@ -170,10 +171,7 @@ impl Pattern {
                 .into_iter()
                 .flatten()
                 .collect();
-            return Ok(Self {
-                alternatives,
-                options,
-            });
+            return Ok(Self::from_alternatives(alternatives, options));
         }
         let mut tokens = Vec::new();
         let mut literals = Vec::new();
@@ -231,14 +229,14 @@ impl Pattern {
         }
         flush_literals(&mut tokens, &mut literals);
 
-        Ok(Self {
-            alternatives: vec![Alternative {
+        Ok(Self::from_alternatives(
+            vec![Alternative {
                 raw: pattern.to_vec(),
                 fast_path: FastPath::compile(&tokens, options),
                 tokens,
             }],
             options,
-        })
+        ))
     }
 
     /// Reports whether a pattern is syntactically valid without retaining it.
@@ -253,14 +251,23 @@ impl Pattern {
     #[must_use]
     pub fn is_match(&self, path: impl AsRef<[u8]>) -> bool {
         let path = path.as_ref();
-        self.alternatives.iter().any(|alternative| {
-            if self.options.extglob && contains_extglob(&alternative.raw, self.options.escape) {
-                match_extglob(&alternative.raw, path, self.options)
+        self.is_match_with(&self.alternatives, self.options, path)
+    }
+
+    fn is_match_with(
+        &self,
+        alternatives: &[Alternative],
+        options: PatternOptions,
+        path: &[u8],
+    ) -> bool {
+        alternatives.iter().any(|alternative| {
+            if options.extglob && contains_extglob(&alternative.raw, options.escape) {
+                match_extglob(&alternative.raw, path, options)
             } else if let Some(fast_path) = &alternative.fast_path {
-                fast_path.is_match(path, self.options)
+                fast_path.is_match(path, options)
             } else {
                 let mut failed = FailedStates::new(&alternative.tokens, path);
-                self.matches_from(&alternative.tokens, 0, 0, path, &mut failed)
+                Self::matches_from(&alternative.tokens, 0, 0, path, options, &mut failed)
             }
         })
     }
@@ -274,34 +281,26 @@ impl Pattern {
     where
         T: AsRef<[u8]> + ?Sized + 'a,
     {
-        if !self.needs_path_filter_semantics() {
+        let Some(alternatives) = &self.path_filter_alternatives else {
             return paths
                 .into_iter()
                 .filter(|path| self.is_match(path.as_ref()))
                 .collect();
-        }
-        let mut matcher = self.clone();
-        matcher.options.component_wildcards = true;
-        for alternative in &mut matcher.alternatives {
-            alternative.fast_path = None;
-            let leading_dot_slash = alternative.raw.starts_with(b"./")
-                && matches!(alternative.tokens.as_slice(), [Token::Literal(dot), Token::Separator, ..] if dot == b".");
-            if leading_dot_slash {
-                alternative.raw.drain(..2);
-                alternative.tokens.drain(..2);
-            }
-            if !matcher.options.recursive_double_star {
-                alternative.tokens = path_list_tokens(std::mem::take(&mut alternative.tokens));
-            }
-        }
+        };
+        let options = PatternOptions {
+            component_wildcards: true,
+            ..self.options
+        };
         paths
             .into_iter()
-            .filter(|path| matcher.is_match(path.as_ref()))
+            .filter(|path| self.is_match_with(alternatives, options, path.as_ref()))
             .collect()
     }
 
-    fn needs_path_filter_semantics(&self) -> bool {
-        self.alternatives.iter().any(|alternative| {
+    fn from_alternatives(alternatives: Vec<Alternative>, options: PatternOptions) -> Self {
+        let path_filter_alternatives = alternatives
+            .iter()
+            .any(|alternative| {
             alternative.raw.starts_with(b"./")
                 || alternative.tokens.windows(2).any(|tokens| {
                     matches!(
@@ -309,15 +308,39 @@ impl Pattern {
                         [Token::Separator, Token::Any | Token::Star | Token::Class(_)]
                     )
                 })
-        })
+            })
+            .then(|| {
+                alternatives
+                    .iter()
+                    .cloned()
+                    .map(|mut alternative| {
+                        alternative.fast_path = None;
+                        let leading_dot_slash = alternative.raw.starts_with(b"./")
+                            && matches!(alternative.tokens.as_slice(), [Token::Literal(dot), Token::Separator, ..] if dot == b".");
+                        if leading_dot_slash {
+                            alternative.raw.drain(..2);
+                            alternative.tokens.drain(..2);
+                        }
+                        if !options.recursive_double_star {
+                            alternative.tokens = path_list_tokens(std::mem::take(&mut alternative.tokens));
+                        }
+                        alternative
+                    })
+                    .collect()
+            });
+        Self {
+            alternatives,
+            path_filter_alternatives,
+            options,
+        }
     }
 
     fn matches_from(
-        &self,
         tokens: &[Token],
         token_index: usize,
         path_index: usize,
         path: &[u8],
+        options: PatternOptions,
         failed: &mut FailedStates,
     ) -> bool {
         if token_index == tokens.len() {
@@ -328,32 +351,64 @@ impl Pattern {
         }
 
         let matches = match &tokens[token_index] {
-            Token::Literal(literal) => {
-                self.match_literal(tokens, token_index, path_index, path, failed, literal)
-            }
-            Token::Separator => {
-                path.get(path_index).is_some_and(|byte| is_separator(*byte))
-                    && self.matches_from(tokens, token_index + 1, path_index + 1, path, failed)
-            }
-            Token::Any => self.match_one(tokens, token_index, path_index, path, failed, |_| true),
-            Token::Class(class) => {
-                self.match_one(tokens, token_index, path_index, path, failed, |byte| {
-                    class.matches(byte, self.options.case_insensitive)
-                })
-            }
-            Token::Star => self.match_star(
+            Token::Literal(literal) => Self::match_literal(
                 tokens,
                 token_index,
                 path_index,
                 path,
+                options,
                 failed,
-                !self.component_wildcard(tokens, token_index),
+                literal,
             ),
-            Token::PathStar => {
-                self.match_star(tokens, token_index, path_index, path, failed, false)
+            Token::Separator => {
+                path.get(path_index).is_some_and(|byte| is_separator(*byte))
+                    && Self::matches_from(
+                        tokens,
+                        token_index + 1,
+                        path_index + 1,
+                        path,
+                        options,
+                        failed,
+                    )
             }
+            Token::Any => Self::match_one(
+                tokens,
+                token_index,
+                path_index,
+                path,
+                options,
+                failed,
+                |_| true,
+            ),
+            Token::Class(class) => Self::match_one(
+                tokens,
+                token_index,
+                path_index,
+                path,
+                options,
+                failed,
+                |byte| class.matches(byte, options.case_insensitive),
+            ),
+            Token::Star => Self::match_star(
+                tokens,
+                token_index,
+                path_index,
+                path,
+                options,
+                failed,
+                !Self::component_wildcard(tokens, token_index, options),
+            ),
+            Token::PathStar => Self::match_star(
+                tokens,
+                token_index,
+                path_index,
+                path,
+                options,
+                failed,
+                false,
+            ),
             Token::RecursiveStar | Token::RecursivePrefix => {
-                self.match_star(tokens, token_index, path_index, path, failed, true)
+                Self::match_star(tokens, token_index, path_index, path, options, failed, true)
             }
         };
 
@@ -363,32 +418,35 @@ impl Pattern {
         matches
     }
 
-    fn component_wildcard(&self, tokens: &[Token], token_index: usize) -> bool {
-        self.options.component_wildcards
+    fn component_wildcard(tokens: &[Token], token_index: usize, options: PatternOptions) -> bool {
+        options.component_wildcards
             && token_index > 0
             && matches!(tokens[token_index - 1], Token::Separator)
     }
 
     fn match_literal(
-        &self,
         tokens: &[Token],
         token_index: usize,
         path_index: usize,
         path: &[u8],
+        options: PatternOptions,
         failed: &mut FailedStates,
         literal: &[u8],
     ) -> bool {
         let Some(candidate) = path.get(path_index..path_index + literal.len()) else {
             return false;
         };
-        if literal.iter().zip(candidate).all(|(&expected, &actual)| {
-            bytes_equal(expected, actual, self.options.case_insensitive)
-        }) {
-            self.matches_from(
+        if literal
+            .iter()
+            .zip(candidate)
+            .all(|(&expected, &actual)| bytes_equal(expected, actual, options.case_insensitive))
+        {
+            Self::matches_from(
                 tokens,
                 token_index + 1,
                 path_index + literal.len(),
                 path,
+                options,
                 failed,
             )
         } else {
@@ -397,46 +455,51 @@ impl Pattern {
     }
 
     fn match_one(
-        &self,
         tokens: &[Token],
         token_index: usize,
         path_index: usize,
         path: &[u8],
+        options: PatternOptions,
         failed: &mut FailedStates,
         accepts: impl FnOnce(u8) -> bool,
     ) -> bool {
         path.get(path_index).is_some_and(|&byte| {
             accepts(byte)
-                && (!self.component_wildcard(tokens, token_index) || !is_separator(byte))
-                && (self.options.match_hidden
-                    || byte != b'.'
-                    || !at_component_start(path, path_index))
-                && self.matches_from(tokens, token_index + 1, path_index + 1, path, failed)
+                && (!Self::component_wildcard(tokens, token_index, options) || !is_separator(byte))
+                && (options.match_hidden || byte != b'.' || !at_component_start(path, path_index))
+                && Self::matches_from(
+                    tokens,
+                    token_index + 1,
+                    path_index + 1,
+                    path,
+                    options,
+                    failed,
+                )
         })
     }
 
     fn match_star(
-        &self,
         tokens: &[Token],
         token_index: usize,
         path_index: usize,
         path: &[u8],
+        options: PatternOptions,
         failed: &mut FailedStates,
         recursive: bool,
     ) -> bool {
-        if self.matches_from(tokens, token_index + 1, path_index, path, failed) {
+        if Self::matches_from(tokens, token_index + 1, path_index, path, options, failed) {
             return true;
         }
         let Some(&byte) = path.get(path_index) else {
             return false;
         };
-        if !recursive && self.options.component_wildcards && is_separator(byte) {
+        if !recursive && options.component_wildcards && is_separator(byte) {
             return false;
         }
-        if !self.options.match_hidden && byte == b'.' && at_component_start(path, path_index) {
+        if !options.match_hidden && byte == b'.' && at_component_start(path, path_index) {
             return false;
         }
-        self.matches_from(tokens, token_index, path_index + 1, path, failed)
+        Self::matches_from(tokens, token_index, path_index + 1, path, options, failed)
     }
 }
 
@@ -1545,6 +1608,25 @@ mod tests {
             vec![&"lua/init.lua", &"nvim/lua/setup.lua"]
         );
         assert!(pattern.is_match("nvim/lua/sub/nested.lua"));
+    }
+
+    #[test]
+    fn filter_paths_precompiles_its_component_sensitive_ir() {
+        let component_pattern = Pattern::compile("src/*.rs", PatternOptions::default())
+            .expect("component pattern compiles");
+        assert!(component_pattern.path_filter_alternatives.is_some());
+        assert!(
+            component_pattern
+                .path_filter_alternatives
+                .as_ref()
+                .is_some_and(|alternatives| alternatives
+                    .iter()
+                    .all(|alternative| alternative.fast_path.is_none()))
+        );
+
+        let root_pattern =
+            Pattern::compile("*.rs", PatternOptions::default()).expect("root pattern compiles");
+        assert!(root_pattern.path_filter_alternatives.is_none());
     }
 
     #[test]
