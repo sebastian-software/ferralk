@@ -269,7 +269,7 @@ impl Walker {
     /// Runs the serial portable backend to completion.
     pub fn collect(self) -> Result<WalkResult, WalkError> {
         let backend = StdBackend;
-        let mut state = WalkState::new(&self, root_gitignore(&self));
+        let mut state = WalkState::new(&self);
         state.walk_directory(&backend, self.root.clone())?;
         if self.options.sort {
             state
@@ -288,13 +288,11 @@ impl Walker {
     /// is intentionally a collect-only global operation.
     #[must_use]
     pub fn stream(self) -> WalkStream {
-        let gitignore = root_gitignore(&self);
         WalkStream {
             pending_directories: vec![self.root.clone()],
             walker: self,
             pending_entries: VecDeque::new(),
             visited_directories: HashSet::new(),
-            gitignore,
             cancelled: false,
             stopped: false,
         }
@@ -374,7 +372,6 @@ pub struct WalkStream {
     pending_directories: Vec<PathBuf>,
     pending_entries: VecDeque<BackendEntry>,
     visited_directories: HashSet<PathBuf>,
-    gitignore: Option<Gitignore>,
     cancelled: bool,
     stopped: bool,
 }
@@ -446,11 +443,7 @@ impl WalkStream {
         {
             return None;
         }
-        if self.gitignore.as_ref().is_some_and(|rules| {
-            rules
-                .matched_path_or_any_parents(&entry.path, entry.is_dir)
-                .is_ignore()
-        }) {
+        if is_git_ignored(&self.walker, &entry.path, entry.is_dir) {
             return None;
         }
         if entry.is_symlink && self.walker.options.follow_symlinks {
@@ -522,18 +515,16 @@ struct WalkState<'walker> {
     entries: Vec<WalkEntry>,
     errors: Vec<WalkError>,
     visited_directories: HashSet<PathBuf>,
-    gitignore: Option<Gitignore>,
     cancelled: bool,
 }
 
 impl<'walker> WalkState<'walker> {
-    fn new(walker: &'walker Walker, gitignore: Option<Gitignore>) -> Self {
+    fn new(walker: &'walker Walker) -> Self {
         Self {
             walker,
             entries: Vec::new(),
             errors: Vec::new(),
             visited_directories: HashSet::new(),
-            gitignore,
             cancelled: false,
         }
     }
@@ -593,11 +584,7 @@ impl<'walker> WalkState<'walker> {
         {
             return Ok(());
         }
-        if self.gitignore.as_ref().is_some_and(|rules| {
-            rules
-                .matched_path_or_any_parents(&entry.path, entry.is_dir)
-                .is_ignore()
-        }) {
+        if is_git_ignored(self.walker, &entry.path, entry.is_dir) {
             return Ok(());
         }
         if entry.is_symlink && self.walker.options.follow_symlinks {
@@ -676,10 +663,30 @@ impl<'walker> WalkState<'walker> {
     }
 }
 
-fn root_gitignore(walker: &Walker) -> Option<Gitignore> {
-    walker
-        .respect_git_ignore
-        .then(|| Gitignore::new(walker.root.join(".gitignore")).0)
+fn is_git_ignored(walker: &Walker, path: &Path, is_dir: bool) -> bool {
+    if !walker.respect_git_ignore {
+        return false;
+    }
+    let mut directories = Vec::new();
+    let mut current = path
+        .parent()
+        .filter(|parent| parent.starts_with(&walker.root));
+    while let Some(directory) = current {
+        directories.push(directory);
+        if directory == walker.root {
+            break;
+        }
+        current = directory.parent();
+    }
+    let mut ignored = false;
+    for directory in directories.into_iter().rev() {
+        let (rules, _) = Gitignore::new(directory.join(".gitignore"));
+        let matched = rules.matched_path_or_any_parents(path, is_dir);
+        if !matched.is_none() {
+            ignored = matched.is_ignore();
+        }
+    }
+    ignored
 }
 
 /// Crate version exposed for build and integration diagnostics.
@@ -807,8 +814,11 @@ mod tests {
         fixture.write("generated.tmp");
         fixture.write("keep.tmp");
         fixture.write("src/main.rs");
+        fixture.write("src/keep.tmp");
         fs::write(fixture.root.join(".gitignore"), b"*.tmp\n!keep.tmp\n")
             .expect("write root gitignore");
+        fs::write(fixture.root.join("src/.gitignore"), b"!keep.tmp\n")
+            .expect("write nested gitignore");
 
         let collected = Walker::new(&fixture.root)
             .respect_git_ignore(true)
@@ -818,6 +828,7 @@ mod tests {
         let collected_paths = relative_paths(collected.entries(), &fixture.root);
         assert!(!collected_paths.contains(&PathBuf::from("generated.tmp")));
         assert!(collected_paths.contains(&PathBuf::from("keep.tmp")));
+        assert!(collected_paths.contains(&PathBuf::from("src/keep.tmp")));
 
         let streamed = Walker::new(&fixture.root)
             .respect_git_ignore(true)
@@ -827,6 +838,7 @@ mod tests {
         let streamed_paths = relative_paths(&streamed, &fixture.root);
         assert!(!streamed_paths.contains(&PathBuf::from("generated.tmp")));
         assert!(streamed_paths.contains(&PathBuf::from("keep.tmp")));
+        assert!(streamed_paths.contains(&PathBuf::from("src/keep.tmp")));
     }
 
     #[test]

@@ -284,3 +284,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   `stream()`, backed directly by `ignore::Gitignore`. A fixture verifies
   ordinary ignore and `!` re-inclusion; nested per-directory chains and their
   pruning guard remain open M3 work.
+- Extended that matcher to evaluate each ancestor `.gitignore` in precedence
+  order, so a nested `!` rule can re-include a file excluded by the root.
+  The fixture covers both collect and stream. This correctness-first form
+  rebuilds matchers on demand; shared-parent caching remains open M3 work.
