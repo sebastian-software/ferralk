@@ -386,6 +386,10 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   121-package lockfile scanned clean against 1,217 advisories. Combined with
   the zero-unsafe source scan and the committed CI gate, this closes the M4
   dependency/unsafe audit before native backend work.
+- Release-preflight: `cargo package --no-verify` packages `ferralk-glob`
+  0.1.0 successfully. `ferralk` deliberately cannot prepare an upload until
+  that dependency exists on crates.io, so publication must happen in order
+  (`ferralk-glob` first) and requires maintainer registry authority.
 - Added `WalkOptions::directories_only` as the non-mutating `ZLOB_ONLYDIR`
   mapping. It filters returned files while preserving descent into directories
   across serial, parallel, and streaming walks; `ZLOB_MARK` remains the
