@@ -18,6 +18,10 @@ pub struct Case {
     /// Behaviour switches in the compatibility matrix namespace.
     #[serde(default)]
     pub flags: Vec<String>,
+    /// Newline-delimited rules placed in the synthetic `.gitignore` by the
+    /// Git oracle. Used only by `ignore.jsonl` cases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_rules: Vec<String>,
     /// Whether the expression accepts the candidate path.
     pub expected: bool,
     /// Result produced by the named external oracle when it intentionally

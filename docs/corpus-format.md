@@ -16,6 +16,7 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | `pattern` | yes | Glob or ignore expression using the byte codec below. |
 | `path` | yes | Candidate path using the byte codec below. |
 | `flags` | no | Ordered behaviour switches from the compatibility matrix. |
+| `ignore_rules` | no | Lines written to a synthetic `.gitignore` for an ignore case. |
 | `expected` | yes | Whether the expression accepts the candidate. |
 | `oracle_expected` | no | The external-oracle result when it deliberately differs from `expected`. |
 | `source` | yes | `zlob_1_6_3`, `fast_glob`, `git_check_ignore`, or `handwritten`. |
@@ -27,6 +28,12 @@ The initial topic files are `wildcards.jsonl`, `classes.jsonl`,
 `ignore.jsonl`. Files are added when a topic gains a case. Case IDs do not
 change once published; a changed expected value is a new case plus an
 explanation in `note`.
+
+For `ignore.jsonl`, `pattern` is the primary rule for quick review and
+`ignore_rules` is the complete ordered rule chain. The Git oracle creates an
+isolated repository, writes those lines into `.gitignore`, creates `path`, and
+uses `git check-ignore --no-index --quiet -- path`. This keeps nested/negated
+behaviour tied to Git rather than to ferralk implementation details.
 
 ## Byte codec
 

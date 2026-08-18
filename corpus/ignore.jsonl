@@ -1,0 +1,3 @@
+{"id":"ignore-001","pattern":"*.log","path":"debug.log","flags":[],"ignore_rules":["*.log"],"expected":true,"source":"git_check_ignore","note":"Basic suffix rule."}
+{"id":"ignore-002","pattern":"*.log","path":"important.log","flags":[],"ignore_rules":["*.log","!important.log"],"expected":false,"source":"git_check_ignore","note":"A later negation re-includes the file."}
+{"id":"ignore-003","pattern":"build/","path":"build/main.o","flags":[],"ignore_rules":["build/"],"expected":true,"source":"git_check_ignore","note":"Directory rule applies to descendants."}

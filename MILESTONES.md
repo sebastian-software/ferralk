@@ -30,7 +30,7 @@ disputed or undefined zlob semantics are captured as flagged corpus cases.
       triggered corpus-regen workflow — ADR-0007
 - [ ] Wire `fast-glob` (oxc) into the harness as second reference for the
       common syntax subset — ADR-0007
-- [ ] Build the `git check-ignore` oracle runner for ignore cases — ADR-0006
+- [x] Build the `git check-ignore` oracle runner for ignore cases — ADR-0006
 - [x] Record disputed/undefined semantics as corpus cases with a `disputed`
       flag
 - [ ] Send the courtesy notice to the zlob maintainer — ADR-0001
@@ -193,3 +193,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   remaining standard byte classes) to the compiled matcher. Initial imported
   cases pass both the Zig-free harness and the zlob oracle; the mechanical-port
   checklist entry remains open pending the complete upstream class suite.
+- Added an isolated `git check-ignore --no-index` runner and a seed
+  `ignore.jsonl` with ordinary, negated, and directory-rule cases. Its normal
+  harness integration verifies that Git remains the normative source before
+  the M3 `ignore`-crate matcher is introduced.

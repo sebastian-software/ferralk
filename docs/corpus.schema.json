@@ -10,6 +10,7 @@
     "pattern": { "type": "string" },
     "path": { "type": "string" },
     "flags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "default": [] },
+    "ignore_rules": { "type": "array", "items": { "type": "string" }, "default": [] },
     "expected": { "type": "boolean" },
     "oracle_expected": { "type": "boolean" },
     "source": { "enum": ["zlob_1_6_3", "fast_glob", "git_check_ignore", "handwritten"] },
