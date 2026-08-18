@@ -326,6 +326,7 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
             .excludes
             .iter()
             .any(|pattern| pattern.covers_subtree(bytes))
+        && shared.walker.may_descend_into(bytes)
     {
         shared.schedule(&worker.queue, entry.path.clone());
     }
@@ -334,7 +335,7 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
             .walker
             .includes
             .iter()
-            .any(|pattern| pattern.is_match(bytes))
+            .any(|pattern| pattern.matches(bytes))
     {
         return;
     }

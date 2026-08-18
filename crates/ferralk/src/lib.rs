@@ -203,7 +203,7 @@ impl WalkResult {
 #[derive(Debug, Clone)]
 pub struct Walker {
     root: PathBuf,
-    includes: Vec<Pattern>,
+    includes: Vec<TraversalPattern>,
     excludes: Vec<TraversalPattern>,
     options: WalkOptions,
     error_policy: ErrorPolicy,
@@ -234,7 +234,7 @@ impl Walker {
     /// entry is returned.
     pub fn include(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
         self.includes
-            .push(Pattern::compile(pattern, traversal_pattern_options())?);
+            .push(TraversalPattern::compile(pattern.as_ref())?);
         Ok(self)
     }
 
@@ -328,6 +328,14 @@ impl Walker {
             stopped: false,
         }
     }
+
+    fn may_descend_into(&self, relative: &[u8]) -> bool {
+        self.includes.is_empty()
+            || self
+                .includes
+                .iter()
+                .any(|pattern| pattern.could_match_descendant(relative))
+    }
 }
 
 fn traversal_pattern_options() -> PatternOptions {
@@ -341,6 +349,7 @@ fn traversal_pattern_options() -> PatternOptions {
 struct TraversalPattern {
     matcher: Pattern,
     subtree_root: Option<Pattern>,
+    literal_root: Option<Vec<u8>>,
 }
 
 impl TraversalPattern {
@@ -353,6 +362,7 @@ impl TraversalPattern {
         Ok(Self {
             matcher: Pattern::compile(pattern, options)?,
             subtree_root,
+            literal_root: literal_pattern_root(pattern),
         })
     }
 
@@ -365,6 +375,42 @@ impl TraversalPattern {
             .as_ref()
             .is_some_and(|root| root.is_match(path))
     }
+
+    fn could_match_descendant(&self, path: &[u8]) -> bool {
+        let Some(root) = &self.literal_root else {
+            return true;
+        };
+        root == path
+            || root
+                .strip_prefix(path)
+                .is_some_and(|suffix| suffix.starts_with(b"/"))
+            || path
+                .strip_prefix(root.as_slice())
+                .is_some_and(|suffix| suffix.starts_with(b"/"))
+    }
+}
+
+fn literal_pattern_root(pattern: &[u8]) -> Option<Vec<u8>> {
+    let magic = pattern.iter().position(|byte| {
+        matches!(
+            byte,
+            b'*' | b'?' | b'[' | b'{' | b'\\' | b'(' | b')' | b'@' | b'+' | b'!'
+        )
+    });
+    let prefix = &pattern[..magic.unwrap_or(pattern.len())];
+    let root = if magic.is_some() {
+        if let Some(prefix) = prefix.strip_suffix(b"/") {
+            prefix
+        } else {
+            prefix
+                .iter()
+                .rposition(|byte| *byte == b'/')
+                .map_or(prefix, |separator| &prefix[..separator])
+        }
+    } else {
+        prefix
+    };
+    (!root.is_empty()).then(|| root.to_vec())
 }
 
 trait DirectoryBackend {
@@ -496,6 +542,7 @@ impl WalkStream {
                 .excludes
                 .iter()
                 .any(|pattern| pattern.covers_subtree(bytes))
+            && self.walker.may_descend_into(bytes)
         {
             self.pending_directories.push(entry.path.clone());
         }
@@ -504,7 +551,7 @@ impl WalkStream {
                 .walker
                 .includes
                 .iter()
-                .any(|pattern| pattern.is_match(bytes))
+                .any(|pattern| pattern.matches(bytes))
         {
             return None;
         }
@@ -645,15 +692,14 @@ impl<'walker> WalkState<'walker> {
                 }
             }
         }
-        if entry.is_dir {
-            if self
+        if entry.is_dir
+            && !self
                 .walker
                 .excludes
                 .iter()
                 .any(|pattern| pattern.covers_subtree(bytes))
-            {
-                return Ok(());
-            }
+            && self.walker.may_descend_into(bytes)
+        {
             self.walk_directory(backend, entry.path.clone())?;
         }
 
@@ -674,7 +720,7 @@ impl<'walker> WalkState<'walker> {
                 .walker
                 .includes
                 .iter()
-                .any(|pattern| pattern.is_match(bytes))
+                .any(|pattern| pattern.matches(bytes))
         {
             if git_ignored {
                 return Ok(());
@@ -791,6 +837,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::RefCell,
         collections::HashMap,
         fs,
         path::{Path, PathBuf},
@@ -803,7 +850,7 @@ mod tests {
 
     use super::{
         CancellationToken, ErrorPolicy, TraversalPattern, WalkEntry, WalkOptions, Walker,
-        gitignore_node,
+        gitignore_node, literal_pattern_root,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -1080,6 +1127,72 @@ mod tests {
             TraversalPattern::compile(b"**/target/**").expect("valid recursive subtree pattern");
         assert!(nested.covers_subtree(b"target"));
         assert!(nested.covers_subtree(b"crates/ferralk/target"));
+
+        assert_eq!(
+            literal_pattern_root(b"src/foo/*.rs"),
+            Some(b"src/foo".to_vec())
+        );
+        assert_eq!(literal_pattern_root(b"src/foo*.rs"), Some(b"src".to_vec()));
+        assert_eq!(literal_pattern_root(b"**/*.rs"), None);
+    }
+
+    #[test]
+    fn literal_include_roots_prune_unrelated_sibling_directories() {
+        struct RecordingBackend {
+            entries: HashMap<PathBuf, Vec<super::BackendEntry>>,
+            reads: RefCell<Vec<PathBuf>>,
+        }
+
+        impl super::DirectoryBackend for RecordingBackend {
+            fn read_directory(&self, path: &Path) -> std::io::Result<Vec<super::BackendEntry>> {
+                self.reads.borrow_mut().push(path.to_path_buf());
+                Ok(self.entries.get(path).cloned().unwrap_or_default())
+            }
+        }
+
+        let root = PathBuf::from("/fixture");
+        let source = root.join("src");
+        let docs = root.join("docs");
+        let mut entries = HashMap::new();
+        entries.insert(
+            root.clone(),
+            vec![
+                super::BackendEntry {
+                    path: source.clone(),
+                    is_dir: true,
+                    is_symlink: false,
+                },
+                super::BackendEntry {
+                    path: docs.clone(),
+                    is_dir: true,
+                    is_symlink: false,
+                },
+            ],
+        );
+        entries.insert(
+            source.clone(),
+            vec![super::BackendEntry {
+                path: source.join("main.rs"),
+                is_dir: false,
+                is_symlink: false,
+            }],
+        );
+        let backend = RecordingBackend {
+            entries,
+            reads: RefCell::new(Vec::new()),
+        };
+        let walker = Walker::new(&root)
+            .include("src/**/*.rs")
+            .expect("valid include");
+        let mut state = super::WalkState::new(&walker);
+
+        state
+            .walk_directory(&backend, root.clone())
+            .expect("backend walk succeeds");
+
+        assert_eq!(backend.reads.into_inner(), vec![root, source]);
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].path(), Path::new("/fixture/src/main.rs"));
     }
 
     #[test]

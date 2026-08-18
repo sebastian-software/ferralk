@@ -351,3 +351,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   invoke `cargo bench -p bench`. Local short-run smoke measurements execute;
   cross-engine comparisons, committed baselines, and the external CodSpeed
   budget gates remain open.
+- Added conservative literal-root planning for include patterns. `src/**/*.rs`
+  now avoids opening unrelated sibling directories in serial, streaming, and
+  parallel traversal; wildcard-, escape-, and otherwise ambiguous prefixes
+  deliberately stay unpruned. Extension prefilters remain open before the
+  aggregate M2 pruning checkpoint can close.
