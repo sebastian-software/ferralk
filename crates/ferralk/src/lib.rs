@@ -1119,6 +1119,62 @@ mod tests {
     }
 
     #[test]
+    fn source_walk_glob_patterns_filter_recursive_anchored_and_brace_paths() {
+        let fixture = Fixture::new();
+        fixture.write("src/a.rs");
+        fixture.write("src/b.txt");
+        fixture.write("src/deep/e.rs");
+        fixture.write("lib/c.rs");
+        fixture.write("docs/d.md");
+        fixture.write("top.rs");
+        let options = WalkOptions::default().sort(true);
+
+        let recursive = Walker::new(&fixture.root)
+            .include("**/*.rs")
+            .expect("valid recursive include")
+            .options(options)
+            .collect()
+            .expect("recursive walk succeeds");
+        assert_eq!(
+            relative_paths(recursive.entries(), &fixture.root),
+            vec![
+                PathBuf::from("lib/c.rs"),
+                PathBuf::from("src/a.rs"),
+                PathBuf::from("src/deep/e.rs"),
+                PathBuf::from("top.rs"),
+            ]
+        );
+
+        let anchored = Walker::new(&fixture.root)
+            .include("src/**")
+            .expect("valid anchored include")
+            .options(options)
+            .collect()
+            .expect("anchored walk succeeds");
+        assert_eq!(
+            relative_paths(anchored.entries(), &fixture.root),
+            vec![
+                PathBuf::from("src"),
+                PathBuf::from("src/a.rs"),
+                PathBuf::from("src/b.txt"),
+                PathBuf::from("src/deep"),
+                PathBuf::from("src/deep/e.rs"),
+            ]
+        );
+
+        let brace = Walker::new(&fixture.root)
+            .include("**/*.{md,txt}")
+            .expect("valid brace include")
+            .options(options)
+            .collect()
+            .expect("brace walk succeeds");
+        assert_eq!(
+            relative_paths(brace.entries(), &fixture.root),
+            vec![PathBuf::from("docs/d.md"), PathBuf::from("src/b.txt")]
+        );
+    }
+
+    #[test]
     fn directories_only_filters_results_without_pruning_descendants() {
         let fixture = Fixture::new();
         fixture.write("src/main.rs");

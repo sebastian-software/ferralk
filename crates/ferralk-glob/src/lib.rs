@@ -421,7 +421,8 @@ impl Pattern {
                 literal,
             ),
             Token::Separator => {
-                path.get(path_index).is_some_and(|byte| is_separator(*byte))
+                path.get(path_index)
+                    .is_some_and(|byte| is_separator(*byte))
                     && Self::matches_from(
                         tokens,
                         token_index + 1,
@@ -430,6 +431,9 @@ impl Pattern {
                         options,
                         failed,
                     )
+                    || path_index == path.len()
+                        && token_index + 2 == tokens.len()
+                        && matches!(tokens.get(token_index + 1), Some(Token::RecursiveStar))
             }
             Token::Any => Self::match_one(
                 tokens,
@@ -1438,6 +1442,9 @@ mod tests {
         assert!(pattern.is_match("lib.rs"));
         assert!(pattern.is_match("src/bin/main.rs"));
         assert!(!pattern.is_match("src/.private.rs"));
+        assert!(Pattern::compile("src/**", options)
+            .unwrap()
+            .is_match("src"));
         assert!(compile("**/*.rs").is_match("src/main.rs"));
         assert!(compile("**/*.rs").is_match("src/bin/main.rs"));
     }

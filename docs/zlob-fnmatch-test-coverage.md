@@ -53,6 +53,11 @@ source provenance remains zlob, but the `expected` value is deliberately
 recorded as `git_check_ignore`: ADR-0006 makes Git, rather than zlob's private
 GitIgnore implementation, Ferralk's normative ignore oracle.
 
+The recursive, anchored, and brace-filtered traversal block in
+`test/test_walk.zig` is covered by the Walker regression fixture. In
+particular, terminal `src/**` matches `src` itself and all of its descendants,
+matching zlob's zero-component recursive-wildcard behaviour.
+
 ## Syntax preflight cases
 
 The flag-sensitive `hasWildcards` assertions are represented by

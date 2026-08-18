@@ -627,3 +627,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   Rust `matchPaths` disagree not only on empty Extglob branches but also on
   wildcard hidden-name filtering and hidden-directory recursion; all three
   evidence pairs are retained as disputed corpus records rather than conflated.
+- Ported the public recursive, anchored, and brace-pattern traversal block
+  from frozen `test_walk.zig` as a Walker regression fixture. It exposed and
+  fixed terminal `**`: `src/**` now includes the `src` directory itself, as
+  zlob's zero-component globstar contract requires, while still including its
+  descendants.
