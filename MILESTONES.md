@@ -681,6 +681,13 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   returned. The fixture validates the same behaviour in serial, parallel, and
   streaming walks; zlob's C-shaped result buffer and `.`/`..` root results
   remain deliberate API differences.
+- Added a direct dispatch for single compiled non-Extglob FastPath
+  alternatives, avoiding the general alternatives loop for the common case
+  while multi-branch brace and Extglob patterns retain their established path.
+  The local common median is now about 13.35/2.79 ns (match/non-match), which
+  meets the 1.5× zlob and 1.25× fast-glob limits against the current local
+  references. The M1 benchmark checkbox remains open only for its required
+  external CodSpeed confirmation.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no

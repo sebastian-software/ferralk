@@ -251,6 +251,12 @@ impl Pattern {
     #[must_use]
     pub fn is_match(&self, path: impl AsRef<[u8]>) -> bool {
         let path = path.as_ref();
+        if !self.options.extglob
+            && let [alternative] = self.alternatives.as_slice()
+            && let Some(fast_path) = &alternative.fast_path
+        {
+            return fast_path.is_match(path, self.options);
+        }
         self.is_match_with(&self.alternatives, self.options, path)
     }
 
