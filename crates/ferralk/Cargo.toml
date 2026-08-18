@@ -1,0 +1,17 @@
+[package]
+name = "ferralk"
+description = "Portable filesystem walking for ferralk."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+ferralk-glob = { path = "../ferralk-glob", version = "0.1.0" }
+
+[lints]
+workspace = true

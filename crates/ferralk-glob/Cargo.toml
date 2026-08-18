@@ -1,0 +1,14 @@
+[package]
+name = "ferralk-glob"
+description = "Portable, byte-first glob matching for ferralk."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,7 @@
+ferralk is independently developed under the MIT License.
+
+It is designed for behavioural compatibility testing against zlob 1.6.3,
+maintained at https://github.com/dmtrKovalenko/zlob. No zlob source code has
+been copied into this repository at this point. When a zlob module or test is
+ported, its original copyright and MIT license notice must be preserved in the
+ported file and recorded in its provenance header.

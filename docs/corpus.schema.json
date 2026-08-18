@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/sebastian-software/ferralk/blob/main/docs/corpus.schema.json",
+  "title": "ferralk corpus case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "pattern", "path", "expected", "source"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "pattern": { "type": "string" },
+    "path": { "type": "string" },
+    "flags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "default": [] },
+    "expected": { "type": "boolean" },
+    "source": { "enum": ["zlob_1_6_3", "fast_glob", "git_check_ignore", "handwritten"] },
+    "disputed": { "type": "boolean", "default": false },
+    "note": { "type": "string" }
+  }
+}

@@ -14,14 +14,14 @@ Milestones M0–M4 are sequential; M5 starts only after 1.0 (ADR-0010).
 **Exit criterion:** the corpus replays in CI without a Zig toolchain, and
 disputed or undefined zlob semantics are captured as flagged corpus cases.
 
-- [ ] Scaffold the Cargo workspace: `ferralk-glob`, `ferralk`, plus
+- [x] Scaffold the Cargo workspace: `ferralk-glob`, `ferralk`, plus
       unpublished `corpus`, `harness`, `bench`, and `oracle` (excluded from
       default members) — ADR-0003
-- [ ] Add LICENSE (MIT) and NOTICE with zlob attribution — ADR-0001
-- [ ] Set up the Ferroni repo blueprint: CI for Linux/macOS/Windows, dedicated
+- [x] Add LICENSE (MIT) and NOTICE with zlob attribution — ADR-0001
+- [x] Set up the Ferroni repo blueprint: CI for Linux/macOS/Windows, dedicated
       MSRV job, release-please, renovate, codecov, CodSpeed — ADR-0004,
       ADR-0012
-- [ ] Define the corpus schema: JSONL layout, `\xNN` byte-escape codec
+- [x] Define the corpus schema: JSONL layout, `\xNN` byte-escape codec
       (encoder/decoder in Rust), JSON Schema documentation — ADR-0007
 - [ ] Inventory the zlob 1.6.3 Rust and C APIs and all flags; write the
       compatibility matrix document
@@ -142,3 +142,24 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
       executable
 - [ ] Differential tests portable vs native; sanitizers in CI
 - [ ] Benchmark gate on Linux
+
+## Implementation log
+
+### 2026-08-18 — M0 foundation established
+
+- Completed the workspace boundary, license/NOTICE, repository automation, and
+  corpus contract. `cargo test --workspace`, `cargo run -p harness -- corpus`,
+  and formatting checks pass locally.
+- Added a living compatibility matrix seeded from zlob's public README. It is
+  deliberately labelled provisional until the frozen source is verified.
+- **Blocker — zlob 1.6.3 source coordinate:** the public repository is
+  available, but its tag and matching Rust crate cannot yet be independently
+  verified from this environment. The `oracle` crate and its manual workflow
+  are intentionally present but fail closed; do not add an unpinned `zlob`
+  dependency or tick the API-inventory/oracle/corpus-import items until the
+  exact tag commit, crate release, LICENSE copyright line, and test-suite
+  revision have been recorded.
+- **Blocker — external actions:** sending a maintainer courtesy notice and
+  configuring repository-side Codecov/CodSpeed credentials require maintainer
+  authority. The committed workflows are ready; no external message or
+  repository setting has been changed.

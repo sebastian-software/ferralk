@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/ferralk-glob",
+    "crates/ferralk",
+    "tools/corpus",
+    "tools/harness",
+    "tools/oracle",
+    "tools/bench",
+]
+default-members = ["crates/ferralk-glob", "crates/ferralk"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+repository = "https://github.com/sebastian-software/ferralk"
+homepage = "https://github.com/sebastian-software/ferralk"
+keywords = ["glob", "filesystem", "walk", "ignore"]
+categories = ["filesystem", "development-tools"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

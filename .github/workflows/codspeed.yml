@@ -1,0 +1,19 @@
+name: CodSpeed
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: CodSpeedHQ/action@v4
+        with:
+          run: cargo test -p bench

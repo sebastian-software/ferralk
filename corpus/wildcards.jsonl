@@ -1,0 +1,2 @@
+{"id":"wildcard-001","pattern":"*.rs","path":"lib.rs","flags":[],"expected":true,"source":"handwritten","note":"Bootstrap regression; replaced or confirmed by the zlob 1.6.3 seed during corpus import."}
+{"id":"wildcard-002","pattern":"*.rs","path":"src/lib.rs","flags":[],"expected":false,"source":"handwritten","note":"Bootstrap regression; a single star does not cross a path separator."}

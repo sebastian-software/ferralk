@@ -1,0 +1,22 @@
+name: Regenerate oracle corpus
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: Why regeneration is needed; generated cases still require review.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  regenerate:
+    name: zlob 1.6.3 oracle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run adapter
+        run: cargo run -p oracle

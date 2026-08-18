@@ -1,0 +1,14 @@
+[package]
+name = "oracle"
+description = "Development-only zlob corpus regeneration adapter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# The zlob 1.6.3 adapter is intentionally held until its exact crates.io
+# release and source revision are verified; see MILESTONES.md.
+
+[lints]
+workspace = true
