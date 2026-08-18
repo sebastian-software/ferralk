@@ -14,5 +14,9 @@ categories.workspace = true
 ferralk-glob = { path = "../ferralk-glob", version = "0.1.0" }
 ignore = "0.4"
 
+[dev-dependencies]
+corpus = { path = "../../tools/corpus" }
+serde_json.workspace = true
+
 [lints]
 workspace = true

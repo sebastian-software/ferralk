@@ -881,6 +881,37 @@ mod tests {
     }
 
     #[test]
+    fn git_ignore_corpus_replays_through_the_walker() {
+        let corpus_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/ignore.jsonl");
+        for line in fs::read_to_string(corpus_path)
+            .expect("read ignore corpus")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+        {
+            let case: corpus::Case = serde_json::from_str(line).expect("valid ignore corpus case");
+            let fixture = Fixture::new();
+            fs::write(
+                fixture.root.join(".gitignore"),
+                case.ignore_rules.join("\n").as_bytes(),
+            )
+            .expect("write fixture gitignore");
+            fixture.write(&case.path);
+
+            let result = Walker::new(&fixture.root)
+                .respect_git_ignore(true)
+                .collect()
+                .expect("walk succeeds");
+            let returned =
+                relative_paths(result.entries(), &fixture.root).contains(&PathBuf::from(case.path));
+            assert_eq!(
+                !returned, case.expected,
+                "walker verdict for corpus case {}",
+                case.id
+            );
+        }
+    }
+
+    #[test]
     fn prune_planner_only_accepts_explicit_whole_subtree_excludes() {
         let subtree = TraversalPattern::compile(b"src/**").expect("valid subtree pattern");
         assert!(subtree.covers_subtree(b"src"));

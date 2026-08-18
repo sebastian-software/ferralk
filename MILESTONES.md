@@ -92,7 +92,7 @@ faster than parallel `ignore` + pruning on all traversal corpora.
       per-directory nodes with shared-parent caching — ADR-0006
 - [x] Negation-aware pruning guard (never prune when a later rule may
       re-include)
-- [ ] `ignore.jsonl` corpus green against `git check-ignore`
+- [x] `ignore.jsonl` corpus green against `git check-ignore`
 - [ ] Scheduler: `crossbeam-deque` work stealing, lazy worker spawn,
       per-worker scratch and result shards — ADR-0009
 - [ ] Single cancellation state, lossless error channel, documented panic
@@ -295,3 +295,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 - Added a per-traversal cache of parsed `.gitignore` matchers keyed by their
   directory. It removes repeated parsing while preserving ancestor precedence;
   the stronger immutable shared-parent node representation remains open.
+- Added a Walker-level replay of every `ignore.jsonl` case. Each fixture
+  writes the same rule chain that the existing `git check-ignore` oracle
+  validates, then asserts the Walker's returned-path verdict, tying the Git
+  corpus directly to M3 traversal behaviour.

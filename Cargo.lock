@@ -135,8 +135,10 @@ dependencies = [
 name = "ferralk"
 version = "0.1.0"
 dependencies = [
+ "corpus",
  "ferralk-glob",
  "ignore",
+ "serde_json",
 ]
 
 [[package]]
