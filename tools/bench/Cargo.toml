@@ -32,6 +32,10 @@ name = "walker"
 harness = false
 
 [[bench]]
+name = "walker_palamedes"
+harness = false
+
+[[bench]]
 name = "walker_zlob"
 harness = false
 required-features = ["zlob-oracle"]

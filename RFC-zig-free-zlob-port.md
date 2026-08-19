@@ -60,6 +60,11 @@ the business case. On a warm-cache 50,000-file tree:
 | `ignore` parallel + safe subtree pruning | 149.667 ms | 15.74x |
 | zlob 1.6.3 walker | 139.820 ms | 16.84x |
 
+That measurement was taken against a different codebase on different hardware
+and is kept here as the historical business case. The same comparison on the
+current code, as a committed benchmark rather than a one-off, is in
+[benchmark evidence](docs/benchmark-evidence.md).
+
 On that workload, existing Rust crates recover nearly all of zlob's advantage.
 This RFC is therefore not a recommendation to rewrite zlob solely for
 Palamedes. It defines how to do the rewrite if broader reuse, simpler packaging,
