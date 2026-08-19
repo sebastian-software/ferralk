@@ -141,7 +141,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 - [ ] `statx` only where metadata is requested
 - [x] Bounds-checked record parsing and fuzz target
 - [ ] Miri where executable
-- [ ] Differential tests portable vs native; sanitizers in CI
+- [x] Serial native/portable Walker differential test
+- [ ] Broaden native/portable differential corpus; execute sanitizers in CI
 - [ ] Benchmark gate on Linux
 
 ## Implementation log
@@ -184,6 +185,11 @@ specific action needed to clear each one are consolidated in
   normal Ubuntu native CI plus manual fuzz/AddressSanitizer workflows are
   committed but not yet externally run. `statx`, Linux differential execution,
   and benchmark evidence remain open.
+- Added the corresponding serial Linux Walker differential test: it compares
+  native and portable output across recursive filtering, exclusions, Gitignore,
+  hidden paths, opt-in metadata, and a directory symlink. It cross-compiles on
+  the local x86_64-Linux target; its runtime evidence remains with the committed
+  Ubuntu native CI job rather than being claimed from this macOS workspace.
 
 ### 2026-08-18 — M0 foundation established
 

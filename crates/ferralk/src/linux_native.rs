@@ -182,12 +182,13 @@ fn malformed_record() -> io::Error {
 mod tests {
     use std::{
         fs,
+        os::unix::fs::symlink,
         path::{Path, PathBuf},
         sync::atomic::{AtomicUsize, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use crate::{DirectoryBackend, StdBackend};
+    use crate::{DirectoryBackend, ErrorPolicy, StdBackend, WalkEntry, WalkOptions, Walker};
 
     use super::{BackendEntry, DT_DIR, DT_REG, NAME_OFFSET, parse_records, read_directory};
 
@@ -265,5 +266,97 @@ mod tests {
         };
         assert_eq!(describe(native), describe(portable));
         fs::remove_dir_all(root).expect("remove native fixture");
+    }
+
+    #[test]
+    fn native_walker_matches_portable_filters_metadata_and_symlinks() {
+        let root = fixture_root("walker");
+        fs::create_dir_all(root.join("src/nested")).expect("create source fixture");
+        fs::create_dir_all(root.join("ignored")).expect("create ignored fixture");
+        fs::create_dir_all(root.join(".hidden")).expect("create hidden fixture");
+        fs::write(root.join("src/lib.rs"), b"library").expect("write source fixture");
+        fs::write(root.join("src/nested/mod.rs"), b"module").expect("write nested fixture");
+        fs::write(root.join("src/generated.tmp"), b"temporary").expect("write temp fixture");
+        fs::write(root.join("ignored/skip.rs"), b"ignored").expect("write ignored fixture");
+        fs::write(root.join(".hidden/skip.rs"), b"hidden").expect("write hidden fixture");
+        fs::write(root.join(".gitignore"), b"ignored/\n").expect("write gitignore fixture");
+        symlink("src", root.join("source-link")).expect("create directory symlink");
+
+        let walker = Walker::new(&root)
+            .threads(1)
+            .include("**/*")
+            .expect("valid include")
+            .exclude("**/*.tmp")
+            .expect("valid exclude")
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Collect)
+            .options(
+                WalkOptions::default()
+                    .sort(true)
+                    .metadata(true)
+                    .skip_hidden(true),
+            );
+        let native = walker.clone().collect().expect("native walk succeeds");
+        let (portable_entries, portable_errors) = collect_with_portable_backend(&walker);
+
+        assert!(native.errors().is_empty());
+        assert!(portable_errors.is_empty());
+        assert_eq!(
+            describe_walk_entries(native.entries(), &root),
+            describe_walk_entries(&portable_entries, &root)
+        );
+        fs::remove_dir_all(root).expect("remove walker fixture");
+    }
+
+    type DescribedWalkEntry = (PathBuf, bool, bool, usize, Option<(u64, bool, bool)>);
+
+    fn fixture_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ferralk-linux-native-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos()
+                + NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed) as u128
+        ))
+    }
+
+    fn collect_with_portable_backend(walker: &Walker) -> (Vec<WalkEntry>, Vec<crate::WalkError>) {
+        let mut state = crate::WalkState::new(walker);
+        state
+            .walk_directory(&StdBackend, walker.root.clone())
+            .expect("portable walk succeeds");
+        if walker.options.sort {
+            state
+                .entries
+                .sort_by(|left, right| left.path.cmp(&right.path));
+        }
+        (state.entries, state.errors)
+    }
+
+    fn describe_walk_entries(entries: &[WalkEntry], root: &Path) -> Vec<DescribedWalkEntry> {
+        entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry
+                        .path()
+                        .strip_prefix(root)
+                        .expect("entry belongs to fixture")
+                        .to_path_buf(),
+                    entry.is_dir(),
+                    entry.is_symlink(),
+                    entry.depth(),
+                    entry.metadata().map(|metadata| {
+                        (
+                            metadata.len(),
+                            metadata.file_type().is_dir(),
+                            metadata.file_type().is_symlink(),
+                        )
+                    }),
+                )
+            })
+            .collect()
     }
 }
