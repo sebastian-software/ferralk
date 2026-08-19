@@ -212,9 +212,11 @@ specific action needed to clear each one are consolidated in
   about 0.858 ms versus zlob at 0.619 ms. Reusing the native 32-KiB buffer per
   thread improved Ferralk to about 0.779 ms (0.741 ms sample median), while
   the immediate zlob comparison was 0.623 ms (0.621 ms sample median). The
-  remaining roughly 25% Criterion-time gap is still above the 20% gate. This
-  is profiling, not release evidence; retain the benchmark checkbox and
-  prioritize the parallel Walker hot path.
+  sample medians are therefore about 19.4% apart and meet the local 20%
+  median threshold. The Criterion time estimates remain roughly 25% apart,
+  and neither p95 nor remote-CI evidence exists yet. This is profiling, not
+  release evidence, so retain the benchmark checkbox and continue to optimize
+  the parallel Walker hot path.
 
 ### 2026-08-19 — M1 component-aware deterministic IR
 
