@@ -13,9 +13,9 @@
 //! `test/test_fnmatch.zig`. Deliberate differences live in
 //! the checked-in corpus and compatibility matrix.
 
-use std::{collections::HashSet, error::Error, fmt};
+use std::{cell::RefCell, collections::HashSet, error::Error, fmt};
 
-use memchr::{memchr, memchr3, memmem};
+use memchr::{memchr, memchr2, memchr3, memmem};
 
 /// A compiled glob pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,10 +280,73 @@ impl Pattern {
             {
                 fast_path.is_match(path, options)
             } else {
-                let mut failed = FailedStates::new(&alternative.tokens, path);
-                Self::matches_from(&alternative.tokens, 0, 0, path, options, &mut failed)
+                Self::matches_general(&alternative.tokens, path, options)
             }
         })
+    }
+
+    /// Runs the general matcher on the thread's reusable scratch buffers.
+    ///
+    /// The visited matrix and the work list are sized by the candidate, so
+    /// allocating them per call dominated a walker filter: `**/*.ts` leaves the
+    /// inline matrix budget for any relative path longer than about 40 bytes.
+    /// Borrowing them from a thread-local keeps repeated calls allocation-free
+    /// without putting state on [`Pattern`], which stays `Send + Sync`.
+    fn matches_general(tokens: &[Token], path: &[u8], options: PatternOptions) -> bool {
+        SCRATCH.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut scratch) => {
+                let matched = Self::matches_with_scratch(tokens, path, options, &mut scratch);
+                // One oversized candidate must not pin a large matrix on a
+                // worker thread for the rest of the process.
+                if scratch.visited.len() > RETAINED_SCRATCH_WORDS {
+                    scratch.visited.truncate(RETAINED_SCRATCH_WORDS);
+                    scratch.visited.shrink_to_fit();
+                }
+                matched
+            }
+            // A nested match on this thread cannot share the borrowed buffers.
+            Err(_) => Self::matches_with_scratch(tokens, path, options, &mut Scratch::default()),
+        })
+    }
+
+    fn matches_with_scratch(
+        tokens: &[Token],
+        path: &[u8],
+        options: PatternOptions,
+        scratch: &mut Scratch,
+    ) -> bool {
+        // Generation 0 marks a stale entry, so a live match never uses it.
+        if scratch.generation == u64::MAX {
+            scratch.scans.clear();
+            scratch.generation = 0;
+        }
+        scratch.generation += 1;
+        let Scratch {
+            visited,
+            deferred,
+            scans,
+            generation,
+        } = scratch;
+        deferred.clear();
+        if scans.len() < tokens.len() {
+            scans.resize(tokens.len(), StarScans::default());
+        }
+        let mut failed = FailedStates::new(tokens, path, visited);
+        let (skip_token, skip_literal) =
+            skipping_star(tokens, options).unwrap_or((usize::MAX, &[]));
+        let mut work = StarWork {
+            scans,
+            generation: *generation,
+            skip_token,
+            skip_literal,
+        };
+        // Two instantiations: patterns that cannot skip keep a matcher loop
+        // with none of the skipping machinery in it.
+        if skip_token == usize::MAX {
+            Self::matches_from::<false>(tokens, path, options, &mut failed, deferred, &mut work)
+        } else {
+            Self::matches_from::<true>(tokens, path, options, &mut failed, deferred, &mut work)
+        }
     }
 
     /// Returns the input paths accepted by this compiled pattern, in input
@@ -466,16 +529,15 @@ impl Pattern {
     /// hold strictly increasing token indices and never exceed one per token.
     /// `FailedStates` still bounds the explored state space to
     /// `tokens × path` visits.
-    fn matches_from(
+    fn matches_from<const SKIP: bool>(
         tokens: &[Token],
-        token_index: usize,
-        path_index: usize,
         path: &[u8],
         options: PatternOptions,
-        failed: &mut FailedStates,
+        failed: &mut FailedStates<'_>,
+        deferred: &mut Vec<(usize, usize)>,
+        work: &mut StarWork<'_>,
     ) -> bool {
-        let mut deferred: Vec<(usize, usize)> = Vec::new();
-        let mut state = (token_index, path_index);
+        let mut state = (0_usize, 0_usize);
 
         loop {
             let (token_index, path_index) = state;
@@ -511,29 +573,32 @@ impl Pattern {
                             class.matches(byte, options.case_insensitive)
                         })
                     }
-                    Token::Star => Self::advance_star(
+                    Token::Star => Self::advance_star::<SKIP>(
                         token_index,
                         path_index,
                         path,
                         options,
                         !Self::component_wildcard(tokens, token_index, options),
-                        &mut deferred,
+                        deferred,
+                        work,
                     ),
-                    Token::PathStar => Self::advance_star(
+                    Token::PathStar => Self::advance_star::<SKIP>(
                         token_index,
                         path_index,
                         path,
                         options,
                         false,
-                        &mut deferred,
+                        deferred,
+                        work,
                     ),
-                    Token::RecursiveStar | Token::RecursivePrefix => Self::advance_star(
+                    Token::RecursiveStar | Token::RecursivePrefix => Self::advance_star::<SKIP>(
                         token_index,
                         path_index,
                         path,
                         options,
                         true,
-                        &mut deferred,
+                        deferred,
+                        work,
                     ),
                 }
             };
@@ -590,23 +655,101 @@ impl Pattern {
     }
 
     /// Queues the star's repetition branch and returns the branch that stops
-    /// consuming here, which the caller explores first. The repetition is only
-    /// queued while the next byte is one this star may consume.
-    fn advance_star(
+    /// consuming here, which the caller explores first.
+    fn advance_star<const SKIP: bool>(
         token_index: usize,
         path_index: usize,
         path: &[u8],
         options: PatternOptions,
         recursive: bool,
         deferred: &mut Vec<(usize, usize)>,
+        work: &mut StarWork<'_>,
     ) -> Option<(usize, usize)> {
-        if let Some(&byte) = path.get(path_index)
-            && (recursive || !options.component_wildcards || !is_separator(byte))
-            && (options.match_hidden || byte != b'.' || !at_component_start(path, path_index))
-        {
-            deferred.push((token_index, path_index + 1));
+        if let Some(next) = Self::next_star_position::<SKIP>(
+            token_index,
+            path_index,
+            path,
+            options,
+            recursive,
+            work,
+        ) {
+            deferred.push((token_index, next));
         }
         Some((token_index + 1, path_index))
+    }
+
+    /// Where the star should resume consuming, or `None` when it cannot.
+    ///
+    /// A star followed by a literal only has to stop where that literal could
+    /// begin, so the repetition jumps straight there instead of walking one
+    /// byte at a time (ADR-0008). Positions in between can only fail: their
+    /// sole other successor is the literal, which does not start there.
+    ///
+    /// The jump never crosses a byte the star may not consume, because it is
+    /// clamped to [`star_barrier`]. Both the barrier and the literal search are
+    /// monotone in `path_index` and cached as such, so a star re-entered at
+    /// many positions still scans each byte a bounded number of times.
+    ///
+    /// Case-insensitive matching keeps the byte-wise walk: `memmem` has no
+    /// folded form, and folding the candidate would mean allocating.
+    #[inline]
+    fn next_star_position<const SKIP: bool>(
+        token_index: usize,
+        path_index: usize,
+        path: &[u8],
+        options: PatternOptions,
+        recursive: bool,
+        work: &mut StarWork<'_>,
+    ) -> Option<usize> {
+        if SKIP && work.skip_token == token_index {
+            return Self::skip_to_literal(token_index, path_index, path, options, recursive, work);
+        }
+
+        let &byte = path.get(path_index)?;
+        star_consumes_byte(path, path_index, byte, options, recursive).then_some(path_index + 1)
+    }
+
+    /// The skipping half of [`Self::next_star_position`], kept out of line so
+    /// the byte-wise walk stays a handful of instructions in the matcher loop.
+    #[inline(never)]
+    fn skip_to_literal(
+        token_index: usize,
+        path_index: usize,
+        path: &[u8],
+        options: PatternOptions,
+        recursive: bool,
+        work: &mut StarWork<'_>,
+    ) -> Option<usize> {
+        let literal = work.skip_literal;
+        let scans = work.scans(token_index);
+        if scans.stalled >= STALLED_SKIPS {
+            let &byte = path.get(path_index)?;
+            return star_consumes_byte(path, path_index, byte, options, recursive)
+                .then_some(path_index + 1);
+        }
+        if let Some(cached) = scans.skip.get(path_index) {
+            return cached;
+        }
+        let barrier = star_barrier(path, path_index, options, recursive, scans);
+        let start = path_index + 1;
+        if start > barrier {
+            return scans.skip.record(path_index, path_index, None);
+        }
+        match next_literal_start(path, start, literal, &mut scans.literal) {
+            // Nothing left to aim for, whatever the star consumes.
+            None => scans.skip.record(path_index, usize::MAX, None),
+            // The occurrence is out of reach, and stays out of reach for every
+            // position up to the barrier.
+            Some(found) if found > barrier => scans.skip.record(path_index, barrier, None),
+            Some(found) => {
+                scans.stalled = if found == start {
+                    scans.stalled.saturating_add(1)
+                } else {
+                    0
+                };
+                scans.skip.record(path_index, found - 1, Some(found))
+            }
+        }
     }
 }
 
@@ -620,23 +763,31 @@ impl Pattern {
 /// A visited pair is never cleared. The recursive matcher used to clear one on
 /// the way out of a successful frame, which was unobservable: a match returned
 /// straight through every caller, and each invocation builds its own matrix.
-enum FailedStates {
-    Inline { width: usize, states: u128 },
-    Heap { width: usize, states: Vec<bool> },
+enum FailedStates<'scratch> {
+    Inline {
+        width: usize,
+        states: u128,
+    },
+    Heap {
+        width: usize,
+        states: &'scratch mut [u64],
+    },
 }
 
-impl FailedStates {
-    fn new(tokens: &[Token], path: &[u8]) -> Self {
+impl<'scratch> FailedStates<'scratch> {
+    fn new(tokens: &[Token], path: &[u8], scratch: &'scratch mut Vec<u64>) -> Self {
         let width = path.len() + 1;
         let state_count = tokens.len().saturating_mul(width);
         if state_count <= u128::BITS as usize {
-            Self::Inline { width, states: 0 }
-        } else {
-            Self::Heap {
-                width,
-                states: vec![false; state_count],
-            }
+            return Self::Inline { width, states: 0 };
         }
+        let words = state_count.div_ceil(u64::BITS as usize);
+        if scratch.len() < words {
+            scratch.resize(words, 0);
+        }
+        let states = &mut scratch[..words];
+        states.fill(0);
+        Self::Heap { width, states }
     }
 
     fn insert(&mut self, token_index: usize, path_index: usize) -> bool {
@@ -651,16 +802,365 @@ impl FailedStates {
                 }
             }
             Self::Heap { width, states } => {
-                let state = &mut states[token_index * *width + path_index];
-                if *state {
+                let state = token_index * *width + path_index;
+                let word = &mut states[state / u64::BITS as usize];
+                let mask = 1_u64 << (state % u64::BITS as usize);
+                if *word & mask != 0 {
                     false
                 } else {
-                    *state = true;
+                    *word |= mask;
                     true
                 }
             }
         }
     }
+}
+
+/// Reusable matcher buffers for one thread.
+///
+/// Every field is sized by the candidate or the pattern, so building them per
+/// call was the dominant cost of a walker filter. They are cleared, never
+/// reallocated, once a thread has seen its first long candidate.
+#[derive(Default)]
+struct Scratch {
+    visited: Vec<u64>,
+    deferred: Vec<(usize, usize)>,
+    scans: Vec<StarScans>,
+    generation: u64,
+}
+
+/// The literal-skipping bookkeeping for one match, borrowed out of [`Scratch`].
+struct StarWork<'scratch> {
+    /// Cached scans, one entry per token. Entries from an earlier match are
+    /// recognised by their generation and reset when first used, so starting a
+    /// match costs nothing per token.
+    scans: &'scratch mut [StarScans],
+    generation: u64,
+    /// Token index of the one star that skips, or `usize::MAX` for none.
+    /// Resolved once per match so the matcher loop only loads and compares a
+    /// single word per star state. See [`skipping_star`].
+    skip_token: usize,
+    /// The literal that star aims at.
+    skip_literal: &'scratch [u8],
+}
+
+impl StarWork<'_> {
+    fn scans(&mut self, token_index: usize) -> &mut StarScans {
+        let scans = &mut self.scans[token_index];
+        if scans.generation != self.generation {
+            *scans = StarScans {
+                generation: self.generation,
+                ..StarScans::default()
+            };
+        }
+        scans
+    }
+}
+
+/// Visited-matrix words a thread keeps between calls. 8 Ki words is 64 KiB and
+/// holds 512 Ki token/path states — past any realistic path — while stopping
+/// one huge candidate from pinning memory on a worker thread for good.
+const RETAINED_SCRATCH_WORDS: usize = 8 * 1024;
+
+thread_local! {
+    static SCRATCH: RefCell<Scratch> = const {
+        RefCell::new(Scratch {
+            visited: Vec::new(),
+            deferred: Vec::new(),
+            scans: Vec::new(),
+            generation: 0,
+        })
+    };
+}
+
+/// Capacities the calling thread's scratch currently holds.
+///
+/// Used by the steady-state test to show that repeated matches reuse the
+/// buffers instead of reallocating them.
+#[cfg(test)]
+fn scratch_capacities() -> (usize, usize, usize) {
+    SCRATCH.with(|cell| {
+        let scratch = cell.borrow();
+        (
+            scratch.visited.capacity(),
+            scratch.deferred.capacity(),
+            scratch.scans.capacity(),
+        )
+    })
+}
+
+/// The forward scans one star token needs, each cached on its own.
+///
+/// Every entry is private to a token, so the spans a token rescans are
+/// disjoint and its total scanning stays linear in the candidate however often
+/// an enclosing `**` re-enters it. `skip` caches the combined answer, which is
+/// what an enclosing `**` hits on almost every position.
+///
+/// `generation` is the match that filled the entry; anything older is stale.
+#[derive(Clone, Copy, Default)]
+struct StarScans {
+    generation: u64,
+    skip: SkipDecision,
+    separator: FirstAtOrAfter,
+    component_dot: FirstAtOrAfter,
+    literal: FirstAtOrAfter,
+    /// Consecutive jumps that landed on the very next byte; see
+    /// [`STALLED_SKIPS`].
+    stalled: u8,
+}
+
+/// How many single-byte jumps in a row turn skipping off for a token.
+///
+/// A candidate dense in the literal — `a*a*a*b` over a run of `a`s — has an
+/// occurrence at every position, so the search finds only the next byte and the
+/// scan is pure overhead on top of the step it replaces. Falling back to the
+/// byte-wise walk there costs nothing in correctness: both answers name the
+/// same state, and the walk is what the visited matrix shares anyway.
+const STALLED_SKIPS: u8 = 4;
+
+/// Cached resume decision for one star token, valid for `from..=upto`.
+///
+/// Both inputs to the decision — the consumption barrier and the next literal
+/// start — are monotone in the path index, so one answer covers the whole span
+/// up to the position that changes it.
+#[derive(Clone, Copy)]
+struct SkipDecision {
+    from: usize,
+    upto: usize,
+    /// Where the repetition resumes, or `usize::MAX` for "it cannot".
+    jump: usize,
+}
+
+impl SkipDecision {
+    fn get(self, index: usize) -> Option<Option<usize>> {
+        (self.from <= index && index <= self.upto)
+            .then(|| (self.jump != usize::MAX).then_some(self.jump))
+    }
+
+    fn record(&mut self, from: usize, upto: usize, jump: Option<usize>) -> Option<usize> {
+        *self = Self {
+            from,
+            upto,
+            jump: jump.unwrap_or(usize::MAX),
+        };
+        jump
+    }
+}
+
+impl Default for SkipDecision {
+    fn default() -> Self {
+        Self {
+            from: usize::MAX,
+            upto: 0,
+            jump: usize::MAX,
+        }
+    }
+}
+
+/// Cached answer of a monotone "first index at or after `from`" question.
+///
+/// The answer for `from` is also the answer for every index up to it, so one
+/// entry serves the whole span it covers and a later miss starts beyond it.
+/// Successive misses therefore scan disjoint parts of the candidate.
+#[derive(Clone, Copy)]
+struct FirstAtOrAfter {
+    from: usize,
+    answer: usize,
+}
+
+impl FirstAtOrAfter {
+    /// A cache that answers nothing.
+    const EMPTY: Self = Self {
+        from: usize::MAX,
+        answer: 0,
+    };
+
+    fn get(self, index: usize) -> Option<usize> {
+        (self.from <= index && index <= self.answer).then_some(self.answer)
+    }
+
+    fn record(&mut self, index: usize, answer: usize) -> usize {
+        *self = Self {
+            from: index,
+            answer,
+        };
+        answer
+    }
+}
+
+impl Default for FirstAtOrAfter {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+/// The star whose repetition is worth skipping, and the literal it aims at.
+///
+/// A star is entered once per position its prefix can end at. Only the first
+/// star has a fixed-width prefix; every later one is re-entered at as many
+/// positions as the earlier stars can reach, and there the byte-wise steps are
+/// already shared through the visited matrix — a scan per entry would cost more
+/// than the state visits it removes. So skipping is applied to the first star
+/// only, where one scan replaces a walk over the whole candidate.
+///
+/// Case folding keeps the byte-wise walk everywhere: `memmem` has no folded
+/// form, and folding the candidate would mean allocating.
+fn skipping_star(tokens: &[Token], options: PatternOptions) -> Option<(usize, &[u8])> {
+    if options.case_insensitive {
+        return None;
+    }
+    let index = tokens.iter().position(|token| {
+        matches!(
+            token,
+            Token::Star | Token::PathStar | Token::RecursiveStar | Token::RecursivePrefix
+        )
+    })?;
+    match tokens.get(index + 1) {
+        Some(Token::Literal(literal)) if !literal.is_empty() => Some((index, literal)),
+        _ => None,
+    }
+}
+
+/// Whether a star may consume the byte at `path_index`.
+fn star_consumes_byte(
+    path: &[u8],
+    path_index: usize,
+    byte: u8,
+    options: PatternOptions,
+    recursive: bool,
+) -> bool {
+    (recursive || !options.component_wildcards || !is_separator(byte))
+        && (options.match_hidden || byte != b'.' || !at_component_start(path, path_index))
+}
+
+/// First index at or after `path_index` that a star may not consume.
+///
+/// A component-local star stops at the next separator; unless hidden entries
+/// match, every star stops at the leading dot of a component. This is the span
+/// form of [`star_consumes_byte`], answered with `memchr`/`memmem` so a skipped
+/// run costs one vectorised pass instead of one state visit per byte.
+fn star_barrier(
+    path: &[u8],
+    path_index: usize,
+    options: PatternOptions,
+    recursive: bool,
+    scans: &mut StarScans,
+) -> usize {
+    let mut barrier = path.len();
+    if !recursive && options.component_wildcards {
+        barrier = barrier.min(next_separator_from(path, path_index, &mut scans.separator));
+    }
+    if !options.match_hidden {
+        barrier = barrier.min(next_component_dot(
+            path,
+            path_index,
+            &mut scans.component_dot,
+        ));
+    }
+    barrier
+}
+
+/// First index at or after `index` where `literal` starts.
+fn next_literal_start(
+    path: &[u8],
+    index: usize,
+    literal: &[u8],
+    cache: &mut FirstAtOrAfter,
+) -> Option<usize> {
+    let found = match cache.get(index) {
+        Some(found) => found,
+        None => {
+            let found = path
+                .get(index..)
+                .and_then(|tail| find_literal(tail, literal))
+                .map_or(usize::MAX, |offset| index + offset);
+            cache.record(index, found)
+        }
+    };
+    (found != usize::MAX).then_some(found)
+}
+
+/// Offset of `needle` in `haystack`.
+///
+/// `memmem` builds a searcher per call, which costs more than the whole scan
+/// for the short candidates a walker filter sees. Below the floor a plain
+/// `memchr` on the first byte plus a tail comparison is setup-free; above it
+/// the vectorised two-byte search wins.
+fn find_literal(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    const MEMMEM_HAYSTACK_FLOOR: usize = 256;
+    const SCALAR_HAYSTACK_CEILING: usize = 32;
+    let (&first, rest) = needle.split_first()?;
+    if haystack.len() >= MEMMEM_HAYSTACK_FLOOR {
+        return memmem::find(haystack, needle);
+    }
+    if haystack.len() <= SCALAR_HAYSTACK_CEILING {
+        // A path component is shorter than one SIMD block, so even `memchr`'s
+        // entry sequence outweighs the comparisons it saves.
+        return (0..haystack.len())
+            .find(|&start| haystack[start] == first && haystack[start + 1..].starts_with(rest));
+    }
+    let mut offset = 0;
+    while let Some(hit) = memchr(first, &haystack[offset..]) {
+        let start = offset + hit;
+        if haystack[start + 1..].starts_with(rest) {
+            return Some(start);
+        }
+        offset = start + 1;
+    }
+    None
+}
+
+/// First separator at or after `index`, or the candidate's length.
+fn next_separator_from(path: &[u8], index: usize, cache: &mut FirstAtOrAfter) -> usize {
+    if let Some(found) = cache.get(index) {
+        return found;
+    }
+    let found = path
+        .get(index..)
+        .and_then(next_separator)
+        .map_or(path.len(), |offset| index + offset);
+    cache.record(index, found)
+}
+
+/// Offset of the first path separator in `bytes`, using the platform's set.
+fn next_separator(bytes: &[u8]) -> Option<usize> {
+    if cfg!(windows) {
+        memchr2(b'/', b'\\', bytes)
+    } else {
+        memchr(b'/', bytes)
+    }
+}
+
+/// First index at or after `index` that starts a component with a dot, or the
+/// candidate's length.
+///
+/// Past index 0 a component starts exactly after a separator, so the blocked
+/// positions are the dots that directly follow one.
+fn next_component_dot(path: &[u8], index: usize, cache: &mut FirstAtOrAfter) -> usize {
+    if let Some(found) = cache.get(index) {
+        return found;
+    }
+    if index == 0 && path.first() == Some(&b'.') {
+        return cache.record(0, 0);
+    }
+    let start = index.saturating_sub(1);
+    let found = match path.get(start..) {
+        Some(window) => {
+            let mut offset = 0;
+            loop {
+                let Some(hit) = next_separator(&window[offset..]) else {
+                    break path.len();
+                };
+                let at = offset + hit;
+                if window.get(at + 1) == Some(&b'.') {
+                    break start + at + 1;
+                }
+                offset = at + 1;
+            }
+        }
+        None => path.len(),
+    };
+    cache.record(index, found)
 }
 
 /// Crate version exposed for build and integration diagnostics.
@@ -1792,10 +2292,92 @@ fn extglob_component_end(path: &[u8], path_index: usize, options: PatternOptions
 
 #[cfg(test)]
 mod tests {
-    use super::{FailedStates, FastPath, Pattern, PatternOptions, Token};
+    use super::{FailedStates, FastPath, Pattern, PatternOptions, Token, scratch_capacities};
 
     fn compile(pattern: &str) -> Pattern {
         Pattern::compile(pattern, PatternOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn compiled_patterns_stay_shareable_across_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Pattern>();
+        assert_send_sync::<PatternOptions>();
+    }
+
+    #[test]
+    fn repeated_general_matches_reuse_the_thread_local_scratch() {
+        // libtest gives each test its own thread, so the scratch observed here
+        // is private to this test.
+        let pattern = Pattern::compile(
+            "**/*.ts",
+            PatternOptions::default().recursive_double_star(true),
+        )
+        .unwrap();
+        let matching = "src/deep/nested/module/component/widget/main.ts";
+        let other = "src/deep/nested/module/component/widget/main.tsx";
+
+        for _ in 0..8 {
+            assert!(pattern.is_match_glob_path(matching));
+            assert!(!pattern.is_match_glob_path(other));
+        }
+        let warm = scratch_capacities();
+        assert!(
+            warm.0 > 0 && warm.1 > 0 && warm.2 > 0,
+            "this shape must leave the inline budget and use every buffer: {warm:?}"
+        );
+
+        for _ in 0..1_000 {
+            assert!(pattern.is_match_glob_path(matching));
+            assert!(!pattern.is_match_glob_path(other));
+        }
+        assert_eq!(
+            scratch_capacities(),
+            warm,
+            "steady-state matching must not grow a scratch buffer"
+        );
+
+        // One oversized candidate grows the matrix, but must not keep it.
+        let long = "x".repeat(300_000);
+        assert!(
+            !Pattern::compile("*a*y", PatternOptions::default())
+                .unwrap()
+                .is_match(&long)
+        );
+        assert!(
+            scratch_capacities().0 <= super::RETAINED_SCRATCH_WORDS,
+            "an oversized candidate must release the matrix it needed"
+        );
+    }
+
+    #[test]
+    fn literal_skipping_honours_component_and_leading_dot_policies() {
+        // A skip must never carry a star across a byte it may not consume.
+        let component = Pattern::compile(
+            "*b.ts",
+            PatternOptions {
+                component_wildcards: true,
+                root_component_wildcards: true,
+                ..PatternOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(component.is_match("ab.ts"));
+        assert!(!component.is_match("a/b.ts"));
+
+        // The dot that starts a component blocks the jump behind it.
+        assert!(!compile("*b.ts").is_match("a/.b.ts"));
+        assert!(
+            Pattern::compile("*b.ts", PatternOptions::default().match_hidden(true))
+                .unwrap()
+                .is_match("a/.b.ts")
+        );
+        assert!(!compile("*.ts").is_match(".hidden.ts"));
+
+        // A jump target that only appears past the barrier is not reachable,
+        // but an earlier one still is.
+        assert!(compile("*b.ts").is_match("bb.ts"));
+        assert!(!compile("*x.ts").is_match(".a/x.ts"));
     }
 
     #[test]
@@ -2081,21 +2663,31 @@ mod tests {
 
     #[test]
     fn failed_state_memos_use_inline_and_heap_storage_without_changing_membership() {
+        let mut words = Vec::new();
         let tokens = vec![Token::Star];
-        let mut inline = FailedStates::new(&tokens, b"abc");
+        let mut inline = FailedStates::new(&tokens, b"abc", &mut words);
         assert!(matches!(&inline, FailedStates::Inline { .. }));
         assert!(inline.insert(0, 1));
         assert!(!inline.insert(0, 1));
         assert!(inline.insert(0, 2));
         assert!(!inline.insert(0, 2));
+        assert!(words.is_empty(), "an inline matrix must not touch the heap");
 
         let tokens = vec![Token::Star; 2];
-        let mut heap = FailedStates::new(&tokens, &[b'a'; 64]);
+        let mut heap = FailedStates::new(&tokens, &[b'a'; 64], &mut words);
         assert!(matches!(&heap, FailedStates::Heap { .. }));
         assert!(heap.insert(1, 63));
         assert!(!heap.insert(1, 63));
         assert!(heap.insert(0, 63));
         assert!(!heap.insert(0, 63));
+        // 2 tokens x 65 path positions is 130 bits, which is three words.
+        assert_eq!(words.len(), 3);
+
+        // Reusing the buffer must present a cleared matrix, and the words the
+        // previous call dirtied must not leak into the next one.
+        let mut reused = FailedStates::new(&tokens, &[b'a'; 64], &mut words);
+        assert!(reused.insert(1, 63));
+        assert!(reused.insert(0, 63));
     }
 
     #[test]
