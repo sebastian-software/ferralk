@@ -156,6 +156,36 @@ fn matcher(c: &mut Criterion) {
         benchmark.iter(|| black_box(general.is_match(black_box("src/deep/main.txt"))))
     });
 
+    // The walker routes every starred pattern through the general matcher once
+    // wildcards are component-local, so these two shapes cover the per-entry
+    // cost of a real traversal filter.
+    let walker_recursive = Pattern::compile(
+        "**/*.ts",
+        PatternOptions::default().recursive_double_star(true),
+    )
+    .expect("walker recursive benchmark pattern is valid");
+    let walker_path = "src/deep/nested/module/component/widget/main.ts";
+    let walker_other = "src/deep/nested/module/component/widget/main.tsx";
+    c.bench_function("walker_component/recursive_suffix/matching", |benchmark| {
+        benchmark.iter(|| black_box(walker_recursive.is_match_glob_path(black_box(walker_path))))
+    });
+    c.bench_function(
+        "walker_component/recursive_suffix/non_matching",
+        |benchmark| {
+            benchmark
+                .iter(|| black_box(walker_recursive.is_match_glob_path(black_box(walker_other))))
+        },
+    );
+
+    let general_literal_skip = Pattern::compile("*a*b.ts", PatternOptions::default())
+        .expect("general literal-skip benchmark pattern is valid");
+    c.bench_function("general_literal_skip/matching", |benchmark| {
+        benchmark.iter(|| black_box(general_literal_skip.is_match(black_box(walker_path))))
+    });
+    c.bench_function("general_literal_skip/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(general_literal_skip.is_match(black_box(walker_other))))
+    });
+
     let suffix_star = Pattern::compile("*.rs", PatternOptions::default())
         .expect("suffix-star benchmark pattern is valid");
     c.bench_function("single_star/ferralk_compiled/matching", |benchmark| {
