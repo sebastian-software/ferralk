@@ -31,8 +31,10 @@ pub(super) fn collect(walker: Walker) -> Result<WalkResult, WalkError> {
     // The caller starts alone. Helpers are created only after the root made
     // parallel directory work available, as required by ADR-0009.
     shared.begin_task();
-    process_directory(&shared, &mut caller, walker.root.clone());
-    shared.finish_task();
+    {
+        let _root_task = TaskGuard::claim(&shared);
+        process_directory(&shared, &mut caller, walker.root.clone());
+    }
     caller.flush_into(&shared.scheduler);
 
     let pending = shared.pending.load(Ordering::Acquire);
@@ -203,6 +205,25 @@ impl Shared {
     }
 }
 
+/// Owns one in-flight task that `begin_task` already counted and releases it
+/// on drop, so a panic inside `process_directory` cannot strand the pending
+/// count and leave the sibling workers waiting for work that never completes.
+struct TaskGuard<'a> {
+    shared: &'a Shared,
+}
+
+impl<'a> TaskGuard<'a> {
+    fn claim(shared: &'a Shared) -> Self {
+        Self { shared }
+    }
+}
+
+impl Drop for TaskGuard<'_> {
+    fn drop(&mut self) {
+        self.shared.finish_task();
+    }
+}
+
 struct WorkerScratch {
     queue: Worker<PathBuf>,
     gitignore_cache: HashMap<PathBuf, Arc<GitIgnoreNode>>,
@@ -241,10 +262,10 @@ fn catch_worker_panic(shared: &Shared, work: impl FnOnce()) {
 
 fn run_worker(shared: &Shared, worker: &mut WorkerScratch, stealers: &[Stealer<PathBuf>]) {
     while let Some(directory) = next_task(shared, worker, stealers) {
+        let _task = TaskGuard::claim(shared);
         if !shared.should_stop() {
             process_directory(shared, worker, directory);
         }
-        shared.finish_task();
     }
 }
 
@@ -254,6 +275,12 @@ fn next_task(
     stealers: &[Stealer<PathBuf>],
 ) -> Option<PathBuf> {
     loop {
+        // Cancellation ends the search right away. Queued tasks are plain
+        // paths, so leaving them behind has no observable effect, and workers
+        // stop within one poll interval instead of draining the whole tree.
+        if shared.should_stop() {
+            return None;
+        }
         if let Some(task) = try_take(shared, worker, stealers) {
             return Some(task);
         }
@@ -294,6 +321,10 @@ fn try_take(
 }
 
 fn process_directory(shared: &Shared, worker: &mut WorkerScratch, directory: PathBuf) {
+    #[cfg(test)]
+    if should_panic_in_directory(&directory) {
+        panic!("injected directory panic");
+    }
     if shared.should_stop() {
         return;
     }
@@ -439,18 +470,81 @@ fn should_fail_next_worker_spawn() -> bool {
     FAIL_NEXT_WORKER_SPAWN.with(std::cell::Cell::take)
 }
 
+/// Directory whose traversal panics once, on whichever worker picks it up.
+/// The trigger is process-wide because helper threads own their tasks, and it
+/// matches one absolute path so concurrent tests stay independent.
+#[cfg(test)]
+static PANIC_IN_DIRECTORY: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+#[cfg(test)]
+fn panic_in_directory(directory: PathBuf) {
+    *lock(&PANIC_IN_DIRECTORY) = Some(directory);
+}
+
+#[cfg(test)]
+fn should_panic_in_directory(directory: &std::path::Path) -> bool {
+    let mut target = lock(&PANIC_IN_DIRECTORY);
+    if target.as_deref() == Some(directory) {
+        *target = None;
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         fs,
         panic::{AssertUnwindSafe, catch_unwind},
-        path::PathBuf,
-        sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
+        path::{Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use super::{Shared, Walker, catch_worker_panic, fail_next_worker_spawn, finish};
+    use super::{
+        Shared, Walker, catch_worker_panic, fail_next_worker_spawn, finish, panic_in_directory,
+    };
     use crate::CancellationToken;
+
+    /// A hung `collect()` is the regression under test, so the assertion has to
+    /// time out instead of blocking the suite forever.
+    const RESUME_TIMEOUT: Duration = Duration::from_secs(30);
+
+    static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
+
+    fn unique_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ferralk-{label}-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// Builds a tree wide enough to keep several helpers busy while one of them
+    /// panics, so the surviving workers have to notice the cancellation.
+    fn create_wide_fixture(root: &Path) {
+        for branch in 0..6 {
+            for nested in 0..4 {
+                let directory = root
+                    .join(format!("branch-{branch}"))
+                    .join(format!("nested-{nested}"));
+                fs::create_dir_all(&directory).expect("create fixture directory");
+                for file in 0..4 {
+                    fs::write(directory.join(format!("file-{file}.txt")), b"fixture")
+                        .expect("write fixture file");
+                }
+            }
+        }
+    }
 
     #[test]
     fn worker_panic_cancels_siblings_and_resumes_on_the_caller() {
@@ -464,15 +558,49 @@ mod tests {
     }
 
     #[test]
+    fn worker_panic_during_traversal_resumes_without_hanging_the_walk() {
+        // Repeated rounds keep the panic landing on different workers, so a
+        // stranded pending count would show up as a hang instead of flaking.
+        for round in 0..4 {
+            let root = unique_root("worker-panic");
+            create_wide_fixture(&root);
+            panic_in_directory(root.join("branch-3").join("nested-2"));
+
+            let cancellation = CancellationToken::default();
+            let walk_root = root.clone();
+            let walk_cancellation = cancellation.clone();
+            let (sender, receiver) = mpsc::channel();
+            let runner = thread::Builder::new()
+                .name("ferralk-panic-regression".into())
+                .spawn(move || {
+                    let outcome = catch_unwind(AssertUnwindSafe(|| {
+                        Walker::new(&walk_root)
+                            .threads(4)
+                            .cancellation(walk_cancellation)
+                            .collect()
+                    }));
+                    let _ = sender.send(outcome.is_err());
+                })
+                .expect("spawn the walking thread");
+
+            let resumed = receiver.recv_timeout(RESUME_TIMEOUT);
+            let _ = fs::remove_dir_all(&root);
+            assert_eq!(
+                resumed,
+                Ok(true),
+                "round {round}: the injected worker panic must resume on the caller"
+            );
+            runner.join().expect("the walking thread joins");
+            assert!(
+                cancellation.is_cancelled(),
+                "round {round}: the panic must cancel the sibling workers"
+            );
+        }
+    }
+
+    #[test]
     fn worker_start_failure_returns_a_structured_error_and_cancels() {
-        let root = std::env::temp_dir().join(format!(
-            "ferralk-worker-start-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock is after epoch")
-                .as_nanos()
-        ));
+        let root = unique_root("worker-start");
         fs::create_dir_all(root.join("left")).expect("create left fixture");
         fs::create_dir_all(root.join("right")).expect("create right fixture");
         let cancellation = CancellationToken::default();
