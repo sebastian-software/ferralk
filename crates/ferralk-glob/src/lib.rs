@@ -164,7 +164,7 @@ impl Pattern {
                 braces: false,
                 ..options
             };
-            let alternatives = expand_braces(pattern, options.escape)?
+            let alternatives = expand_brace_alternatives(pattern, options.escape)?
                 .into_iter()
                 .map(|alternative| {
                     Self::compile(alternative, parse_options).map(|pattern| pattern.alternatives)
@@ -1870,7 +1870,46 @@ const MAX_BRACE_ALTERNATIVES: usize = 1 << 12;
 /// count. Checking it before each push therefore rejects exactly the patterns
 /// whose expansion would pass [`MAX_BRACE_ALTERNATIVES`], and bounds the work
 /// and the memory rather than only the result.
-fn expand_braces(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8>>, PatternError> {
+/// Expands brace alternatives into the plain patterns a pattern stands for.
+///
+/// [`Pattern::compile`] expands braces before it compiles anything; this
+/// exposes the same expansion so callers can reason about the alternatives
+/// themselves. Deriving a prefilter is the motivating case: every alternative
+/// of `**/*.{ts,tsx}` ends in a literal extension, so a caller can prefilter on
+/// `ts` and `tsx` without giving up on brace patterns.
+///
+/// Without [`PatternOptions::braces`] a pattern stands for itself and the
+/// result is the input unchanged. Alternatives come back in the order the
+/// expansion produces them, and a pattern always expands to at least one.
+///
+/// ```
+/// use ferralk_glob::{PatternOptions, expand_braces};
+///
+/// let options = PatternOptions::default().braces(true);
+/// let alternatives = expand_braces("**/*.{ts,tsx}", options)?;
+/// assert_eq!(alternatives, [b"**/*.ts".to_vec(), b"**/*.tsx".to_vec()]);
+/// # Ok::<(), ferralk_glob::PatternError>(())
+/// ```
+///
+/// # Errors
+///
+/// Reports a pattern that asks for more than [`MAX_BRACE_ALTERNATIVES`]
+/// alternatives, so a caller never has to assume the expansion succeeds. Glob
+/// syntax is not checked here: an unclosed brace is ordinary text, the way
+/// [`Pattern::compile`] treats it, and anything else malformed is reported when
+/// the alternative it belongs to is compiled.
+pub fn expand_braces(
+    pattern: impl AsRef<[u8]>,
+    options: PatternOptions,
+) -> Result<Vec<Vec<u8>>, PatternError> {
+    let pattern = pattern.as_ref();
+    if !options.braces {
+        return Ok(vec![pattern.to_vec()]);
+    }
+    expand_brace_alternatives(pattern, options.escape)
+}
+
+fn expand_brace_alternatives(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8>>, PatternError> {
     let Some(first_open) = first_unescaped_brace(pattern, escapes) else {
         return Ok(vec![pattern.to_vec()]);
     };
@@ -2601,7 +2640,7 @@ mod tests {
         // The work list must emit combinations in the order the recursive
         // expansion did: every choice of the first group before the second's.
         assert_eq!(
-            super::expand_braces(b"{a,b}{c,d}", true).unwrap(),
+            super::expand_brace_alternatives(b"{a,b}{c,d}", true).unwrap(),
             vec![
                 b"ac".to_vec(),
                 b"ad".to_vec(),
@@ -2610,7 +2649,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            super::expand_braces(b"{x,{y,z}}!", true).unwrap(),
+            super::expand_brace_alternatives(b"{x,{y,z}}!", true).unwrap(),
             vec![b"x!".to_vec(), b"y!".to_vec(), b"z!".to_vec()]
         );
     }
@@ -2621,7 +2660,9 @@ mod tests {
         // Two-way groups make the boundary exact: 2^12 is the budget.
         let within = "{a,b}".repeat(12);
         assert_eq!(
-            super::expand_braces(within.as_bytes(), true).unwrap().len(),
+            super::expand_brace_alternatives(within.as_bytes(), true)
+                .unwrap()
+                .len(),
             super::MAX_BRACE_ALTERNATIVES
         );
         assert!(Pattern::compile(&within, options).is_ok());

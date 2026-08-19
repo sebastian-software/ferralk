@@ -214,6 +214,59 @@ fn files_only_excludes_directories_without_pruning_their_contents() {
 
 #[cfg(unix)]
 #[test]
+fn a_brace_scoped_include_prunes_an_unreadable_sibling_before_opening_it() {
+    // The braced form of the include above. Its literal roots only survive the
+    // planner if the brace alternatives are expanded, so without that the walk
+    // opens `locked/` and aborts.
+    let fixture = Fixture::new();
+    if fs::metadata(&fixture.root)
+        .expect("fixture root metadata")
+        .uid()
+        == 0
+    {
+        return;
+    }
+    fs::create_dir_all(fixture.root.join("src")).expect("create source directory");
+    fs::write(fixture.root.join("src/a.rs"), b"fixture").expect("write source fixture");
+    fs::create_dir_all(fixture.root.join("lib")).expect("create library directory");
+    fs::write(fixture.root.join("lib/b.rs"), b"fixture").expect("write library fixture");
+    fs::create_dir_all(fixture.root.join("locked")).expect("create locked directory");
+    fs::write(fixture.root.join("locked/secret.rs"), b"fixture").expect("write locked fixture");
+    let locked = fixture.root.join("locked");
+    let original_permissions = fs::metadata(&locked)
+        .expect("locked directory metadata")
+        .permissions();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o0))
+        .expect("make locked directory unreadable");
+
+    let result = Walker::new(&fixture.root)
+        .include("{src,lib}/**/*.rs")
+        .expect("valid braced include")
+        .error_policy(ErrorPolicy::Abort)
+        .options(WalkOptions::default().sort(true))
+        .collect();
+
+    fs::set_permissions(&locked, original_permissions).expect("restore locked permissions");
+    let result = result.expect("out-of-scope unreadable directory is pruned");
+    let paths = result
+        .entries()
+        .iter()
+        .map(|entry| {
+            entry
+                .path()
+                .strip_prefix(&fixture.root)
+                .expect("entry belongs to fixture")
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        vec![PathBuf::from("lib/b.rs"), PathBuf::from("src/a.rs")]
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn scoped_include_prunes_an_unreadable_sibling_before_opening_it() {
     // Ported from zlob/test/test_walk.zig's out-of-scope unreadable-directory
     // regression. Root can bypass mode bits, so that environment cannot prove
