@@ -1,6 +1,8 @@
 name: Linux native fuzz
 
 on:
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       max_total_time:
@@ -11,32 +13,50 @@ on:
 permissions:
   contents: read
 
+env:
+  # Keep PR fuzzing bounded while retaining a longer manual validation run.
+  MAX_TOTAL_TIME: ${{ inputs.max_total_time || '60' }}
+
 jobs:
   fuzz:
+    name: Linux native fuzz
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-04
       - run: cargo install cargo-fuzz --locked
-      - run: cargo fuzz run linux_dirent_parser -- -max_total_time=${{ inputs.max_total_time }}
+      - run: cargo fuzz run linux_dirent_parser -- -max_total_time=$MAX_TOTAL_TIME
 
   address-sanitizer:
+    name: Linux AddressSanitizer
     runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: -Zsanitizer=address
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo test -p ferralk --features native-linux --lib
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-04
+      - name: Run AddressSanitizer tests
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zsanitizer=address
+        # Loom's generator runtime intentionally retains model state until
+        # process exit, which LeakSanitizer reports outside the native code.
+        run: >-
+          cargo test --target x86_64-unknown-linux-gnu -p ferralk --features native-linux --lib --
+          --skip scheduler::loom_models::last_completion_notifies_exactly_once
+          --skip scheduler::loom_models::queued_child_keeps_waiting_workers_alive_until_it_is_observed
 
   miri-parser:
+    name: Linux Miri parser
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-08-04
           components: miri
-      - run: cargo +nightly miri setup
+      - run: cargo +nightly-2026-08-04 miri setup
       # The raw-syscall reader requires a real Linux kernel. This focused test
       # exercises the bounds-checked parser without crossing that FFI boundary.
-      - run: cargo +nightly miri test -p ferralk --features native-linux linux_native::tests::parser_skips_dot_entries_and_rejects_truncated_records
+      - run: cargo +nightly-2026-08-04 miri test -p ferralk --features native-linux linux_native::tests::parser_skips_dot_entries_and_rejects_truncated_records
