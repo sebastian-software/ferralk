@@ -5,8 +5,10 @@ roughly correspond to one PR. A milestone is done when every box is checked
 and its exit criterion holds. Architecture: [RFC](RFC-zig-free-zlob-port.md);
 individual decisions: [ADRs](docs/adr/README.md).
 
-Milestones M0–M3 are sequential. M4 is release-readiness work, not a promise
-of an imminent 1.0; stable-release timing and versioning remain an explicit
+Milestones M0–M3 record the sequential portable-port work. Their remaining
+external comparison and communication rows are evidence/follow-up work, not
+missing implementation. M4 is release-readiness work, not a promise of an
+imminent 1.0; stable-release timing and versioning remain an explicit
 maintainer decision. M5 starts only after that stable scope is chosen
 (ADR-0010).
 
@@ -38,7 +40,8 @@ disputed or undefined zlob semantics are captured as flagged corpus cases.
 - [x] Build the `git check-ignore` oracle runner for ignore cases — ADR-0006
 - [x] Record disputed/undefined semantics as corpus cases with a `disputed`
       flag
-- [ ] Send the courtesy notice to the zlob maintainer — ADR-0001
+- [ ] Send the courtesy notice to the zlob maintainer — ADR-0001. A reviewed,
+      unsent draft is in [`docs/zlob-courtesy-note.md`](docs/zlob-courtesy-note.md).
 
 ## M1 — Matcher port (RFC Phase 1, ~3–5 weeks)
 
@@ -118,7 +121,8 @@ maintainer-selected public release; Windows tier-2 CI is green. A 1.0 date is
 intentionally not part of this milestone — ADR-0010.
 
 - [x] Compatibility guide: zlob API mapping and all deliberate divergences
-- [ ] Downstream trial: integrate into Palamedes, fold feedback back
+- [ ] Separate follow-up: integrate into Palamedes and fold feedback back.
+      It is no longer a gate for completing the portable RFC implementation.
 - [x] MSRV and feature audit; API review (cargo-semver-checks in CI)
 - [x] Dependency and unsafe audit (expected: zero unsafe before M5)
 - [x] Oracle retirement check: corpus is self-sufficient, Zig-free CI
@@ -168,13 +172,28 @@ specific action needed to clear each one are consolidated in
   validation commands. The compatibility guide remains the migration reference
   rather than the primary getting-started path.
 - Reframed M4 as release readiness: no first-public-release version or 1.0 date
-  is implied. Benchmark evidence and the Palamedes downstream trial remain
-  prerequisites for a later maintainer decision.
+  is implied. Benchmark evidence remains a prerequisite for a later maintainer
+  decision; the Palamedes trial is separate downstream work.
 - Opened the Palamedes downstream trial as
   [palamedes#877](https://github.com/sebastian-software/palamedes/pull/877).
   It replaces only the CLI extractor's serial source traversal with a pinned
   Ferralk Git dependency, while retaining Palamedes' existing `globset`
-  configuration semantics; the trial remains open pending review and remote CI.
+  configuration semantics. It is now tracked as separate downstream work and
+  does not hold up the portable RFC milestone.
+
+### 2026-08-19 — RFC completion evidence prepared
+
+- Both the generated lockstep-version release PR and the native-fuzz lockfile
+  correction have merged. The workspace is now at the same `0.1.1` version for
+  both publishable crates; no release or registry publication is implied.
+- Added a maintainer-reviewable, explicitly **unsent** courtesy note for zlob's
+  maintainer in [`docs/zlob-courtesy-note.md`](docs/zlob-courtesy-note.md).
+  Sending remains an external communication step and is deliberately not
+  marked complete by this draft.
+- Prepared the local macOS comparison: `cargo bench --no-run -p bench --features
+  zlob-oracle --bench matcher --bench matcher_zlob --bench walker --bench
+  walker_zlob` completes successfully. The actual measured run remains pending
+  so it can be performed on the maintainer's Mac under an observed idle state.
 
 ### 2026-08-19 — Public repository and standard CI validated
 
