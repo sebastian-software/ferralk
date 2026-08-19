@@ -1426,7 +1426,10 @@ fn match_extglob_from(
                     continue;
                 }
                 b'?' if path.get(path_index).is_some_and(|&byte| {
-                    options.match_hidden || byte != b'.' || !at_component_start(path, path_index)
+                    (!options.component_wildcards || !is_separator(byte))
+                        && (options.match_hidden
+                            || byte != b'.'
+                            || !at_component_start(path, path_index))
                 }) =>
                 {
                     pattern_index += 1;
@@ -1436,9 +1439,10 @@ fn match_extglob_from(
                 b'[' if let Ok((class, next)) =
                     parse_class(pattern, pattern_index, options.escape)
                     && path.get(path_index).is_some_and(|&byte| {
-                        (options.match_hidden
-                            || byte != b'.'
-                            || !at_component_start(path, path_index))
+                        (!options.component_wildcards || !is_separator(byte))
+                            && (options.match_hidden
+                                || byte != b'.'
+                                || !at_component_start(path, path_index))
                             && class.matches(byte, options.case_insensitive)
                     }) =>
                 {
@@ -1470,6 +1474,12 @@ fn match_extglob_from(
         }
 
         if has_star && star_path_index < path.len() {
+            if options.component_wildcards && is_separator(path[star_path_index]) {
+                pattern_index = star_pattern_index;
+                path_index = star_path_index;
+                has_star = false;
+                continue;
+            }
             if !options.match_hidden
                 && path.get(star_path_index) == Some(&b'.')
                 && at_component_start(path, star_path_index)
@@ -1522,7 +1532,7 @@ fn match_extglob_group(
             &mut HashSet::new(),
         ),
         ExtglobKind::Negated => {
-            for end in path_index..=path.len() {
+            for end in path_index..=extglob_component_end(path, path_index, options) {
                 if alternatives.iter().all(|alternative| {
                     !match_extglob_alternative_exact(alternative, &path[path_index..end], options)
                 }) && match_extglob_from(rest, path, 0, end, options)
@@ -1543,7 +1553,7 @@ fn match_extglob_alternative(
     options: PatternOptions,
 ) -> bool {
     alternatives.iter().any(|alternative| {
-        (path_index..=path.len()).any(|end| {
+        (path_index..=extglob_component_end(path, path_index, options)).any(|end| {
             match_extglob_alternative_exact(alternative, &path[path_index..end], options)
                 && match_extglob_from(rest, path, 0, end, options)
         })
@@ -1562,7 +1572,7 @@ fn match_extglob_repeated(
         return false;
     }
     for alternative in alternatives {
-        for end in path_index..=path.len() {
+        for end in path_index..=extglob_component_end(path, path_index, options) {
             if match_extglob_alternative_exact(alternative, &path[path_index..end], options)
                 && (match_extglob_from(rest, path, 0, end, options)
                     || (end > path_index
@@ -1585,7 +1595,25 @@ fn match_extglob_alternative_exact(
         extglob: false,
         ..options
     };
-    Pattern::compile(alternative, options).is_ok_and(|pattern| pattern.is_match(path))
+    Pattern::compile(alternative, options).is_ok_and(|pattern| {
+        if options.root_component_wildcards {
+            pattern.is_match_glob_path(path)
+        } else {
+            pattern.is_match(path)
+        }
+    })
+}
+
+fn extglob_component_end(path: &[u8], path_index: usize, options: PatternOptions) -> usize {
+    if options.component_wildcards {
+        path_index
+            + path[path_index..]
+                .iter()
+                .position(|byte| is_separator(*byte))
+                .unwrap_or(path.len() - path_index)
+    } else {
+        path.len()
+    }
 }
 
 #[cfg(test)]
@@ -1984,6 +2012,14 @@ mod tests {
         assert!(root_pattern.is_match_path("src/nested.rs"));
         assert!(!root_pattern.is_match_glob_path("src/nested.rs"));
         assert!(root_pattern.is_match_glob_path("nested.rs"));
+
+        let extglob = Pattern::compile("@(a*)", PatternOptions::default().extglob(true)).unwrap();
+        assert!(extglob.is_match_glob_path("aaa"));
+        assert!(!extglob.is_match_glob_path("aaa/nested"));
+        let nested_extglob =
+            Pattern::compile("@(foo)/*/bar", PatternOptions::default().extglob(true)).unwrap();
+        assert!(nested_extglob.is_match_glob_path("foo/a/bar"));
+        assert!(!nested_extglob.is_match_glob_path("foo/a/deep/bar"));
     }
 
     #[test]

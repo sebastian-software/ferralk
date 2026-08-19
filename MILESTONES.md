@@ -707,6 +707,11 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   from that frozen Rust-glob fixture in the same public regression: no-match,
   prefix-star, exact nested path, and `./*` equivalence now have direct
   assertions rather than relying on broader pattern cases.
+- Applied that strict Walker component boundary to Extglob evaluation as well:
+  Extglob alternatives, `?`, classes, repetition, negation, and star
+  backtracking stop at the next separator under `is_match_glob_path`, while
+  direct matcher semantics remain unchanged. Regressions cover both root
+  `@(a*)` and embedded `@(foo)/*/bar` forms.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no
