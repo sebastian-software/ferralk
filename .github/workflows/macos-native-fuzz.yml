@@ -15,7 +15,7 @@ jobs:
   fuzz:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo install cargo-fuzz --locked
       - run: cargo fuzz run macos_dirent_parser -- -max_total_time=${{ inputs.max_total_time }}
@@ -25,6 +25,6 @@ jobs:
     env:
       RUSTFLAGS: -Zsanitizer=address
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo test -p ferralk --features native-macos --lib
