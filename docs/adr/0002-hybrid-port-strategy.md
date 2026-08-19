@@ -29,3 +29,12 @@ Split the port by component nature:
 - A planned refactor debt in the matcher (port → IR) that must not be skipped.
 - The corpus must exist before matcher code, or port correctness is unprovable
   (see ADR-0007).
+
+## Implementation evidence
+
+The post-corpus refactor is complete. `Pattern::compile` produces immutable
+`CompiledAlternative` values, including the derived component-sensitive
+path-filter representation. Matching only borrows this compiled IR; the
+failure memo is deliberately per invocation and is not part of the compiled
+state. The direct IR, fast-path equivalence, corpus, and oracle tests provide
+the regression evidence for this boundary.

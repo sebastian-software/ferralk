@@ -20,8 +20,8 @@ use memchr::{memchr, memchr3, memmem};
 /// A compiled glob pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern {
-    alternatives: Vec<Alternative>,
-    path_filter_alternatives: Option<Vec<Alternative>>,
+    alternatives: Vec<CompiledAlternative>,
+    path_filter_alternatives: Option<Vec<CompiledAlternative>>,
     options: PatternOptions,
 }
 
@@ -232,7 +232,7 @@ impl Pattern {
         flush_literals(&mut tokens, &mut literals);
 
         Ok(Self::from_alternatives(
-            vec![Alternative {
+            vec![CompiledAlternative {
                 raw: pattern.to_vec(),
                 fast_path: FastPath::compile(&tokens, options),
                 tokens,
@@ -264,7 +264,7 @@ impl Pattern {
 
     fn is_match_with(
         &self,
-        alternatives: &[Alternative],
+        alternatives: &[CompiledAlternative],
         options: PatternOptions,
         path: &[u8],
     ) -> bool {
@@ -392,47 +392,63 @@ impl Pattern {
         self.is_match_with(alternatives, options, path)
     }
 
-    fn from_alternatives(alternatives: Vec<Alternative>, options: PatternOptions) -> Self {
+    fn from_alternatives(alternatives: Vec<CompiledAlternative>, options: PatternOptions) -> Self {
         let path_filter_alternatives = alternatives
             .iter()
             .any(|alternative| {
-            alternative.raw.starts_with(b"./")
-                || alternative.tokens.windows(2).any(|tokens| {
-                    matches!(
-                        tokens,
-                        [Token::Separator, Token::Any | Token::Star | Token::Class(_)]
-                    )
-                })
+                alternative.raw.starts_with(b"./")
+                    || alternative.tokens.windows(2).any(|tokens| {
+                        matches!(
+                            tokens,
+                            [Token::Separator, Token::Any | Token::Star | Token::Class(_)]
+                        )
+                    })
             })
             .then(|| {
                 alternatives
                     .iter()
-                    .cloned()
-                    .map(|mut alternative| {
-                        let leading_dot_slash = alternative.raw.starts_with(b"./")
-                            && matches!(alternative.tokens.as_slice(), [Token::Literal(dot), Token::Separator, ..] if dot == b".");
-                        if leading_dot_slash {
-                            alternative.raw.drain(..2);
-                            alternative.tokens.drain(..2);
-                        }
-                        if !options.recursive_double_star {
-                            alternative.tokens = path_list_tokens(std::mem::take(&mut alternative.tokens));
-                        }
-                        alternative.fast_path = FastPath::compile(
-                            &alternative.tokens,
-                            PatternOptions {
-                                component_wildcards: true,
-                                ..options
-                            },
-                        );
-                        alternative
-                    })
+                    .map(|alternative| Self::compile_path_filter_alternative(alternative, options))
                     .collect()
             });
         Self {
             alternatives,
             path_filter_alternatives,
             options,
+        }
+    }
+
+    fn compile_path_filter_alternative(
+        alternative: &CompiledAlternative,
+        options: PatternOptions,
+    ) -> CompiledAlternative {
+        let leading_dot_slash = alternative.raw.starts_with(b"./")
+            && matches!(alternative.tokens.as_slice(), [Token::Literal(dot), Token::Separator, ..] if dot == b".");
+        let raw = if leading_dot_slash {
+            alternative.raw[2..].to_vec()
+        } else {
+            alternative.raw.clone()
+        };
+        let source_tokens = if leading_dot_slash {
+            &alternative.tokens[2..]
+        } else {
+            &alternative.tokens
+        };
+        let tokens = if options.recursive_double_star {
+            source_tokens.to_vec()
+        } else {
+            path_list_tokens(source_tokens.to_vec())
+        };
+        let fast_path = FastPath::compile(
+            &tokens,
+            PatternOptions {
+                component_wildcards: true,
+                ..options
+            },
+        );
+        CompiledAlternative {
+            raw,
+            fast_path,
+            tokens,
         }
     }
 
@@ -696,7 +712,11 @@ fn path_list_tokens(tokens: Vec<Token>) -> Vec<Token> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Alternative {
+/// Immutable compiled representation of one syntax alternative.
+///
+/// It is constructed only during [`Pattern::compile`]. Matching borrows it;
+/// per-call memoization remains outside this IR in [`FailedStates`].
+struct CompiledAlternative {
     raw: Vec<u8>,
     fast_path: Option<FastPath>,
     tokens: Vec<Token>,

@@ -55,7 +55,7 @@ matcher ≤1.5x zlob median, ≤1.25x `fast-glob` median on the common subset.
       disagreement into the corpus — ADR-0007
 - [x] Property tests (literal-only patterns, subset/superset invariants)
 - [x] Fuzzers for parser and matcher with seeded corpora
-- [ ] Refactor the ported code toward the immutable IR (after corpus green) —
+- [x] Refactor the ported code toward the immutable IR (after corpus green) —
       ADR-0002
 - [x] Profile, then apply memchr/memmem hot-path primitives — ADR-0008
 - [ ] Matcher benchmarks vs zlob, `fast-glob`, and `globset` in CodSpeed;
@@ -198,6 +198,13 @@ specific action needed to clear each one are consolidated in
   status, and requested metadata. It executes locally for `native-macos` and
   cross-compiles with the Linux-native test configuration; broader filesystem
   corpus and sanitizer-runtime evidence remain open.
+- Completed the M1 immutable-IR refactor: `Pattern::compile` now produces
+  named, immutable `CompiledAlternative` values for both direct matching and
+  the optional component-sensitive path-filter form. The path-filter compiler
+  derives its representation without mutating an existing alternative; runtime
+  matching only borrows those values and keeps its failure memo strictly local
+  to an invocation. Direct IR and fast-path equivalence tests, the corpus, and
+  the zlob oracle cover the completed representation.
 
 ### 2026-08-19 — M1 component-aware deterministic IR
 
