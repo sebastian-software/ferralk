@@ -33,6 +33,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The fuzz crate is a separate workspace, so `--workspace` never sees
+      # it; a corpus::Case schema change once broke its hand-built struct
+      # literal invisibly. Check the three platform-neutral glob bins here —
+      # the native dirent bins are cfg-gated per OS (no single host compiles
+      # them all) and every PR already builds them in the native fuzz jobs.
+      - run: >-
+          cargo check --manifest-path fuzz/Cargo.toml
+          --bin pattern_parser --bin pattern_matcher --bin ferralk_vs_fast_glob
 
   test:
     name: test (${{ matrix.os }})
