@@ -27,7 +27,9 @@ jobs:
         with:
           toolchain: nightly-2026-08-04
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       - run: cargo fuzz run linux_dirent_parser -- -max_total_time=$MAX_TOTAL_TIME
 
   address-sanitizer:
