@@ -712,6 +712,12 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   backtracking stop at the next separator under `is_match_glob_path`, while
   direct matcher semantics remain unchanged. Regressions cover both root
   `@(a*)` and embedded `@(foo)/*/bar` forms.
+- Ran the release packaging preflight: `cargo package` successfully packages
+  and verifies `ferralk-glob` 0.1.0. `ferralk` correctly cannot complete
+  Cargo's upload verification until that exact `ferralk-glob` version exists
+  on crates.io; the package resolver reports it absent from the registry.
+  This confirms the documented publication order and leaves only maintainer
+  registry authority as the blocker, not a local package defect.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no
