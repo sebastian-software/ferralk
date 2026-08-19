@@ -176,6 +176,10 @@ specific action needed to clear each one are consolidated in
   `ferralk`, allowing for registry-index propagation between them. Publishing
   remains an external release gate until crates.io trusted publishing is
   configured and a release PR is approved.
+- The first remote configuration run exposed a filename mismatch before any
+  release action: Release Please requires `.release-please-config.json`.
+  The corrected dotfile is committed separately; no package, tag, release, or
+  release PR was created by the failed run.
 
 ### 2026-08-19 — M0 Rust-only scope confirmed
 
