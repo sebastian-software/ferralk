@@ -1,10 +1,10 @@
-name: Regenerate oracle corpus
+name: Replay corpus against zlob oracle
 
 on:
   workflow_dispatch:
     inputs:
       reason:
-        description: Why regeneration is needed; generated cases still require review.
+        description: Why the replay is needed; the corpus is checked in and is never rewritten here.
         required: true
         type: string
 
@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 jobs:
-  regenerate:
+  replay:
     name: zlob 1.6.3 oracle
     runs-on: ubuntu-latest
     steps:
@@ -22,4 +22,14 @@ jobs:
         with:
           version: 0.16.0
       - name: Replay corpus and generated common subset against zlob
-        run: cargo test -p oracle --test zlob_oracle --test generated_subset -- --ignored
+        shell: bash
+        run: |
+          cargo test -p oracle --test zlob_oracle --test generated_subset \
+            -- --ignored --nocapture 2>&1 | tee oracle-replay.log
+      - name: Upload the replay log with its skip counts and disagreements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oracle-replay-log
+          path: oracle-replay.log
+          if-no-files-found: warn
