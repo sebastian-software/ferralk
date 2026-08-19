@@ -154,6 +154,18 @@ The current external-release prerequisites, their local evidence, and the
 specific action needed to clear each one are consolidated in
 [`docs/external-release-gates.md`](docs/external-release-gates.md).
 
+### 2026-08-19 — Public repository and standard CI validated
+
+- Created the public `sebastian-software/ferralk` repository and pushed the
+  complete `main` history. The current standard CI run validates Linux, macOS,
+  and Windows test matrices; both native backend jobs; Rust 1.93 MSRV;
+  dependency/unsafe audit; coverage; and Codecov upload. Actions now use
+  Checkout v7, CodSpeed v5 with explicit simulation mode, Codecov v7, and
+  Release Please v5. The remaining Release Please failure is an explicit
+  release-configuration decision for the workspace's six packages, not a
+  source or test failure. The long-running CodSpeed comparison remains an
+  external benchmark gate.
+
 ### 2026-08-19 — M0 Rust-only scope confirmed
 
 - Confirmed the accepted ADR-0003 boundary: Ferralk 1.0 remains Rust-only.
