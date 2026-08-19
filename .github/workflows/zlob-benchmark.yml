@@ -28,13 +28,23 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.16.0
+      # See walker-bench.yml: a restored criterion directory can silence the
+      # measurement while the step still exits zero.
       - name: Measure against zlob 1.6.3
         shell: bash
-        run: >-
-          cargo bench -p bench --features zlob-oracle
-          --bench walker_zlob --bench matcher_zlob --
-          --warm-up-time 1 --measurement-time 5 --sample-size 20
-          --output-format bencher | tee zlob-comparison.txt
+        run: |
+          rm -rf target/criterion
+          cargo bench -p bench --features zlob-oracle \
+            --bench walker_zlob --bench matcher_zlob -- \
+            --warm-up-time 1 --measurement-time 5 --sample-size 20 \
+            --output-format bencher | tee zlob-comparison.txt
+      - name: Check that the comparison actually measured something
+        shell: bash
+        run: |
+          if ! grep -q 'ns/iter' zlob-comparison.txt; then
+            echo "::error::the zlob comparison produced no measurements"
+            exit 1
+          fi
       - name: Publish the medians
         if: always()
         run: |

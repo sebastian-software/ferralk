@@ -40,12 +40,24 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Shorter than criterion's defaults so the lane stays inside a pull
       # request's budget; the sample count is still large enough for a median.
+      # The restored target directory can carry partial criterion state from
+      # another commit, and criterion then fails to load a baseline and prints
+      # no measurement at all -- while still exiting zero. Start from nothing.
       - name: Measure
         shell: bash
-        run: >-
-          cargo bench -p bench --bench walker ${{ matrix.features }} --
-          --warm-up-time 1 --measurement-time 5 --sample-size 20
-          --output-format bencher | tee walker-${{ matrix.lane }}.txt
+        run: |
+          rm -rf target/criterion
+          cargo bench -p bench --bench walker ${{ matrix.features }} -- \
+            --warm-up-time 1 --measurement-time 5 --sample-size 20 \
+            --output-format bencher | tee walker-${{ matrix.lane }}.txt
+      # A performance lane that prints nothing must not report success.
+      - name: Check that the lane actually measured something
+        shell: bash
+        run: |
+          if ! grep -q 'ns/iter' walker-${{ matrix.lane }}.txt; then
+            echo "::error::the walker benchmark produced no measurements"
+            exit 1
+          fi
       - name: Publish the medians
         if: always()
         run: |
