@@ -470,7 +470,7 @@ fn has_hidden_component(path: &[u8]) -> bool {
 /// Gives glob matchers a root-relative path with `/` separators on every
 /// platform. Native `Path` values retain their platform representation; only
 /// the byte-oriented pattern language is normalized.
-fn glob_path_bytes(path: &Path) -> Cow<'_, [u8]> {
+pub(crate) fn glob_path_bytes(path: &Path) -> Cow<'_, [u8]> {
     let bytes = path.as_os_str().as_encoded_bytes();
     #[cfg(windows)]
     {

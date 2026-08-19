@@ -17,8 +17,8 @@ use crossbeam_deque::{Steal, Stealer, Worker};
 
 use super::{
     BackendEntry, DirectoryBackend, ErrorPolicy, GitIgnoreNode, SystemBackend, WalkEntry,
-    WalkError, WalkResult, Walker, has_hidden_component, is_git_ignored, scheduler::Scheduler,
-    should_skip_git_directory,
+    WalkError, WalkResult, Walker, glob_path_bytes, has_hidden_component, is_git_ignored,
+    scheduler::Scheduler, should_skip_git_directory,
 };
 
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -334,8 +334,8 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
     if !shared.walker.includes_depth(relative) {
         return;
     }
-    let bytes = relative.as_os_str().as_encoded_bytes();
-    if shared.walker.options.skip_hidden && has_hidden_component(bytes) {
+    let bytes = glob_path_bytes(relative);
+    if shared.walker.options.skip_hidden && has_hidden_component(bytes.as_ref()) {
         return;
     }
     if should_skip_git_directory(&shared.walker, &entry.path) {
@@ -345,7 +345,7 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
         .walker
         .excludes
         .iter()
-        .any(|pattern| pattern.matches(bytes, entry.is_dir))
+        .any(|pattern| pattern.matches(bytes.as_ref(), entry.is_dir))
     {
         return;
     }
@@ -367,7 +367,7 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
             }
         }
     }
-    if !entry.is_dir && !shared.walker.may_include_file(bytes) {
+    if !entry.is_dir && !shared.walker.may_include_file(bytes.as_ref()) {
         return;
     }
     if entry.is_dir
@@ -375,8 +375,8 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
             .walker
             .excludes
             .iter()
-            .any(|pattern| pattern.covers_subtree(bytes))
-        && shared.walker.may_descend_path(relative, bytes)
+            .any(|pattern| pattern.covers_subtree(bytes.as_ref()))
+        && shared.walker.may_descend_path(relative, bytes.as_ref())
     {
         shared.schedule(&worker.queue, entry.path.clone());
     }
@@ -385,7 +385,7 @@ fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: Backend
             .walker
             .includes
             .iter()
-            .any(|pattern| pattern.matches(bytes, entry.is_dir))
+            .any(|pattern| pattern.matches(bytes.as_ref(), entry.is_dir))
     {
         return;
     }
