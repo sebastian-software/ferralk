@@ -452,6 +452,20 @@ impl Pattern {
         }
     }
 
+    /// Explores the token/path state graph without native recursion.
+    ///
+    /// A star is the only token with two successors, and it is the one that
+    /// used to recurse once per consumed path byte, so a long candidate
+    /// overflowed the native stack. Its repetition branch is now deferred to an
+    /// explicit work list while the "stop consuming here" branch continues in
+    /// place. Depth-first order is unchanged, because a deferred entry is
+    /// popped exactly when the branch that was taken instead is exhausted.
+    ///
+    /// The work list stays small: a star's repetition branch keeps its token
+    /// index while its other successor advances it, so the deferred entries
+    /// hold strictly increasing token indices and never exceed one per token.
+    /// `FailedStates` still bounds the explored state space to
+    /// `tokens × path` visits.
     fn matches_from(
         tokens: &[Token],
         token_index: usize,
@@ -460,82 +474,79 @@ impl Pattern {
         options: PatternOptions,
         failed: &mut FailedStates,
     ) -> bool {
-        if token_index == tokens.len() {
-            return path_index == path.len();
-        }
-        if !failed.insert(token_index, path_index) {
-            return false;
-        }
+        let mut deferred: Vec<(usize, usize)> = Vec::new();
+        let mut state = (token_index, path_index);
 
-        let matches = match &tokens[token_index] {
-            Token::Literal(literal) => Self::match_literal(
-                tokens,
-                token_index,
-                path_index,
-                path,
-                options,
-                failed,
-                literal,
-            ),
-            Token::Separator => {
-                path.get(path_index).is_some_and(|byte| is_separator(*byte))
-                    && Self::matches_from(
-                        tokens,
-                        token_index + 1,
-                        path_index + 1,
+        loop {
+            let (token_index, path_index) = state;
+            let advanced = if token_index == tokens.len() {
+                if path_index == path.len() {
+                    return true;
+                }
+                None
+            } else if !failed.insert(token_index, path_index) {
+                None
+            } else {
+                match &tokens[token_index] {
+                    Token::Literal(literal) => {
+                        Self::advance_literal(token_index, path_index, path, options, literal)
+                    }
+                    Token::Separator => {
+                        if path.get(path_index).is_some_and(|byte| is_separator(*byte)) {
+                            Some((token_index + 1, path_index + 1))
+                        } else if path_index == path.len()
+                            && token_index + 2 == tokens.len()
+                            && matches!(tokens.get(token_index + 1), Some(Token::RecursiveStar))
+                        {
+                            return true;
+                        } else {
+                            None
+                        }
+                    }
+                    Token::Any => {
+                        Self::advance_one(tokens, token_index, path_index, path, options, |_| true)
+                    }
+                    Token::Class(class) => {
+                        Self::advance_one(tokens, token_index, path_index, path, options, |byte| {
+                            class.matches(byte, options.case_insensitive)
+                        })
+                    }
+                    Token::Star => Self::advance_star(
+                        token_index,
+                        path_index,
                         path,
                         options,
-                        failed,
-                    )
-                    || path_index == path.len()
-                        && token_index + 2 == tokens.len()
-                        && matches!(tokens.get(token_index + 1), Some(Token::RecursiveStar))
-            }
-            Token::Any => Self::match_one(
-                tokens,
-                token_index,
-                path_index,
-                path,
-                options,
-                failed,
-                |_| true,
-            ),
-            Token::Class(class) => Self::match_one(
-                tokens,
-                token_index,
-                path_index,
-                path,
-                options,
-                failed,
-                |byte| class.matches(byte, options.case_insensitive),
-            ),
-            Token::Star => Self::match_star(
-                tokens,
-                token_index,
-                path_index,
-                path,
-                options,
-                failed,
-                !Self::component_wildcard(tokens, token_index, options),
-            ),
-            Token::PathStar => Self::match_star(
-                tokens,
-                token_index,
-                path_index,
-                path,
-                options,
-                failed,
-                false,
-            ),
-            Token::RecursiveStar | Token::RecursivePrefix => {
-                Self::match_star(tokens, token_index, path_index, path, options, failed, true)
-            }
-        };
+                        !Self::component_wildcard(tokens, token_index, options),
+                        &mut deferred,
+                    ),
+                    Token::PathStar => Self::advance_star(
+                        token_index,
+                        path_index,
+                        path,
+                        options,
+                        false,
+                        &mut deferred,
+                    ),
+                    Token::RecursiveStar | Token::RecursivePrefix => Self::advance_star(
+                        token_index,
+                        path_index,
+                        path,
+                        options,
+                        true,
+                        &mut deferred,
+                    ),
+                }
+            };
 
-        if matches {
-            failed.remove(token_index, path_index);
+            debug_assert!(
+                deferred.len() <= tokens.len(),
+                "the work list holds at most one deferred repetition per token"
+            );
+            match advanced.or_else(|| deferred.pop()) {
+                Some(next) => state = next,
+                None => return false,
+            }
         }
-        matches
     }
 
     fn component_wildcard(tokens: &[Token], token_index: usize, options: PatternOptions) -> bool {
@@ -544,91 +555,71 @@ impl Pattern {
                 || token_index > 0 && matches!(tokens[token_index - 1], Token::Separator))
     }
 
-    fn match_literal(
-        tokens: &[Token],
+    /// Returns the state after a literal token, or `None` if it does not match.
+    fn advance_literal(
         token_index: usize,
         path_index: usize,
         path: &[u8],
         options: PatternOptions,
-        failed: &mut FailedStates,
         literal: &[u8],
-    ) -> bool {
-        let Some(candidate) = path.get(path_index..path_index + literal.len()) else {
-            return false;
-        };
-        if literal
+    ) -> Option<(usize, usize)> {
+        let candidate = path.get(path_index..path_index + literal.len())?;
+        literal
             .iter()
             .zip(candidate)
             .all(|(&expected, &actual)| bytes_equal(expected, actual, options.case_insensitive))
-        {
-            Self::matches_from(
-                tokens,
-                token_index + 1,
-                path_index + literal.len(),
-                path,
-                options,
-                failed,
-            )
-        } else {
-            false
-        }
+            .then_some((token_index + 1, path_index + literal.len()))
     }
 
-    fn match_one(
+    /// Returns the state after a single-byte token, or `None` if the candidate
+    /// byte is rejected by the token, the component policy, or the leading-dot
+    /// policy.
+    fn advance_one(
         tokens: &[Token],
         token_index: usize,
         path_index: usize,
         path: &[u8],
         options: PatternOptions,
-        failed: &mut FailedStates,
         accepts: impl FnOnce(u8) -> bool,
-    ) -> bool {
-        path.get(path_index).is_some_and(|&byte| {
-            accepts(byte)
-                && (!Self::component_wildcard(tokens, token_index, options) || !is_separator(byte))
-                && (options.match_hidden || byte != b'.' || !at_component_start(path, path_index))
-                && Self::matches_from(
-                    tokens,
-                    token_index + 1,
-                    path_index + 1,
-                    path,
-                    options,
-                    failed,
-                )
-        })
+    ) -> Option<(usize, usize)> {
+        let &byte = path.get(path_index)?;
+        (accepts(byte)
+            && (!Self::component_wildcard(tokens, token_index, options) || !is_separator(byte))
+            && (options.match_hidden || byte != b'.' || !at_component_start(path, path_index)))
+        .then_some((token_index + 1, path_index + 1))
     }
 
-    fn match_star(
-        tokens: &[Token],
+    /// Queues the star's repetition branch and returns the branch that stops
+    /// consuming here, which the caller explores first. The repetition is only
+    /// queued while the next byte is one this star may consume.
+    fn advance_star(
         token_index: usize,
         path_index: usize,
         path: &[u8],
         options: PatternOptions,
-        failed: &mut FailedStates,
         recursive: bool,
-    ) -> bool {
-        if Self::matches_from(tokens, token_index + 1, path_index, path, options, failed) {
-            return true;
+        deferred: &mut Vec<(usize, usize)>,
+    ) -> Option<(usize, usize)> {
+        if let Some(&byte) = path.get(path_index)
+            && (recursive || !options.component_wildcards || !is_separator(byte))
+            && (options.match_hidden || byte != b'.' || !at_component_start(path, path_index))
+        {
+            deferred.push((token_index, path_index + 1));
         }
-        let Some(&byte) = path.get(path_index) else {
-            return false;
-        };
-        if !recursive && options.component_wildcards && is_separator(byte) {
-            return false;
-        }
-        if !options.match_hidden && byte == b'.' && at_component_start(path, path_index) {
-            return false;
-        }
-        Self::matches_from(tokens, token_index, path_index + 1, path, options, failed)
+        Some((token_index + 1, path_index))
     }
 }
 
-/// Memoized failed token/path pairs for one matcher invocation.
+/// Visited token/path pairs for one matcher invocation.
 ///
 /// The state space is dense by construction: token and path indices are both
 /// bounded by the input slices. Small matrices live directly in a matcher
 /// frame; larger inputs retain the flat heap matrix. Both avoid hashing while
 /// keeping the original backtracking semantics.
+///
+/// A visited pair is never cleared. The recursive matcher used to clear one on
+/// the way out of a successful frame, which was unobservable: a match returned
+/// straight through every caller, and each invocation builds its own matrix.
 enum FailedStates {
     Inline { width: usize, states: u128 },
     Heap { width: usize, states: Vec<bool> },
@@ -667,17 +658,6 @@ impl FailedStates {
                     *state = true;
                     true
                 }
-            }
-        }
-    }
-
-    fn remove(&mut self, token_index: usize, path_index: usize) {
-        match self {
-            Self::Inline { width, states } => {
-                *states &= !(1_u128 << (token_index * *width + path_index));
-            }
-            Self::Heap { width, states } => {
-                states[token_index * *width + path_index] = false;
             }
         }
     }
@@ -1850,6 +1830,48 @@ mod tests {
     }
 
     #[test]
+    fn long_candidates_do_not_overflow_the_native_stack() {
+        // Star repetition used to recurse once per consumed path byte, so a
+        // few thousand candidate bytes aborted the process. 256 KiB is well
+        // below the 2 MiB a worker thread gets by default, which pins the
+        // bound: the matcher must not use the native stack per path byte.
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let filler = "x".repeat(300_000);
+                let pattern = compile("*a*y");
+                assert!(!pattern.is_match(&filler));
+
+                let mut matching = String::with_capacity(filler.len() + 2);
+                matching.push_str(&filler[..150_000]);
+                matching.push('a');
+                matching.push_str(&filler[150_000..]);
+                matching.push('y');
+                assert!(pattern.is_match(&matching));
+
+                // The walker routes every starred pattern through the general
+                // matcher once wildcards are component-local.
+                assert!(pattern.is_match_glob_path(&matching));
+                assert!(!pattern.is_match_glob_path(&filler));
+
+                let recursive = Pattern::compile(
+                    "**/*a*.rs",
+                    PatternOptions::default().recursive_double_star(true),
+                )
+                .unwrap();
+                let mut deep = "dir/".repeat(20_000);
+                deep.push_str("zzz.rs");
+                assert!(!recursive.is_match_glob_path(&deep));
+                deep.truncate(deep.len() - "zzz.rs".len());
+                deep.push_str("zaz.rs");
+                assert!(recursive.is_match_glob_path(&deep));
+            })
+            .expect("spawn a small-stack matcher worker")
+            .join()
+            .expect("the matcher must not overflow a 256 KiB stack");
+    }
+
+    #[test]
     fn character_classes_support_ranges_and_negation() {
         assert!(compile("file[0-9].rs").is_match("file7.rs"));
         assert!(compile("file[!0-9].rs").is_match("filex.rs"));
@@ -2064,16 +2086,16 @@ mod tests {
         assert!(matches!(&inline, FailedStates::Inline { .. }));
         assert!(inline.insert(0, 1));
         assert!(!inline.insert(0, 1));
-        inline.remove(0, 1);
-        assert!(inline.insert(0, 1));
+        assert!(inline.insert(0, 2));
+        assert!(!inline.insert(0, 2));
 
         let tokens = vec![Token::Star; 2];
         let mut heap = FailedStates::new(&tokens, &[b'a'; 64]);
         assert!(matches!(&heap, FailedStates::Heap { .. }));
         assert!(heap.insert(1, 63));
         assert!(!heap.insert(1, 63));
-        heap.remove(1, 63);
-        assert!(heap.insert(1, 63));
+        assert!(heap.insert(0, 63));
+        assert!(!heap.insert(0, 63));
     }
 
     #[test]
