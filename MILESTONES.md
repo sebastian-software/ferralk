@@ -127,8 +127,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 ### macOS (first)
 
 - [x] `getdirentries64` backend behind a feature flag
-- [ ] `getattrlistbulk` batch metadata with capability detection and portable
-      fallback (SMB/FUSE)
+- [x] `getattrlistbulk` batch name/type metadata with capability detection and
+      portable fallback (SMB/FUSE)
 - [x] Bounds-checked record parsing with module-level invariants
 - [x] Fuzz the record decoder
 - [ ] Differential tests portable vs native; sanitizers in CI
@@ -158,8 +158,16 @@ specific action needed to clear each one are consolidated in
   cover the safe boundary. On the shared filtered fixture, native serial
   traversal measures about 1.31 ms locally after avoiding metadata fallback
   for `DT_REG`. The feature-gated, syscall-free `macos_dirent_parser`
-  cargo-fuzz target and macOS manual workflow now exercise the raw parser;
-  `getattrlistbulk` and the macOS benchmark gate remain open.
+  cargo-fuzz target and macOS manual workflow now exercise the raw parser.
+  `getattrlistbulk` now supplies the primary batch name/type path. Its record
+  decoder validates returned-attribute sets, per-entry errors, variable-length
+  attribute references, names, and object types before a path is created.
+  EINVAL/EOPNOTSUPP before the first batch takes the existing portable fallback
+  for SMB/FUSE-like filesystems; later errors remain observable failures. The
+  native/portable fixture covers files, directories, and symlinks, while the
+  no-syscall fuzz hook covers both Darwin binary record formats. The local
+  ten-sample serial median was about 1.35 ms; this is a local observation only,
+  so the macOS differential/sanitizer and benchmark gates remain open.
 
 ### 2026-08-18 — M0 foundation established
 

@@ -19,7 +19,9 @@ repository.
 ## Deferred, not blocked
 
 M5 native backends are intentionally scheduled after portable 1.0 by
-ADR-0010. The macOS name/type `getdirentries64` feature is now implemented;
-batch metadata, fuzzing, native parity series, and Linux remain post-1.0 work.
+ADR-0010. The macOS name/type `getdirentries64` and `getattrlistbulk` paths,
+including record fuzzing and an unsupported-filesystem fallback, are now
+implemented. Native parity/sanitizer series, performance gates, and Linux
+remain post-1.0 work.
 None is a prerequisite for the portable release or evidence of a current
 implementation failure.

@@ -27,7 +27,7 @@ read the [compatibility guide](compatibility-guide.md).
 
 | zlob capability / flag | ferralk API | Status | Notes |
 |---|---|---|---|
-| path traversal | `Walker::new` / `Walker::threads` | In progress (M3/M5) | Portable `std::fs` backend by default; macOS `native-macos` optionally uses audited `getdirentries64`, while `collect()` uses a lazy work-stealing parallel scheduler and `stream()` remains incremental and single-threaded. |
+| path traversal | `Walker::new` / `Walker::threads` | In progress (M3/M5) | Portable `std::fs` backend by default; macOS `native-macos` optionally uses audited `getattrlistbulk` batch name/type records, with a portable fallback for unsupported filesystems and a separately tested `getdirentries64` decoder. `collect()` uses a lazy work-stealing parallel scheduler and `stream()` remains incremental and single-threaded. |
 | `ZLOB_GITIGNORE` | `Walker::respect_git_ignore` | Implemented (M3) | Nested `.gitignore` chains plus zlob-compatible `.ignore` supplements (loaded after `.gitignore`), negation-aware descent, and shared-parent caching use `ignore`'s matcher. |
 | `ZLOB_WALK_KEEP_GIT_DIR` | `WalkOptions::keep_git_dir` | Implemented (M3) | `.git` is skipped with Gitignore by default; this explicit opt-in keeps it. |
 | `ZLOB_SKIP_HIDDEN` | `WalkOptions::skip_hidden` | Implemented (M2) | Explicit opt-in; suppresses hidden files and whole hidden subtrees. |

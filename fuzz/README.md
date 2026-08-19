@@ -3,7 +3,8 @@
 The two targets exercise parsing and matching with arbitrary bytes and option
 combinations. Their checked-in seeds derive from the executable matcher corpus.
 On macOS, `macos_dirent_parser` additionally fuzzes the feature-gated
-`getdirentries64` record validator without issuing syscalls or touching paths.
+`getdirentries64` and `getattrlistbulk` record validators without issuing
+syscalls or touching paths.
 
 Install cargo-fuzz, then run cargo fuzz run pattern_parser or cargo fuzz run
 pattern_matcher from the repository root.
