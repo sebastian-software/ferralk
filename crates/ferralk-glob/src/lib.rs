@@ -1064,10 +1064,17 @@ fn next_literal_start(
 /// the vectorised two-byte search wins.
 fn find_literal(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     const MEMMEM_HAYSTACK_FLOOR: usize = 256;
+    const SCALAR_HAYSTACK_CEILING: usize = 32;
+    let (&first, rest) = needle.split_first()?;
     if haystack.len() >= MEMMEM_HAYSTACK_FLOOR {
         return memmem::find(haystack, needle);
     }
-    let (&first, rest) = needle.split_first()?;
+    if haystack.len() <= SCALAR_HAYSTACK_CEILING {
+        // A path component is shorter than one SIMD block, so even `memchr`'s
+        // entry sequence outweighs the comparisons it saves.
+        return (0..haystack.len())
+            .find(|&start| haystack[start] == first && haystack[start + 1..].starts_with(rest));
+    }
     let mut offset = 0;
     while let Some(hit) = memchr(first, &haystack[offset..]) {
         let start = offset + hit;
