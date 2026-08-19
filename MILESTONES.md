@@ -129,8 +129,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 - [x] `getdirentries64` backend behind a feature flag
 - [ ] `getattrlistbulk` batch metadata with capability detection and portable
       fallback (SMB/FUSE)
-- [ ] Bounds-checked record parsing with module-level invariants; fuzz the
-      record decoder
+- [x] Bounds-checked record parsing with module-level invariants
+- [ ] Fuzz the record decoder
 - [ ] Differential tests portable vs native; sanitizers in CI
 - [ ] Benchmark gate on macOS
 
