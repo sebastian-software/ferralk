@@ -12,7 +12,8 @@ use std::{
 use crossbeam_deque::{Steal, Stealer, Worker};
 
 use super::{
-    BackendEntry, DirectoryBackend, ErrorPolicy, WalkEntry, WalkError, WalkResult, Walker,
+    BackendEntry, CYCLE_KEY_OPERATION, CycleKey, DirectoryBackend, ErrorPolicy, WalkEntry,
+    WalkError, WalkResult, Walker,
     classify::{DirectoryTask, EntryAction, classify_entry},
     gitignore::IgnoreScope,
     scheduler::{Coordinator, Scheduler, WorkerSlot},
@@ -180,7 +181,11 @@ struct Shared<'backend> {
     abort_error: Mutex<Option<WalkError>>,
     startup_error: Mutex<Option<WalkError>>,
     panic: Mutex<Option<Box<dyn Any + Send + 'static>>>,
-    visited_directories: Mutex<HashSet<PathBuf>>,
+    /// The follow-symlinks guard. One mutex rather than shards: the key is
+    /// sixteen `Copy` bytes, so the critical section is a hash and an insert,
+    /// and the measurement in the pull request found sharding unmeasurable
+    /// against a walk that is dominated by syscalls.
+    visited_directories: Mutex<HashSet<CycleKey>>,
 }
 
 impl<'backend> Shared<'backend> {
@@ -372,10 +377,12 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
 }
 
 fn mark_directory(shared: &Shared, directory: &Path) -> bool {
-    match shared.backend.canonicalize(directory) {
-        Ok(canonical) => lock(&shared.visited_directories).insert(canonical),
+    // The key is computed outside the lock, so the critical section holds only
+    // the hash and the insert.
+    match shared.backend.cycle_key(directory) {
+        Ok(key) => lock(&shared.visited_directories).insert(key),
         Err(source) => {
-            shared.record_error("canonicalize", directory.to_path_buf(), source);
+            shared.record_error(CYCLE_KEY_OPERATION, directory.to_path_buf(), source);
             false
         }
     }

@@ -686,6 +686,7 @@ trait DirectoryBackend {
     }
 
     /// Resolves a directory for the follow-symlinks loop guard.
+    #[cfg(not(unix))]
     fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
         fs::canonicalize(path)
     }
@@ -695,7 +696,48 @@ trait DirectoryBackend {
     fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         fs::read(path)
     }
+
+    /// Identifies a directory for the follow-symlinks loop guard.
+    ///
+    /// The call follows symlinks, which is what the guard needs: every path
+    /// that reaches one directory has to produce one key.
+    fn cycle_key(&self, path: &Path) -> std::io::Result<CycleKey> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let metadata = self.metadata(path)?;
+            Ok((metadata.dev(), metadata.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            self.canonicalize(path)
+        }
+    }
 }
+
+/// What identifies a directory that the follow-symlinks guard has seen.
+///
+/// On Unix this is `(st_dev, st_ino)`: sixteen `Copy` bytes from the one
+/// `metadata` call the guard already has to make, with no path resolution and
+/// no allocation. Two names for one directory, a symlink and the real path
+/// among them, share an inode and are therefore recognised as one place --
+/// which a resolved path only manages when the resolution agrees.
+///
+/// Elsewhere the resolved path stays the key. Windows exposes a file index
+/// through `std::os::windows::fs::MetadataExt`, but only on the unstable
+/// `windows_by_handle` feature, and a walker on stable cannot depend on that.
+#[cfg(unix)]
+type CycleKey = (u64, u64);
+#[cfg(not(unix))]
+type CycleKey = PathBuf;
+
+/// Names the call whose failure ends a directory in follow mode, so the
+/// reported operation stays the one that actually ran.
+#[cfg(unix)]
+const CYCLE_KEY_OPERATION: &str = "metadata";
+#[cfg(not(unix))]
+const CYCLE_KEY_OPERATION: &str = "canonicalize";
 
 #[derive(Debug, Clone)]
 struct BackendEntry {
@@ -766,7 +808,7 @@ pub struct WalkStream {
     walker: Walker,
     pending_directories: Vec<DirectoryTask>,
     pending_entries: VecDeque<BackendEntry>,
-    visited_directories: HashSet<PathBuf>,
+    visited_directories: HashSet<CycleKey>,
     /// Ignore rules of the directory whose entries are being delivered.
     ignores: IgnoreScope,
     cancelled: bool,
@@ -809,13 +851,13 @@ impl WalkStream {
     fn prepare_directory(&mut self, task: DirectoryTask) -> Option<Result<WalkEntry, WalkError>> {
         let DirectoryTask { path, ignores } = task;
         if self.walker.options.follow_symlinks {
-            match SystemBackend.canonicalize(&path) {
-                Ok(canonical) => {
-                    if !self.visited_directories.insert(canonical) {
+            match SystemBackend.cycle_key(&path) {
+                Ok(key) => {
+                    if !self.visited_directories.insert(key) {
                         return None;
                     }
                 }
-                Err(source) => return self.error("canonicalize", path, source),
+                Err(source) => return self.error(CYCLE_KEY_OPERATION, path, source),
             }
         }
         match SystemBackend.read_directory(&path) {
@@ -880,7 +922,7 @@ struct WalkState<'walker> {
     walker: &'walker Walker,
     entries: Vec<WalkEntry>,
     errors: Vec<WalkError>,
-    visited_directories: HashSet<PathBuf>,
+    visited_directories: HashSet<CycleKey>,
     cancelled: bool,
 }
 
@@ -928,10 +970,10 @@ impl<'walker> WalkState<'walker> {
         backend: &impl DirectoryBackend,
         directory: &Path,
     ) -> Result<bool, WalkError> {
-        match backend.canonicalize(directory) {
-            Ok(canonical) => Ok(self.visited_directories.insert(canonical)),
+        match backend.cycle_key(directory) {
+            Ok(key) => Ok(self.visited_directories.insert(key)),
             Err(source) => {
-                self.handle_error("canonicalize", directory.to_path_buf(), source)?;
+                self.handle_error(CYCLE_KEY_OPERATION, directory.to_path_buf(), source)?;
                 Ok(false)
             }
         }
@@ -2800,6 +2842,53 @@ mod tests {
             .stream();
         assert!(cancelled.next().is_none());
         assert!(cancelled.was_cancelled());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_directory_under_several_names_is_entered_once_by_every_frontend() {
+        use std::os::unix::fs::symlink;
+
+        // Three names, one directory. The guard keys on what a name reaches,
+        // not on the name, so whichever one the walk happens to take first,
+        // the other two are recognised as the same place. Each frontend keeps
+        // its own visited set, so each is checked.
+        let fixture = Fixture::new();
+        fixture.write("real/inside.txt");
+        symlink("real", fixture.root.join("first")).expect("create first directory symlink");
+        symlink("real", fixture.root.join("second")).expect("create second directory symlink");
+        let options = WalkOptions::default().follow_symlinks(true).sort(true);
+
+        let count_inside = |paths: Vec<PathBuf>| {
+            paths
+                .iter()
+                .filter(|path| path.file_name().is_some_and(|name| name == "inside.txt"))
+                .count()
+        };
+
+        for threads in [1, 4] {
+            let result = Walker::new(&fixture.root)
+                .threads(threads)
+                .options(options)
+                .collect()
+                .expect("walk succeeds");
+            assert_eq!(
+                count_inside(relative_paths(result.entries(), &fixture.root)),
+                1,
+                "collect with {threads} thread(s) entered the directory more than once"
+            );
+        }
+
+        let streamed = Walker::new(&fixture.root)
+            .options(options)
+            .stream()
+            .map(|entry| entry.expect("fixture has no I/O errors"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            count_inside(relative_paths(&streamed, &fixture.root)),
+            1,
+            "the stream entered the directory more than once"
+        );
     }
 
     #[cfg(unix)]
