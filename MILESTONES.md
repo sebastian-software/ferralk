@@ -170,6 +170,11 @@ specific action needed to clear each one are consolidated in
 - Reframed M4 as release readiness: no first-public-release version or 1.0 date
   is implied. Benchmark evidence and the Palamedes downstream trial remain
   prerequisites for a later maintainer decision.
+- Opened the Palamedes downstream trial as
+  [palamedes#877](https://github.com/sebastian-software/palamedes/pull/877).
+  It replaces only the CLI extractor's serial source traversal with a pinned
+  Ferralk Git dependency, while retaining Palamedes' existing `globset`
+  configuration semantics; the trial remains open pending review and remote CI.
 
 ### 2026-08-19 — Public repository and standard CI validated
 
