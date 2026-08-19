@@ -15,6 +15,9 @@ libfuzzer-sys = "0.4"
 [target.'cfg(target_os = "macos")'.dependencies]
 ferralk = { path = "../crates/ferralk", features = ["native-macos"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ferralk = { path = "../crates/ferralk", features = ["native-linux"] }
+
 [[bin]]
 name = "pattern_parser"
 path = "fuzz_targets/pattern_parser.rs"
@@ -32,6 +35,13 @@ bench = false
 [[bin]]
 name = "macos_dirent_parser"
 path = "fuzz_targets/macos_dirent_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "linux_dirent_parser"
+path = "fuzz_targets/linux_dirent_parser.rs"
 test = false
 doc = false
 bench = false

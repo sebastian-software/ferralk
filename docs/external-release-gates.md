@@ -21,7 +21,9 @@ repository.
 M5 native backends are intentionally scheduled after portable 1.0 by
 ADR-0010. The macOS name/type `getdirentries64` and `getattrlistbulk` paths,
 including record fuzzing and an unsupported-filesystem fallback, are now
-implemented. Native parity/sanitizer series, performance gates, and Linux
-remain post-1.0 work.
+implemented. The feature-gated Linux `getdents64` path is locally
+cross-compiled and its parser fuzz target is committed; Ubuntu execution,
+`statx`, native parity/sanitizer series, and performance gates remain post-1.0
+work.
 None is a prerequisite for the portable release or evidence of a current
 implementation failure.

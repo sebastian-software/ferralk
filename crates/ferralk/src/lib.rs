@@ -24,9 +24,15 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 pub use ferralk_glob;
 
+#[cfg(all(feature = "native-linux", target_os = "linux"))]
+#[allow(unsafe_code)]
+mod linux_native;
 #[cfg(all(feature = "native-macos", target_os = "macos"))]
 #[allow(unsafe_code)]
 mod macos_native;
+#[cfg(all(feature = "native-linux", target_os = "linux"))]
+#[doc(hidden)]
+pub use linux_native::fuzz_validate_records as fuzz_validate_linux_dirent_records;
 #[cfg(all(feature = "native-macos", target_os = "macos"))]
 #[doc(hidden)]
 pub use macos_native::fuzz_validate_bulk_record as fuzz_validate_macos_bulk_record;
@@ -674,7 +680,24 @@ impl DirectoryBackend for SystemBackend {
                 Err(error) => Err(error),
             }
         }
-        #[cfg(not(all(feature = "native-macos", target_os = "macos")))]
+        #[cfg(all(
+            feature = "native-linux",
+            target_os = "linux",
+            not(all(feature = "native-macos", target_os = "macos"))
+        ))]
+        {
+            match linux_native::read_directory(path) {
+                Ok(entries) => Ok(entries),
+                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                    StdBackend.read_directory(path)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        #[cfg(not(any(
+            all(feature = "native-macos", target_os = "macos"),
+            all(feature = "native-linux", target_os = "linux")
+        )))]
         StdBackend.read_directory(path)
     }
 }

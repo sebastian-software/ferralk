@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [features]
+native-linux = ["ferralk/native-linux"]
 native-macos = ["ferralk/native-macos"]
 zlob-oracle = ["dep:zlob"]
 

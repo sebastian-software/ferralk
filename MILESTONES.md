@@ -137,10 +137,10 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 
 ### Linux (second)
 
-- [ ] Batched `getdents64` backend behind a feature flag
+- [x] Batched `getdents64` backend behind a feature flag
 - [ ] `statx` only where metadata is requested
-- [ ] Bounds-checked record parsing; fuzz the record decoder; Miri where
-      executable
+- [x] Bounds-checked record parsing and fuzz target
+- [ ] Miri where executable
 - [ ] Differential tests portable vs native; sanitizers in CI
 - [ ] Benchmark gate on Linux
 
@@ -175,6 +175,15 @@ specific action needed to clear each one are consolidated in
   manual native-fuzz workflow additionally declares an AddressSanitizer test
   job. Neither remote CI job has been dispatched from this workspace, so the
   broader native parity/sanitizer gate remains open.
+- Began the Linux backend with the feature-gated `native-linux` `getdents64`
+  reader. Its syscall-number table explicitly supports 64-bit x86, AArch64,
+  RISC-V64, x86, and ARM; unreviewed architectures report `Unsupported` and
+  use the portable backend. The byte parser checks every variable-length
+  `linux_dirent64` record and is exposed to a dedicated fuzz target. The
+  x86_64-Linux target cross-compiles with tests and Clippy from this workspace;
+  normal Ubuntu native CI plus manual fuzz/AddressSanitizer workflows are
+  committed but not yet externally run. `statx`, Linux differential execution,
+  and benchmark evidence remain open.
 
 ### 2026-08-18 — M0 foundation established
 
