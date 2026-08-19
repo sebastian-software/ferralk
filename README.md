@@ -119,8 +119,8 @@ unsorted so it can yield entries incrementally.
 - [Corpus format](docs/corpus-format.md) — the JSONL behavioural test corpus.
 - [Architecture RFC](RFC-zig-free-zlob-port.md) and [ADRs](docs/adr/README.md)
   — design rationale and non-goals.
-- [External release gates](docs/external-release-gates.md) — work that needs
-  remote evidence or maintainer action rather than a local code change.
+- [Deferred follow-up](docs/external-release-gates.md) — open work tracked in
+  GitHub after the initial release.
 
 ## Principles
 
