@@ -10,11 +10,12 @@
 
 use std::{
     cell::RefCell,
-    ffi::{OsString, c_int, c_void},
-    fs::{self, File},
+    ffi::{OsStr, c_int, c_void},
+    fs::{self, File, OpenOptions},
     io,
-    os::unix::{ffi::OsStringExt, io::AsRawFd},
+    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawFd},
     path::Path,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use super::BackendEntry;
@@ -27,6 +28,12 @@ const NAME_OFFSET: usize = 21;
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
+// Types that are neither a directory nor a symlink, so they need no stat.
+const DT_FIFO: u8 = 1;
+const DT_CHR: u8 = 2;
+const DT_BLK: u8 = 6;
+const DT_SOCK: u8 = 12;
+const O_DIRECTORY: i32 = 0x0010_0000;
 const ATTR_BIT_MAP_COUNT: u16 = 5;
 const ATTR_CMN_NAME: u32 = 0x0000_0001;
 const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
@@ -35,9 +42,24 @@ const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
 const FSOPT_NOFOLLOW: u64 = 0x0000_0001;
 const VREG: u32 = 1;
 const VDIR: u32 = 2;
+const VBLK: u32 = 3;
+const VCHR: u32 = 4;
 const VLNK: u32 = 5;
+const VSOCK: u32 = 6;
+const VFIFO: u32 = 7;
 const ATTRIBUTE_SET_SIZE: usize = 5 * std::mem::size_of::<u32>();
 const ATTRIBUTE_RECORD_HEADER_SIZE: usize = std::mem::size_of::<u32>() + ATTRIBUTE_SET_SIZE;
+
+/// Set once the kernel reports that bulk attribute reads are unavailable.
+///
+/// Support is a property of the filesystem driver rather than of one
+/// directory, so probing again for every directory only pays a failed open, a
+/// failed syscall, and a second `opendir`. The latch is per process: a walk
+/// that crosses from a filesystem without bulk support onto one with it keeps
+/// using the portable reader, which costs speed and never correctness. Keying
+/// it by `st_dev` instead would need the device id before the first read, and
+/// obtaining that costs the very syscall this avoids.
+static BULK_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
 std::thread_local! {
     static BULK_BUFFER: RefCell<Box<[u8; BUFFER_SIZE]>> = RefCell::new(Box::new([0; BUFFER_SIZE]));
@@ -73,14 +95,41 @@ unsafe extern "C" {
 }
 
 pub(super) fn read_directory(path: &Path) -> io::Result<Vec<BackendEntry>> {
-    BULK_BUFFER.with(|buffer| {
+    if BULK_UNSUPPORTED.load(Ordering::Relaxed) {
+        return Err(unsupported("getattrlistbulk is unavailable on this system"));
+    }
+    let result = BULK_BUFFER.with(|buffer| {
         let mut buffer = buffer.borrow_mut();
         read_bulk_directory(path, &mut buffer[..])
-    })
+    });
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == io::ErrorKind::Unsupported)
+    {
+        BULK_UNSUPPORTED.store(true, Ordering::Relaxed);
+    }
+    result
+}
+
+fn unsupported(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, message)
+}
+
+/// Opens a directory for reading, refusing anything that is not one.
+///
+/// `O_DIRECTORY` makes the open fail with `ENOTDIR` instead of blocking when
+/// the scheduled path was replaced by a FIFO between scheduling and open.
+/// `O_NOFOLLOW` is deliberately absent: a walk that follows symlinks has to be
+/// able to open through one.
+fn open_directory(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY)
+        .open(path)
 }
 
 fn read_bulk_directory(path: &Path, buffer: &mut [u8]) -> io::Result<Vec<BackendEntry>> {
-    let directory = File::open(path)?;
+    let directory = open_directory(path)?;
     let mut entries = Vec::new();
     let attributes = AttrList {
         bitmap_count: ATTR_BIT_MAP_COUNT,
@@ -103,13 +152,16 @@ fn read_bulk_directory(path: &Path, buffer: &mut [u8]) -> io::Result<Vec<Backend
         primed: false,
     };
     while let Some((name, object_type)) = reader.next()? {
-        let path = path.join(OsString::from_vec(name));
-        let (is_dir, is_symlink) = bulk_entry_kind(&path, object_type)?;
-        entries.push(BackendEntry {
-            path,
-            is_dir,
-            is_symlink,
-        });
+        let path = path.join(OsStr::from_bytes(&name));
+        // An entry that vanished between the read and its stat costs that one
+        // entry; the rest of the listing is still valid and is returned.
+        if let Some((is_dir, is_symlink)) = bulk_entry_kind(&path, object_type)? {
+            entries.push(BackendEntry {
+                path,
+                is_dir,
+                is_symlink,
+            });
+        }
     }
     Ok(entries)
 }
@@ -124,7 +176,7 @@ struct BulkReader<'buffer> {
 }
 
 impl<'buffer> BulkReader<'buffer> {
-    fn next(&mut self) -> io::Result<Option<(Vec<u8>, u32)>> {
+    fn next(&mut self) -> io::Result<Option<(Vec<u8>, Option<u32>)>> {
         loop {
             if self.remaining == 0 && !self.refill()? {
                 return Ok(None);
@@ -187,7 +239,15 @@ fn is_unsupported_bulk_error(error: &io::Error, primed: bool) -> bool {
     !primed && matches!(error.raw_os_error(), Some(22 | 45))
 }
 
-fn parse_bulk_record(record: &[u8]) -> io::Result<Option<(&[u8], u32)>> {
+/// Parses one bulk record into its name and, when the filesystem returned it,
+/// its object type.
+///
+/// A record without `ATTR_CMN_OBJTYPE` yields `None` for the type so the
+/// caller resolves it with one stat. A record without `ATTR_CMN_NAME` cannot
+/// be used at all and is reported as unsupported, which makes the adapter read
+/// the directory portably instead of losing it: network filesystems are
+/// allowed to omit attributes, and doing so is not a malformed record.
+fn parse_bulk_record(record: &[u8]) -> io::Result<Option<(&[u8], Option<u32>)>> {
     if record.len() < ATTRIBUTE_RECORD_HEADER_SIZE || read_u32(record, 0)? as usize != record.len()
     {
         return Err(malformed_bulk_record());
@@ -207,7 +267,9 @@ fn parse_bulk_record(record: &[u8]) -> io::Result<Option<(&[u8], u32)>> {
         }
     }
     if common_attributes & ATTR_CMN_NAME == 0 {
-        return Err(malformed_bulk_record());
+        return Err(unsupported(
+            "getattrlistbulk did not return entry names on this filesystem",
+        ));
     }
     let reference_offset = read_i32(record, offset)?;
     let name_length = read_u32(record, offset + std::mem::size_of::<i32>())? as usize;
@@ -235,10 +297,10 @@ fn parse_bulk_record(record: &[u8]) -> io::Result<Option<(&[u8], u32)>> {
         return Err(malformed_bulk_record());
     }
     if common_attributes & ATTR_CMN_OBJTYPE == 0 {
-        return Err(malformed_bulk_record());
+        return Ok(Some((name, None)));
     }
     let object_type = read_u32(record, offset)?;
-    Ok(Some((name, object_type)))
+    Ok(Some((name, Some(object_type))))
 }
 
 /// Validates one raw Darwin bulk-attribute record without touching the
@@ -270,12 +332,14 @@ fn read_i32(bytes: &[u8], offset: usize) -> io::Result<i32> {
     ))
 }
 
-fn bulk_entry_kind(path: &Path, object_type: u32) -> io::Result<(bool, bool)> {
+fn bulk_entry_kind(path: &Path, object_type: Option<u32>) -> io::Result<Option<(bool, bool)>> {
     match object_type {
-        VDIR => Ok((true, false)),
-        VREG => Ok((false, false)),
-        VLNK => Ok((false, true)),
-        _ => entry_kind(path, 0),
+        Some(VDIR) => Ok(Some((true, false))),
+        Some(VREG | VBLK | VCHR | VSOCK | VFIFO) => Ok(Some((false, false))),
+        Some(VLNK) => Ok(Some((false, true))),
+        // `VNON`, `VBAD`, and a record the filesystem left without an object
+        // type need one stat.
+        _ => stat_entry_kind(path),
     }
 }
 
@@ -291,7 +355,7 @@ fn read_direntries_directory_with_buffer(
     path: &Path,
     buffer: &mut [u8],
 ) -> io::Result<Vec<BackendEntry>> {
-    let directory = File::open(path)?;
+    let directory = open_directory(path)?;
     let mut base = 0_u64;
     let mut entries = Vec::new();
     loop {
@@ -336,13 +400,14 @@ fn parse_records(
     entries: &mut Vec<BackendEntry>,
 ) -> io::Result<()> {
     for_each_record(records, |name, directory_type| {
-        let path = directory.join(OsString::from_vec(name.to_vec()));
-        let (is_dir, is_symlink) = entry_kind(&path, directory_type)?;
-        entries.push(BackendEntry {
-            path,
-            is_dir,
-            is_symlink,
-        });
+        let path = directory.join(OsStr::from_bytes(name));
+        if let Some((is_dir, is_symlink)) = entry_kind(&path, directory_type)? {
+            entries.push(BackendEntry {
+                path,
+                is_dir,
+                is_symlink,
+            });
+        }
         Ok(())
     })
 }
@@ -398,16 +463,39 @@ fn for_each_record(
     Ok(())
 }
 
-fn entry_kind(path: &Path, directory_type: u8) -> io::Result<(bool, bool)> {
+/// Classifies one entry, or reports that it no longer exists.
+///
+/// `Ok(None)` means the entry disappeared or became unreadable between the
+/// directory read and its stat. That costs one entry rather than the whole
+/// listing, which is what a caller racing with a deletion needs.
+fn entry_kind(path: &Path, directory_type: u8) -> io::Result<Option<(bool, bool)>> {
     match directory_type {
-        DT_DIR => Ok((true, false)),
-        DT_REG => Ok((false, false)),
-        DT_LNK => Ok((false, true)),
-        _ => {
-            let file_type = fs::symlink_metadata(path)?.file_type();
-            Ok((file_type.is_dir(), file_type.is_symlink()))
-        }
+        DT_DIR => Ok(Some((true, false))),
+        DT_REG | DT_FIFO | DT_CHR | DT_BLK | DT_SOCK => Ok(Some((false, false))),
+        DT_LNK => Ok(Some((false, true))),
+        // `DT_UNKNOWN`, and any type this build does not name, need one stat.
+        _ => stat_entry_kind(path),
     }
+}
+
+fn stat_entry_kind(path: &Path) -> io::Result<Option<(bool, bool)>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            Ok(Some((file_type.is_dir(), file_type.is_symlink())))
+        }
+        Err(error) if is_vanished_entry(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether a per-entry stat failure describes that entry rather than the
+/// directory. A genuine fault, `EIO` for instance, still ends the read.
+fn is_vanished_entry(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::NotADirectory
+    )
 }
 
 fn malformed_record() -> io::Error {
@@ -431,9 +519,10 @@ mod tests {
 
     use super::{
         ATTR_CMN_ERROR, ATTR_CMN_NAME, ATTR_CMN_OBJTYPE, ATTR_CMN_RETURNED_ATTRS,
-        ATTRIBUTE_RECORD_HEADER_SIZE, BackendEntry, DT_DIR, DT_REG, NAME_OFFSET, VDIR,
-        is_unsupported_bulk_error, parse_bulk_record, parse_records, read_directory,
-        read_direntries_directory,
+        ATTRIBUTE_RECORD_HEADER_SIZE, BackendEntry, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG,
+        DT_SOCK, NAME_OFFSET, VBLK, VCHR, VDIR, VFIFO, VSOCK, bulk_entry_kind, entry_kind,
+        is_unsupported_bulk_error, open_directory, parse_bulk_record, parse_records,
+        read_directory, read_direntries_directory,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -499,7 +588,7 @@ mod tests {
             .expect("valid bulk record")
             .expect("entry has no error");
         assert_eq!(name, b"nested");
-        assert_eq!(object_type, VDIR);
+        assert_eq!(object_type, Some(VDIR));
 
         let mut missing_nul = bulk_record(b"file", VDIR);
         *missing_nul
@@ -520,6 +609,100 @@ mod tests {
                 .expect("entry errors are skipped")
                 .is_none()
         );
+    }
+
+    /// Builds a bulk record whose returned-attribute mask omits one attribute.
+    fn bulk_record_without(name: &[u8], missing: u32) -> Vec<u8> {
+        let attribute_error_offset = ATTRIBUTE_RECORD_HEADER_SIZE;
+        let name_reference_offset = attribute_error_offset + 4;
+        let name_offset = name_reference_offset + 8;
+        let length = name_offset + name.len() + 1;
+        let mut record = vec![0_u8; length];
+        record[0..4].copy_from_slice(&(length as u32).to_ne_bytes());
+        let mask = (ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE)
+            & !missing;
+        record[4..8].copy_from_slice(&mask.to_ne_bytes());
+        record[name_reference_offset..name_reference_offset + 4]
+            .copy_from_slice(&((name_offset - name_reference_offset) as i32).to_ne_bytes());
+        record[name_reference_offset + 4..name_offset]
+            .copy_from_slice(&((name.len() + 1) as u32).to_ne_bytes());
+        record[name_offset..name_offset + name.len()].copy_from_slice(name);
+        record
+    }
+
+    #[test]
+    fn missing_object_type_defers_to_a_stat_instead_of_failing() {
+        let record = bulk_record_without(b"file", ATTR_CMN_OBJTYPE);
+        let (name, object_type) = parse_bulk_record(&record)
+            .expect("a record without an object type is usable")
+            .expect("entry has no error");
+        assert_eq!(name, b"file");
+        assert_eq!(object_type, None, "the caller resolves the type by stat");
+    }
+
+    #[test]
+    fn missing_name_is_unsupported_rather_than_malformed() {
+        // A network filesystem may return fewer attributes than requested.
+        // Without a name the record is unusable, but the directory is not:
+        // reporting `Unsupported` makes the adapter read it portably, while
+        // `InvalidData` would surface as a lost directory.
+        let record = bulk_record_without(b"file", ATTR_CMN_NAME);
+        let error = parse_bulk_record(&record).expect_err("a nameless record is unusable");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn a_vanished_entry_costs_one_entry_and_not_the_listing() {
+        let missing = format!(
+            "ferralk-vanished-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        );
+        // `DT_UNKNOWN` forces the stat that races with the deletion.
+        let mut records = record(missing.as_bytes(), 0);
+        records.extend(record(b"survivor", DT_REG));
+        let mut entries: Vec<BackendEntry> = Vec::new();
+
+        parse_records(Path::new("/tmp"), &records, &mut entries)
+            .expect("a vanished entry does not end the listing");
+
+        assert_eq!(entries.len(), 1, "only the vanished entry is dropped");
+        assert!(entries[0].path.ends_with("survivor"));
+    }
+
+    #[test]
+    fn special_file_types_are_classified_without_a_stat() {
+        // The path does not exist, so any stat would fail. Reaching a verdict
+        // proves these types are decided from the record alone.
+        let absent = Path::new("/ferralk-nonexistent-special");
+        for directory_type in [DT_FIFO, DT_CHR, DT_BLK, DT_SOCK] {
+            assert_eq!(
+                entry_kind(absent, directory_type).expect("no stat is attempted"),
+                Some((false, false))
+            );
+        }
+        for object_type in [VBLK, VCHR, VSOCK, VFIFO] {
+            assert_eq!(
+                bulk_entry_kind(absent, Some(object_type)).expect("no stat is attempted"),
+                Some((false, false))
+            );
+        }
+    }
+
+    #[test]
+    fn opening_a_non_directory_fails_instead_of_blocking() {
+        // Without `O_DIRECTORY` opening a FIFO blocks until a writer appears,
+        // which hangs the worker when a scheduled directory is swapped for
+        // one. A regular file shows the same refusal without needing mkfifo.
+        let path = std::env::temp_dir().join(format!(
+            "ferralk-not-a-directory-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, b"fixture").expect("write fixture file");
+        let error = open_directory(&path).expect_err("a regular file is not a directory");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
