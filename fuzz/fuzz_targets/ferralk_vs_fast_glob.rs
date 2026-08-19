@@ -173,7 +173,9 @@ fn class_end(pattern: &[u8], open: usize) -> Option<usize> {
         return None;
     }
     // A leading `]` is an ordinary member in both engines.
+    let mut previous = None;
     if pattern.get(scan) == Some(&b']') {
+        previous = Some(b']');
         scan += 1;
     }
     loop {
@@ -183,13 +185,48 @@ fn class_end(pattern: &[u8], open: usize) -> Option<usize> {
             // Only fast-glob lets a class accept a separator, and brace
             // expansion inside a class rewrites the class itself.
             Some(b'/' | b'{' | b'}') => return None,
-            Some(b'\\') => {
-                if !pattern.get(scan + 1).copied().is_some_and(is_shared_escape) {
+            Some(b'-') => {
+                // A `-` with nothing before it, or directly before the closing
+                // bracket, is an ordinary member rather than a range.
+                let (Some(start), Some(&next)) = (previous, pattern.get(scan + 1)) else {
+                    previous = Some(b'-');
+                    scan += 1;
+                    continue;
+                };
+                if next == b']' {
+                    previous = Some(b'-');
+                    scan += 1;
+                    continue;
+                }
+                let (end, after) = if next == b'\\' {
+                    let escaped = *pattern.get(scan + 2)?;
+                    if !is_shared_escape(escaped) {
+                        return None;
+                    }
+                    (escaped, scan + 3)
+                } else {
+                    (next, scan + 2)
+                };
+                // A range that spans the separator accepts it, which is the
+                // same divergence as writing `/` in the class directly.
+                if start <= b'/' && b'/' <= end {
                     return None;
                 }
+                previous = None;
+                scan = after;
+            }
+            Some(b'\\') => {
+                let escaped = *pattern.get(scan + 1)?;
+                if !is_shared_escape(escaped) {
+                    return None;
+                }
+                previous = Some(escaped);
                 scan += 2;
             }
-            Some(_) => scan += 1,
+            Some(&byte) => {
+                previous = Some(byte);
+                scan += 1;
+            }
         }
     }
 }

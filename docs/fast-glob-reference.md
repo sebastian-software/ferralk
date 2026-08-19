@@ -27,7 +27,7 @@ shape of the pattern, so a fuzz failure is always a new finding.
 | `**` is a whole path component, not a recursive wildcard | `**/a` vs `aa` | `true` | `false` | Any `**` except the pattern `**` itself |
 | A trailing `**` component elides to nothing | `a/**` vs `a` | `true` | `false` | Same rule |
 | A backslash before an ordinary byte unescapes it | `\b` vs `b` | `true` | `false` | `\` only before `* ? [ ] { } \` |
-| A class may accept a separator | `[/]` vs `/` | `false` | `true` | `/` inside a class, and every negated class |
+| A class may accept a separator | `[/]` vs `/`, `[.-r]` vs `/` | `false` | `true` | `/` inside a class, a range spanning `/`, and every negated class |
 | POSIX class names | `[[:alpha:]]` vs `a` | `true` | `false` | `[:` at the start of a class |
 | Brace nesting depth | — | nested | capped | More than one open brace |
 | A comma outside a brace group stays an alternative separator | `{}{},` vs `` | `false` | `true` | Any comma at brace depth zero |

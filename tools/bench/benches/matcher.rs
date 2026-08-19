@@ -34,6 +34,20 @@ fn matcher(c: &mut Criterion) {
         })
     });
 
+    c.bench_function("compile/long_recursive_pattern", |benchmark| {
+        benchmark.iter(|| {
+            black_box(
+                Pattern::compile(
+                    black_box("src/**/vendor/*/lib/[a-z]*/{main,mod,lib}.{rs,toml}"),
+                    PatternOptions::default()
+                        .braces(true)
+                        .recursive_double_star(true),
+                )
+                .expect("compile benchmark pattern is valid"),
+            )
+        })
+    });
+
     let common_pattern = "src/**/*.rs";
     let common_options = PatternOptions::default().recursive_double_star(true);
     let ferralk = Pattern::compile(common_pattern, common_options)
@@ -219,12 +233,199 @@ fn matcher(c: &mut Criterion) {
     c.bench_function("common/globset_compiled/non_matching", |benchmark| {
         benchmark.iter(|| black_box(globset.is_match(black_box(common_non_matching))))
     });
+    // Every comparator input is black-boxed, including the pattern. These two
+    // benches used to pass compile-time constants, which let the optimizer
+    // fold work the ferralk and globset benches still had to do.
     c.bench_function("common/fast_glob_interpreted/matching", |benchmark| {
-        benchmark.iter(|| black_box(fast_glob::glob_match(common_pattern, common_matching)))
+        benchmark.iter(|| {
+            black_box(fast_glob::glob_match(
+                black_box(common_pattern),
+                black_box(common_matching),
+            ))
+        })
     });
     c.bench_function("common/fast_glob_interpreted/non_matching", |benchmark| {
-        benchmark.iter(|| black_box(fast_glob::glob_match(common_pattern, common_non_matching)))
+        benchmark.iter(|| {
+            black_box(fast_glob::glob_match(
+                black_box(common_pattern),
+                black_box(common_non_matching),
+            ))
+        })
     });
+
+    comparators(c);
+    long_paths(c);
+    adversarial(c);
+    large_path_filter(c);
+}
+
+/// Pendants for the scenarios that previously ran against no comparator.
+fn comparators(c: &mut Criterion) {
+    let literal = GlobBuilder::new("src/deep/nested/main.rs")
+        .literal_separator(true)
+        .build()
+        .expect("literal comparator pattern is valid")
+        .compile_matcher();
+    c.bench_function("literal/globset_compiled/matching", |benchmark| {
+        benchmark.iter(|| black_box(literal.is_match(black_box("src/deep/nested/main.rs"))))
+    });
+    c.bench_function("literal/globset_compiled/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(literal.is_match(black_box("src/deep/nested/main.txt"))))
+    });
+
+    let casefold = GlobBuilder::new("Src/**/*.RS")
+        .literal_separator(true)
+        .case_insensitive(true)
+        .build()
+        .expect("case-folded comparator pattern is valid")
+        .compile_matcher();
+    c.bench_function(
+        "recursive_casefold/globset_compiled/matching",
+        |benchmark| benchmark.iter(|| black_box(casefold.is_match(black_box("src/deep/main.rs")))),
+    );
+    c.bench_function(
+        "recursive_casefold/globset_compiled/non_matching",
+        |benchmark| benchmark.iter(|| black_box(casefold.is_match(black_box("src/deep/main.txt")))),
+    );
+
+    let deterministic = GlobBuilder::new("src/[ab]?.[Rr][Ss]")
+        .literal_separator(true)
+        .case_insensitive(true)
+        .build()
+        .expect("deterministic comparator pattern is valid")
+        .compile_matcher();
+    c.bench_function("deterministic/globset_compiled/matching", |benchmark| {
+        benchmark.iter(|| black_box(deterministic.is_match(black_box("src/aX.RS"))))
+    });
+    c.bench_function("deterministic/globset_compiled/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(deterministic.is_match(black_box("src/zz.rs"))))
+    });
+}
+
+/// Candidates long enough that per-byte cost dominates fixed overhead.
+///
+/// The existing candidates are 15 to 25 bytes, short enough that a matcher's
+/// setup cost hides its scanning cost.
+fn long_paths(c: &mut Criterion) {
+    let matching = long_path("main.rs");
+    let non_matching = long_path("main.txt");
+    assert!(
+        matching.len() > 100,
+        "the long candidate must exceed 100 bytes"
+    );
+
+    let pattern = "src/**/*.rs";
+    let ferralk = Pattern::compile(
+        pattern,
+        PatternOptions::default().recursive_double_star(true),
+    )
+    .expect("long-path benchmark pattern is valid");
+    let globset = GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .expect("long-path comparator pattern is valid")
+        .compile_matcher();
+
+    c.bench_function("long_path/ferralk_compiled/matching", |benchmark| {
+        benchmark.iter(|| black_box(ferralk.is_match(black_box(matching.as_str()))))
+    });
+    c.bench_function("long_path/ferralk_compiled/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(ferralk.is_match(black_box(non_matching.as_str()))))
+    });
+    c.bench_function("long_path/globset_compiled/matching", |benchmark| {
+        benchmark.iter(|| black_box(globset.is_match(black_box(matching.as_str()))))
+    });
+    c.bench_function("long_path/globset_compiled/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(globset.is_match(black_box(non_matching.as_str()))))
+    });
+    c.bench_function("long_path/fast_glob_interpreted/matching", |benchmark| {
+        benchmark.iter(|| {
+            black_box(fast_glob::glob_match(
+                black_box(pattern),
+                black_box(matching.as_str()),
+            ))
+        })
+    });
+    c.bench_function(
+        "long_path/fast_glob_interpreted/non_matching",
+        |benchmark| {
+            benchmark.iter(|| {
+                black_box(fast_glob::glob_match(
+                    black_box(pattern),
+                    black_box(non_matching.as_str()),
+                ))
+            })
+        },
+    );
+}
+
+/// The star-chain worst case, where a naive matcher backtracks exponentially.
+///
+/// `a*a*a*a*b` against a run of `a` never matches, so every engine must
+/// exhaust its search. ferralk memoizes failed token/candidate pairs, which is
+/// exactly what this bench guards.
+fn adversarial(c: &mut Criterion) {
+    let pattern = "a*a*a*a*b";
+    let candidate = "a".repeat(64);
+    let ferralk =
+        Pattern::compile(pattern, PatternOptions::default()).expect("adversarial pattern is valid");
+    let globset = GlobBuilder::new(pattern)
+        .build()
+        .expect("adversarial comparator pattern is valid")
+        .compile_matcher();
+
+    c.bench_function("backtracking/ferralk_compiled/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(ferralk.is_match(black_box(candidate.as_str()))))
+    });
+    c.bench_function("backtracking/globset_compiled/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(globset.is_match(black_box(candidate.as_str()))))
+    });
+    c.bench_function(
+        "backtracking/fast_glob_interpreted/non_matching",
+        |benchmark| {
+            benchmark.iter(|| {
+                black_box(fast_glob::glob_match(
+                    black_box(pattern),
+                    black_box(candidate.as_str()),
+                ))
+            })
+        },
+    );
+}
+
+/// A candidate list at the size a caller actually filters.
+///
+/// The other `path_filter` benches pass four to six entries, where the call
+/// overhead dominates the per-entry work.
+fn large_path_filter(c: &mut Criterion) {
+    let paths: Vec<String> = (0..1024)
+        .map(|index| {
+            if index % 3 == 0 {
+                format!("src/module{index}/lib.rs")
+            } else {
+                format!("docs/module{index}/notes.md")
+            }
+        })
+        .collect();
+    let filter = Pattern::compile(
+        "src/**/*.rs",
+        PatternOptions::default().recursive_double_star(true),
+    )
+    .expect("large-list filter pattern is valid");
+
+    c.bench_function("path_filter/large_list", |benchmark| {
+        benchmark.iter(|| black_box(filter.filter_paths(black_box(paths.as_slice())).len()))
+    });
+}
+
+fn long_path(file: &str) -> String {
+    let mut path = String::from("src");
+    for segment in 0..12 {
+        path.push_str(&format!("/segment{segment}"));
+    }
+    path.push('/');
+    path.push_str(file);
+    path
 }
 
 criterion_group!(benches, matcher);
