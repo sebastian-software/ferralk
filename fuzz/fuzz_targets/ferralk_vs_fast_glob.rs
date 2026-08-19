@@ -49,6 +49,15 @@ fuzz_target!(|data: &[u8]| {
     );
 });
 
+/// Brace groups fast-glob answers correctly for.
+///
+/// Past ten it returns `false` for a pattern that matches, whatever the
+/// alternative count and whichever combination the candidate takes: eleven
+/// two-way groups miss even their first one. A single group of two thousand
+/// alternatives is fine, so the cap counts groups rather than combinations.
+/// Measured against fast-glob 1.1.0; see `docs/fast-glob-reference.md`.
+const FAST_GLOB_MAX_BRACE_GROUPS: usize = 10;
+
 /// The options that make ferralk speak fast-glob's dialect.
 ///
 /// Extglobs are fast-glob-only syntax, case folding is ferralk-only, and
@@ -85,6 +94,7 @@ fn in_shared_subset(pattern: &[u8]) -> bool {
     }
     let mut index = 0;
     let mut brace_depth = 0_usize;
+    let mut brace_groups = 0_usize;
     while index < pattern.len() {
         match pattern[index] {
             b'\\' => {
@@ -112,6 +122,12 @@ fn in_shared_subset(pattern: &[u8]) -> bool {
                         // ground.
                         brace_depth += 1;
                         if brace_depth > 1 {
+                            return false;
+                        }
+                        // It also caps how many groups a pattern may have at
+                        // all, and answers `false` rather than erring past it.
+                        brace_groups += 1;
+                        if brace_groups > FAST_GLOB_MAX_BRACE_GROUPS {
                             return false;
                         }
                     }
