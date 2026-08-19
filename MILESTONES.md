@@ -767,3 +767,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   Unix integration suite. An aborting walk constrained to `src/**/*.rs`
   returns `src/a.rs` without opening its unreadable `locked` sibling; the test
   skips root execution because root intentionally bypasses the mode-bit proof.
+- Extended `respect_git_ignore(true)` with zlob-compatible `.ignore` files.
+  Each immutable directory node now builds `.gitignore` first and `.ignore`
+  second, so a later negation can re-include a path; a source-backed fixture
+  proves precedence, nested rules, and serial/parallel/stream parity.

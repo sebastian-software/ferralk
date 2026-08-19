@@ -28,7 +28,7 @@ read the [compatibility guide](compatibility-guide.md).
 | zlob capability / flag | ferralk API | Status | Notes |
 |---|---|---|---|
 | path traversal | `Walker::new` / `Walker::threads` | In progress (M3) | Portable `std::fs` backend; `collect()` uses a lazy work-stealing parallel scheduler while `stream()` remains incremental and single-threaded. |
-| `ZLOB_GITIGNORE` | `Walker::respect_git_ignore` | Implemented (M3) | Nested .gitignore chains, negation-aware descent, and shared-parent caching use `ignore`'s matcher. |
+| `ZLOB_GITIGNORE` | `Walker::respect_git_ignore` | Implemented (M3) | Nested `.gitignore` chains plus zlob-compatible `.ignore` supplements (loaded after `.gitignore`), negation-aware descent, and shared-parent caching use `ignore`'s matcher. |
 | `ZLOB_WALK_KEEP_GIT_DIR` | `WalkOptions::keep_git_dir` | Implemented (M3) | `.git` is skipped with Gitignore by default; this explicit opt-in keeps it. |
 | `ZLOB_SKIP_HIDDEN` | `WalkOptions::skip_hidden` | Implemented (M2) | Explicit opt-in; suppresses hidden files and whole hidden subtrees. |
 | `ZLOB_FOLLOW_SYMLINKS` | `WalkOptions::follow_symlinks` | Implemented (M2) | Default off; canonical-path cycle guard when enabled. |

@@ -20,7 +20,7 @@ use std::{
 };
 
 use ferralk_glob::{Pattern, PatternError, PatternOptions};
-use ignore::gitignore::Gitignore;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 pub use ferralk_glob;
 
@@ -351,7 +351,7 @@ impl Walker {
         self
     }
 
-    /// Applies the root .gitignore with Git-compatible matching semantics.
+    /// Applies `.gitignore` rules plus zlob-compatible `.ignore` supplements.
     #[must_use]
     pub const fn respect_git_ignore(mut self, enabled: bool) -> Self {
         self.respect_git_ignore = enabled;
@@ -1078,11 +1078,22 @@ fn gitignore_node(
         .flatten()
         .map(|parent| gitignore_node(walker, parent, cache));
     let node = Arc::new(GitIgnoreNode {
-        rules: Gitignore::new(directory.join(".gitignore")).0,
+        rules: gitignore_rules(directory),
         parent,
     });
     cache.insert(directory.to_path_buf(), Arc::clone(&node));
     node
+}
+
+fn gitignore_rules(directory: &Path) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(directory);
+    for file_name in [".gitignore", ".ignore"] {
+        let path = directory.join(file_name);
+        if path.is_file() {
+            let _ = builder.add(path);
+        }
+    }
+    builder.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
 /// Crate version exposed for build and integration diagnostics.
@@ -1771,6 +1782,67 @@ mod tests {
         let unfiltered_paths = relative_paths(without_ignore.entries(), &fixture.root);
         assert!(unfiltered_paths.contains(&PathBuf::from(".git/config")));
         assert!(unfiltered_paths.len() > paths.len());
+    }
+
+    #[test]
+    fn source_walk_ignore_file_overrides_gitignore_rules() {
+        // Ported from zlob/test/test_walk.zig's reusable IgnoreRules scenario.
+        let fixture = Fixture::new();
+        for path in [
+            "app.log",
+            "keep.log",
+            "scratch.tmp",
+            "important.tmp",
+            "old.bak",
+            "src/main.rs",
+            "src/old.bak",
+            "build/artifact.txt",
+        ] {
+            fixture.write(path);
+        }
+        fs::write(
+            fixture.root.join(".gitignore"),
+            b"*.log\nbuild/\n!keep.log\n*.tmp\n",
+        )
+        .expect("write root gitignore");
+        fs::write(fixture.root.join(".ignore"), b"!important.tmp\n")
+            .expect("write root ignore supplement");
+        fs::write(fixture.root.join("src/.gitignore"), b"*.bak\n").expect("write nested gitignore");
+
+        let expected = vec![
+            PathBuf::from(".gitignore"),
+            PathBuf::from(".ignore"),
+            PathBuf::from("important.tmp"),
+            PathBuf::from("keep.log"),
+            PathBuf::from("old.bak"),
+            PathBuf::from("src"),
+            PathBuf::from("src/.gitignore"),
+            PathBuf::from("src/main.rs"),
+        ];
+        let options = WalkOptions::default().sort(true);
+        let serial = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .threads(1)
+            .options(options)
+            .collect()
+            .expect("serial ignore walk succeeds");
+        let parallel = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .threads(4)
+            .options(options)
+            .collect()
+            .expect("parallel ignore walk succeeds");
+        let mut streamed = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .options(options)
+            .stream()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream ignore walk succeeds");
+        streamed.sort_by(|left, right| left.path().cmp(right.path()));
+
+        assert_eq!(relative_paths(serial.entries(), &fixture.root), expected);
+        assert_eq!(relative_paths(parallel.entries(), &fixture.root), expected);
+        assert_eq!(relative_paths(&streamed, &fixture.root), expected);
     }
 
     #[test]
