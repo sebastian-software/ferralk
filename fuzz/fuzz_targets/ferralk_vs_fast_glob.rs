@@ -250,6 +250,7 @@ fn corpus_candidate(pattern: &[u8], path: &[u8], ours: bool, reference: bool) ->
             "match_hidden".to_owned(),
         ],
         ignore_rules: Vec::new(),
+        nested_ignore_rules: Vec::new(),
         expected: ours,
         oracle_expected: Some(reference),
         error_offset: None,
