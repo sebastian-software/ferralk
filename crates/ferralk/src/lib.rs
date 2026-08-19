@@ -40,8 +40,11 @@ pub use macos_native::fuzz_validate_bulk_record as fuzz_validate_macos_bulk_reco
 #[cfg(all(feature = "native-macos", target_os = "macos"))]
 #[doc(hidden)]
 pub use macos_native::fuzz_validate_records as fuzz_validate_macos_dirent_records;
+mod classify;
 mod parallel;
 mod scheduler;
+
+use classify::{EntryAction, EntryCaches, classify_entry};
 
 /// Controls what a walk does after a recoverable filesystem error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -387,10 +390,18 @@ impl Walker {
     /// A panic inside a worker stops the sibling workers and is resumed on the
     /// calling thread after they have been joined.
     pub fn collect(self) -> Result<WalkResult, WalkError> {
+        self.collect_with(&SystemBackend)
+    }
+
+    /// The collect implementation both frontends share, with the filesystem
+    /// behind a backend so tests can drive either of them with a mock.
+    fn collect_with<B: DirectoryBackend + Sync>(
+        self,
+        backend: &B,
+    ) -> Result<WalkResult, WalkError> {
         if self.threads > 1 {
-            return parallel::collect(self);
+            return parallel::collect(self, backend);
         }
-        let backend = SystemBackend;
         let mut state = WalkState::new(&self);
         // Use the same injector-to-worker transfer as the forthcoming parallel
         // backend. The serial baseline owns one local queue and deliberately
@@ -400,7 +411,7 @@ impl Walker {
         scheduler.push(self.root.clone());
         let worker = scheduler.worker();
         while let Some(directory) = scheduler.steal_into(&worker).or_else(|| worker.pop()) {
-            state.walk_directory(&backend, directory)?;
+            state.walk_directory(backend, directory)?;
         }
         if self.options.sort {
             state
@@ -424,7 +435,7 @@ impl Walker {
             walker: self,
             pending_entries: VecDeque::new(),
             visited_directories: HashSet::new(),
-            gitignore_cache: HashMap::new(),
+            caches: EntryCaches::new(),
             cancelled: false,
             stopped: false,
         }
@@ -438,19 +449,13 @@ impl Walker {
                 .any(|pattern| pattern.could_match_descendant(relative))
     }
 
-    fn may_descend_path(&self, relative: &Path, bytes: &[u8]) -> bool {
-        self.includes_depth(relative)
-            && self
-                .options
-                .max_depth
-                .is_none_or(|max_depth| relative.components().count() < max_depth)
-            && self.may_descend_into(bytes)
-    }
-
-    fn includes_depth(&self, relative: &Path) -> bool {
+    /// Whether the walk may traverse into a directory found at `depth`. The
+    /// caller counted the components once and passes the result in.
+    fn may_descend_at(&self, depth: usize, bytes: &[u8]) -> bool {
         self.options
             .max_depth
-            .is_none_or(|max_depth| relative.components().count() <= max_depth)
+            .is_none_or(|max_depth| depth < max_depth)
+            && self.may_descend_into(bytes)
     }
 
     fn may_include_file(&self, relative: &[u8]) -> bool {
@@ -656,8 +661,27 @@ fn has_closing_parenthesis(pattern: &[u8], open: usize) -> bool {
     false
 }
 
+/// The filesystem calls that traversal and classification make, so one mock
+/// can drive the serial and the parallel frontend alike. Reading `.gitignore`
+/// files is not part of it: those go through the `ignore` crate, which owns
+/// its own IO.
 trait DirectoryBackend {
     fn read_directory(&self, path: &Path) -> std::io::Result<Vec<BackendEntry>>;
+
+    /// Follows symlinks; decides whether a link points at a directory.
+    fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+        fs::metadata(path)
+    }
+
+    /// Does not follow symlinks; fills in the metadata option of an entry.
+    fn symlink_metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+        fs::symlink_metadata(path)
+    }
+
+    /// Resolves a directory for the follow-symlinks loop guard.
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+        fs::canonicalize(path)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -730,7 +754,7 @@ pub struct WalkStream {
     pending_directories: Vec<PathBuf>,
     pending_entries: VecDeque<BackendEntry>,
     visited_directories: HashSet<PathBuf>,
-    gitignore_cache: HashMap<PathBuf, Arc<GitIgnoreNode>>,
+    caches: EntryCaches,
     cancelled: bool,
     stopped: bool,
 }
@@ -770,7 +794,7 @@ impl WalkStream {
 
     fn prepare_directory(&mut self, directory: PathBuf) -> Option<Result<WalkEntry, WalkError>> {
         if self.walker.options.follow_symlinks {
-            match fs::canonicalize(&directory) {
+            match SystemBackend.canonicalize(&directory) {
                 Ok(canonical) => {
                     if !self.visited_directories.insert(canonical) {
                         return None;
@@ -788,91 +812,25 @@ impl WalkStream {
         }
     }
 
-    fn process_entry(&mut self, mut entry: BackendEntry) -> Option<Result<WalkEntry, WalkError>> {
-        let relative = entry
-            .path
-            .strip_prefix(&self.walker.root)
-            .unwrap_or(entry.path.as_path());
-        let depth = relative.components().count();
-        if !self.walker.includes_depth(relative) {
-            return None;
-        }
-        let bytes = glob_path_bytes(relative);
-        if self.walker.options.skip_hidden && has_hidden_component(bytes.as_ref()) {
-            return None;
-        }
-        if should_skip_git_directory(&self.walker, &entry.path) {
-            return None;
-        }
-        if self
-            .walker
-            .excludes
-            .iter()
-            .any(|pattern| pattern.matches(bytes.as_ref(), entry.is_dir))
-        {
-            return None;
-        }
-        let git_ignored = is_git_ignored(
-            &self.walker,
-            &entry.path,
-            entry.is_dir,
-            &mut self.gitignore_cache,
-        );
-        if git_ignored && !entry.is_dir {
-            return None;
-        }
-        if entry.is_symlink && self.walker.options.follow_symlinks {
-            match fs::metadata(&entry.path) {
-                Ok(metadata) => entry.is_dir = metadata.is_dir(),
-                Err(source) => return self.error("metadata", entry.path, source),
+    fn process_entry(&mut self, entry: BackendEntry) -> Option<Result<WalkEntry, WalkError>> {
+        match classify_entry(&self.walker, &SystemBackend, entry, &mut self.caches) {
+            EntryAction::Skip => None,
+            EntryAction::Descend(path) => {
+                self.pending_directories.push(path);
+                None
+            }
+            EntryAction::Emit(entry) => Some(Ok(entry)),
+            EntryAction::DescendAndEmit(entry) => {
+                self.pending_directories.push(entry.path.clone());
+                Some(Ok(entry))
+            }
+            EntryAction::Failed { failure, descend } => {
+                if let Some(path) = descend {
+                    self.pending_directories.push(path);
+                }
+                self.error(failure.operation, failure.path, failure.source)
             }
         }
-        if !entry.is_dir && !self.walker.may_include_file(bytes.as_ref()) {
-            return None;
-        }
-        if entry.is_dir
-            && !self
-                .walker
-                .excludes
-                .iter()
-                .any(|pattern| pattern.covers_subtree(bytes.as_ref()))
-            && self.walker.may_descend_path(relative, bytes.as_ref())
-        {
-            self.pending_directories.push(entry.path.clone());
-        }
-        if !self.walker.includes.is_empty()
-            && !self
-                .walker
-                .includes
-                .iter()
-                .any(|pattern| pattern.matches(bytes.as_ref(), entry.is_dir))
-        {
-            return None;
-        }
-        if git_ignored {
-            return None;
-        }
-        if self.walker.options.directories_only && !entry.is_dir {
-            return None;
-        }
-        if self.walker.options.files_only && entry.is_dir {
-            return None;
-        }
-        let metadata = if self.walker.options.metadata {
-            match fs::symlink_metadata(&entry.path) {
-                Ok(metadata) => Some(metadata),
-                Err(source) => return self.error("symlink_metadata", entry.path, source),
-            }
-        } else {
-            None
-        };
-        Some(Ok(WalkEntry {
-            path: entry.path,
-            is_dir: entry.is_dir,
-            is_symlink: entry.is_symlink,
-            depth,
-            metadata,
-        }))
     }
 }
 
@@ -905,7 +863,7 @@ struct WalkState<'walker> {
     entries: Vec<WalkEntry>,
     errors: Vec<WalkError>,
     visited_directories: HashSet<PathBuf>,
-    gitignore_cache: HashMap<PathBuf, Arc<GitIgnoreNode>>,
+    caches: EntryCaches,
     cancelled: bool,
 }
 
@@ -916,7 +874,7 @@ impl<'walker> WalkState<'walker> {
             entries: Vec::new(),
             errors: Vec::new(),
             visited_directories: HashSet::new(),
-            gitignore_cache: HashMap::new(),
+            caches: EntryCaches::new(),
             cancelled: false,
         }
     }
@@ -929,7 +887,7 @@ impl<'walker> WalkState<'walker> {
         if self.check_cancellation() {
             return Ok(());
         }
-        if self.walker.options.follow_symlinks && !self.mark_directory(&directory)? {
+        if self.walker.options.follow_symlinks && !self.mark_directory(backend, &directory)? {
             return Ok(());
         }
         let entries = match backend.read_directory(&directory) {
@@ -945,8 +903,12 @@ impl<'walker> WalkState<'walker> {
         Ok(())
     }
 
-    fn mark_directory(&mut self, directory: &Path) -> Result<bool, WalkError> {
-        match fs::canonicalize(directory) {
+    fn mark_directory(
+        &mut self,
+        backend: &impl DirectoryBackend,
+        directory: &Path,
+    ) -> Result<bool, WalkError> {
+        match backend.canonicalize(directory) {
             Ok(canonical) => Ok(self.visited_directories.insert(canonical)),
             Err(source) => {
                 self.handle_error("canonicalize", directory.to_path_buf(), source)?;
@@ -958,102 +920,33 @@ impl<'walker> WalkState<'walker> {
     fn visit_entry(
         &mut self,
         backend: &impl DirectoryBackend,
-        mut entry: BackendEntry,
+        entry: BackendEntry,
     ) -> Result<(), WalkError> {
         if self.check_cancellation() {
             return Ok(());
         }
-        let relative = entry
-            .path
-            .strip_prefix(&self.walker.root)
-            .unwrap_or(entry.path.as_path());
-        let depth = relative.components().count();
-        if !self.walker.includes_depth(relative) {
-            return Ok(());
-        }
-        let bytes = glob_path_bytes(relative);
-        if self.walker.options.skip_hidden && has_hidden_component(bytes.as_ref()) {
-            return Ok(());
-        }
-        if should_skip_git_directory(self.walker, &entry.path) {
-            return Ok(());
-        }
-        if self
-            .walker
-            .excludes
-            .iter()
-            .any(|pattern| pattern.matches(bytes.as_ref(), entry.is_dir))
-        {
-            return Ok(());
-        }
-        let git_ignored = is_git_ignored(
-            self.walker,
-            &entry.path,
-            entry.is_dir,
-            &mut self.gitignore_cache,
-        );
-        if git_ignored && !entry.is_dir {
-            return Ok(());
-        }
-        if entry.is_symlink && self.walker.options.follow_symlinks {
-            match fs::metadata(&entry.path) {
-                Ok(metadata) => entry.is_dir = metadata.is_dir(),
-                Err(source) => {
-                    self.handle_error("metadata", entry.path.clone(), source)?;
-                    return Ok(());
+        match classify_entry(self.walker, backend, entry, &mut self.caches) {
+            EntryAction::Skip => Ok(()),
+            EntryAction::Descend(path) => self.walk_directory(backend, path),
+            EntryAction::Emit(entry) => {
+                self.entries.push(entry);
+                Ok(())
+            }
+            // The subtree is walked before the directory itself is recorded,
+            // which is the depth-first order this frontend has always had.
+            EntryAction::DescendAndEmit(entry) => {
+                self.walk_directory(backend, entry.path.clone())?;
+                self.entries.push(entry);
+                Ok(())
+            }
+            EntryAction::Failed { failure, descend } => {
+                self.handle_error(failure.operation, failure.path, failure.source)?;
+                if let Some(path) = descend {
+                    self.walk_directory(backend, path)?;
                 }
+                Ok(())
             }
         }
-        if !entry.is_dir && !self.walker.may_include_file(bytes.as_ref()) {
-            return Ok(());
-        }
-        if entry.is_dir
-            && !self
-                .walker
-                .excludes
-                .iter()
-                .any(|pattern| pattern.covers_subtree(bytes.as_ref()))
-            && self.walker.may_descend_path(relative, bytes.as_ref())
-        {
-            self.walk_directory(backend, entry.path.clone())?;
-        }
-
-        if self.walker.options.files_only && entry.is_dir {
-            return Ok(());
-        }
-
-        let metadata = if self.walker.options.metadata {
-            match fs::symlink_metadata(&entry.path) {
-                Ok(metadata) => Some(metadata),
-                Err(source) => {
-                    self.handle_error("symlink_metadata", entry.path.clone(), source)?;
-                    return Ok(());
-                }
-            }
-        } else {
-            None
-        };
-
-        if (!self.walker.options.directories_only || entry.is_dir)
-            && (self.walker.includes.is_empty()
-                || self
-                    .walker
-                    .includes
-                    .iter()
-                    .any(|pattern| pattern.matches(bytes.as_ref(), entry.is_dir)))
-        {
-            if git_ignored {
-                return Ok(());
-            }
-            self.entries.push(WalkEntry {
-                path: entry.path,
-                is_dir: entry.is_dir,
-                is_symlink: entry.is_symlink,
-                depth,
-                metadata,
-            });
-        }
-        Ok(())
     }
 
     fn handle_error(
@@ -1225,6 +1118,103 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// What one frontend observed for a walk. Under `Abort` only the operation
+    /// that stopped the walk is comparable: which entry loses the race is up to
+    /// the traversal order, which the three frontends are free to differ on.
+    #[derive(Debug, PartialEq, Eq)]
+    enum FrontendOutcome {
+        Completed {
+            entries: Vec<PathBuf>,
+            errors: Vec<(&'static str, PathBuf)>,
+        },
+        Aborted(&'static str),
+    }
+
+    fn error_multiset(errors: &[super::WalkError], root: &Path) -> Vec<(&'static str, PathBuf)> {
+        let mut errors = errors
+            .iter()
+            .map(|error| {
+                (
+                    error.operation(),
+                    error
+                        .path()
+                        .strip_prefix(root)
+                        .unwrap_or(error.path())
+                        .to_path_buf(),
+                )
+            })
+            .collect::<Vec<_>>();
+        errors.sort_unstable();
+        errors
+    }
+
+    fn collect_outcome(
+        result: Result<super::WalkResult, super::WalkError>,
+        root: &Path,
+    ) -> FrontendOutcome {
+        match result {
+            Ok(result) => {
+                let mut entries = relative_paths(result.entries(), root);
+                entries.sort_unstable();
+                FrontendOutcome::Completed {
+                    entries,
+                    errors: error_multiset(result.errors(), root),
+                }
+            }
+            Err(error) => FrontendOutcome::Aborted(error.operation()),
+        }
+    }
+
+    fn stream_outcome(
+        stream: super::WalkStream,
+        root: &Path,
+        policy: ErrorPolicy,
+    ) -> FrontendOutcome {
+        let mut entries = Vec::new();
+        let mut errors = Vec::new();
+        for item in stream {
+            match item {
+                Ok(entry) => entries.push(
+                    entry
+                        .path()
+                        .strip_prefix(root)
+                        .expect("entry is rooted in fixture")
+                        .to_path_buf(),
+                ),
+                Err(error) => {
+                    if policy == ErrorPolicy::Abort {
+                        return FrontendOutcome::Aborted(error.operation());
+                    }
+                    errors.push(error);
+                }
+            }
+        }
+        entries.sort_unstable();
+        FrontendOutcome::Completed {
+            entries,
+            errors: error_multiset(&errors, root),
+        }
+    }
+
+    /// Serial `collect`, parallel `collect` and `stream` share one
+    /// classification pipeline, so they have to report the same entries and the
+    /// same errors for the same tree under every policy.
+    fn assert_frontends_agree(label: &str, root: &Path, build: impl Fn() -> Walker) {
+        for policy in [ErrorPolicy::Collect, ErrorPolicy::Skip, ErrorPolicy::Abort] {
+            let serial = collect_outcome(build().threads(1).error_policy(policy).collect(), root);
+            let parallel = collect_outcome(build().threads(4).error_policy(policy).collect(), root);
+            let streamed = stream_outcome(build().error_policy(policy).stream(), root, policy);
+            assert_eq!(
+                parallel, serial,
+                "{label}: parallel and serial disagree under {policy:?}"
+            );
+            assert_eq!(
+                streamed, serial,
+                "{label}: stream and serial disagree under {policy:?}"
+            );
         }
     }
 
@@ -2061,6 +2051,225 @@ mod tests {
         assert!(!rust_sources.matches_extension(b"src/lib.txt"));
         assert_eq!(literal_extension(b"src/**/*.{rs,ts}"), None);
         assert_eq!(literal_extension(b"src/**/*.rs"), Some(b"rs".to_vec()));
+    }
+
+    #[test]
+    fn the_three_frontends_agree_on_entries_and_errors() {
+        let fixture = Fixture::new();
+        fixture.write("src/lib.rs");
+        fixture.write("src/nested/mod.rs");
+        fixture.write("docs/guide.md");
+        fixture.write("docs/notes/todo.md");
+        fs::create_dir_all(fixture.root.join("empty")).expect("create empty fixture directory");
+
+        assert_frontends_agree("plain tree", &fixture.root, || Walker::new(&fixture.root));
+        assert_frontends_agree("with metadata", &fixture.root, || {
+            Walker::new(&fixture.root).options(WalkOptions::default().metadata(true))
+        });
+        assert_frontends_agree("include filtered", &fixture.root, || {
+            Walker::new(&fixture.root)
+                .options(WalkOptions::default().metadata(true))
+                .include("**/*.md")
+                .expect("valid include")
+        });
+        assert_frontends_agree("directories only", &fixture.root, || {
+            Walker::new(&fixture.root).options(
+                WalkOptions::default()
+                    .metadata(true)
+                    .directories_only(true)
+                    .max_depth(2),
+            )
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_three_frontends_agree_when_stat_fails() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        fixture.write("src/lib.rs");
+        fixture.write("docs/guide.md");
+        symlink("missing-target", fixture.root.join("src/dangling"))
+            .expect("create dangling symlink");
+        symlink("missing-target", fixture.root.join("docs/dangling"))
+            .expect("create second dangling symlink");
+
+        // Following the links stats them, and both stats fail: every frontend
+        // has to report that the same way.
+        assert_frontends_agree("dangling symlinks", &fixture.root, || {
+            Walker::new(&fixture.root).options(
+                WalkOptions::default()
+                    .metadata(true)
+                    .follow_symlinks(true)
+                    .sort(true),
+            )
+        });
+    }
+
+    /// An entry whose `stat` would fail but that no filter emits must not be
+    /// stat-ed at all, so the walk stays silent about it. The filters used here
+    /// are the ones that only decide emission - `directories_only` and an
+    /// include pattern without a literal extension - because those are exactly
+    /// the ones the serial walk used to apply *after* its stat, which made it
+    /// report an error the other two frontends never saw.
+    #[cfg(unix)]
+    #[test]
+    fn a_filtered_entry_is_never_stat_ed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        fixture.write("keep/note.md");
+        fixture.write("blocked/hidden.txt");
+        let blocked = fixture.root.join("blocked");
+        // Readable but not searchable: the directory still lists, stat-ing what
+        // is inside it does not.
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o400))
+            .expect("restrict fixture directory");
+
+        // Running as root, or a filesystem that needs a stat to report the file
+        // type, would not exercise this at all; leave it rather than fail.
+        let listable = fs::read_dir(&blocked).is_ok_and(|entries| {
+            entries
+                .into_iter()
+                .all(|entry| entry.is_ok_and(|entry| entry.file_type().is_ok()))
+        });
+        let stat_fails = fs::symlink_metadata(blocked.join("hidden.txt")).is_err();
+        let outcomes = (listable && stat_fails).then(|| {
+            let directories_only = || {
+                Walker::new(&fixture.root)
+                    .options(WalkOptions::default().metadata(true).directories_only(true))
+            };
+            let included = || {
+                Walker::new(&fixture.root)
+                    .options(WalkOptions::default().metadata(true))
+                    .include("**/keep/**")
+                    .expect("valid include")
+            };
+            assert_frontends_agree(
+                "unreadable file, directories only",
+                &fixture.root,
+                directories_only,
+            );
+            assert_frontends_agree("unreadable file, not included", &fixture.root, included);
+            (
+                collect_outcome(directories_only().threads(1).collect(), &fixture.root),
+                collect_outcome(included().threads(1).collect(), &fixture.root),
+            )
+        });
+        // Restore before the fixture removes itself, and before any assertion
+        // below can unwind past this point.
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))
+            .expect("restore fixture directory");
+
+        let Some((directories_only, included)) = outcomes else {
+            return;
+        };
+        assert_eq!(
+            directories_only,
+            FrontendOutcome::Completed {
+                entries: vec![PathBuf::from("blocked"), PathBuf::from("keep")],
+                errors: Vec::new(),
+            },
+            "a file dropped by directories_only must not be stat-ed"
+        );
+        assert_eq!(
+            included,
+            FrontendOutcome::Completed {
+                entries: vec![PathBuf::from("keep"), PathBuf::from("keep/note.md")],
+                errors: Vec::new(),
+            },
+            "an entry dropped by the include patterns must not be stat-ed"
+        );
+    }
+
+    #[test]
+    fn a_mock_backend_drives_the_parallel_walker() {
+        struct InjectingBackend {
+            failing_stat: PathBuf,
+            reads: std::sync::Mutex<Vec<PathBuf>>,
+        }
+
+        impl super::DirectoryBackend for InjectingBackend {
+            fn read_directory(&self, path: &Path) -> std::io::Result<Vec<super::BackendEntry>> {
+                self.reads
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(path.to_path_buf());
+                super::StdBackend.read_directory(path)
+            }
+
+            fn symlink_metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+                if path == self.failing_stat {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                fs::symlink_metadata(path)
+            }
+        }
+
+        let fixture = Fixture::new();
+        fixture.write("src/lib.rs");
+        fixture.write("src/nested/mod.rs");
+        fixture.write("docs/guide.md");
+        let failing_stat = fixture.root.join("src/nested/mod.rs");
+        let backend = InjectingBackend {
+            failing_stat: failing_stat.clone(),
+            reads: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let result = Walker::new(&fixture.root)
+            .threads(4)
+            .options(WalkOptions::default().metadata(true).sort(true))
+            .collect_with(&backend)
+            .expect("collect policy retains the injected error");
+
+        let reads = backend
+            .reads
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            reads.contains(&fixture.root.join("src")),
+            "the parallel walker has to read through the injected backend"
+        );
+        assert_eq!(result.errors().len(), 1);
+        assert_eq!(result.errors()[0].operation(), "symlink_metadata");
+        assert_eq!(result.errors()[0].path(), failing_stat);
+        assert!(
+            !result
+                .entries()
+                .iter()
+                .any(|entry| entry.path() == failing_stat)
+        );
+
+        // The same injected failure on an entry that is dropped before the
+        // stat stays invisible. `directories_only` is the filter to use here:
+        // it decides emission alone, so nothing rejects the file earlier.
+        let backend = InjectingBackend {
+            failing_stat: failing_stat.clone(),
+            reads: std::sync::Mutex::new(Vec::new()),
+        };
+        let filtered = Walker::new(&fixture.root)
+            .threads(4)
+            .options(
+                WalkOptions::default()
+                    .metadata(true)
+                    .directories_only(true)
+                    .sort(true),
+            )
+            .collect_with(&backend)
+            .expect("filtered walk succeeds");
+        assert!(
+            filtered.errors().is_empty(),
+            "a filtered entry must not be stat-ed on the parallel path either"
+        );
+        assert_eq!(
+            relative_paths(filtered.entries(), &fixture.root),
+            vec![
+                PathBuf::from("docs"),
+                PathBuf::from("src"),
+                PathBuf::from("src/nested")
+            ]
+        );
     }
 
     #[test]

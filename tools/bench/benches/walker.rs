@@ -1,4 +1,17 @@
 #![forbid(unsafe_code)]
+//! Walker benchmarks, measured as wall time.
+//!
+//! These benches do real filesystem work and use several threads, which
+//! CodSpeed's simulation instrument cannot model: it serializes threads and
+//! does not reproduce syscall cost, so a parallel-versus-serial comparison
+//! there measures instruction count rather than speedup. They therefore run in
+//! the wall-time lane in `.github/workflows/walker-bench.yml`, not in the
+//! CodSpeed simulation lane.
+//!
+//! **Cache assumption:** every fixture is written immediately before the
+//! measurement, so its directory entries and inodes are in the page cache.
+//! These numbers describe warm-cache traversal. Cold-cache behaviour is a
+//! different measurement and is not made here.
 
 use std::{
     fs,
@@ -13,12 +26,30 @@ use ignore::{WalkBuilder, WalkState, overrides::OverrideBuilder};
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
+/// Benchmark-id prefix, so a native-backend run does not overwrite the
+/// portable run's series when both report to the same collector.
+const LANE: &str = if cfg!(feature = "native-linux") {
+    "walker_native_linux"
+} else if cfg!(feature = "native-macos") {
+    "walker_native_macos"
+} else {
+    "walker"
+};
+
+/// A nested directory tree of known shape.
 struct Fixture {
     root: PathBuf,
+    files: usize,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    /// Builds `branches` chains that are `depth` directories deep, each
+    /// directory holding `files_per_directory` files, half of them matching.
+    ///
+    /// The directories nest — `branch-3/depth-0/depth-1/depth-2` — so `**`
+    /// recursion actually descends. An earlier revision created the `depth-N`
+    /// directories as siblings, which fixed the effective depth at two.
+    fn new(branches: usize, depth: usize, files_per_directory: usize) -> Self {
         let unique = format!(
             "ferralk-bench-{}-{}",
             std::process::id(),
@@ -29,15 +60,24 @@ impl Fixture {
                 + NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed) as u128
         );
         let root = std::env::temp_dir().join(unique);
-        for branch in 0..16 {
-            for depth in 0..4 {
-                let directory = root.join(format!("branch-{branch}/depth-{depth}"));
+        let mut files = 0;
+        for branch in 0..branches {
+            let mut directory = root.join(format!("branch-{branch}"));
+            for level in 0..depth {
+                directory = directory.join(format!("depth-{level}"));
                 fs::create_dir_all(&directory).expect("create benchmark directory");
-                fs::write(directory.join("match.rs"), b"fixture").expect("write matching file");
-                fs::write(directory.join("skip.txt"), b"fixture").expect("write non-matching file");
+                for index in 0..files_per_directory {
+                    let name = if index % 2 == 0 {
+                        format!("match-{index}.rs")
+                    } else {
+                        format!("skip-{index}.txt")
+                    };
+                    fs::write(directory.join(name), b"fixture").expect("write benchmark file");
+                    files += 1;
+                }
             }
         }
-        Self { root }
+        Self { root, files }
     }
 }
 
@@ -48,10 +88,25 @@ impl Drop for Fixture {
 }
 
 fn walker(c: &mut Criterion) {
-    let fixture = Fixture::new();
+    // 16 chains, four levels deep, two files per directory: the same 128 files
+    // the previous fixture held, now at an effective depth of four.
+    let small = Fixture::new(16, 4, 2);
+    // A repository-sized tree: 5120 files across 320 directories, eight levels
+    // deep, where per-entry cost stops being lost in fixed overhead.
+    let large = Fixture::new(40, 8, 16);
+    assert!(
+        large.files >= 5000,
+        "the large fixture must exceed 5k files"
+    );
+
+    bench_tree(c, "", &small);
+    bench_tree(c, "large/", &large);
+}
+
+fn bench_tree(c: &mut Criterion, group: &str, fixture: &Fixture) {
     let options = WalkOptions::default();
 
-    c.bench_function("walker/serial_filtered", |benchmark| {
+    c.bench_function(&format!("{LANE}/{group}serial_filtered"), |benchmark| {
         benchmark.iter(|| {
             black_box(
                 Walker::new(&fixture.root)
@@ -64,7 +119,7 @@ fn walker(c: &mut Criterion) {
             )
         })
     });
-    c.bench_function("walker/parallel_filtered", |benchmark| {
+    c.bench_function(&format!("{LANE}/{group}parallel_filtered"), |benchmark| {
         benchmark.iter(|| {
             black_box(
                 Walker::new(&fixture.root)
@@ -77,12 +132,15 @@ fn walker(c: &mut Criterion) {
             )
         })
     });
-    c.bench_function("walker/ignore_parallel_filtered", |benchmark| {
-        benchmark.iter(|| {
-            ignore_parallel_filtered(&fixture.root);
-            black_box(())
-        })
-    });
+    c.bench_function(
+        &format!("{LANE}/{group}ignore_parallel_filtered"),
+        |benchmark| {
+            benchmark.iter(|| {
+                ignore_parallel_filtered(&fixture.root);
+                black_box(())
+            })
+        },
+    );
 }
 
 fn ignore_parallel_filtered(root: &Path) {
