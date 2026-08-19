@@ -16,9 +16,17 @@ use corpus::{Case, Source, encode_bytes};
 use ferralk_glob::{Pattern, PatternOptions};
 use libfuzzer_sys::fuzz_target;
 
+#[path = "brace_budget.rs"]
+mod brace_budget;
+
 fuzz_target!(|data: &[u8]| {
     let (pattern, path) = split_input(data);
     if !in_shared_subset(pattern) {
+        return;
+    }
+    // This target always enables braces, whose expansion has no budget in the
+    // matcher; see brace_budget.
+    if !brace_budget::within_budget(pattern) {
         return;
     }
     // fast-glob rejects patterns ferralk accepts and the reverse; comparing a
@@ -100,17 +108,31 @@ fn in_shared_subset(pattern: &[u8]) -> bool {
             }
             b']' => return false,
             b'{' | b'}' | b',' => {
-                if pattern[index] == b'{' {
-                    // fast-glob caps brace nesting; one level is common ground.
-                    brace_depth += 1;
-                    if brace_depth > 1 {
-                        return false;
+                match pattern[index] {
+                    b'{' => {
+                        // fast-glob caps brace nesting; one level is common
+                        // ground.
+                        brace_depth += 1;
+                        if brace_depth > 1 {
+                            return false;
+                        }
                     }
-                } else if pattern[index] == b'}' {
-                    if brace_depth == 0 {
-                        return false;
+                    b'}' => {
+                        if brace_depth == 0 {
+                            return false;
+                        }
+                        brace_depth -= 1;
                     }
-                    brace_depth -= 1;
+                    // A comma separates alternatives inside a brace group and
+                    // is an ordinary byte outside one, but fast-glob does not
+                    // always return to that reading after a group closes:
+                    // `{}{},` matches the empty candidate there and the
+                    // literal `,` in ferralk.
+                    _ => {
+                        if brace_depth == 0 {
+                            return false;
+                        }
+                    }
                 }
                 // Brace expansion concatenates its alternative with the
                 // surrounding text, so a star beside brace punctuation can

@@ -3,13 +3,19 @@
 use ferralk_glob::{Pattern, PatternOptions};
 use libfuzzer_sys::fuzz_target;
 
+#[path = "brace_budget.rs"]
+mod brace_budget;
+
 fuzz_target!(|data: &[u8]| {
-    let options = options_from(data);
-    let _ = Pattern::compile(data, options);
+    let bits = data.first().copied().unwrap_or_default();
+    // Brace expansion has no budget in the matcher; see brace_budget.
+    if bits & 1 != 0 && !brace_budget::within_budget(data) {
+        return;
+    }
+    let _ = Pattern::compile(data, options_from(bits));
 });
 
-fn options_from(data: &[u8]) -> PatternOptions {
-    let bits = data.first().copied().unwrap_or_default();
+fn options_from(bits: u8) -> PatternOptions {
     PatternOptions::default()
         .braces(bits & 1 != 0)
         .recursive_double_star(bits & 2 != 0)

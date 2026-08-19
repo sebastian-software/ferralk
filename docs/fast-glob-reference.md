@@ -30,6 +30,12 @@ shape of the pattern, so a fuzz failure is always a new finding.
 | A class may accept a separator | `[/]` vs `/` | `false` | `true` | `/` inside a class, and every negated class |
 | POSIX class names | `[[:alpha:]]` vs `a` | `true` | `false` | `[:` at the start of a class |
 | Brace nesting depth | — | nested | capped | More than one open brace |
+| A comma outside a brace group stays an alternative separator | `{}{},` vs `` | `false` | `true` | Any comma at brace depth zero |
+
+The last row is a fast-glob defect rather than a design difference: after two
+brace groups close, the following comma is still read as a separator, so
+`{}{},` accepts the empty candidate there and the literal `,` in ferralk. The
+differential fuzz target found it within a minute of its first run.
 
 Brace expansion happens before matching, so an alternative can concatenate
 with the surrounding text into a `**` that only ferralk reads recursively
