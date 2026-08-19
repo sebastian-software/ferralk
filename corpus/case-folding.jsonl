@@ -1,0 +1,9 @@
+{"id":"fold-literal-prefix","pattern":"README*","path":"readme.md","flags":["case_insensitive"],"expected":true,"source":"handwritten","note":"ASCII case folding is a ferralk extension; zlob 1.6.3 has no such flag."}
+{"id":"fold-literal-prefix-case-sensitive","pattern":"README*","path":"readme.md","flags":[],"expected":false,"source":"handwritten","note":"Matching stays case-sensitive on every platform unless folding is requested."}
+{"id":"fold-star-suffix","pattern":"*.TXT","path":"notes.txt","flags":["case_insensitive"],"expected":true,"source":"handwritten"}
+{"id":"fold-class-range","pattern":"[a-f]oo","path":"Foo","flags":["case_insensitive"],"expected":true,"source":"handwritten","note":"Both ends of a range and the candidate byte are folded."}
+{"id":"fold-posix-class","pattern":"[[:lower:]]bc","path":"Abc","flags":["case_insensitive"],"expected":true,"source":"handwritten","note":"A POSIX class also folds, so [[:lower:]] accepts an uppercase byte."}
+{"id":"fold-recursive-double-star","pattern":"src/**/*.RS","path":"src/a/b/main.rs","flags":["case_insensitive","recursive_double_star"],"expected":true,"source":"handwritten"}
+{"id":"fold-brace-alternative","pattern":"{FOO,BAR}.md","path":"bar.md","flags":["case_insensitive","braces"],"expected":true,"source":"handwritten"}
+{"id":"fold-extglob-alternative","pattern":"@(FOO|BAR).md","path":"foo.md","flags":["case_insensitive","extglob"],"expected":true,"source":"handwritten"}
+{"id":"fold-non-ascii-stays-distinct","pattern":"caf\\xC3\\x89*","path":"caf\\xC3\\xA9.txt","flags":["case_insensitive"],"expected":false,"source":"handwritten","note":"Folding is ASCII-only, so U+00C9 and U+00E9 remain distinct."}
