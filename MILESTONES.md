@@ -145,6 +145,10 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 
 ## Implementation log
 
+The current external-release prerequisites, their local evidence, and the
+specific action needed to clear each one are consolidated in
+[`docs/external-release-gates.md`](docs/external-release-gates.md).
+
 ### 2026-08-18 — M0 foundation established
 
 - Completed the workspace boundary, license/NOTICE, repository automation, and
