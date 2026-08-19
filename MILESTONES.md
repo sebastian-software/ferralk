@@ -725,6 +725,11 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   the registry-backed package verification and reached its deliberately
   aborted upload step. `ferralk-glob` is therefore locally publication-ready;
   the actual registry upload remains the explicit maintainer-authority gate.
+- Re-ran the local M3 apples-to-apples Walker comparison on the shared filtered
+  fixture: Ferralk serial measured about 1.38 ms, Ferralk parallel 0.70 ms,
+  parallel `ignore` 1.80 ms, and pinned zlob parallel 0.70 ms. This confirms
+  local parity with zlob and a clear lead over `ignore`; retain the M3 checkbox
+  until the required broader CodSpeed series supplies release evidence.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no
