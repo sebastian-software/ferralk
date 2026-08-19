@@ -16,25 +16,23 @@ use corpus::{Case, Source, encode_bytes};
 use ferralk_glob::{Pattern, PatternOptions};
 use libfuzzer_sys::fuzz_target;
 
-#[path = "brace_budget.rs"]
-mod brace_budget;
-
 fuzz_target!(|data: &[u8]| {
     let (pattern, path) = split_input(data);
     if !in_shared_subset(pattern) {
         return;
     }
-    // This target always enables braces, whose expansion has no budget in the
-    // matcher; see brace_budget.
-    if !brace_budget::within_budget(pattern) {
-        return;
-    }
     // fast-glob rejects patterns ferralk accepts and the reverse; comparing a
     // verdict either engine declines to produce would compare error models,
-    // not matching.
+    // not matching. `validate` is a parse and stays cheap on every input.
     if fast_glob::validate(pattern).is_err() {
         return;
     }
+    // Compiling before `glob_match` is what keeps this target fast: fast-glob
+    // backtracks over brace alternatives instead of expanding them, and spends
+    // 42 s on the ten-group pattern from issue #42. ferralk's expansion budget
+    // rejects that pattern here, so only patterns inside the budget — measured
+    // at microseconds in fast-glob — ever reach the comparison. Raising
+    // `MAX_BRACE_ALTERNATIVES` would need this checked again.
     let Ok(compiled) = Pattern::compile(pattern, options()) else {
         return;
     };

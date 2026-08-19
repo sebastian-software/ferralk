@@ -14,12 +14,17 @@ than a known difference. The divergences and their exclusions are tabulated in
 [`docs/fast-glob-reference.md`](../docs/fast-glob-reference.md). A disagreement
 is reported as a ready-to-paste `corpus/fast-glob.jsonl` line.
 
-All three glob targets skip patterns whose brace expansion exceeds
-`brace_budget::MAX_ALTERNATIVES`. `Pattern::compile` expands braces eagerly
-with no budget, so about a hundred bytes of nine-way groups exhausts memory and
-libFuzzer reports an out-of-memory that hides every other finding. The cap
-still admits thousands of alternatives, far more than a real pattern uses. Lift
-it once the matcher bounds its own expansion.
+The glob targets used to skip patterns whose brace expansion was too large,
+because `Pattern::compile` expanded braces eagerly with no budget and about a
+hundred bytes of nine-way groups exhausted memory. `Pattern::compile` now
+rejects those patterns itself, so the targets hand them straight to it and
+exercise the real error path.
+
+`ferralk_vs_fast_glob` depends on that budget for its own speed: fast-glob
+backtracks over brace alternatives rather than expanding them, and spends 42 s
+on the ten-group pattern from issue #42. Compiling before `fast_glob::glob_match`
+keeps such a pattern away from it. Raising `MAX_BRACE_ALTERNATIVES` means
+re-measuring fast-glob at the new limit.
 
 The glob targets run automatically: a short budget per pull request and a long
 nightly run, both from `.github/workflows/glob-fuzz.yml`. `fuzz.yml` runs one
