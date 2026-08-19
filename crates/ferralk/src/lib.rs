@@ -661,8 +661,10 @@ fn has_closing_parenthesis(pattern: &[u8], open: usize) -> bool {
     false
 }
 
-/// Every filesystem call a walk makes goes through this trait, so one mock can
-/// drive the serial and the parallel frontend alike.
+/// The filesystem calls that traversal and classification make, so one mock
+/// can drive the serial and the parallel frontend alike. Reading `.gitignore`
+/// files is not part of it: those go through the `ignore` crate, which owns
+/// its own IO.
 trait DirectoryBackend {
     fn read_directory(&self, path: &Path) -> std::io::Result<Vec<BackendEntry>>;
 
