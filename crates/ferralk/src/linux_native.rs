@@ -20,6 +20,7 @@ use super::BackendEntry;
 
 const BUFFER_SIZE: usize = 32 * 1024;
 const RECORD_LENGTH_OFFSET: usize = 16;
+const TYPE_OFFSET: usize = 18;
 const NAME_OFFSET: usize = 19;
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
@@ -155,7 +156,10 @@ fn for_each_record(
         if record_length < NAME_OFFSET + 1 || record_length > record.len() {
             return Err(malformed_record());
         }
-        let name_and_padding = &record[NAME_OFFSET..record_length - 1];
+        // `d_type` immediately precedes `d_name`; any alignment padding is at
+        // the end of the record, so a valid terminating NUL may be its final
+        // byte. Search the entire name-and-padding region.
+        let name_and_padding = &record[NAME_OFFSET..record_length];
         let Some(name_length) = name_and_padding.iter().position(|&byte| byte == 0) else {
             return Err(malformed_record());
         };
@@ -169,7 +173,7 @@ fn for_each_record(
         if name.contains(&b'/') {
             return Err(malformed_record());
         }
-        visit(name, record[record_length - 1])?;
+        visit(name, record[TYPE_OFFSET])?;
     }
     Ok(())
 }
@@ -202,7 +206,9 @@ mod tests {
 
     use crate::{DirectoryBackend, ErrorPolicy, StdBackend, WalkEntry, WalkOptions, Walker};
 
-    use super::{BackendEntry, DT_DIR, DT_REG, NAME_OFFSET, parse_records, read_directory};
+    use super::{
+        BackendEntry, DT_DIR, DT_REG, NAME_OFFSET, TYPE_OFFSET, parse_records, read_directory,
+    };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
@@ -211,7 +217,7 @@ mod tests {
         let mut record = vec![0_u8; length];
         record[16..18].copy_from_slice(&(length as u16).to_ne_bytes());
         record[NAME_OFFSET..NAME_OFFSET + name.len()].copy_from_slice(name);
-        record[length - 1] = directory_type;
+        record[TYPE_OFFSET] = directory_type;
         record
     }
 
