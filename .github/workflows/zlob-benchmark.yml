@@ -10,17 +10,25 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   benchmarks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Set up Rust and cargo-codspeed
+        uses: moonrepo/setup-rust@v0
+        with:
+          channel: stable
+          cache-target: release
+          bins: cargo-codspeed
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      - name: Build zlob benchmarks
+        run: cargo codspeed build -p bench --bench walker_zlob --bench matcher_zlob --features zlob-oracle
       - uses: CodSpeedHQ/action@v5
         with:
           mode: simulation
-          run: cargo bench -p bench --bench walker_zlob --bench matcher_zlob --features zlob-oracle
+          run: cargo codspeed run -p bench --bench walker_zlob --bench matcher_zlob --features zlob-oracle
