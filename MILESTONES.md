@@ -721,6 +721,10 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 - Verified the public API documentation with `cargo doc --workspace --no-deps`
   after the matcher and Walker API additions; every workspace crate renders
   successfully with its intra-doc links resolved locally.
+- Ran `cargo publish -p ferralk-glob --dry-run --allow-dirty`: Cargo completed
+  the registry-backed package verification and reached its deliberately
+  aborted upload step. `ferralk-glob` is therefore locally publication-ready;
+  the actual registry upload remains the explicit maintainer-authority gate.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no
