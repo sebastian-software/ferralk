@@ -18,6 +18,19 @@
     "path": { "type": "string" },
     "flags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "default": [] },
     "ignore_rules": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "ignore_files": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "rules"],
+        "properties": {
+          "path": { "type": "string" },
+          "rules": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
     "expected": { "type": "boolean" },
     "oracle_expected": { "type": "boolean" },
     "error_offset": { "type": "integer", "minimum": 0 },

@@ -63,7 +63,7 @@ let result = Walker::new(".")
 
 | zlob concept | Ferralk mapping |
 | --- | --- |
-| `ZLOB_GITIGNORE` | `Walker::respect_git_ignore(true)` (`.gitignore`, then zlob-compatible `.ignore`) |
+| `ZLOB_GITIGNORE` | `Walker::respect_git_ignore(true)` (`.git/info/exclude`, then `.gitignore`, then zlob-compatible `.ignore`) |
 | `ZLOB_WALK_KEEP_GIT_DIR` | `WalkOptions::keep_git_dir(true)` |
 | `ZLOB_SKIP_HIDDEN` | `WalkOptions::skip_hidden(true)` |
 | `ZLOB_FOLLOW_SYMLINKS` | `WalkOptions::follow_symlinks(true)` |

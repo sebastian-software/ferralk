@@ -9,8 +9,8 @@
 
 use std::{
     borrow::Cow,
+    collections::HashSet,
     collections::VecDeque,
-    collections::{HashMap, HashSet},
     error::Error,
     fmt, fs,
     path::{Path, PathBuf},
@@ -21,7 +21,6 @@ use std::{
 };
 
 use ferralk_glob::{Pattern, PatternError, PatternOptions};
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 pub use ferralk_glob;
 
@@ -41,10 +40,12 @@ pub use macos_native::fuzz_validate_bulk_record as fuzz_validate_macos_bulk_reco
 #[doc(hidden)]
 pub use macos_native::fuzz_validate_records as fuzz_validate_macos_dirent_records;
 mod classify;
+mod gitignore;
 mod parallel;
 mod scheduler;
 
-use classify::{EntryAction, EntryCaches, classify_entry};
+use classify::{DirectoryTask, EntryAction, classify_entry};
+use gitignore::IgnoreScope;
 
 /// Controls what a walk does after a recoverable filesystem error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -403,15 +404,17 @@ impl Walker {
             return parallel::collect(self, backend);
         }
         let mut state = WalkState::new(&self);
-        // Use the same injector-to-worker transfer as the forthcoming parallel
-        // backend. The serial baseline owns one local queue and deliberately
-        // drains it before returning; worker creation and task fan-out remain
-        // M3 work.
+        // Use the same injector-to-worker transfer as the parallel backend. The
+        // serial baseline owns one local queue and deliberately drains it
+        // before returning.
         let scheduler = scheduler::Scheduler::new();
-        scheduler.push(self.root.clone());
+        scheduler.push(DirectoryTask {
+            path: self.root.clone(),
+            ignores: IgnoreScope::root(&self, backend),
+        });
         let worker = scheduler.worker();
-        while let Some(directory) = scheduler.steal_into(&worker).or_else(|| worker.pop()) {
-            state.walk_directory(backend, directory)?;
+        while let Some(task) = scheduler.steal_into(&worker).or_else(|| worker.pop()) {
+            state.walk_directory(backend, task)?;
         }
         if self.options.sort {
             state
@@ -430,12 +433,16 @@ impl Walker {
     /// is intentionally a collect-only global operation.
     #[must_use]
     pub fn stream(self) -> WalkStream {
+        let ignores = IgnoreScope::root(&self, &SystemBackend);
         WalkStream {
-            pending_directories: vec![self.root.clone()],
+            pending_directories: vec![DirectoryTask {
+                path: self.root.clone(),
+                ignores,
+            }],
             walker: self,
             pending_entries: VecDeque::new(),
             visited_directories: HashSet::new(),
-            caches: EntryCaches::new(),
+            ignores: IgnoreScope::default(),
             cancelled: false,
             stopped: false,
         }
@@ -682,6 +689,12 @@ trait DirectoryBackend {
     fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
         fs::canonicalize(path)
     }
+
+    /// Reads one ignore file. Missing files are the common case and are
+    /// reported as an error rather than probed for beforehand.
+    fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        fs::read(path)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -751,10 +764,11 @@ impl DirectoryBackend for SystemBackend {
 #[derive(Debug)]
 pub struct WalkStream {
     walker: Walker,
-    pending_directories: Vec<PathBuf>,
+    pending_directories: Vec<DirectoryTask>,
     pending_entries: VecDeque<BackendEntry>,
     visited_directories: HashSet<PathBuf>,
-    caches: EntryCaches,
+    /// Ignore rules of the directory whose entries are being delivered.
+    ignores: IgnoreScope,
     cancelled: bool,
     stopped: bool,
 }
@@ -792,41 +806,45 @@ impl WalkStream {
         }
     }
 
-    fn prepare_directory(&mut self, directory: PathBuf) -> Option<Result<WalkEntry, WalkError>> {
+    fn prepare_directory(&mut self, task: DirectoryTask) -> Option<Result<WalkEntry, WalkError>> {
+        let DirectoryTask { path, ignores } = task;
         if self.walker.options.follow_symlinks {
-            match SystemBackend.canonicalize(&directory) {
+            match SystemBackend.canonicalize(&path) {
                 Ok(canonical) => {
                     if !self.visited_directories.insert(canonical) {
                         return None;
                     }
                 }
-                Err(source) => return self.error("canonicalize", directory, source),
+                Err(source) => return self.error("canonicalize", path, source),
             }
         }
-        match SystemBackend.read_directory(&directory) {
+        match SystemBackend.read_directory(&path) {
             Ok(entries) => {
+                // The directory's own ignore files join the chain here, once,
+                // recognized in the listing that was just read.
+                self.ignores = ignores.enter(&self.walker, &SystemBackend, &path, &entries);
                 self.pending_entries = entries.into();
                 None
             }
-            Err(source) => self.error("read_dir", directory, source),
+            Err(source) => self.error("read_dir", path, source),
         }
     }
 
     fn process_entry(&mut self, entry: BackendEntry) -> Option<Result<WalkEntry, WalkError>> {
-        match classify_entry(&self.walker, &SystemBackend, entry, &mut self.caches) {
+        match classify_entry(&self.walker, &SystemBackend, entry, &self.ignores) {
             EntryAction::Skip => None,
-            EntryAction::Descend(path) => {
-                self.pending_directories.push(path);
+            EntryAction::Descend(task) => {
+                self.pending_directories.push(task);
                 None
             }
             EntryAction::Emit(entry) => Some(Ok(entry)),
-            EntryAction::DescendAndEmit(entry) => {
-                self.pending_directories.push(entry.path.clone());
+            EntryAction::DescendAndEmit(entry, task) => {
+                self.pending_directories.push(task);
                 Some(Ok(entry))
             }
             EntryAction::Failed { failure, descend } => {
-                if let Some(path) = descend {
-                    self.pending_directories.push(path);
+                if let Some(task) = descend {
+                    self.pending_directories.push(task);
                 }
                 self.error(failure.operation, failure.path, failure.source)
             }
@@ -849,8 +867,8 @@ impl Iterator for WalkStream {
                 }
                 continue;
             }
-            let directory = self.pending_directories.pop()?;
-            if let Some(result) = self.prepare_directory(directory) {
+            let task = self.pending_directories.pop()?;
+            if let Some(result) = self.prepare_directory(task) {
                 return Some(result);
             }
         }
@@ -863,7 +881,6 @@ struct WalkState<'walker> {
     entries: Vec<WalkEntry>,
     errors: Vec<WalkError>,
     visited_directories: HashSet<PathBuf>,
-    caches: EntryCaches,
     cancelled: bool,
 }
 
@@ -874,7 +891,6 @@ impl<'walker> WalkState<'walker> {
             entries: Vec::new(),
             errors: Vec::new(),
             visited_directories: HashSet::new(),
-            caches: EntryCaches::new(),
             cancelled: false,
         }
     }
@@ -882,23 +898,27 @@ impl<'walker> WalkState<'walker> {
     fn walk_directory(
         &mut self,
         backend: &impl DirectoryBackend,
-        directory: PathBuf,
+        task: DirectoryTask,
     ) -> Result<(), WalkError> {
         if self.check_cancellation() {
             return Ok(());
         }
-        if self.walker.options.follow_symlinks && !self.mark_directory(backend, &directory)? {
+        let DirectoryTask { path, ignores } = task;
+        if self.walker.options.follow_symlinks && !self.mark_directory(backend, &path)? {
             return Ok(());
         }
-        let entries = match backend.read_directory(&directory) {
+        let entries = match backend.read_directory(&path) {
             Ok(entries) => entries,
-            Err(source) => return self.handle_error("read_dir", directory, source),
+            Err(source) => return self.handle_error("read_dir", path, source),
         };
+        // The directory's own ignore files join the chain here, once,
+        // recognized in the listing that was just read.
+        let ignores = ignores.enter(self.walker, backend, &path, &entries);
         for entry in entries {
             if self.check_cancellation() {
                 return Ok(());
             }
-            self.visit_entry(backend, entry)?;
+            self.visit_entry(backend, entry, &ignores)?;
         }
         Ok(())
     }
@@ -921,28 +941,29 @@ impl<'walker> WalkState<'walker> {
         &mut self,
         backend: &impl DirectoryBackend,
         entry: BackendEntry,
+        ignores: &IgnoreScope,
     ) -> Result<(), WalkError> {
         if self.check_cancellation() {
             return Ok(());
         }
-        match classify_entry(self.walker, backend, entry, &mut self.caches) {
+        match classify_entry(self.walker, backend, entry, ignores) {
             EntryAction::Skip => Ok(()),
-            EntryAction::Descend(path) => self.walk_directory(backend, path),
+            EntryAction::Descend(task) => self.walk_directory(backend, task),
             EntryAction::Emit(entry) => {
                 self.entries.push(entry);
                 Ok(())
             }
             // The subtree is walked before the directory itself is recorded,
             // which is the depth-first order this frontend has always had.
-            EntryAction::DescendAndEmit(entry) => {
-                self.walk_directory(backend, entry.path.clone())?;
+            EntryAction::DescendAndEmit(entry, task) => {
+                self.walk_directory(backend, task)?;
                 self.entries.push(entry);
                 Ok(())
             }
             EntryAction::Failed { failure, descend } => {
                 self.handle_error(failure.operation, failure.path, failure.source)?;
-                if let Some(path) = descend {
-                    self.walk_directory(backend, path)?;
+                if let Some(task) = descend {
+                    self.walk_directory(backend, task)?;
                 }
                 Ok(())
             }
@@ -976,91 +997,10 @@ impl<'walker> WalkState<'walker> {
     }
 }
 
-fn is_git_ignored(
-    walker: &Walker,
-    path: &Path,
-    is_dir: bool,
-    cache: &mut HashMap<PathBuf, Arc<GitIgnoreNode>>,
-) -> bool {
-    if !walker.respect_git_ignore {
-        return false;
-    }
-    let directory = path
-        .parent()
-        .filter(|parent| parent.starts_with(&walker.root));
-    directory
-        .is_some_and(|directory| gitignore_node(walker, directory, cache).is_ignored(path, is_dir))
-}
-
 fn should_skip_git_directory(walker: &Walker, path: &Path) -> bool {
     walker.respect_git_ignore
         && !walker.options.keep_git_dir
         && path.file_name().is_some_and(|name| name == ".git")
-}
-
-/// One directory's parsed ignore rules plus its immutable inherited chain.
-/// Nodes are cached per walk, so siblings reuse the same parent evaluation.
-struct GitIgnoreNode {
-    rules: Gitignore,
-    parent: Option<Arc<Self>>,
-}
-
-impl fmt::Debug for GitIgnoreNode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("GitIgnoreNode")
-            .field("has_parent", &self.parent.is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-impl GitIgnoreNode {
-    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        let mut ignored = self
-            .parent
-            .as_ref()
-            .is_some_and(|parent| parent.is_ignored(path, is_dir));
-        let matched = self.rules.matched_path_or_any_parents(path, is_dir);
-        if !matched.is_none() {
-            ignored = matched.is_ignore();
-        }
-        ignored
-    }
-}
-
-fn gitignore_node(
-    walker: &Walker,
-    directory: &Path,
-    cache: &mut HashMap<PathBuf, Arc<GitIgnoreNode>>,
-) -> Arc<GitIgnoreNode> {
-    if let Some(node) = cache.get(directory) {
-        return Arc::clone(node);
-    }
-    let parent = (directory != walker.root)
-        .then(|| {
-            directory
-                .parent()
-                .filter(|parent| parent.starts_with(&walker.root))
-        })
-        .flatten()
-        .map(|parent| gitignore_node(walker, parent, cache));
-    let node = Arc::new(GitIgnoreNode {
-        rules: gitignore_rules(directory),
-        parent,
-    });
-    cache.insert(directory.to_path_buf(), Arc::clone(&node));
-    node
-}
-
-fn gitignore_rules(directory: &Path) -> Gitignore {
-    let mut builder = GitignoreBuilder::new(directory);
-    for file_name in [".gitignore", ".ignore"] {
-        let path = directory.join(file_name);
-        if path.is_file() {
-            let _ = builder.add(path);
-        }
-    }
-    builder.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
 /// Crate version exposed for build and integration diagnostics.
@@ -1073,16 +1013,13 @@ mod tests {
         collections::HashMap,
         fs,
         path::{Path, PathBuf},
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
+        sync::atomic::{AtomicUsize, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::{
         CancellationToken, ErrorPolicy, TraversalPattern, WalkEntry, WalkEntryKind, WalkOptions,
-        Walker, gitignore_node, literal_extension, literal_pattern_root,
+        Walker, literal_extension, literal_pattern_root,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -1215,6 +1152,55 @@ mod tests {
                 streamed, serial,
                 "{label}: stream and serial disagree under {policy:?}"
             );
+        }
+    }
+
+    /// Builds the root task the way the walk frontends do, for tests that
+    /// drive `WalkState` directly.
+    fn directory_task(
+        walker: &Walker,
+        backend: &impl super::DirectoryBackend,
+        path: PathBuf,
+    ) -> super::DirectoryTask {
+        super::DirectoryTask {
+            path,
+            ignores: super::IgnoreScope::root(walker, backend),
+        }
+    }
+
+    /// Counts what a walk reads, so tests can pin how often it happens.
+    #[derive(Default)]
+    struct CountingBackend {
+        ignore_reads: std::sync::Mutex<HashMap<PathBuf, usize>>,
+    }
+
+    impl CountingBackend {
+        fn ignore_reads(&self) -> Vec<(PathBuf, usize)> {
+            let mut reads = self
+                .ignore_reads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .map(|(path, count)| (path.clone(), *count))
+                .collect::<Vec<_>>();
+            reads.sort_unstable();
+            reads
+        }
+    }
+
+    impl super::DirectoryBackend for CountingBackend {
+        fn read_directory(&self, path: &Path) -> std::io::Result<Vec<super::BackendEntry>> {
+            super::StdBackend.read_directory(path)
+        }
+
+        fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            *self
+                .ignore_reads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(path.to_path_buf())
+                .or_default() += 1;
+            fs::read(path)
         }
     }
 
@@ -1972,18 +1958,146 @@ mod tests {
         assert_eq!(relative_paths(&streamed, &fixture.root), expected);
     }
 
+    /// The ignore chain travels with the directory tasks, so no directory is
+    /// read twice however many workers share the walk.
     #[test]
-    fn gitignore_nodes_share_their_immutable_parent_chain() {
+    fn every_ignore_file_is_read_once_per_walk() {
         let fixture = Fixture::new();
-        let walker = Walker::new(&fixture.root).respect_git_ignore(true);
-        let mut cache = HashMap::new();
-        let left = gitignore_node(&walker, &fixture.root.join("left/nested"), &mut cache);
-        let right = gitignore_node(&walker, &fixture.root.join("left/sibling"), &mut cache);
+        fixture.write(".gitignore");
+        fixture.write("src/.gitignore");
+        fixture.write("src/nested/.gitignore");
+        for branch in 0..6 {
+            fixture.write(format!("src/nested/branch-{branch}/leaf.txt"));
+            fixture.write(format!("docs/branch-{branch}/leaf.md"));
+        }
 
-        let left_parent = left.parent.as_ref().expect("nested left parent");
-        let right_parent = right.parent.as_ref().expect("nested right parent");
-        assert!(Arc::ptr_eq(left_parent, right_parent));
-        assert_eq!(cache.len(), 4, "root, left, and two child nodes are cached");
+        for threads in [1, 4] {
+            let backend = CountingBackend::default();
+            Walker::new(&fixture.root)
+                .threads(threads)
+                .respect_git_ignore(true)
+                .collect_with(&backend)
+                .expect("walk succeeds");
+
+            let repeated = backend
+                .ignore_reads()
+                .into_iter()
+                .filter(|(_, reads)| *reads > 1)
+                .collect::<Vec<_>>();
+            assert!(
+                repeated.is_empty(),
+                "with {threads} threads these ignore files were read more than once: {repeated:?}"
+            );
+            assert!(
+                backend
+                    .ignore_reads()
+                    .iter()
+                    .any(|(path, _)| path.ends_with("src/.gitignore")),
+                "the walk has to read the nested ignore files through the backend"
+            );
+        }
+    }
+
+    /// The chain is rebuilt per directory now, so a rule at the root still has
+    /// to reach an entry several levels down, and a rule closer to the entry
+    /// still has to win.
+    #[test]
+    fn root_rules_reach_deep_entries_and_deeper_rules_win() {
+        let fixture = Fixture::new();
+        fixture.write("a/b/c/deep.log");
+        fixture.write("a/b/other.log");
+        fixture.write("a/b/c/keep.txt");
+        fs::write(fixture.root.join(".gitignore"), b"*.log\n").expect("write root gitignore");
+        fs::write(fixture.root.join("a/b/c/.gitignore"), b"!deep.log\n")
+            .expect("write nested gitignore");
+
+        let walked = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("walk succeeds");
+        let paths = relative_paths(walked.entries(), &fixture.root);
+
+        assert!(
+            !paths.contains(&PathBuf::from("a/b/other.log")),
+            "a root rule has to reach entries below it"
+        );
+        assert!(
+            paths.contains(&PathBuf::from("a/b/c/deep.log")),
+            "the ignore file closest to the entry decides"
+        );
+        assert!(paths.contains(&PathBuf::from("a/b/c/keep.txt")));
+    }
+
+    /// Directory-only rules and rules that span levels have to behave the same
+    /// however the entry is reached.
+    #[test]
+    fn directory_rules_and_spanning_rules_apply_per_directory() {
+        let fixture = Fixture::new();
+        fixture.write("logs");
+        fixture.write("build/main.o");
+        fixture.write("a/b/temp/c/note.txt");
+        fixture.write("a/b/kept.txt");
+        fs::write(
+            fixture.root.join(".gitignore"),
+            b"logs/\nbuild/\n**/temp/**\n",
+        )
+        .expect("write root gitignore");
+
+        let walked = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("walk succeeds");
+        let paths = relative_paths(walked.entries(), &fixture.root);
+
+        assert!(
+            paths.contains(&PathBuf::from("logs")),
+            "a directory-only rule must not match a file of the same name"
+        );
+        assert!(!paths.contains(&PathBuf::from("build")));
+        assert!(!paths.contains(&PathBuf::from("build/main.o")));
+        assert!(!paths.contains(&PathBuf::from("a/b/temp/c/note.txt")));
+        assert!(paths.contains(&PathBuf::from("a/b/kept.txt")));
+    }
+
+    /// Each frontend now builds the ignore chain along its own descent, so the
+    /// three have to agree on a tree that exercises it.
+    #[test]
+    fn the_three_frontends_agree_on_nested_ignore_files() {
+        let fixture = Fixture::new();
+        fixture.write("src/main.rs");
+        fixture.write("src/debug.log");
+        fixture.write("src/keep.log");
+        fixture.write("src/nested/deep.log");
+        fixture.write("docs/guide.md");
+        fixture.write("build/main.o");
+        fixture.write("build/keep.txt");
+        fs::write(fixture.root.join(".gitignore"), b"*.log\nbuild/\n")
+            .expect("write root gitignore");
+        fs::write(fixture.root.join("src/.gitignore"), b"!keep.log\n")
+            .expect("write nested gitignore");
+        fs::write(fixture.root.join("build/.gitignore"), b"!keep.txt\n").expect("write re-include");
+        fs::create_dir_all(fixture.root.join(".git/info")).expect("create git directory");
+        fs::write(fixture.root.join(".git/info/exclude"), b"*.md\n")
+            .expect("write repository excludes");
+
+        assert_frontends_agree("nested ignore files", &fixture.root, || {
+            Walker::new(&fixture.root).respect_git_ignore(true)
+        });
+
+        let walked = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("walk succeeds");
+        let paths = relative_paths(walked.entries(), &fixture.root);
+        assert!(
+            !paths.contains(&PathBuf::from("docs/guide.md")),
+            "the repository excludes have to apply"
+        );
+        assert!(paths.contains(&PathBuf::from("src/keep.log")));
+        assert!(!paths.contains(&PathBuf::from("src/nested/deep.log")));
     }
 
     #[test]
@@ -2001,6 +2115,12 @@ mod tests {
                 case.ignore_rules.join("\n").as_bytes(),
             )
             .expect("write fixture gitignore");
+            for file in &case.ignore_files {
+                let path = fixture.root.join(&file.path);
+                fs::create_dir_all(path.parent().expect("ignore file has a parent"))
+                    .expect("create ignore file parent");
+                fs::write(path, file.rules.join("\n").as_bytes()).expect("write ignore file");
+            }
             fixture.write(&case.path);
 
             let result = Walker::new(&fixture.root)
@@ -2323,7 +2443,7 @@ mod tests {
         let mut state = super::WalkState::new(&walker);
 
         state
-            .walk_directory(&backend, root.clone())
+            .walk_directory(&backend, directory_task(&walker, &backend, root.clone()))
             .expect("backend walk succeeds");
 
         assert_eq!(backend.reads.into_inner(), vec![root, source]);
@@ -2364,7 +2484,10 @@ mod tests {
         let mut state = super::WalkState::new(&walker);
 
         state
-            .walk_directory(&backend, fixture.root.clone())
+            .walk_directory(
+                &backend,
+                directory_task(&walker, &backend, fixture.root.clone()),
+            )
             .expect("collect policy retains the metadata error");
 
         assert!(state.entries.is_empty());

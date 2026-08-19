@@ -13,12 +13,27 @@ static TEMPORARY_REPOSITORY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Evaluates a candidate path against rules with Git's own ignore matcher.
 ///
+/// `rules` become the repository root's `.gitignore`; `files` are the further
+/// ignore files a case needs, such as a nested `.gitignore` or
+/// `.git/info/exclude`.
+///
 /// A new repository is created for each call so no caller state, global Git
 /// configuration, or checked-out repository changes the verdict.
-pub fn git_check_ignore(rules: &[String], candidate: &str) -> io::Result<bool> {
+pub fn git_check_ignore(
+    rules: &[String],
+    files: &[corpus::IgnoreFile],
+    candidate: &str,
+) -> io::Result<bool> {
     let repository = TemporaryRepository::create()?;
     run_git(repository.path(), ["init", "--quiet"])?;
     fs::write(repository.path().join(".gitignore"), rules.join("\n"))?;
+    for file in files {
+        let path = repository.path().join(&file.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, file.rules.join("\n"))?;
+    }
 
     let candidate_path = repository.path().join(candidate);
     if let Some(parent) = candidate_path.parent() {

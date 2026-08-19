@@ -21,7 +21,8 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | `pattern` | yes | Glob or ignore expression using the byte codec below. |
 | `path` | yes | Candidate path using the byte codec below; empty for syntax-only records. |
 | `flags` | no | Ordered behaviour switches from the compatibility matrix. |
-| `ignore_rules` | no | Lines written to a synthetic `.gitignore` for an ignore case. |
+| `ignore_rules` | no | Lines written to the repository root's synthetic `.gitignore` for an ignore case. |
+| `ignore_files` | no | Further ignore files of an ignore case: `{ "path": "src/.gitignore", "rules": [...] }`, also used for `.git/info/exclude`. |
 | `expected` | yes | Whether the expression accepts the candidate. |
 | `oracle_expected` | no | The external-oracle result when it deliberately differs from `expected`. |
 | `error_offset` | no | Byte offset the rejected construct must be reported at, for a `compile_error` case. |
@@ -41,9 +42,12 @@ not change once published; a changed expected value is a new case plus an
 explanation in `note`.
 
 For `ignore.jsonl`, `pattern` is the primary rule for quick review and
-`ignore_rules` is the complete ordered rule chain. The Git oracle creates an
-isolated repository, writes those lines into `.gitignore`, creates `path`, and
-uses `git check-ignore --no-index --quiet -- path`. This keeps nested/negated
+`ignore_rules` is the complete ordered rule chain of the repository root's
+`.gitignore`. `ignore_files` carries every other ignore file the case needs,
+which is how nested `.gitignore` files and the repository's
+`.git/info/exclude` are expressed. The Git oracle creates an isolated
+repository, writes those files, creates `path`, and uses
+`git check-ignore --no-index --quiet -- path`. This keeps nested/negated
 behaviour tied to Git rather than to ferralk implementation details.
 
 ## Rejected patterns

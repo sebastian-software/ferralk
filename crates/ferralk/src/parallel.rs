@@ -13,7 +13,8 @@ use crossbeam_deque::{Steal, Stealer, Worker};
 
 use super::{
     BackendEntry, DirectoryBackend, ErrorPolicy, WalkEntry, WalkError, WalkResult, Walker,
-    classify::{EntryAction, EntryCaches, classify_entry},
+    classify::{DirectoryTask, EntryAction, classify_entry},
+    gitignore::IgnoreScope,
     scheduler::{Coordinator, Scheduler, WorkerSlot},
 };
 
@@ -31,7 +32,11 @@ pub(super) fn collect<B: DirectoryBackend + Sync>(
     shared.coordinator.begin_task();
     {
         let _root_task = shared.coordinator.claim_task();
-        process_directory(&shared, &mut caller, walker.root.clone());
+        let root = DirectoryTask {
+            path: walker.root.clone(),
+            ignores: IgnoreScope::root(&walker, backend),
+        };
+        process_directory(&shared, &mut caller, root);
     }
     caller.flush_into(&shared.scheduler);
 
@@ -82,7 +87,7 @@ pub(super) fn collect<B: DirectoryBackend + Sync>(
 struct HelperPool<'scope, 'env> {
     scope: &'scope thread::Scope<'scope, 'env>,
     shared: &'env Arc<Shared<'env>>,
-    stealers: &'env [Stealer<PathBuf>],
+    stealers: &'env [Stealer<DirectoryTask>],
     idle: &'env Mutex<Vec<WorkerScratch>>,
     shards: &'env Mutex<Vec<Vec<WalkEntry>>>,
 }
@@ -167,7 +172,7 @@ struct Shared<'backend> {
     /// a test mock drive the parallel frontend the same way it drives the
     /// serial one.
     backend: &'backend (dyn DirectoryBackend + Sync),
-    scheduler: Scheduler<PathBuf>,
+    scheduler: Scheduler<DirectoryTask>,
     /// Task accounting, worker slots and the parking protocol.
     coordinator: Coordinator,
     cancellation: super::CancellationToken,
@@ -195,9 +200,9 @@ impl<'backend> Shared<'backend> {
         }
     }
 
-    fn schedule(&self, worker: &Worker<PathBuf>, directory: PathBuf) {
+    fn schedule(&self, worker: &Worker<DirectoryTask>, task: DirectoryTask) {
         self.coordinator.begin_task();
-        worker.push(directory);
+        worker.push(task);
         self.coordinator.wake_waiters();
     }
 
@@ -248,8 +253,7 @@ struct WorkerScratch {
     /// Position of this worker's stealer in the shared stealer list, so the
     /// idle scan can start next door and skip its own queue.
     index: usize,
-    queue: Worker<PathBuf>,
-    caches: EntryCaches,
+    queue: Worker<DirectoryTask>,
     entries: Vec<WalkEntry>,
 }
 
@@ -258,14 +262,13 @@ impl WorkerScratch {
         Self {
             index,
             queue: Worker::new_fifo(),
-            caches: EntryCaches::new(),
             entries: Vec::new(),
         }
     }
 
-    fn flush_into(&self, scheduler: &Scheduler<PathBuf>) {
-        while let Some(directory) = self.queue.pop() {
-            scheduler.push(directory);
+    fn flush_into(&self, scheduler: &Scheduler<DirectoryTask>) {
+        while let Some(task) = self.queue.pop() {
+            scheduler.push(task);
         }
     }
 }
@@ -301,8 +304,8 @@ fn run_worker(pool: HelperPool<'_, '_>, worker: &mut WorkerScratch) {
 fn next_task(
     shared: &Shared,
     worker: &WorkerScratch,
-    stealers: &[Stealer<PathBuf>],
-) -> Option<PathBuf> {
+    stealers: &[Stealer<DirectoryTask>],
+) -> Option<DirectoryTask> {
     shared.coordinator.wait_for_task(
         || shared.should_stop(),
         || try_take(shared, worker, stealers),
@@ -312,8 +315,8 @@ fn next_task(
 fn try_take(
     shared: &Shared,
     worker: &WorkerScratch,
-    stealers: &[Stealer<PathBuf>],
-) -> Option<PathBuf> {
+    stealers: &[Stealer<DirectoryTask>],
+) -> Option<DirectoryTask> {
     worker
         .queue
         .pop()
@@ -337,29 +340,34 @@ fn try_take(
         })
 }
 
-fn process_directory(shared: &Shared, worker: &mut WorkerScratch, directory: PathBuf) {
+fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: DirectoryTask) {
+    let DirectoryTask { path, ignores } = task;
     #[cfg(test)]
-    if should_panic_in_directory(&directory) {
+    if should_panic_in_directory(&path) {
         panic!("injected directory panic");
     }
     if shared.should_stop() {
         return;
     }
-    if shared.walker.options.follow_symlinks && !mark_directory(shared, &directory) {
+    if shared.walker.options.follow_symlinks && !mark_directory(shared, &path) {
         return;
     }
-    let entries = match shared.backend.read_directory(&directory) {
+    let entries = match shared.backend.read_directory(&path) {
         Ok(entries) => entries,
         Err(source) => {
-            shared.record_error("read_dir", directory, source);
+            shared.record_error("read_dir", path, source);
             return;
         }
     };
+    // The directory's own ignore files join the chain here. Every directory is
+    // processed once, so every ignore file is read once, whatever the worker
+    // count.
+    let ignores = ignores.enter(&shared.walker, shared.backend, &path, &entries);
     for entry in entries {
         if shared.should_stop() {
             return;
         }
-        process_entry(shared, worker, entry);
+        process_entry(shared, worker, entry, &ignores);
     }
 }
 
@@ -373,18 +381,23 @@ fn mark_directory(shared: &Shared, directory: &Path) -> bool {
     }
 }
 
-fn process_entry(shared: &Shared, worker: &mut WorkerScratch, entry: BackendEntry) {
-    match classify_entry(&shared.walker, shared.backend, entry, &mut worker.caches) {
+fn process_entry(
+    shared: &Shared,
+    worker: &mut WorkerScratch,
+    entry: BackendEntry,
+    ignores: &IgnoreScope,
+) {
+    match classify_entry(&shared.walker, shared.backend, entry, ignores) {
         EntryAction::Skip => {}
-        EntryAction::Descend(path) => shared.schedule(&worker.queue, path),
-        EntryAction::DescendAndEmit(entry) => {
-            shared.schedule(&worker.queue, entry.path.clone());
+        EntryAction::Descend(task) => shared.schedule(&worker.queue, task),
+        EntryAction::DescendAndEmit(entry, task) => {
+            shared.schedule(&worker.queue, task);
             worker.entries.push(entry);
         }
         EntryAction::Emit(entry) => worker.entries.push(entry),
         EntryAction::Failed { failure, descend } => {
-            if let Some(path) = descend {
-                shared.schedule(&worker.queue, path);
+            if let Some(task) = descend {
+                shared.schedule(&worker.queue, task);
             }
             shared.record_error(failure.operation, failure.path, failure.source);
         }

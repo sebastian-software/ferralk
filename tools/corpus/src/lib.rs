@@ -41,10 +41,15 @@ pub struct Case {
     /// Behaviour switches in the compatibility matrix namespace.
     #[serde(default)]
     pub flags: Vec<String>,
-    /// Newline-delimited rules placed in the synthetic `.gitignore` by the
-    /// Git oracle. Used only by `ignore.jsonl` cases.
+    /// Newline-delimited rules placed in the synthetic `.gitignore` at the
+    /// repository root by the Git oracle. Used only by `ignore.jsonl` cases.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore_rules: Vec<String>,
+    /// Further ignore files the case needs, relative to the repository root:
+    /// nested `.gitignore` files and `.git/info/exclude`. Used only by
+    /// `ignore.jsonl` cases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_files: Vec<IgnoreFile>,
     /// Whether the expression accepts the candidate path. A
     /// [`CaseKind::CompileError`] case never accepts and records `false`.
     pub expected: bool,
@@ -73,6 +78,17 @@ pub struct Case {
     /// Human-readable context, especially for disagreements between oracles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+/// One ignore file of a case, beyond the repository root's `.gitignore`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IgnoreFile {
+    /// Location relative to the repository root, such as `src/.gitignore` or
+    /// `.git/info/exclude`.
+    pub path: String,
+    /// Newline-delimited rules written into that file.
+    pub rules: Vec<String>,
 }
 
 /// The operation a corpus record verifies.
