@@ -164,7 +164,7 @@ impl Pattern {
                 braces: false,
                 ..options
             };
-            let alternatives = expand_braces(pattern, options.escape)?
+            let alternatives = expand_brace_alternatives(pattern, options.escape)?
                 .into_iter()
                 .map(|alternative| {
                     Self::compile(alternative, parse_options).map(|pattern| pattern.alternatives)
@@ -1844,7 +1844,42 @@ fn flush_literals(tokens: &mut Vec<Token>, literals: &mut Vec<u8>) {
     }
 }
 
-fn expand_braces(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8>>, PatternError> {
+/// Expands brace alternatives into the plain patterns a pattern stands for.
+///
+/// [`Pattern::compile`] expands braces before it compiles anything; this
+/// exposes the same expansion so callers can reason about the alternatives
+/// themselves. Deriving a prefilter is the motivating case: every alternative
+/// of `**/*.{ts,tsx}` ends in a literal extension, so a caller can prefilter on
+/// `ts` and `tsx` without giving up on brace patterns.
+///
+/// Without [`PatternOptions::braces`] a pattern stands for itself and the
+/// result is the input unchanged. Alternatives are returned in the order the
+/// expansion produces them, and a pattern always expands to at least one.
+///
+/// ```
+/// use ferralk_glob::{PatternOptions, expand_braces};
+///
+/// let options = PatternOptions::default().braces(true);
+/// let alternatives = expand_braces("**/*.{ts,tsx}", options)?;
+/// assert_eq!(alternatives, [b"**/*.ts".to_vec(), b"**/*.tsx".to_vec()]);
+/// # Ok::<(), ferralk_glob::PatternError>(())
+/// ```
+///
+/// # Errors
+///
+/// Reports what [`Pattern::compile`] reports for the same pattern and options.
+pub fn expand_braces(
+    pattern: impl AsRef<[u8]>,
+    options: PatternOptions,
+) -> Result<Vec<Vec<u8>>, PatternError> {
+    let pattern = pattern.as_ref();
+    if !options.braces {
+        return Ok(vec![pattern.to_vec()]);
+    }
+    expand_brace_alternatives(pattern, options.escape)
+}
+
+fn expand_brace_alternatives(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8>>, PatternError> {
     let Some(open) = first_unescaped_brace(pattern, escapes) else {
         return Ok(vec![pattern.to_vec()]);
     };
@@ -1860,7 +1895,7 @@ fn expand_braces(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8>>, PatternE
         combined.extend_from_slice(&pattern[..open]);
         combined.extend_from_slice(alternative);
         combined.extend_from_slice(&pattern[close + 1..]);
-        expanded.extend(expand_braces(&combined, escapes)?);
+        expanded.extend(expand_brace_alternatives(&combined, escapes)?);
     }
     Ok(expanded)
 }
