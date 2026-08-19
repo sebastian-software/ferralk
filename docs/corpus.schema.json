@@ -7,7 +7,7 @@
   "required": ["id", "pattern", "path", "expected", "source"],
   "properties": {
     "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
-    "kind": { "enum": ["matcher", "has_wildcards", "match_paths", "match_paths_at", "match_path_indices", "match_path_indices_at", "compile_error"], "default": "matcher" },
+    "kind": { "enum": ["matcher", "has_wildcards", "match_paths", "match_paths_at", "match_path_indices", "match_path_indices_at", "compile_error", "match_glob_path"], "default": "matcher" },
     "paths": { "type": "array", "items": { "type": "string" }, "default": [] },
     "matches": { "type": "array", "items": { "type": "string" }, "default": [] },
     "oracle_matches": { "type": "array", "items": { "type": "string" } },
@@ -18,6 +18,19 @@
     "path": { "type": "string" },
     "flags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "default": [] },
     "ignore_rules": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "nested_ignore_rules": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["directory", "rules"],
+        "properties": {
+          "directory": { "type": "string" },
+          "rules": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
     "expected": { "type": "boolean" },
     "oracle_expected": { "type": "boolean" },
     "error_offset": { "type": "integer", "minimum": 0 },
