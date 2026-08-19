@@ -161,10 +161,21 @@ specific action needed to clear each one are consolidated in
   and Windows test matrices; both native backend jobs; Rust 1.93 MSRV;
   dependency/unsafe audit; coverage; and Codecov upload. Actions now use
   Checkout v7, CodSpeed v5 with explicit simulation mode, Codecov v7, and
-  Release Please v5. The remaining Release Please failure is an explicit
-  release-configuration decision for the workspace's six packages, not a
-  source or test failure. The long-running CodSpeed comparison remains an
-  external benchmark gate.
+  Release Please v5. The long-running CodSpeed comparison remains an external
+  benchmark gate.
+
+### 2026-08-19 — Lockstep crate-version release automation configured
+
+- Release Please now models Ferralk as one logical `ferralk` release, following
+  Palamedes' workspace-version pattern while retaining Ferroni-style `vX.Y.Z`
+  tags. A release PR updates the workspace version, `ferralk`'s exact internal
+  `ferralk-glob` dependency, all six workspace entries in `Cargo.lock`, and the
+  changelog together.
+- A published GitHub release starts the separate Rust publication workflow:
+  it validates the locked workspace and publishes `ferralk-glob` before
+  `ferralk`, allowing for registry-index propagation between them. Publishing
+  remains an external release gate until crates.io trusted publishing is
+  configured and a release PR is approved.
 
 ### 2026-08-19 — M0 Rust-only scope confirmed
 

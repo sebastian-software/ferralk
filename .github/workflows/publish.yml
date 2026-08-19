@@ -1,0 +1,56 @@
+name: Publish crates
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name || github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CARGO_HTTP_MULTIPLEXING: "false"
+      CARGO_NET_RETRY: "10"
+    steps:
+      - name: Check out the release
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || github.sha }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate the workspace
+        run: cargo test --workspace --locked
+
+      - name: Package ferralk-glob
+        run: cargo package --locked --no-verify -p ferralk-glob
+
+      - name: Publish ferralk-glob
+        if: ${{ github.event_name == 'release' }}
+        run: cargo publish --locked -p ferralk-glob
+
+      - name: Publish ferralk after registry sync
+        if: ${{ github.event_name == 'release' }}
+        run: |
+          for attempt in {1..10}; do
+            if cargo publish --locked -p ferralk; then
+              exit 0
+            fi
+
+            if [ "$attempt" -eq 10 ]; then
+              exit 1
+            fi
+
+            sleep 15
+          done

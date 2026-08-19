@@ -26,8 +26,11 @@ migration facade; a compatibility guide documents the API mapping instead.
 ## Consequences
 
 - Clean dependency story per audience; the stable matcher can version
-  independently from the faster-moving walker.
-- Two versions to coordinate at release time.
+  independently from the faster-moving walker at the API level.
+- One workspace version governs both published crates. Release Please updates
+  the workspace manifest, the internal `ferralk` → `ferralk-glob` dependency,
+  and the workspace lockfile in one release PR; the publish workflow sends
+  `ferralk-glob` to crates.io before `ferralk`.
 - Non-Rust consumers are out of scope for now.
 
 ## Scope confirmation
