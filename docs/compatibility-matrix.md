@@ -34,6 +34,7 @@ read the [compatibility guide](compatibility-guide.md).
 | `ZLOB_FOLLOW_SYMLINKS` | `WalkOptions::follow_symlinks` | Implemented (M2) | Default off; canonical-path cycle guard when enabled. |
 | `ZLOB_ONLYDIR` | `WalkOptions::directories_only` | Implemented (M2) | Filters returned files without pruning traversal. |
 | `ZLOB_WALK_NO_REPORT_DIRS` | `WalkOptions::files_only` | Implemented (M2) | Filters returned directories without pruning traversal. |
+| root-relative glob filter | `Pattern::is_match_glob_path` / `Walker::include` | Implemented (M2) | Ordinary wildcard and Extglob tokens stay within every component; `**` is the recursive form. |
 | walker `max_depth` | `WalkOptions::max_depth` | Implemented (M2) | Returns entries through the depth boundary while pruning any deeper descent in serial, parallel, and streaming modes. |
 | `ZLOB_MARK` | — | Deliberate divergence | Ferralk preserves native paths instead of appending display-only separators. |
 | `ZLOB_ERR` | `ErrorPolicy::{Abort,Skip,Collect}` | Implemented (M2) | `Collect` default. |
