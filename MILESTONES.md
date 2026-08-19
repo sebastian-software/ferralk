@@ -155,8 +155,10 @@ specific action needed to clear each one are consolidated in
   `__getdirentries64` adapter owns the syscall buffer, bounds-checks every
   Darwin record before reading its fields, and preserves portable fallback on
   an unsupported syscall. Direct parser and native-vs-portable reader tests
-  cover the safe boundary; `getattrlistbulk`, native fuzzing, and the macOS
-  benchmark gate remain open.
+  cover the safe boundary. On the shared filtered fixture, native serial
+  traversal measures about 1.31 ms locally after avoiding metadata fallback
+  for `DT_REG`; `getattrlistbulk`, native fuzzing, and the macOS benchmark gate
+  remain open.
 
 ### 2026-08-18 — M0 foundation established
 

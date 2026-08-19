@@ -22,6 +22,7 @@ const NAME_LENGTH_OFFSET: usize = 18;
 const TYPE_OFFSET: usize = 20;
 const NAME_OFFSET: usize = 21;
 const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
 
 unsafe extern "C" {
@@ -118,6 +119,7 @@ fn parse_records(
 fn entry_kind(path: &Path, directory_type: u8) -> io::Result<(bool, bool)> {
     match directory_type {
         DT_DIR => Ok((true, false)),
+        DT_REG => Ok((false, false)),
         DT_LNK => Ok((false, true)),
         _ => {
             let file_type = fs::symlink_metadata(path)?.file_type();
@@ -144,7 +146,7 @@ mod tests {
 
     use crate::{DirectoryBackend, StdBackend};
 
-    use super::{BackendEntry, DT_DIR, NAME_OFFSET, parse_records, read_directory};
+    use super::{BackendEntry, DT_DIR, DT_REG, NAME_OFFSET, parse_records, read_directory};
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
@@ -162,10 +164,22 @@ mod tests {
     fn parser_skips_dot_entries_and_rejects_truncated_records() {
         let mut records = record(b".", DT_DIR);
         records.extend(record(b"..", DT_DIR));
+        records.extend(record(b"regular", DT_REG));
         let mut entries: Vec<BackendEntry> = Vec::new();
         parse_records(Path::new("/tmp"), &records, &mut entries).expect("dot records parse");
-        assert!(entries.is_empty());
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].is_dir);
+        assert!(!entries[0].is_symlink);
         assert!(parse_records(Path::new("/tmp"), &[0_u8; NAME_OFFSET - 1], &mut entries).is_err());
+
+        let mut zero_length = vec![0_u8; NAME_OFFSET];
+        zero_length[18..20].copy_from_slice(&1_u16.to_ne_bytes());
+        assert!(parse_records(Path::new("/tmp"), &zero_length, &mut entries).is_err());
+
+        let mut oversized_name = record(b"x", DT_REG);
+        let oversized_length = oversized_name.len() as u16;
+        oversized_name[18..20].copy_from_slice(&oversized_length.to_ne_bytes());
+        assert!(parse_records(Path::new("/tmp"), &oversized_name, &mut entries).is_err());
     }
 
     #[test]
