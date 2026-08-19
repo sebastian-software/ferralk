@@ -207,13 +207,14 @@ specific action needed to clear each one are consolidated in
   matching only borrows those values and keeps its failure memo strictly local
   to an invocation. Direct IR and fast-path equivalence tests, the corpus, and
   the zlob oracle cover the completed representation.
-- The local native-macOS Walker comparison is not yet at the M5 target: the
-  shared 16-branch Criterion fixture measured Ferralk parallel at about
-  0.858 ms (0.800 ms sample median) and zlob parallel at about 0.619 ms
-  (0.612 ms sample median). Ferralk is therefore about 39% slower by the
-  Criterion time estimate, above the 20% gate. This is a profiling result,
-  not release evidence; retain the benchmark checkbox and prioritize the
-  parallel Walker hot path.
+- The local native-macOS Walker comparison is not yet at the M5 target. The
+  initial shared 16-branch Criterion fixture measured Ferralk parallel at
+  about 0.858 ms versus zlob at 0.619 ms. Reusing the native 32-KiB buffer per
+  thread improved Ferralk to about 0.779 ms (0.741 ms sample median), while
+  the immediate zlob comparison was 0.623 ms (0.621 ms sample median). The
+  remaining roughly 25% Criterion-time gap is still above the 20% gate. This
+  is profiling, not release evidence; retain the benchmark checkbox and
+  prioritize the parallel Walker hot path.
 
 ### 2026-08-19 — M1 component-aware deterministic IR
 

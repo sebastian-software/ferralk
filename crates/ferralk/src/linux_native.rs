@@ -4,9 +4,11 @@
 //! owned buffer remains valid for each call, and every variable-length dirent
 //! is validated before its fields or name are read. Architectures without a
 //! reviewed syscall number report an unsupported operation so the safe adapter
-//! selects the portable reader.
+//! selects the portable reader. A per-thread buffer avoids allocation on every
+//! small directory read.
 
 use std::{
+    cell::RefCell,
     ffi::{OsString, c_long, c_void},
     fs::{self, File},
     io,
@@ -23,6 +25,10 @@ const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
 
+std::thread_local! {
+    static DIRECTORY_BUFFER: RefCell<Box<[u8; BUFFER_SIZE]>> = RefCell::new(Box::new([0; BUFFER_SIZE]));
+}
+
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 const SYS_GETDENTS64: c_long = 217;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -37,11 +43,17 @@ unsafe extern "C" {
 }
 
 pub(super) fn read_directory(path: &Path) -> io::Result<Vec<BackendEntry>> {
+    DIRECTORY_BUFFER.with(|buffer| {
+        let mut buffer = buffer.borrow_mut();
+        read_directory_with_buffer(path, &mut buffer[..])
+    })
+}
+
+fn read_directory_with_buffer(path: &Path, buffer: &mut [u8]) -> io::Result<Vec<BackendEntry>> {
     let directory = File::open(path)?;
-    let mut buffer = vec![0_u8; BUFFER_SIZE];
     let mut entries = Vec::new();
     loop {
-        let byte_count = read_batch(&directory, &mut buffer)?;
+        let byte_count = read_batch(&directory, buffer)?;
         if byte_count == 0 {
             return Ok(entries);
         }

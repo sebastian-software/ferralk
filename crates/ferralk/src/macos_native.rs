@@ -1,14 +1,15 @@
 //! macOS bulk-directory backend.
 //!
-//! The only unsafe operations are Darwin syscalls. Their buffers are owned byte
-//! vectors that remain live for each call; every kernel record is bounds-checked
-//! before its fields or name are read. `getattrlistbulk` is preferred because it
+//! The only unsafe operations are Darwin syscalls. Per-thread owned buffers
+//! remain live for each call; every kernel record is bounds-checked before its
+//! fields or name are read. `getattrlistbulk` is preferred because it
 //! returns entry names and object types in batches. Filesystems that do not
 //! support it report an unsupported operation so the safe adapter can use the
 //! portable backend. The `getdirentries64` reader remains a separately tested
 //! parser regression boundary.
 
 use std::{
+    cell::RefCell,
     ffi::{OsString, c_int, c_void},
     fs::{self, File},
     io,
@@ -37,6 +38,11 @@ const VDIR: u32 = 2;
 const VLNK: u32 = 5;
 const ATTRIBUTE_SET_SIZE: usize = 5 * std::mem::size_of::<u32>();
 const ATTRIBUTE_RECORD_HEADER_SIZE: usize = std::mem::size_of::<u32>() + ATTRIBUTE_SET_SIZE;
+
+std::thread_local! {
+    static BULK_BUFFER: RefCell<Box<[u8; BUFFER_SIZE]>> = RefCell::new(Box::new([0; BUFFER_SIZE]));
+    static DIRENTRIES_BUFFER: RefCell<Box<[u8; BUFFER_SIZE]>> = RefCell::new(Box::new([0; BUFFER_SIZE]));
+}
 
 #[repr(C)]
 struct AttrList {
@@ -67,12 +73,14 @@ unsafe extern "C" {
 }
 
 pub(super) fn read_directory(path: &Path) -> io::Result<Vec<BackendEntry>> {
-    read_bulk_directory(path)
+    BULK_BUFFER.with(|buffer| {
+        let mut buffer = buffer.borrow_mut();
+        read_bulk_directory(path, &mut buffer[..])
+    })
 }
 
-fn read_bulk_directory(path: &Path) -> io::Result<Vec<BackendEntry>> {
+fn read_bulk_directory(path: &Path, buffer: &mut [u8]) -> io::Result<Vec<BackendEntry>> {
     let directory = File::open(path)?;
-    let mut buffer = vec![0_u8; BUFFER_SIZE];
     let mut entries = Vec::new();
     let attributes = AttrList {
         bitmap_count: ATTR_BIT_MAP_COUNT,
@@ -88,7 +96,7 @@ fn read_bulk_directory(path: &Path) -> io::Result<Vec<BackendEntry>> {
     };
     let mut reader = BulkReader {
         directory,
-        buffer: &mut buffer,
+        buffer,
         attributes,
         remaining: 0,
         offset: 0,
@@ -273,9 +281,18 @@ fn bulk_entry_kind(path: &Path, object_type: u32) -> io::Result<(bool, bool)> {
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn read_direntries_directory(path: &Path) -> io::Result<Vec<BackendEntry>> {
+    DIRENTRIES_BUFFER.with(|buffer| {
+        let mut buffer = buffer.borrow_mut();
+        read_direntries_directory_with_buffer(path, &mut buffer[..])
+    })
+}
+
+fn read_direntries_directory_with_buffer(
+    path: &Path,
+    buffer: &mut [u8],
+) -> io::Result<Vec<BackendEntry>> {
     let directory = File::open(path)?;
     let mut base = 0_u64;
-    let mut buffer = vec![0_u8; BUFFER_SIZE];
     let mut entries = Vec::new();
     loop {
         let byte_count = loop {
