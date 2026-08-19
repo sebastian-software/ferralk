@@ -8,6 +8,31 @@ use zlob::{
     zlob_match_paths_indices_at,
 };
 
+/// Lower bound on the cases this adapter must hand to zlob.
+///
+/// The corpus only grows, so a run below this floor means the skip mechanism
+/// swallowed the replay instead of exercising the oracle.
+const MINIMUM_REPLAYED: usize = 400;
+
+/// Cases the zlob 1.6.3 Rust API cannot express, counted by reason.
+#[derive(Default)]
+struct Skipped {
+    /// zlob 1.6.3 has no case-folding flag.
+    case_folding: usize,
+    /// zlob's Rust API takes `&str`, so raw non-UTF-8 bytes cannot be passed.
+    non_utf8: usize,
+    /// Rejected patterns are a ferralk contract with its own error taxonomy.
+    compile_error: usize,
+    /// The verdict describes a separator platform this runner is not.
+    platform: usize,
+}
+
+impl Skipped {
+    fn total(&self) -> usize {
+        self.case_folding + self.non_utf8 + self.compile_error + self.platform
+    }
+}
+
 #[test]
 #[ignore = "requires Zig 0.16 and libclang; run only from the manual oracle workflow"]
 fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
@@ -17,6 +42,7 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
     files.sort();
 
     let mut replayed = 0_usize;
+    let mut skipped = Skipped::default();
     for file in files {
         if file.file_name().is_some_and(|name| name == "ignore.jsonl") {
             continue;
@@ -31,19 +57,31 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
             }
             let case: Case = serde_json::from_str(line)
                 .unwrap_or_else(|error| panic!("{}:{}: {error}", file.display(), line_number + 1));
-            let pattern_bytes = decode_bytes(&case.pattern).expect("decode pattern");
-            let pattern = std::str::from_utf8(&pattern_bytes)
-                .expect("zlob Rust API cannot represent a non-UTF-8 pattern");
-            let path_bytes = decode_bytes(&case.path).expect("decode path");
-            let path = std::str::from_utf8(&path_bytes)
-                .expect("zlob Rust API cannot represent a non-UTF-8 path");
+            if !case.runs_on_host() {
+                skipped.platform += 1;
+                continue;
+            }
+            if case.kind == CaseKind::CompileError {
+                skipped.compile_error += 1;
+                continue;
+            }
+            let Some(flags) = zlob_flags(&case.flags) else {
+                skipped.case_folding += 1;
+                continue;
+            };
+            let Some(text) = CaseText::decode(&case) else {
+                skipped.non_utf8 += 1;
+                continue;
+            };
+            let pattern = text.pattern.as_str();
+            let path = text.path.as_str();
             let actual = match case.kind {
-                CaseKind::Matcher => zlob_match_paths(pattern, &[path], flags(&case.flags))
+                CaseKind::Matcher => zlob_match_paths(pattern, &[path], flags)
                     .unwrap_or_else(|error| {
                         panic!("{}:{}: {error}", file.display(), line_number + 1)
                     })
                     .is_some(),
-                CaseKind::HasWildcards => has_wildcards(pattern, flags(&case.flags)),
+                CaseKind::HasWildcards => has_wildcards(pattern, flags),
                 CaseKind::MatchPaths | CaseKind::MatchPathsAt => {
                     if case.flags.iter().any(|flag| flag == "nocheck") {
                         // zlob 1.6.3's Rust FFI aborts on empty input and
@@ -51,34 +89,20 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                         // The frozen Zig assertion remains the source evidence.
                         case.expected
                     } else {
-                        let paths = case
-                            .paths
-                            .iter()
-                            .map(|path| decode_bytes(path))
-                            .collect::<Result<Vec<_>, _>>()
-                            .expect("decode paths");
-                        let paths = paths
-                            .iter()
-                            .map(|path| std::str::from_utf8(path).expect("zlob paths are UTF-8"))
-                            .collect::<Vec<_>>();
+                        let paths = text.borrowed_paths();
                         let selected = match case.kind {
                             CaseKind::MatchPaths => {
-                                zlob_match_paths(pattern, paths.as_slice(), flags(&case.flags))
+                                zlob_match_paths(pattern, paths.as_slice(), flags)
                             }
-                            CaseKind::MatchPathsAt => {
-                                let base_path =
-                                    decode_bytes(&case.base_path).expect("decode base path");
-                                let base_path = std::str::from_utf8(&base_path)
-                                    .expect("zlob base path is UTF-8");
-                                zlob_match_paths_at(
-                                    base_path,
-                                    pattern,
-                                    paths.as_slice(),
-                                    flags(&case.flags),
-                                )
-                            }
+                            CaseKind::MatchPathsAt => zlob_match_paths_at(
+                                text.base_path.as_str(),
+                                pattern,
+                                paths.as_slice(),
+                                flags,
+                            ),
                             CaseKind::Matcher
                             | CaseKind::HasWildcards
+                            | CaseKind::CompileError
                             | CaseKind::MatchPathIndices
                             | CaseKind::MatchPathIndicesAt => unreachable!(),
                         }
@@ -101,34 +125,20 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                     }
                 }
                 CaseKind::MatchPathIndices | CaseKind::MatchPathIndicesAt => {
-                    let paths = case
-                        .paths
-                        .iter()
-                        .map(|path| decode_bytes(path))
-                        .collect::<Result<Vec<_>, _>>()
-                        .expect("decode paths");
-                    let paths = paths
-                        .iter()
-                        .map(|path| std::str::from_utf8(path).expect("zlob paths are UTF-8"))
-                        .collect::<Vec<_>>();
+                    let paths = text.borrowed_paths();
                     let selected = match case.kind {
                         CaseKind::MatchPathIndices => {
-                            zlob_match_paths_indices(pattern, paths.as_slice(), flags(&case.flags))
+                            zlob_match_paths_indices(pattern, paths.as_slice(), flags)
                         }
-                        CaseKind::MatchPathIndicesAt => {
-                            let base_path =
-                                decode_bytes(&case.base_path).expect("decode base path");
-                            let base_path =
-                                std::str::from_utf8(&base_path).expect("zlob base path is UTF-8");
-                            zlob_match_paths_indices_at(
-                                base_path,
-                                pattern,
-                                paths.as_slice(),
-                                flags(&case.flags),
-                            )
-                        }
+                        CaseKind::MatchPathIndicesAt => zlob_match_paths_indices_at(
+                            text.base_path.as_str(),
+                            pattern,
+                            paths.as_slice(),
+                            flags,
+                        ),
                         CaseKind::Matcher
                         | CaseKind::HasWildcards
+                        | CaseKind::CompileError
                         | CaseKind::MatchPaths
                         | CaseKind::MatchPathsAt => unreachable!(),
                     }
@@ -146,6 +156,7 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                     );
                     case.expected
                 }
+                CaseKind::CompileError => unreachable!("compile-error cases are skipped above"),
             };
             assert_eq!(
                 actual,
@@ -159,23 +170,77 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
             replayed += 1;
         }
     }
-    assert!(replayed > 0, "the oracle must exercise at least one case");
+
+    println!(
+        "replayed {replayed} corpus cases against zlob 1.6.3; skipped {} \
+         ({} case-folding, {} non-UTF-8, {} compile-error, {} other-platform)",
+        skipped.total(),
+        skipped.case_folding,
+        skipped.non_utf8,
+        skipped.compile_error,
+        skipped.platform
+    );
+    assert!(
+        replayed >= MINIMUM_REPLAYED,
+        "the oracle replayed only {replayed} cases and skipped {}; \
+         it must replay at least {MINIMUM_REPLAYED}",
+        skipped.total()
+    );
 }
 
-fn flags(names: &[String]) -> ZlobFlags {
-    names.iter().fold(ZlobFlags::empty(), |flags, name| {
-        flags
-            | match name.as_str() {
-                "braces" => ZlobFlags::BRACE,
-                "recursive_double_star" => ZlobFlags::DOUBLESTAR_RECURSIVE,
-                "extglob" => ZlobFlags::EXTGLOB,
-                "match_hidden" => ZlobFlags::PERIOD,
-                "no_escape" => ZlobFlags::NOESCAPE,
-                "nocheck" => ZlobFlags::NOCHECK,
-                "case_insensitive" => panic!("zlob 1.6.3 has no case-folding flag"),
-                unknown => panic!("unknown matcher flag {unknown:?}"),
-            }
-    })
+/// A corpus case decoded into the UTF-8 strings the zlob Rust API accepts.
+struct CaseText {
+    pattern: String,
+    path: String,
+    base_path: String,
+    paths: Vec<String>,
+}
+
+impl CaseText {
+    /// Returns `None` when any field carries bytes that are not UTF-8.
+    ///
+    /// zlob's Rust API is `&str`-based, so a byte-matching case from
+    /// ADR-0005 has no representation here and belongs to the harness alone.
+    fn decode(case: &Case) -> Option<Self> {
+        Some(Self {
+            pattern: utf8(&case.pattern)?,
+            path: utf8(&case.path)?,
+            base_path: utf8(&case.base_path)?,
+            paths: case
+                .paths
+                .iter()
+                .map(|path| utf8(path))
+                .collect::<Option<Vec<_>>>()?,
+        })
+    }
+
+    fn borrowed_paths(&self) -> Vec<&str> {
+        self.paths.iter().map(String::as_str).collect()
+    }
+}
+
+fn utf8(encoded: &str) -> Option<String> {
+    String::from_utf8(decode_bytes(encoded).expect("decode corpus byte codec")).ok()
+}
+
+/// Translates corpus flags, or reports that zlob 1.6.3 cannot express one.
+fn zlob_flags(names: &[String]) -> Option<ZlobFlags> {
+    let mut flags = ZlobFlags::empty();
+    for name in names {
+        flags |= match name.as_str() {
+            "braces" => ZlobFlags::BRACE,
+            "recursive_double_star" => ZlobFlags::DOUBLESTAR_RECURSIVE,
+            "extglob" => ZlobFlags::EXTGLOB,
+            "match_hidden" => ZlobFlags::PERIOD,
+            "no_escape" => ZlobFlags::NOESCAPE,
+            "nocheck" => ZlobFlags::NOCHECK,
+            // zlob 1.6.3 has no case-folding flag; ferralk's ASCII folding is
+            // a documented extension the harness replays on its own.
+            "case_insensitive" => return None,
+            unknown => panic!("unknown matcher flag {unknown:?}"),
+        };
+    }
+    Some(flags)
 }
 
 fn collect_jsonl(root: &Path, files: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
