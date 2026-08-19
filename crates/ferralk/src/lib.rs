@@ -2143,6 +2143,120 @@ mod tests {
         assert_eq!(state.errors[0].path(), disappeared);
     }
 
+    #[cfg(any(
+        all(feature = "native-macos", target_os = "macos"),
+        all(feature = "native-linux", target_os = "linux")
+    ))]
+    #[test]
+    fn native_backend_matches_portable_across_walker_option_matrix() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        fixture.write("src/lib.rs");
+        fixture.write("src/nested/mod.rs");
+        fixture.write("src/generated.tmp");
+        fixture.write("ignored/skip.rs");
+        fixture.write(".hidden/skip.rs");
+        fixture.write(".gitignore");
+        fs::write(fixture.root.join(".gitignore"), b"ignored/\n").expect("write ignore rule");
+        symlink("src", fixture.root.join("source-link")).expect("create directory symlink");
+
+        let cases = [
+            ("baseline", WalkOptions::default().sort(true)),
+            ("metadata", WalkOptions::default().sort(true).metadata(true)),
+            (
+                "directories_only",
+                WalkOptions::default().sort(true).directories_only(true),
+            ),
+            (
+                "files_only",
+                WalkOptions::default().sort(true).files_only(true),
+            ),
+            (
+                "skip_hidden",
+                WalkOptions::default().sort(true).skip_hidden(true),
+            ),
+            (
+                "follow_symlinks",
+                WalkOptions::default().sort(true).follow_symlinks(true),
+            ),
+            ("max_depth", WalkOptions::default().sort(true).max_depth(1)),
+        ];
+        for (name, options) in cases {
+            let walker = Walker::new(&fixture.root)
+                .threads(1)
+                .include("**/*")
+                .expect("valid include")
+                .exclude("**/*.tmp")
+                .expect("valid exclude")
+                .respect_git_ignore(true)
+                .error_policy(ErrorPolicy::Collect)
+                .options(options);
+            let native = walker.clone().collect().expect("native walk succeeds");
+            let (portable_entries, portable_errors) = collect_with_portable_backend(&walker);
+
+            assert!(native.errors().is_empty(), "native {name} errors");
+            assert!(portable_errors.is_empty(), "portable {name} errors");
+            assert_eq!(
+                describe_entries(native.entries(), &fixture.root),
+                describe_entries(&portable_entries, &fixture.root),
+                "native {name} differs from portable"
+            );
+        }
+    }
+
+    #[cfg(any(
+        all(feature = "native-macos", target_os = "macos"),
+        all(feature = "native-linux", target_os = "linux")
+    ))]
+    type DescribedEntry = (PathBuf, bool, bool, usize, Option<(u64, bool, bool)>);
+
+    #[cfg(any(
+        all(feature = "native-macos", target_os = "macos"),
+        all(feature = "native-linux", target_os = "linux")
+    ))]
+    fn collect_with_portable_backend(walker: &Walker) -> (Vec<WalkEntry>, Vec<super::WalkError>) {
+        let mut state = super::WalkState::new(walker);
+        state
+            .walk_directory(&super::StdBackend, walker.root.clone())
+            .expect("portable walk succeeds");
+        if walker.options.sort {
+            state
+                .entries
+                .sort_by(|left, right| left.path.cmp(&right.path));
+        }
+        (state.entries, state.errors)
+    }
+
+    #[cfg(any(
+        all(feature = "native-macos", target_os = "macos"),
+        all(feature = "native-linux", target_os = "linux")
+    ))]
+    fn describe_entries(entries: &[WalkEntry], root: &Path) -> Vec<DescribedEntry> {
+        entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry
+                        .path()
+                        .strip_prefix(root)
+                        .expect("entry belongs to fixture")
+                        .to_path_buf(),
+                    entry.is_dir(),
+                    entry.is_symlink(),
+                    entry.depth(),
+                    entry.metadata().map(|metadata| {
+                        (
+                            metadata.len(),
+                            metadata.file_type().is_dir(),
+                            metadata.file_type().is_symlink(),
+                        )
+                    }),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn collect_and_skip_distinguish_recoverable_root_errors() {
         let missing = std::env::temp_dir().join(format!(

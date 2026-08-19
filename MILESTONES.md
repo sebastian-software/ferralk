@@ -131,8 +131,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
       portable fallback (SMB/FUSE)
 - [x] Bounds-checked record parsing with module-level invariants
 - [x] Fuzz the record decoder
-- [x] Serial native/portable Walker differential fixture
-- [ ] Broaden native/portable differential corpus; execute sanitizers in CI
+- [x] Native/portable Walker differential option matrix
+- [ ] Expand the filesystem corpus; execute sanitizers in CI
 - [ ] Benchmark gate on macOS
 
 ### Linux (second)
@@ -141,8 +141,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 - [ ] `statx` only where metadata is requested
 - [x] Bounds-checked record parsing and fuzz target
 - [ ] Miri where executable
-- [x] Serial native/portable Walker differential test
-- [ ] Broaden native/portable differential corpus; execute sanitizers in CI
+- [x] Native/portable Walker differential option matrix
+- [ ] Expand the filesystem corpus; execute sanitizers in CI
 - [ ] Benchmark gate on Linux
 
 ## Implementation log
@@ -190,6 +190,13 @@ specific action needed to clear each one are consolidated in
   hidden paths, opt-in metadata, and a directory symlink. It cross-compiles on
   the local x86_64-Linux target; its runtime evidence remains with the committed
   Ubuntu native CI job rather than being claimed from this macOS workspace.
+- Replaced the single-fixture parity check with a shared native/portable Walker
+  option matrix. It covers baseline traversal, metadata, file- and
+  directory-only filters, hidden-path skipping, symlink following, and maximum
+  depth while asserting relative paths, entry kinds, depths, symlink status,
+  and requested metadata. It executes locally for `native-macos` and
+  cross-compiles with the Linux-native test configuration; broader filesystem
+  corpus and sanitizer-runtime evidence remain open.
 
 ### 2026-08-19 — M1 component-aware deterministic IR
 
