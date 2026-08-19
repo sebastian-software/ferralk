@@ -26,7 +26,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-08-04
-      - run: cargo install cargo-fuzz --locked
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-fuzz
       - run: cargo fuzz run macos_dirent_parser -- -max_total_time=$MAX_TOTAL_TIME
 
   address-sanitizer:
@@ -37,6 +38,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-08-04
+      - uses: Swatinem/rust-cache@v2
       - name: Run AddressSanitizer tests
         env:
           CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS: -Zsanitizer=address

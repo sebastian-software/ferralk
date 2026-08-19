@@ -25,5 +25,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --locked
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-fuzz
       - run: cargo fuzz run ${{ inputs.target }} -- -max_total_time=${{ inputs.max_total_time }}

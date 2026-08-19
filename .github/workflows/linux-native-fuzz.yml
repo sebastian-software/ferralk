@@ -26,7 +26,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-08-04
-      - run: cargo install cargo-fuzz --locked
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-fuzz
       - run: cargo fuzz run linux_dirent_parser -- -max_total_time=$MAX_TOTAL_TIME
 
   address-sanitizer:
@@ -37,6 +38,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-08-04
+      - uses: Swatinem/rust-cache@v2
       - name: Run AddressSanitizer tests
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zsanitizer=address
@@ -56,6 +58,7 @@ jobs:
         with:
           toolchain: nightly-2026-08-04
           components: miri
+      - uses: Swatinem/rust-cache@v2
       - run: cargo +nightly-2026-08-04 miri setup
       # The raw-syscall reader requires a real Linux kernel. This focused test
       # exercises the bounds-checked parser without crossing that FFI boundary.
