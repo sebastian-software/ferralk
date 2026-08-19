@@ -103,6 +103,15 @@ fn matcher(c: &mut Criterion) {
         benchmark.iter(|| black_box(infix_star.is_match(black_box("src/deep/main.txt"))))
     });
 
+    let static_star = Pattern::compile("src/lib/*.rs", PatternOptions::default())
+        .expect("static-star benchmark pattern is valid");
+    c.bench_function("static_star/ferralk_compiled/matching", |benchmark| {
+        benchmark.iter(|| black_box(static_star.is_match(black_box("src/lib/main.rs"))))
+    });
+    c.bench_function("static_star/ferralk_compiled/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(static_star.is_match(black_box("src/lib/main.txt"))))
+    });
+
     let suffix_star = Pattern::compile("*.rs", PatternOptions::default())
         .expect("suffix-star benchmark pattern is valid");
     c.bench_function("single_star/ferralk_compiled/matching", |benchmark| {

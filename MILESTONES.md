@@ -751,3 +751,10 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   separates replayed public semantics from deliberate C ABI, loader, and
   system-runtime exclusions. It makes the still-open M0 whole-suite item a
   concrete scope decision rather than an unspecified blocker.
+- Extended the immutable matcher IR with a static single-star path for patterns
+  such as `src/lib/*.rs`. It compares compiled literal/separator prefixes and
+  suffixes without invoking the general state matrix, while exhaustive
+  case-folding, separator, and hidden-component checks continue to use that
+  matcher as their equivalence oracle. Local ten-sample medians are about
+  15.4 ns for a match and 11.3 ns for a non-match; the broader IR and external
+  CodSpeed confirmation remain open.

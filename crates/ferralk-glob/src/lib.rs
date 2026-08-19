@@ -686,6 +686,10 @@ enum FastPath {
         prefix: Vec<u8>,
         suffix: Vec<u8>,
     },
+    StaticStar {
+        prefix: Vec<Token>,
+        suffix: Vec<Token>,
+    },
     RecursiveTerminalPrefix {
         prefix: Vec<u8>,
     },
@@ -734,6 +738,18 @@ impl FastPath {
                 });
             }
             _ => {}
+        }
+        if let Some(star_index) = tokens.iter().position(|token| matches!(token, Token::Star))
+            && star_index > 0
+            && star_index + 1 < tokens.len()
+            && tokens.iter().enumerate().all(|(index, token)| {
+                index == star_index || matches!(token, Token::Literal(_) | Token::Separator)
+            })
+        {
+            return Some(Self::StaticStar {
+                prefix: tokens[..star_index].to_vec(),
+                suffix: tokens[star_index + 1..].to_vec(),
+            });
         }
         if let [
             Token::Literal(prefix),
@@ -887,6 +903,19 @@ impl FastPath {
                         variable_start + variable.len(),
                     )
             }
+            Self::StaticStar { prefix, suffix } => {
+                let Some(variable_start) = match_static_prefix(prefix, path, options) else {
+                    return false;
+                };
+                let Some(variable_end) = match_static_suffix(suffix, path, options) else {
+                    return false;
+                };
+                if variable_start > variable_end {
+                    return false;
+                }
+                options.match_hidden
+                    || !contains_hidden_component_in(path, variable_start, variable_end)
+            }
             Self::RecursiveTerminalPrefix { prefix } => {
                 let Some(remainder) = strip_literal_prefix(path, prefix, options.case_insensitive)
                 else {
@@ -929,6 +958,61 @@ impl FastPath {
             }
         }
     }
+}
+
+fn match_static_prefix(tokens: &[Token], path: &[u8], options: PatternOptions) -> Option<usize> {
+    let mut index = 0;
+    for token in tokens {
+        match token {
+            Token::Literal(literal) => {
+                let candidate = path.get(index..index + literal.len())?;
+                if !literal.iter().zip(candidate).all(|(&expected, &actual)| {
+                    bytes_equal(expected, actual, options.case_insensitive)
+                }) {
+                    return None;
+                }
+                index += literal.len();
+            }
+            Token::Separator => {
+                if !path.get(index).is_some_and(|byte| is_separator(*byte)) {
+                    return None;
+                }
+                index += 1;
+            }
+            _ => return None,
+        }
+    }
+    Some(index)
+}
+
+fn match_static_suffix(tokens: &[Token], path: &[u8], options: PatternOptions) -> Option<usize> {
+    let mut index = path.len();
+    for token in tokens.iter().rev() {
+        match token {
+            Token::Literal(literal) => {
+                let start = index.checked_sub(literal.len())?;
+                if !literal
+                    .iter()
+                    .zip(&path[start..index])
+                    .all(|(&expected, &actual)| {
+                        bytes_equal(expected, actual, options.case_insensitive)
+                    })
+                {
+                    return None;
+                }
+                index = start;
+            }
+            Token::Separator => {
+                let start = index.checked_sub(1)?;
+                if !is_separator(path[start]) {
+                    return None;
+                }
+                index = start;
+            }
+            _ => return None,
+        }
+    }
+    Some(index)
 }
 
 fn strip_literal_prefix<'a>(
@@ -1800,7 +1884,10 @@ mod tests {
     fn recursive_prefix_suffix_fast_path_matches_the_general_matcher() {
         let options = PatternOptions::default().recursive_double_star(true);
         let fast = Pattern::compile("src/**/*.rs", options).expect("pattern compiles");
-        assert!(fast.alternatives[0].fast_path.is_some());
+        assert!(matches!(
+            fast.alternatives[0].fast_path,
+            Some(FastPath::RecursivePrefixSuffix { .. })
+        ));
         let mut general = fast.clone();
         general.alternatives[0].fast_path = None;
 
@@ -1948,6 +2035,40 @@ mod tests {
             byte_words(b"src./RS", 5)
                 .into_iter()
                 .map(|middle| [b"src".as_slice(), middle.as_slice(), b".rs"].concat()),
+        );
+        for candidate in candidates {
+            assert_eq!(
+                fast.is_match(&candidate),
+                general.is_match(&candidate),
+                "fast path differs for {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_star_fast_path_matches_the_general_matcher() {
+        let options = PatternOptions::default().case_insensitive(true);
+        let fast = Pattern::compile("Src/Lib/*.RS", options).expect("pattern compiles");
+        assert!(matches!(
+            fast.alternatives[0].fast_path,
+            Some(FastPath::StaticStar { .. })
+        ));
+        let mut general = fast.clone();
+        general.alternatives[0].fast_path = None;
+
+        let mut candidates = vec![
+            b"src/lib/.rs".to_vec(),
+            b"src/lib/main.rs".to_vec(),
+            b"SRC/LIB/main.RS".to_vec(),
+            b"src/lib/nested/main.rs".to_vec(),
+            b"src/lib/.hidden.rs".to_vec(),
+            b"src/other/main.rs".to_vec(),
+            b"src/lib/main.txt".to_vec(),
+        ];
+        candidates.extend(
+            byte_words(b"ab./rsRS", 4)
+                .into_iter()
+                .map(|middle| [b"src/lib/".as_slice(), middle.as_slice(), b".rs"].concat()),
         );
         for candidate in candidates {
             assert_eq!(
