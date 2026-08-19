@@ -96,39 +96,39 @@ arm can be fast by finding less. Unscoped finds 7,400 files, scoped 2,600.
 
 | Arm | Median | Relative |
 | --- | ---: | ---: |
-| zlob 1.6.3, 4 threads | **32.52 ms** | 1.00x |
-| ferralk, 4 threads | 38.91 ms | 1.20x |
-| `ignore` parallel + overrides, 4 threads | 39.67 ms | 1.22x |
-| `ignore` serial + `globset` | 76.68 ms | 2.36x |
-| ferralk, serial | 80.11 ms | 2.46x |
+| zlob 1.6.3, 4 threads | **30.90 ms** | 1.00x |
+| `ignore` parallel + overrides, 4 threads | 37.15 ms | 1.20x |
+| ferralk, 4 threads | 37.19 ms | 1.20x |
+| `ignore` serial + `globset` | 75.58 ms | 2.45x |
+| ferralk, serial | 79.64 ms | 2.58x |
 
 ### `{src,packages}/**/*.{ts,tsx}` — the query names its roots
 
 | Arm | Median | Relative |
 | --- | ---: | ---: |
-| ferralk, 4 threads | **7.74 ms** | 1.00x |
-| `ignore` parallel + hand-written subtree pruning, 4 threads | 9.69 ms | 1.25x |
-| ferralk, serial | 13.96 ms | 1.80x |
-| zlob 1.6.3, 4 threads | 32.95 ms | 4.26x |
-| `ignore` parallel + overrides, 4 threads | 40.53 ms | 5.24x |
-| `ignore` serial + `globset` | 77.61 ms | 10.03x |
+| ferralk, 4 threads | **7.34 ms** | 1.00x |
+| `ignore` parallel + hand-written subtree pruning, 4 threads | 9.41 ms | 1.28x |
+| ferralk, serial | 13.72 ms | 1.87x |
+| zlob 1.6.3, 4 threads | 31.74 ms | 4.32x |
+| `ignore` parallel + overrides, 4 threads | 37.91 ms | 5.16x |
+| `ignore` serial + `globset` | 75.74 ms | 10.32x |
 
 ### Reading these
 
 - **Where the whole tree must be read, zlob is still ahead** — 20% over both
-  Rust walkers, which are level with each other. That is the honest state of the
-  unscoped query.
+  Rust walkers, which are level with each other to within the noise of this
+  host. That is the honest state of the unscoped query.
 - **Where the query names its roots, ferralk is ahead**, and it gets there from
   the pattern alone. The `ignore` arm that comes close needs a hand-written
   `filter_entry`; the arm that only passes the globs as overrides is 5.2x
   behind, because overrides decide what is yielded, not what is opened. zlob
   reads the whole tree for this query, which is why it lands near its unscoped
   time.
-- **Serial ferralk beats parallel `ignore` on the scoped query** (13.96 ms
-  against 40.53 ms) purely by not opening `node_modules`. Pruning is worth more
+- **Serial ferralk beats parallel `ignore` on the scoped query** (13.72 ms
+  against 37.91 ms) purely by not opening `node_modules`. Pruning is worth more
   than threads on this shape.
 - The 2,355 ms in the RFC's table was a serial walk doing more per file than
-  this reconstruction does; the 76.68 ms here is the same *approach*, not the
+  this reconstruction does; the 75.58 ms here is the same *approach*, not the
   same code.
 
 ## Matcher, against Rust baselines
@@ -139,20 +139,20 @@ region, as ferralk's pattern is.
 
 | Benchmark | ferralk | `globset` | `fast-glob` |
 | --- | ---: | ---: | ---: |
-| `common` matching | **12 ns** | 38 ns | 99 ns |
-| `common` non-matching | **3 ns** | 38 ns | 108 ns |
-| `literal` matching | **19 ns** | 38 ns | — |
+| `common` matching | **12 ns** | 38 ns | 100 ns |
+| `common` non-matching | **3 ns** | 38 ns | 114 ns |
+| `literal` matching | **18 ns** | 38 ns | — |
 | `literal` non-matching | 17 ns | **9 ns** | — |
 | `recursive_casefold` matching | **13 ns** | 28 ns | — |
-| `recursive_casefold` non-matching | **3 ns** | 30 ns | — |
-| `deterministic` matching | 31 ns | **23 ns** | — |
-| `deterministic` non-matching | **11 ns** | 19 ns | — |
-| `long_path` matching | **12 ns** | 196 ns | 542 ns |
-| `long_path` non-matching | **3 ns** | 196 ns | 554 ns |
-| `backtracking` non-matching | 1825 ns | **97 ns** | 251 ns |
+| `recursive_casefold` non-matching | **3 ns** | 29 ns | — |
+| `deterministic` matching | 26 ns | **23 ns** | — |
+| `deterministic` non-matching | **11 ns** | 20 ns | — |
+| `long_path` matching | **17 ns** | 194 ns | 551 ns |
+| `long_path` non-matching | **3 ns** | 193 ns | 554 ns |
+| `backtracking` non-matching | 1837 ns | **102 ns** | 258 ns |
 
 The last row is the one to keep in view: on a pattern built to force
-backtracking, ferralk is 19x slower than `globset`, which compiles to a regex
+backtracking, ferralk is 18x slower than `globset`, which compiles to a regex
 engine with no backtracking blow-up. `globset` is also ahead on a literal
 non-match and on one deterministic match. Everywhere else the byte-first matcher
 is ahead, most clearly on long paths, where the baselines pay for path
