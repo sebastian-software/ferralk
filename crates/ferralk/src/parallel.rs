@@ -37,61 +37,106 @@ pub(super) fn collect(walker: Walker) -> Result<WalkResult, WalkError> {
     }
     caller.flush_into(&shared.scheduler);
 
-    let pending = shared.pending.load(Ordering::Acquire);
-    if pending == 0 {
-        return finish(shared, caller.entries);
-    }
-    let helper_count = walker
-        .threads
-        .saturating_sub(1)
-        .min(pending.saturating_sub(1));
-    if helper_count == 0 {
-        run_worker(&shared, &mut caller, &[]);
+    if shared.pending.load(Ordering::Acquire) == 0 {
         return finish(shared, caller.entries);
     }
 
-    let mut helpers = (0..helper_count)
+    // Every helper slot is built here so the stealer list is complete and stays
+    // lock-free once the walk runs. Only the threads are lazy: a slot stays
+    // unused until the backlog outgrows the workers that are already running,
+    // which is what lets a tree that only fans out below the root widen too.
+    let spare = (0..walker.threads.saturating_sub(1))
         .map(|_| WorkerScratch::new())
         .collect::<Vec<_>>();
-    let mut stealers = Vec::with_capacity(helper_count + 1);
+    let mut stealers = Vec::with_capacity(spare.len() + 1);
     stealers.push(caller.queue.stealer());
-    stealers.extend(helpers.iter().map(|worker| worker.queue.stealer()));
+    stealers.extend(spare.iter().map(|worker| worker.queue.stealer()));
+    let idle = Mutex::new(spare);
+    let shards = Mutex::new(Vec::new());
 
-    let entries = thread::scope(|scope| {
-        let mut joins = Vec::with_capacity(helper_count);
-        for mut helper in helpers.drain(..) {
-            #[cfg(test)]
-            if should_fail_next_worker_spawn() {
-                shared.record_startup_error(std::io::Error::other("injected worker start failure"));
-                break;
-            }
-            let worker_shared = Arc::clone(&shared);
-            let stealers = &stealers;
-            let spawn = thread::Builder::new()
-                .name("ferralk-worker".into())
-                .spawn_scoped(scope, move || {
-                    run_worker_catching_panics(&worker_shared, &mut helper, stealers);
-                    helper
-                });
-            match spawn {
-                Ok(join) => joins.push(join),
-                Err(source) => {
-                    shared.record_startup_error(source);
-                    break;
-                }
-            }
-        }
-        run_worker_catching_panics(&shared, &mut caller, &stealers);
-        let mut entries = std::mem::take(&mut caller.entries);
-        for join in joins {
-            // Panics are captured inside the worker so joining only waits for
-            // completion and cannot bypass the shared cancellation state.
-            let mut helper = join.join().expect("worker panic is captured before join");
-            entries.append(&mut helper.entries);
-        }
-        entries
+    let mut entries = thread::scope(|scope| {
+        let pool = HelperPool {
+            scope,
+            shared: &shared,
+            stealers: &stealers,
+            idle: &idle,
+            shards: &shards,
+        };
+        pool.grow();
+        run_worker_catching_panics(pool, &mut caller);
+        std::mem::take(&mut caller.entries)
     });
+    // The scope joined every helper, so the shards are complete. Panics are
+    // captured inside each worker and cannot bypass the shared cancellation
+    // state, so no join here can observe one.
+    for shard in lock(&shards).drain(..) {
+        entries.extend(shard);
+    }
     finish(shared, entries)
+}
+
+/// Hands out the helper slots of one walk. Any worker may grow the pool, so a
+/// subtree that only becomes parallel below the root still reaches the
+/// configured thread budget instead of being capped by the root fan-out.
+#[derive(Clone, Copy)]
+struct HelperPool<'scope, 'env> {
+    scope: &'scope thread::Scope<'scope, 'env>,
+    shared: &'env Arc<Shared>,
+    stealers: &'env [Stealer<PathBuf>],
+    idle: &'env Mutex<Vec<WorkerScratch>>,
+    shards: &'env Mutex<Vec<Vec<WalkEntry>>>,
+}
+
+impl<'scope, 'env> HelperPool<'scope, 'env> {
+    /// Starts helpers while queued directories outnumber the running workers
+    /// and the thread budget has room. Cheap enough to call after every
+    /// directory: the common case is two atomic loads.
+    fn grow(self) {
+        while self.needs_another_worker() {
+            let Some(scratch) = lock(self.idle).pop() else {
+                return;
+            };
+            if !self.spawn(scratch) {
+                return;
+            }
+        }
+    }
+
+    fn needs_another_worker(self) -> bool {
+        if self.shared.should_stop() {
+            return false;
+        }
+        let active = self.shared.active_workers.load(Ordering::Acquire);
+        active < self.shared.walker.threads && self.shared.pending.load(Ordering::Acquire) > active
+    }
+
+    /// Reports whether the pool may keep growing after this attempt.
+    fn spawn(self, scratch: WorkerScratch) -> bool {
+        #[cfg(test)]
+        if should_fail_next_worker_spawn() {
+            self.shared
+                .record_startup_error(std::io::Error::other("injected worker start failure"));
+            lock(self.idle).push(scratch);
+            return false;
+        }
+        self.shared.active_workers.fetch_add(1, Ordering::AcqRel);
+        let spawn = thread::Builder::new()
+            .name("ferralk-worker".into())
+            .spawn_scoped(self.scope, move || {
+                let mut scratch = scratch;
+                run_worker_catching_panics(self, &mut scratch);
+                lock(self.shards).push(std::mem::take(&mut scratch.entries));
+            });
+        match spawn {
+            // The scope joins the helper, so the handle is not needed here.
+            Ok(_) => true,
+            Err(source) => {
+                self.shared.active_workers.fetch_sub(1, Ordering::AcqRel);
+                self.shared.record_startup_error(source);
+                false
+            }
+        }
+    }
 }
 
 fn finish(shared: Arc<Shared>, mut entries: Vec<WalkEntry>) -> Result<WalkResult, WalkError> {
@@ -118,6 +163,9 @@ struct Shared {
     walker: Arc<Walker>,
     scheduler: Scheduler<PathBuf>,
     pending: AtomicUsize,
+    /// Workers currently running, the caller included. Compared against the
+    /// pending count to decide whether another helper would find work.
+    active_workers: AtomicUsize,
     cancellation: super::CancellationToken,
     wake_lock: Mutex<()>,
     wake: Condvar,
@@ -135,6 +183,7 @@ impl Shared {
             walker,
             scheduler: Scheduler::new(),
             pending: AtomicUsize::new(0),
+            active_workers: AtomicUsize::new(1),
             cancellation,
             wake_lock: Mutex::new(()),
             wake: Condvar::new(),
@@ -246,12 +295,9 @@ impl WorkerScratch {
     }
 }
 
-fn run_worker_catching_panics(
-    shared: &Shared,
-    worker: &mut WorkerScratch,
-    stealers: &[Stealer<PathBuf>],
-) {
-    catch_worker_panic(shared, || run_worker(shared, worker, stealers));
+fn run_worker_catching_panics(pool: HelperPool<'_, '_>, worker: &mut WorkerScratch) {
+    catch_worker_panic(pool.shared, || run_worker(pool, worker));
+    pool.shared.active_workers.fetch_sub(1, Ordering::AcqRel);
 }
 
 fn catch_worker_panic(shared: &Shared, work: impl FnOnce()) {
@@ -260,12 +306,18 @@ fn catch_worker_panic(shared: &Shared, work: impl FnOnce()) {
     }
 }
 
-fn run_worker(shared: &Shared, worker: &mut WorkerScratch, stealers: &[Stealer<PathBuf>]) {
-    while let Some(directory) = next_task(shared, worker, stealers) {
+fn run_worker(pool: HelperPool<'_, '_>, worker: &mut WorkerScratch) {
+    let shared = pool.shared;
+    while let Some(directory) = next_task(shared, worker, pool.stealers) {
         let _task = TaskGuard::claim(shared);
         if !shared.should_stop() {
             process_directory(shared, worker, directory);
+            // The directory may have opened the tree up, so re-check whether
+            // the walk can use more of the configured thread budget.
+            pool.grow();
         }
+        #[cfg(test)]
+        join_worker_rendezvous(shared);
     }
 }
 
@@ -491,6 +543,80 @@ fn should_panic_in_directory(directory: &std::path::Path) -> bool {
     false
 }
 
+/// Barrier that holds every worker of one walk after it processed a directory
+/// until `expected` distinct threads have arrived. It turns "the walk really
+/// went wide" into a structural assertion: no worker can race ahead and finish
+/// the tree alone, so the observed width never depends on wall-clock timing.
+#[cfg(test)]
+struct WorkerRendezvous {
+    root: PathBuf,
+    expected: usize,
+    threads: HashSet<std::thread::ThreadId>,
+    released: bool,
+}
+
+#[cfg(test)]
+static WORKER_RENDEZVOUS: Mutex<Option<WorkerRendezvous>> = Mutex::new(None);
+
+#[cfg(test)]
+static WORKER_RENDEZVOUS_WAKE: Condvar = Condvar::new();
+
+/// Bounds the barrier so a walk that stays narrow fails the assertion instead
+/// of blocking the suite.
+#[cfg(test)]
+const WORKER_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+fn expect_worker_threads(root: PathBuf, expected: usize) {
+    *lock(&WORKER_RENDEZVOUS) = Some(WorkerRendezvous {
+        root,
+        expected,
+        threads: HashSet::new(),
+        released: false,
+    });
+}
+
+#[cfg(test)]
+fn observed_worker_threads() -> usize {
+    lock(&WORKER_RENDEZVOUS)
+        .take()
+        .map_or(0, |rendezvous| rendezvous.threads.len())
+}
+
+#[cfg(test)]
+fn join_worker_rendezvous(shared: &Shared) {
+    let mut state = lock(&WORKER_RENDEZVOUS);
+    match state.as_mut() {
+        Some(rendezvous) if rendezvous.root == shared.walker.root && !rendezvous.released => {
+            rendezvous.threads.insert(std::thread::current().id());
+        }
+        _ => return,
+    }
+    let deadline = std::time::Instant::now() + WORKER_RENDEZVOUS_TIMEOUT;
+    loop {
+        let Some(rendezvous) = state.as_mut() else {
+            return;
+        };
+        let waited_long_enough = std::time::Instant::now() >= deadline;
+        if rendezvous.released || rendezvous.threads.len() >= rendezvous.expected {
+            rendezvous.released = true;
+            WORKER_RENDEZVOUS_WAKE.notify_all();
+            return;
+        }
+        if waited_long_enough {
+            // The walk never widened. Release everyone so the test reports the
+            // observed width rather than hanging.
+            rendezvous.released = true;
+            WORKER_RENDEZVOUS_WAKE.notify_all();
+            return;
+        }
+        let (resumed, _) = WORKER_RENDEZVOUS_WAKE
+            .wait_timeout(state, CANCELLATION_POLL_INTERVAL)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state = resumed;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -507,9 +633,10 @@ mod tests {
     };
 
     use super::{
-        Shared, Walker, catch_worker_panic, fail_next_worker_spawn, finish, panic_in_directory,
+        Shared, Walker, catch_worker_panic, expect_worker_threads, fail_next_worker_spawn, finish,
+        observed_worker_threads, panic_in_directory,
     };
-    use crate::CancellationToken;
+    use crate::{CancellationToken, WalkOptions, WalkResult};
 
     /// A hung `collect()` is the regression under test, so the assertion has to
     /// time out instead of blocking the suite forever.
@@ -555,6 +682,44 @@ mod tests {
         catch_worker_panic(&shared, || panic!("injected worker panic"));
         assert!(cancellation.is_cancelled());
         assert!(catch_unwind(AssertUnwindSafe(|| finish(shared, Vec::new()))).is_err());
+    }
+
+    fn walked_paths(result: &WalkResult) -> Vec<PathBuf> {
+        result
+            .entries()
+            .iter()
+            .map(|entry| entry.path().to_path_buf())
+            .collect()
+    }
+
+    #[test]
+    fn a_single_root_subdirectory_still_uses_the_configured_threads() {
+        let root = unique_root("single-subtree");
+        // The root has exactly one traversable child, so the root fan-out that
+        // used to size the helper pool is one and the walk stayed serial.
+        create_wide_fixture(&root.join("only"));
+
+        let serial = Walker::new(&root)
+            .threads(1)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("serial walk succeeds");
+
+        expect_worker_threads(root.clone(), 4);
+        let parallel = Walker::new(&root)
+            .threads(4)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("parallel walk succeeds");
+        let observed = observed_worker_threads();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            observed, 4,
+            "a subtree below a single root child must still use the thread budget"
+        );
+        assert_eq!(walked_paths(&parallel), walked_paths(&serial));
+        assert!(parallel.errors().is_empty());
     }
 
     #[test]
