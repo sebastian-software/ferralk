@@ -323,13 +323,15 @@ mod loom_models {
     #[test]
     fn a_panicking_worker_releases_its_task() {
         static EXECUTIONS: AtomicUsize = AtomicUsize::new(0);
-        // The injected panic is expected, so its default report is filtered out
-        // instead of printing once per explored execution. Loom's own failures
-        // still reach the previous hook.
-        let previous = std::panic::take_hook();
+        // The injected panic is expected, so its report is filtered out instead
+        // of printing once per explored execution. Everything else, loom's own
+        // failures included, still reaches the hook that was installed before,
+        // which is put back once the model is done.
+        let previous = std::sync::Arc::new(std::panic::take_hook());
+        let filtered = std::sync::Arc::clone(&previous);
         std::panic::set_hook(Box::new(move |info| {
             if !info.to_string().contains("injected task panic") {
-                previous(info);
+                filtered(info);
             }
         }));
 
@@ -362,6 +364,7 @@ mod loom_models {
         });
 
         let _ = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| previous(info)));
         report("a_panicking_worker_releases_its_task", &EXECUTIONS);
     }
 
