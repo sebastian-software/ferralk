@@ -201,6 +201,13 @@ specific action needed to clear each one are consolidated in
   oracle. The dedicated Criterion row measures the six-path component filter
   at about 174 ns locally; external CodSpeed confirmation remains part of the
   open M1 benchmark gate.
+- Extended the recursive `literal/**/star+suffix` IR to ASCII case-folded
+  patterns, using the same byte comparison as the general matcher for its
+  prefix and suffix. Generated candidates and explicit uppercase paths remain
+  equivalent to the general matcher; dedicated matching/non-matching Criterion
+  rows cover the newly compiled form. The local ten-sample medians are about
+  13.23 ns matching and 2.96 ns non-matching; external CodSpeed remains the
+  release evidence.
 
 ### 2026-08-18 — M0 foundation established
 

@@ -796,9 +796,6 @@ impl FastPath {
                 prefix: prefix.clone(),
             });
         }
-        if options.case_insensitive {
-            return None;
-        }
         let [
             Token::Literal(prefix),
             Token::Separator,
@@ -977,17 +974,28 @@ impl FastPath {
                 suffix,
                 suffix_last,
             } => {
-                if path.last() != Some(suffix_last) {
+                let Some(&path_last) = path.last() else {
+                    return false;
+                };
+                if !bytes_equal(*suffix_last, path_last, options.case_insensitive) {
                     return false;
                 }
                 let Some(suffix_start) = path.len().checked_sub(suffix.len()) else {
                     return false;
                 };
-                if path[suffix_start..path.len() - 1] != suffix[..suffix.len() - 1] {
+                if !suffix
+                    .iter()
+                    .zip(&path[suffix_start..])
+                    .all(|(&expected, &actual)| {
+                        bytes_equal(expected, actual, options.case_insensitive)
+                    })
+                {
                     return false;
                 }
                 let prefix_and_variable = &path[..suffix_start];
-                let Some(variable) = prefix_and_variable.strip_prefix(prefix.as_slice()) else {
+                let Some(variable) =
+                    strip_literal_prefix(prefix_and_variable, prefix, options.case_insensitive)
+                else {
                     return false;
                 };
                 let variable_start = prefix.len();
@@ -1943,8 +1951,10 @@ mod tests {
 
     #[test]
     fn recursive_prefix_suffix_fast_path_matches_the_general_matcher() {
-        let options = PatternOptions::default().recursive_double_star(true);
-        let fast = Pattern::compile("src/**/*.rs", options).expect("pattern compiles");
+        let options = PatternOptions::default()
+            .recursive_double_star(true)
+            .case_insensitive(true);
+        let fast = Pattern::compile("Src/**/*.RS", options).expect("pattern compiles");
         assert!(matches!(
             fast.alternatives[0].fast_path,
             Some(FastPath::RecursivePrefixSuffix { .. })
@@ -1963,6 +1973,7 @@ mod tests {
             b"src/visible.rs".to_vec(),
             b"src/nested/.hidden.rs".to_vec(),
             b"src/nested/visible.rs".to_vec(),
+            b"SRC/NESTED/VISIBLE.RS".to_vec(),
             b"other/visible.rs".to_vec(),
         ];
         candidates.extend(

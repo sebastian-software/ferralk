@@ -52,6 +52,25 @@ fn matcher(c: &mut Criterion) {
     c.bench_function("common/ferralk_compiled/non_matching", |benchmark| {
         benchmark.iter(|| black_box(ferralk.is_match(black_box(common_non_matching))))
     });
+    let common_casefold = Pattern::compile(
+        "Src/**/*.RS",
+        PatternOptions::default()
+            .recursive_double_star(true)
+            .case_insensitive(true),
+    )
+    .expect("case-folded common pattern is valid");
+    c.bench_function(
+        "recursive_casefold/ferralk_compiled/matching",
+        |benchmark| {
+            benchmark.iter(|| black_box(common_casefold.is_match(black_box("src/deep/main.rs"))))
+        },
+    );
+    c.bench_function(
+        "recursive_casefold/ferralk_compiled/non_matching",
+        |benchmark| {
+            benchmark.iter(|| black_box(common_casefold.is_match(black_box("src/deep/main.txt"))))
+        },
+    );
 
     let literal = Pattern::compile("src/deep/nested/main.rs", PatternOptions::default())
         .expect("literal benchmark pattern is valid");
