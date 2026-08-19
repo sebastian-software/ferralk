@@ -26,6 +26,15 @@ jobs:
       - run: cargo test -p corpus -p harness -p bench
       - run: cargo run -p harness -- corpus
 
+  macos-native:
+    name: macOS native backend
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p ferralk --features native-macos
+      - run: cargo check --manifest-path fuzz/Cargo.toml --bin macos_dirent_parser --locked
+
   msrv:
     name: msrv (1.93)
     runs-on: ubuntu-latest

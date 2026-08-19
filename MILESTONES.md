@@ -131,7 +131,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
       portable fallback (SMB/FUSE)
 - [x] Bounds-checked record parsing with module-level invariants
 - [x] Fuzz the record decoder
-- [ ] Differential tests portable vs native; sanitizers in CI
+- [x] Serial native/portable Walker differential fixture
+- [ ] Broaden native/portable differential corpus; execute sanitizers in CI
 - [ ] Benchmark gate on macOS
 
 ### Linux (second)
@@ -168,6 +169,12 @@ specific action needed to clear each one are consolidated in
   no-syscall fuzz hook covers both Darwin binary record formats. The local
   ten-sample serial median was about 1.35 ms; this is a local observation only,
   so the macOS differential/sanitizer and benchmark gates remain open.
+- Added a native/portable serial Walker differential fixture covering recursive
+  filtering, exclusions, Gitignore, hidden paths, entry metadata, and a
+  directory symlink. The normal macOS CI job now enables `native-macos`; the
+  manual native-fuzz workflow additionally declares an AddressSanitizer test
+  job. Neither remote CI job has been dispatched from this workspace, so the
+  broader native parity/sanitizer gate remains open.
 
 ### 2026-08-18 — M0 foundation established
 
