@@ -1867,7 +1867,10 @@ fn flush_literals(tokens: &mut Vec<Token>, literals: &mut Vec<u8>) {
 ///
 /// # Errors
 ///
-/// Reports what [`Pattern::compile`] reports for the same pattern and options.
+/// Reports what the expansion itself rejects, so that a caller never has to
+/// assume it succeeds. Glob syntax is not checked here: an unclosed brace is
+/// ordinary text, the way [`Pattern::compile`] treats it, and anything else
+/// malformed is reported when the alternative it belongs to is compiled.
 pub fn expand_braces(
     pattern: impl AsRef<[u8]>,
     options: PatternOptions,
