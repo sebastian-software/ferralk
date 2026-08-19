@@ -116,6 +116,13 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+The minimum supported Rust version is written down once, as `rust-version`
+under `[workspace.package]` in the root `Cargo.toml`; the CI MSRV job reads
+that field instead of pinning a version of its own. Per
+[ADR-0004](adr/0004-msrv-stable-minus-two.md) the MSRV tracks current stable
+minus two releases, so when a new stable lands, bumping it is one edit to that
+field plus a changelog entry — no workflow change.
+
 The checked-in JSONL corpus is the behavioural source of truth. Read
 [corpus-format.md](corpus-format.md) before adding a case. Fuzz targets live in
 [`fuzz/`](../fuzz/README.md); benchmark evidence and other deferred follow-up

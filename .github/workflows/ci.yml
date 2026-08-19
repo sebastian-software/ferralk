@@ -4,6 +4,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    # Surface new RustSec advisories in quiet phases. Only the audit job runs
+    # on this trigger; every other job is guarded below.
+    - cron: "0 6 * * 1"
 
 permissions:
   contents: read
@@ -12,8 +16,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lint:
+    name: format and lints
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # The oracle adapter links the pinned zlob build, so linting the whole
+      # workspace needs the same Zig toolchain the coverage job installs.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
   test:
     name: test (${{ matrix.os }})
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -22,36 +45,61 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test
       - run: cargo test -p corpus -p harness -p bench
       - run: cargo run -p harness -- corpus
 
   macos-native:
     name: macOS native backend
+    if: github.event_name != 'schedule'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test -p ferralk --features native-macos
       - run: cargo check --manifest-path fuzz/Cargo.toml --bin macos_dirent_parser --locked
 
   linux-native:
     name: Linux native backend
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test -p ferralk --features native-linux
       - run: cargo check --manifest-path fuzz/Cargo.toml --bin linux_dirent_parser --locked
 
   msrv:
-    name: msrv (1.93)
+    name: msrv (workspace rust-version)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.93
-      - run: cargo check
-      - run: cargo check -p corpus -p harness -p bench
+      # ADR-0004 keeps the MSRV at current stable minus two releases. The
+      # workspace manifest is the single place it is written down.
+      - name: Read the MSRV from the workspace manifest
+        id: msrv
+        run: |
+          version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Workspace MSRV is $version"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      # Benches and tests are checked too, so a bench-only MSRV regression
+      # cannot hide. The oracle adapter is excluded: it builds zlob from Zig
+      # sources, is never published, and the oracle workflow covers it.
+      - run: cargo check --workspace --exclude oracle --all-targets --locked
+      - name: Check the native backend features that build on this runner
+        run: >-
+          cargo check -p ferralk -p bench
+          --features ferralk/native-linux,bench/native-linux
+          --all-targets --locked
 
   semver:
     name: public API compatibility
@@ -73,7 +121,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install cargo-audit --locked
+      - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
       - name: Forbid unsafe Rust outside native backend modules
         run: |
@@ -84,6 +132,7 @@ jobs:
 
   coverage:
     name: coverage
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -91,6 +140,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v7
