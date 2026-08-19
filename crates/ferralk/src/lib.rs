@@ -1774,6 +1774,69 @@ mod tests {
     }
 
     #[test]
+    fn source_walk_allowlist_gitignore_descends_into_reincluded_directories() {
+        // Ported from zlob/test/test_walk.zig's allowlist Gitignore regression.
+        let fixture = Fixture::new();
+        for path in [
+            "main.rs",
+            "Makefile",
+            ".keep",
+            "src/lib.rs",
+            "src/noext",
+            "src/deep/a.txt",
+            "dir.d/x.md",
+            "dir.d/noext",
+            "plain/y.txt",
+            ".git/config",
+        ] {
+            fixture.write(path);
+        }
+        fs::write(
+            fixture.root.join(".gitignore"),
+            b"# Ignore all\n*\n\n# Unignore all with extensions\n!*.*\n\n# Unignore all dirs\n!/**/\n",
+        )
+        .expect("write root gitignore");
+
+        let expected = vec![
+            PathBuf::from(".gitignore"),
+            PathBuf::from(".keep"),
+            PathBuf::from("dir.d"),
+            PathBuf::from("dir.d/x.md"),
+            PathBuf::from("main.rs"),
+            PathBuf::from("plain"),
+            PathBuf::from("plain/y.txt"),
+            PathBuf::from("src"),
+            PathBuf::from("src/deep"),
+            PathBuf::from("src/deep/a.txt"),
+            PathBuf::from("src/lib.rs"),
+        ];
+        let options = WalkOptions::default().sort(true);
+        let serial = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .threads(1)
+            .options(options)
+            .collect()
+            .expect("serial Gitignore walk succeeds");
+        let parallel = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .threads(4)
+            .options(options)
+            .collect()
+            .expect("parallel Gitignore walk succeeds");
+        let mut streamed = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .options(options)
+            .stream()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream Gitignore walk succeeds");
+        streamed.sort_by(|left, right| left.path().cmp(right.path()));
+
+        assert_eq!(relative_paths(serial.entries(), &fixture.root), expected);
+        assert_eq!(relative_paths(parallel.entries(), &fixture.root), expected);
+        assert_eq!(relative_paths(&streamed, &fixture.root), expected);
+    }
+
+    #[test]
     fn gitignore_nodes_share_their_immutable_parent_chain() {
         let fixture = Fixture::new();
         let walker = Walker::new(&fixture.root).respect_git_ignore(true);
