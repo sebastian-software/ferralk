@@ -1844,23 +1844,67 @@ fn flush_literals(tokens: &mut Vec<Token>, literals: &mut Vec<u8>) {
     }
 }
 
+/// Alternatives one pattern may expand to before it is rejected.
+///
+/// Brace groups multiply, so expansion is exponential in the number of groups:
+/// ten nine-way groups fit in 100 bytes and ask for 3.5 billion alternatives.
+/// Neither zlob 1.6.3 nor glibc `GLOB_BRACE` bounds this, so a pattern that
+/// small takes them minutes or kills them; ferralk rejects it instead, which is
+/// a deliberate difference recorded in the compatibility guide.
+///
+/// The limit is the fuzz harness's long-standing cap. It is far past any real
+/// pattern — a language's extension list is a handful of alternatives — and
+/// every alternative is a token program [`Pattern::is_match`] tries in turn, so
+/// a pattern needing more is a matching problem even where it fits in memory.
+const MAX_BRACE_ALTERNATIVES: usize = 1 << 12;
+
+/// Expands brace groups into one pattern per combination.
+///
+/// The work list replaces recursion, which used to be one frame per brace group
+/// and overflowed the stack on a pattern of many small groups. Popping from the
+/// back with the alternatives pushed in reverse keeps the original order: every
+/// combination of the first group is emitted before the second group's.
+///
+/// `expanded.len() + pending.len()` only ever grows and every pending entry
+/// yields at least one alternative, so it is a running lower bound on the final
+/// count. Checking it before each push therefore rejects exactly the patterns
+/// whose expansion would pass [`MAX_BRACE_ALTERNATIVES`], and bounds the work
+/// and the memory rather than only the result.
 fn expand_braces(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8>>, PatternError> {
-    let Some(open) = first_unescaped_brace(pattern, escapes) else {
-        return Ok(vec![pattern.to_vec()]);
-    };
-    let Some(close) = matching_brace(pattern, open, escapes) else {
-        // zlob treats an unmatched brace as ordinary text.
+    let Some(first_open) = first_unescaped_brace(pattern, escapes) else {
         return Ok(vec![pattern.to_vec()]);
     };
 
-    let alternatives = split_brace_alternatives(&pattern[open + 1..close], escapes);
-    let mut expanded = Vec::new();
-    for alternative in alternatives {
-        let mut combined = Vec::with_capacity(open + alternative.len() + pattern.len() - close - 1);
-        combined.extend_from_slice(&pattern[..open]);
-        combined.extend_from_slice(alternative);
-        combined.extend_from_slice(&pattern[close + 1..]);
-        expanded.extend(expand_braces(&combined, escapes)?);
+    let mut expanded: Vec<Vec<u8>> = Vec::new();
+    let mut pending: Vec<Vec<u8>> = vec![pattern.to_vec()];
+    while let Some(current) = pending.pop() {
+        let Some(open) = first_unescaped_brace(&current, escapes) else {
+            expanded.push(current);
+            continue;
+        };
+        let Some(close) = matching_brace(&current, open, escapes) else {
+            // zlob treats an unmatched brace as ordinary text.
+            expanded.push(current);
+            continue;
+        };
+
+        let alternatives = split_brace_alternatives(&current[open + 1..close], escapes);
+        for alternative in alternatives.iter().rev() {
+            if expanded.len() + pending.len() >= MAX_BRACE_ALTERNATIVES {
+                return Err(PatternError {
+                    // Offsets into a partly expanded pattern would not point
+                    // into the caller's, so report where its expansion starts.
+                    offset: first_open,
+                    message: "too many brace alternatives",
+                });
+            }
+            let mut combined =
+                Vec::with_capacity(open + alternative.len() + current.len() - close - 1);
+            combined.extend_from_slice(&current[..open]);
+            combined.extend_from_slice(alternative);
+            combined.extend_from_slice(&current[close + 1..]);
+            pending.push(combined);
+        }
     }
     Ok(expanded)
 }
@@ -2550,6 +2594,66 @@ mod tests {
                 .unwrap()
                 .is_match("test_suffix.txt")
         );
+    }
+
+    #[test]
+    fn brace_expansion_keeps_its_order() {
+        // The work list must emit combinations in the order the recursive
+        // expansion did: every choice of the first group before the second's.
+        assert_eq!(
+            super::expand_braces(b"{a,b}{c,d}", true).unwrap(),
+            vec![
+                b"ac".to_vec(),
+                b"ad".to_vec(),
+                b"bc".to_vec(),
+                b"bd".to_vec()
+            ]
+        );
+        assert_eq!(
+            super::expand_braces(b"{x,{y,z}}!", true).unwrap(),
+            vec![b"x!".to_vec(), b"y!".to_vec(), b"z!".to_vec()]
+        );
+    }
+
+    #[test]
+    fn brace_expansion_stops_at_the_alternative_budget() {
+        let options = PatternOptions::default().braces(true);
+        // Two-way groups make the boundary exact: 2^12 is the budget.
+        let within = "{a,b}".repeat(12);
+        assert_eq!(
+            super::expand_braces(within.as_bytes(), true).unwrap().len(),
+            super::MAX_BRACE_ALTERNATIVES
+        );
+        assert!(Pattern::compile(&within, options).is_ok());
+
+        let beyond = "{a,b}".repeat(13);
+        let error = Pattern::compile(&beyond, options).unwrap_err();
+        assert_eq!(error.message(), "too many brace alternatives");
+        assert_eq!(error.offset(), 0);
+
+        // The reproductions from the issue: 9^5 and 9^10 alternatives.
+        for groups in [5, 10] {
+            let pattern = "{,,,,,,,,}".repeat(groups);
+            let error = Pattern::compile(&pattern, options).unwrap_err();
+            assert_eq!(error.message(), "too many brace alternatives");
+        }
+
+        // The offset locates the expansion, not the start of the pattern.
+        let error = Pattern::compile(format!("src/{beyond}"), options).unwrap_err();
+        assert_eq!(error.offset(), 4);
+
+        // Without brace expansion the same pattern is ordinary text.
+        assert!(Pattern::compile(&beyond, PatternOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn brace_expansion_survives_many_small_groups() {
+        // One alternative per group keeps the count at 1 however deep it goes,
+        // so only the expansion's own recursion used to fail here.
+        let options = PatternOptions::default().braces(true);
+        let pattern = "{a}".repeat(20_000);
+        let compiled = Pattern::compile(&pattern, options).unwrap();
+        assert!(compiled.is_match("a".repeat(20_000)));
     }
 
     #[test]

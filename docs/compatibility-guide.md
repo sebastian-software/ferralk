@@ -110,6 +110,18 @@ Ordinary wildcards never cross a path-component boundary there; use recursive
   inside classes and reads the backslash as an ordinary range endpoint. The
   diverging verdicts are recorded as `disputed` corpus cases with
   `oracle_expected` (`class-006/008/009/012/016/024/025`, issue #16).
+- Brace expansion is budgeted. A pattern that would expand to more than 4096
+  alternatives is rejected with `too many brace alternatives` at the offset of
+  the brace group that starts the expansion. Brace groups multiply, so ten
+  nine-way groups fit in 100 bytes and ask for 3.5 billion alternatives; neither
+  reference bounds this. Measured on the pattern from issue #42: zlob 1.6.3
+  needs 18 s already at eight groups (80 bytes) and extrapolates to about 25
+  minutes at ten, and glibc `GLOB_BRACE` takes 64 s at ten. Both abort on
+  `{a}` repeated 50,000 times, where the expansion is a single alternative but
+  the recursion is 50,000 deep. Ferralk rejects the first shape and expands the
+  second iteratively. The boundary is recorded as `compile_error` corpus cases
+  (`error-brace-budget-*`, issue #42), which the zlob adapter skips because the
+  oracle has no error to compare against.
 
 ## Defaults to review
 

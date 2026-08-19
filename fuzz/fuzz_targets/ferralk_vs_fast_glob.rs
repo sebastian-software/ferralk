@@ -16,25 +16,23 @@ use corpus::{Case, Source, encode_bytes};
 use ferralk_glob::{Pattern, PatternOptions};
 use libfuzzer_sys::fuzz_target;
 
-#[path = "brace_budget.rs"]
-mod brace_budget;
-
 fuzz_target!(|data: &[u8]| {
     let (pattern, path) = split_input(data);
     if !in_shared_subset(pattern) {
         return;
     }
-    // This target always enables braces, whose expansion has no budget in the
-    // matcher; see brace_budget.
-    if !brace_budget::within_budget(pattern) {
-        return;
-    }
     // fast-glob rejects patterns ferralk accepts and the reverse; comparing a
     // verdict either engine declines to produce would compare error models,
-    // not matching.
+    // not matching. `validate` is a parse and stays cheap on every input.
     if fast_glob::validate(pattern).is_err() {
         return;
     }
+    // Compiling before `glob_match` is what keeps this target fast: fast-glob
+    // backtracks over brace alternatives instead of expanding them, and spends
+    // 42 s on the ten-group pattern from issue #42. ferralk's expansion budget
+    // rejects that pattern here, so only patterns inside the budget — measured
+    // at microseconds in fast-glob — ever reach the comparison. Raising
+    // `MAX_BRACE_ALTERNATIVES` would need this checked again.
     let Ok(compiled) = Pattern::compile(pattern, options()) else {
         return;
     };
@@ -50,6 +48,15 @@ fuzz_target!(|data: &[u8]| {
         corpus_candidate(pattern, path, ours, reference)
     );
 });
+
+/// Brace groups fast-glob answers correctly for.
+///
+/// Past ten it returns `false` for a pattern that matches, whatever the
+/// alternative count and whichever combination the candidate takes: eleven
+/// two-way groups miss even their first one. A single group of two thousand
+/// alternatives is fine, so the cap counts groups rather than combinations.
+/// Measured against fast-glob 1.1.0; see `docs/fast-glob-reference.md`.
+const FAST_GLOB_MAX_BRACE_GROUPS: usize = 10;
 
 /// The options that make ferralk speak fast-glob's dialect.
 ///
@@ -87,6 +94,7 @@ fn in_shared_subset(pattern: &[u8]) -> bool {
     }
     let mut index = 0;
     let mut brace_depth = 0_usize;
+    let mut brace_groups = 0_usize;
     while index < pattern.len() {
         match pattern[index] {
             b'\\' => {
@@ -114,6 +122,12 @@ fn in_shared_subset(pattern: &[u8]) -> bool {
                         // ground.
                         brace_depth += 1;
                         if brace_depth > 1 {
+                            return false;
+                        }
+                        // It also caps how many groups a pattern may have at
+                        // all, and answers `false` rather than erring past it.
+                        brace_groups += 1;
+                        if brace_groups > FAST_GLOB_MAX_BRACE_GROUPS {
                             return false;
                         }
                     }
