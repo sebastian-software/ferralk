@@ -722,6 +722,11 @@ impl Pattern {
     ) -> Option<usize> {
         let literal = work.skip_literal;
         let scans = work.scans(token_index);
+        if scans.stalled >= STALLED_SKIPS {
+            let &byte = path.get(path_index)?;
+            return star_consumes_byte(path, path_index, byte, options, recursive)
+                .then_some(path_index + 1);
+        }
         if let Some(cached) = scans.skip.get(path_index) {
             return cached;
         }
@@ -736,7 +741,14 @@ impl Pattern {
             // The occurrence is out of reach, and stays out of reach for every
             // position up to the barrier.
             Some(found) if found > barrier => scans.skip.record(path_index, barrier, None),
-            Some(found) => scans.skip.record(path_index, found - 1, Some(found)),
+            Some(found) => {
+                scans.stalled = if found == start {
+                    scans.stalled.saturating_add(1)
+                } else {
+                    0
+                };
+                scans.skip.record(path_index, found - 1, Some(found))
+            }
         }
     }
 }
@@ -892,7 +904,19 @@ struct StarScans {
     separator: FirstAtOrAfter,
     component_dot: FirstAtOrAfter,
     literal: FirstAtOrAfter,
+    /// Consecutive jumps that landed on the very next byte; see
+    /// [`STALLED_SKIPS`].
+    stalled: u8,
 }
+
+/// How many single-byte jumps in a row turn skipping off for a token.
+///
+/// A candidate dense in the literal — `a*a*a*b` over a run of `a`s — has an
+/// occurrence at every position, so the search finds only the next byte and the
+/// scan is pure overhead on top of the step it replaces. Falling back to the
+/// byte-wise walk there costs nothing in correctness: both answers name the
+/// same state, and the walk is what the visited matrix shares anyway.
+const STALLED_SKIPS: u8 = 4;
 
 /// Cached resume decision for one star token, valid for `from..=upto`.
 ///
