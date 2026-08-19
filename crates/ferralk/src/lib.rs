@@ -2237,6 +2237,23 @@ mod tests {
         assert!(partial_extension.matches_extension(b"src/app.js"));
     }
 
+    /// The planner expands before it compiles, so a pattern the expansion
+    /// itself rejects has to reach the caller as that rejection.
+    #[test]
+    fn an_unexpandable_include_is_reported_as_a_pattern_error() {
+        let beyond = "{a,b}".repeat(13);
+        let error = Walker::new(".")
+            .include(&beyond)
+            .expect_err("the expansion budget rejects this pattern");
+        assert_eq!(error.message(), "too many brace alternatives");
+        assert_eq!(
+            error.offset(),
+            ferralk_glob::Pattern::compile(&beyond, super::traversal_pattern_options())
+                .expect_err("the matcher rejects it the same way")
+                .offset()
+        );
+    }
+
     /// A braced include may return exactly what its alternatives return
     /// together: the prefilters must not narrow that, and must not widen it.
     #[test]

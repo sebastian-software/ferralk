@@ -3,15 +3,11 @@
 use ferralk_glob::{Pattern, PatternOptions};
 use libfuzzer_sys::fuzz_target;
 
-#[path = "brace_budget.rs"]
-mod brace_budget;
-
 fuzz_target!(|data: &[u8]| {
+    // Brace expansion is budgeted in the matcher now, so an over-budget
+    // pattern is a `PatternError` this target is meant to reach rather than an
+    // out-of-memory that hides every other finding.
     let bits = data.first().copied().unwrap_or_default();
-    // Brace expansion has no budget in the matcher; see brace_budget.
-    if bits & 1 != 0 && !brace_budget::within_budget(data) {
-        return;
-    }
     let _ = Pattern::compile(data, options_from(bits));
 });
 
