@@ -25,5 +25,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --locked
-      - run: cargo fuzz run ${{ inputs.target }} -- -max_total_time=${{ inputs.max_total_time }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # cargo-fuzz defaults to the target it was itself built for, and the
+      # prebuilt binary is musl, where the sanitizer cannot link against a
+      # static libc. Name this runner's host target instead.
+      - run: >-
+          cargo fuzz run --target x86_64-unknown-linux-gnu ${{ inputs.target }}
+          -- -max_total_time=${{ inputs.max_total_time }}

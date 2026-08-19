@@ -1610,18 +1610,18 @@ fn match_extglob_from(
                     continue;
                 }
                 b'[' => {
-                    if let Ok((class, next)) = parse_class(pattern, pattern_index, options.escape) {
-                        if path.get(path_index).is_some_and(|&byte| {
+                    if let Ok((class, next)) = parse_class(pattern, pattern_index, options.escape)
+                        && path.get(path_index).is_some_and(|&byte| {
                             (!options.component_wildcards || !is_separator(byte))
                                 && (options.match_hidden
                                     || byte != b'.'
                                     || !at_component_start(path, path_index))
                                 && class.matches(byte, options.case_insensitive)
-                        }) {
-                            pattern_index = next;
-                            path_index += 1;
-                            continue;
-                        }
+                        })
+                    {
+                        pattern_index = next;
+                        path_index += 1;
+                        continue;
                     }
                 }
                 b'\\'
