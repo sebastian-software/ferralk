@@ -200,6 +200,40 @@ fn matcher(c: &mut Criterion) {
         benchmark.iter(|| black_box(general_literal_skip.is_match(black_box(walker_other))))
     });
 
+    // Issue #15's measurement: two spellings of the same anchored alternation.
+    // The extglob form is the one that used to interpret pattern bytes per
+    // match, so the pair is kept side by side to keep the gap honest.
+    let alternation_options = PatternOptions::default()
+        .recursive_double_star(true)
+        .extglob(true)
+        .braces(true);
+    let alternation_extglob = Pattern::compile("@(foo|bar)/**/*.ts", alternation_options)
+        .expect("extglob alternation benchmark pattern is valid");
+    let alternation_braces = Pattern::compile("{foo,bar}/**/*.ts", alternation_options)
+        .expect("brace alternation benchmark pattern is valid");
+    let alternation_path = "foo/src/deep/nested/dir1/file1.ts";
+    let alternation_other = "baz/src/deep/nested/dir1/file1.ts";
+    c.bench_function("alternation/extglob/matching", |benchmark| {
+        benchmark.iter(|| black_box(alternation_extglob.is_match(black_box(alternation_path))))
+    });
+    c.bench_function("alternation/extglob/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(alternation_extglob.is_match(black_box(alternation_other))))
+    });
+    c.bench_function("alternation/braces/matching", |benchmark| {
+        benchmark.iter(|| black_box(alternation_braces.is_match(black_box(alternation_path))))
+    });
+    c.bench_function("alternation/braces/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(alternation_braces.is_match(black_box(alternation_other))))
+    });
+    // The walker compiles every traversal pattern with extglob enabled, so a
+    // pattern without extglob syntax used to pay a scan per entry too.
+    let extglob_free = Pattern::compile("src/**/*.ts", alternation_options)
+        .expect("extglob-free benchmark pattern is valid");
+    c.bench_function("alternation/extglob_enabled_but_unused", |benchmark| {
+        benchmark
+            .iter(|| black_box(extglob_free.is_match(black_box("src/deep/nested/dir1/file1.ts"))))
+    });
+
     let suffix_star = Pattern::compile("*.rs", PatternOptions::default())
         .expect("suffix-star benchmark pattern is valid");
     c.bench_function("single_star/ferralk_compiled/matching", |benchmark| {

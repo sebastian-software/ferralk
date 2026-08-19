@@ -13,7 +13,7 @@
 //! `test/test_fnmatch.zig`. Deliberate differences live in
 //! the checked-in corpus and compatibility matrix.
 
-use std::{cell::RefCell, collections::HashSet, error::Error, fmt};
+use std::{cell::RefCell, error::Error, fmt, ops::RangeInclusive};
 
 use memchr::{memchr, memchr2, memchr3, memmem};
 
@@ -233,6 +233,7 @@ impl Pattern {
 
         Ok(Self::from_alternatives(
             vec![CompiledAlternative {
+                extglob: compile_extglob(pattern, options),
                 raw: pattern.to_vec(),
                 fast_path: FastPath::compile(&tokens, options),
                 tokens,
@@ -259,18 +260,23 @@ impl Pattern {
         {
             return fast_path.is_match(path, self.options);
         }
-        self.is_match_with(&self.alternatives, self.options, path)
+        Self::match_alternatives(&self.alternatives, self.options, path)
     }
 
-    fn is_match_with(
-        &self,
+    /// Matches `path` against any of `alternatives` under `options`.
+    ///
+    /// Free of `self` so a compiled extglob alternative can be run through the
+    /// same routing without owning a `Pattern`.
+    fn match_alternatives(
         alternatives: &[CompiledAlternative],
         options: PatternOptions,
         path: &[u8],
     ) -> bool {
         alternatives.iter().any(|alternative| {
-            if options.extglob && contains_extglob(&alternative.raw, options.escape) {
-                match_extglob(&alternative.raw, path, options)
+            if options.extglob
+                && let Some(program) = &alternative.extglob
+            {
+                match_extglob_program(program, path, options)
             } else if let Some(fast_path) = &alternative.fast_path
                 && (!options.component_wildcards
                     || matches!(
@@ -382,7 +388,7 @@ impl Pattern {
             root_component_wildcards: true,
             ..self.options
         };
-        self.is_match_with(&self.alternatives, options, path.as_ref())
+        Self::match_alternatives(&self.alternatives, options, path.as_ref())
     }
 
     /// Returns the input paths accepted relative to `base_path`, preserving
@@ -452,7 +458,7 @@ impl Pattern {
             component_wildcards: true,
             ..self.options
         };
-        self.is_match_with(alternatives, options, path)
+        Self::match_alternatives(alternatives, options, path)
     }
 
     fn from_alternatives(alternatives: Vec<CompiledAlternative>, options: PatternOptions) -> Self {
@@ -509,6 +515,7 @@ impl Pattern {
             },
         );
         CompiledAlternative {
+            extglob: compile_extglob(&raw, options),
             raw,
             fast_path,
             tokens,
@@ -1200,6 +1207,10 @@ struct CompiledAlternative {
     raw: Vec<u8>,
     fast_path: Option<FastPath>,
     tokens: Vec<Token>,
+    /// The compiled extglob program, present exactly when this alternative
+    /// carries extglob syntax and the option is on. Matching borrows it; the
+    /// interpreter used to re-derive all of it from `raw` on every call.
+    extglob: Option<CompiledExtglob>,
 }
 
 /// An allocation-free matcher for a common recursive-prefix/suffix shape.
@@ -2042,6 +2053,194 @@ enum ExtglobKind {
     Negated,
 }
 
+/// A compiled extglob pattern.
+///
+/// One step per byte offset of the raw pattern. The interpreter this replaces
+/// jumped by byte offset — into a group's rest, back to the last star, past a
+/// class — so keeping offsets as the addressing scheme reproduces its control
+/// flow exactly, while every parse it redid on each call happens once here.
+///
+/// Steps are filled only for offsets a walk can reach: a group jumps past its
+/// own content, whose alternatives are compiled separately. An unreachable
+/// offset keeps [`ExtglobStep::NoMatch`], so nothing depends on the interior
+/// of a group being classifiable on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompiledExtglob {
+    steps: Vec<ExtglobStep>,
+    groups: Vec<ExtglobGroup>,
+}
+
+/// What the walk does at one byte offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExtglobStep {
+    /// Nothing matches here; the walk falls back to its last star. Also the
+    /// filler for an offset no walk reaches.
+    NoMatch,
+    /// A run of `*`, resuming at the offset after it.
+    Star { next: usize },
+    /// `?`.
+    Any,
+    /// A bracket class, resuming at the offset after it.
+    Class { class: Class, next: usize },
+    /// A backslash with a byte to escape. The escaped byte matches and skips
+    /// both offsets; a literal backslash matches and skips only this one,
+    /// which leaves the walk on the escaped byte as ordinary text.
+    Escape { escaped: u8 },
+    /// An ordinary byte.
+    Byte(u8),
+    /// An extglob group, indexing [`CompiledExtglob::groups`].
+    Group(usize),
+    /// A group opener whose parenthesis never closes. It still refuses a
+    /// leading period, then reads `byte` as ordinary text.
+    UnclosedGroup { byte: u8 },
+}
+
+/// One alternative of a group, compiled as a whole-candidate pattern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtglobAlternative {
+    /// `None` is an alternative whose syntax does not compile, which matched
+    /// nothing before either.
+    compiled: Option<Vec<CompiledAlternative>>,
+    /// Byte width when every token consumes a fixed count, which lets the scan
+    /// over candidate end offsets visit one offset instead of the component.
+    width: Option<usize>,
+}
+
+/// One `?(…)`, `*(…)`, `+(…)`, `@(…)` or `!(…)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtglobGroup {
+    kind: ExtglobKind,
+    alternatives: Vec<ExtglobAlternative>,
+    /// Offset just past the closing parenthesis.
+    rest: usize,
+}
+
+/// Compiles the extglob program for `pattern`, or `None` when it has no group.
+///
+/// This subsumes the scan `is_match` used to repeat on every call.
+fn compile_extglob(pattern: &[u8], options: PatternOptions) -> Option<CompiledExtglob> {
+    if !options.extglob || !contains_extglob(pattern, options.escape) {
+        return None;
+    }
+    let mut steps = vec![ExtglobStep::NoMatch; pattern.len()];
+    let mut compiled = vec![false; pattern.len()];
+    let mut groups = Vec::new();
+    let mut pending = vec![0_usize];
+    while let Some(index) = pending.pop() {
+        if index >= pattern.len() || compiled[index] {
+            continue;
+        }
+        compiled[index] = true;
+        let step = compile_extglob_step(pattern, index, options, &mut groups);
+        match &step {
+            ExtglobStep::Group(group) => pending.push(groups[*group].rest),
+            ExtglobStep::Star { next } | ExtglobStep::Class { next, .. } => pending.push(*next),
+            // A literal backslash consumes one offset and leaves the walk on
+            // the escaped byte, which is read as ordinary text from there.
+            ExtglobStep::Escape { .. } => {
+                pending.push(index + 1);
+                pending.push(index + 2);
+            }
+            ExtglobStep::Any | ExtglobStep::Byte(_) | ExtglobStep::UnclosedGroup { .. } => {
+                pending.push(index + 1);
+            }
+            ExtglobStep::NoMatch => {}
+        }
+        steps[index] = step;
+    }
+    Some(CompiledExtglob { steps, groups })
+}
+
+/// Classifies one byte offset the way the interpreter classified it.
+fn compile_extglob_step(
+    pattern: &[u8],
+    index: usize,
+    options: PatternOptions,
+    groups: &mut Vec<ExtglobGroup>,
+) -> ExtglobStep {
+    if let Some(kind) = detect_extglob_at(pattern, index) {
+        let open = index + 1;
+        let Some(close) = closing_extglob_parenthesis(pattern, open, options.escape) else {
+            return ExtglobStep::UnclosedGroup {
+                byte: pattern[index],
+            };
+        };
+        let alternatives = split_extglob_alternatives(&pattern[open + 1..close], options.escape)
+            .into_iter()
+            .map(|alternative| compile_extglob_alternative(alternative, options))
+            .collect();
+        groups.push(ExtglobGroup {
+            kind,
+            alternatives,
+            rest: close + 1,
+        });
+        return ExtglobStep::Group(groups.len() - 1);
+    }
+    match pattern[index] {
+        b'*' => {
+            let mut next = index + 1;
+            while pattern.get(next) == Some(&b'*') {
+                next += 1;
+            }
+            ExtglobStep::Star { next }
+        }
+        b'?' => ExtglobStep::Any,
+        // An unparseable class never matched and was never read as a literal
+        // bracket either: its arm had no guard to fall through.
+        b'[' => match parse_class(pattern, index, options.escape) {
+            Ok((class, next)) => ExtglobStep::Class { class, next },
+            Err(_) => ExtglobStep::NoMatch,
+        },
+        b'\\' if options.escape && index + 1 < pattern.len() => ExtglobStep::Escape {
+            escaped: pattern[index + 1],
+        },
+        byte => ExtglobStep::Byte(byte),
+    }
+}
+
+/// Compiles one alternative as a whole-candidate pattern.
+///
+/// Braces and extglobs stay off, exactly as the per-match compile had them, so
+/// a nested group inside an alternative stays ordinary text. The component
+/// policy is left off and supplied by the caller, which is what lets one
+/// compiled alternative serve `is_match` and `is_match_glob_path` alike.
+fn compile_extglob_alternative(alternative: &[u8], options: PatternOptions) -> ExtglobAlternative {
+    let options = PatternOptions {
+        braces: false,
+        extglob: false,
+        component_wildcards: false,
+        root_component_wildcards: false,
+        ..options
+    };
+    let compiled = Pattern::compile(alternative, options)
+        .ok()
+        .map(|pattern| pattern.alternatives);
+    let width = compiled.as_deref().and_then(fixed_token_width);
+    ExtglobAlternative { compiled, width }
+}
+
+/// Total bytes the alternative consumes, when that is the same for every
+/// candidate it accepts.
+///
+/// Braces are off while compiling one, so there is exactly one token list to
+/// measure; a star of any kind makes the width vary and gives up.
+fn fixed_token_width(alternatives: &[CompiledAlternative]) -> Option<usize> {
+    let [alternative] = alternatives else {
+        return None;
+    };
+    let mut width = 0_usize;
+    for token in &alternative.tokens {
+        width += match token {
+            Token::Literal(literal) => literal.len(),
+            Token::Separator | Token::Any | Token::Class(_) => 1,
+            Token::Star | Token::PathStar | Token::RecursiveStar | Token::RecursivePrefix => {
+                return None;
+            }
+        };
+    }
+    Some(width)
+}
+
 fn contains_extglob(pattern: &[u8], escapes: bool) -> bool {
     let mut index = 0;
     while index + 1 < pattern.len() {
@@ -2122,41 +2321,95 @@ fn split_extglob_alternatives(content: &[u8], escapes: bool) -> Vec<&[u8]> {
     alternatives
 }
 
-fn match_extglob(pattern: &[u8], path: &[u8], options: PatternOptions) -> bool {
-    match_extglob_from(pattern, path, 0, 0, options)
+thread_local! {
+    /// Stack of visited-position bitsets, one frame per repetition in flight.
+    static EXTGLOB_VISITED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs a compiled extglob program on the thread's reusable visited buffer.
+///
+/// That buffer is separate from the general matcher's scratch on purpose: an
+/// alternative is matched through [`Pattern::match_alternatives`], which takes
+/// the general scratch, so holding both at once would push every sub-match
+/// onto the re-entrancy fallback and allocate there.
+fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: PatternOptions) -> bool {
+    EXTGLOB_VISITED.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut visited) => {
+            visited.clear();
+            let matched = match_extglob_from(program, path, 0, 0, options, &mut visited);
+            if visited.capacity() > RETAINED_SCRATCH_WORDS {
+                visited.shrink_to(RETAINED_SCRATCH_WORDS);
+            }
+            matched
+        }
+        Err(_) => match_extglob_from(program, path, 0, 0, options, &mut Vec::new()),
+    })
+}
+
+/// Capacity the calling thread's extglob visited buffer currently holds.
+#[cfg(test)]
+fn extglob_visited_capacity() -> usize {
+    EXTGLOB_VISITED.with(|cell| cell.borrow().capacity())
+}
+
+/// Reserves a zeroed frame of `positions` bits and returns its first word.
+fn push_visited(visited: &mut Vec<u64>, positions: usize) -> usize {
+    let base = visited.len();
+    let words = positions.div_ceil(u64::BITS as usize);
+    visited.resize(base + words, 0);
+    base
+}
+
+/// Records `position` in the frame at `base`, reporting whether it is new.
+fn visit(visited: &mut [u64], base: usize, position: usize) -> bool {
+    let word = &mut visited[base + position / u64::BITS as usize];
+    let mask = 1_u64 << (position % u64::BITS as usize);
+    if *word & mask != 0 {
+        false
+    } else {
+        *word |= mask;
+        true
+    }
 }
 
 fn match_extglob_from(
-    pattern: &[u8],
+    program: &CompiledExtglob,
     path: &[u8],
-    mut pattern_index: usize,
-    mut path_index: usize,
+    start: usize,
+    start_path_index: usize,
     options: PatternOptions,
+    visited: &mut Vec<u64>,
 ) -> bool {
+    let steps = &program.steps;
+    let mut pattern_index = start;
+    let mut path_index = start_path_index;
     let mut star_pattern_index = 0_usize;
     let mut star_path_index = 0_usize;
     let mut has_star = false;
 
-    while path_index < path.len() || pattern_index < pattern.len() {
-        if pattern_index < pattern.len() {
-            if let Some(kind) = detect_extglob_at(pattern, pattern_index) {
-                if !options.match_hidden
-                    && path.get(path_index) == Some(&b'.')
-                    && at_component_start(path, path_index)
-                {
-                    return false;
-                }
-                let open = pattern_index + 1;
-                if let Some(close) = closing_extglob_parenthesis(pattern, open, options.escape) {
-                    let alternatives =
-                        split_extglob_alternatives(&pattern[open + 1..close], options.escape);
+    while path_index < path.len() || pattern_index < steps.len() {
+        if pattern_index < steps.len() {
+            // A group refuses a leading period before it looks at its
+            // alternatives, and does so even when its parenthesis never closes
+            // and the bytes end up read as ordinary text.
+            if matches!(
+                steps[pattern_index],
+                ExtglobStep::Group(_) | ExtglobStep::UnclosedGroup { .. }
+            ) && !options.match_hidden
+                && path.get(path_index) == Some(&b'.')
+                && at_component_start(path, path_index)
+            {
+                return false;
+            }
+            match &steps[pattern_index] {
+                ExtglobStep::Group(group) => {
                     if match_extglob_group(
-                        kind,
-                        &alternatives,
-                        &pattern[close + 1..],
+                        program,
+                        &program.groups[*group],
                         path,
                         path_index,
                         options,
+                        visited,
                     ) {
                         return true;
                     }
@@ -2168,65 +2421,83 @@ fn match_extglob_from(
                     }
                     return false;
                 }
-            }
-
-            match pattern[pattern_index] {
-                b'*' => {
-                    pattern_index += 1;
-                    while pattern.get(pattern_index) == Some(&b'*') {
-                        pattern_index += 1;
-                    }
-                    star_pattern_index = pattern_index;
+                ExtglobStep::Star { next } => {
+                    star_pattern_index = *next;
                     star_path_index = path_index;
                     has_star = true;
+                    pattern_index = *next;
                     continue;
                 }
-                b'?' if path.get(path_index).is_some_and(|&byte| {
-                    (!options.component_wildcards || !is_separator(byte))
-                        && (options.match_hidden
-                            || byte != b'.'
-                            || !at_component_start(path, path_index))
-                }) =>
-                {
+                ExtglobStep::UnclosedGroup { byte: b'*' } => {
+                    star_pattern_index = pattern_index + 1;
+                    star_path_index = path_index;
+                    has_star = true;
                     pattern_index += 1;
-                    path_index += 1;
                     continue;
                 }
-                b'[' => {
-                    if let Ok((class, next)) = parse_class(pattern, pattern_index, options.escape)
-                        && path.get(path_index).is_some_and(|&byte| {
-                            (!options.component_wildcards || !is_separator(byte))
-                                && (options.match_hidden
-                                    || byte != b'.'
-                                    || !at_component_start(path, path_index))
-                                && class.matches(byte, options.case_insensitive)
-                        })
+                ExtglobStep::Any | ExtglobStep::UnclosedGroup { byte: b'?' } => {
+                    if path.get(path_index).is_some_and(|&byte| {
+                        (!options.component_wildcards || !is_separator(byte))
+                            && (options.match_hidden
+                                || byte != b'.'
+                                || !at_component_start(path, path_index))
+                    }) {
+                        pattern_index += 1;
+                        path_index += 1;
+                        continue;
+                    }
+                    // The wildcard arm falling through leaves `?` readable as
+                    // an ordinary byte, which only a literal `?` can match.
+                    if path
+                        .get(path_index)
+                        .is_some_and(|&actual| bytes_equal(b'?', actual, options.case_insensitive))
                     {
-                        pattern_index = next;
+                        pattern_index += 1;
                         path_index += 1;
                         continue;
                     }
                 }
-                b'\\'
-                    if options.escape
-                        && pattern_index + 1 < pattern.len()
-                        && path.get(path_index).is_some_and(|&byte| {
-                            bytes_equal(pattern[pattern_index + 1], byte, options.case_insensitive)
-                        }) =>
-                {
-                    pattern_index += 2;
-                    path_index += 1;
-                    continue;
+                ExtglobStep::Class { class, next } => {
+                    if path.get(path_index).is_some_and(|&byte| {
+                        (!options.component_wildcards || !is_separator(byte))
+                            && (options.match_hidden
+                                || byte != b'.'
+                                || !at_component_start(path, path_index))
+                            && class.matches(byte, options.case_insensitive)
+                    }) {
+                        pattern_index = *next;
+                        path_index += 1;
+                        continue;
+                    }
                 }
-                byte if path
-                    .get(path_index)
-                    .is_some_and(|&actual| bytes_equal(byte, actual, options.case_insensitive)) =>
-                {
-                    pattern_index += 1;
-                    path_index += 1;
-                    continue;
+                ExtglobStep::Escape { escaped } => {
+                    if path
+                        .get(path_index)
+                        .is_some_and(|&byte| bytes_equal(*escaped, byte, options.case_insensitive))
+                    {
+                        pattern_index += 2;
+                        path_index += 1;
+                        continue;
+                    }
+                    if path
+                        .get(path_index)
+                        .is_some_and(|&byte| bytes_equal(b'\\', byte, options.case_insensitive))
+                    {
+                        pattern_index += 1;
+                        path_index += 1;
+                        continue;
+                    }
                 }
-                _ => {}
+                ExtglobStep::Byte(expected) | ExtglobStep::UnclosedGroup { byte: expected } => {
+                    if path.get(path_index).is_some_and(|&actual| {
+                        bytes_equal(*expected, actual, options.case_insensitive)
+                    }) {
+                        pattern_index += 1;
+                        path_index += 1;
+                        continue;
+                    }
+                }
+                ExtglobStep::NoMatch => {}
             }
         }
 
@@ -2254,45 +2525,33 @@ fn match_extglob_from(
 }
 
 fn match_extglob_group(
-    kind: ExtglobKind,
-    alternatives: &[&[u8]],
-    rest: &[u8],
+    program: &CompiledExtglob,
+    group: &ExtglobGroup,
     path: &[u8],
     path_index: usize,
     options: PatternOptions,
+    visited: &mut Vec<u64>,
 ) -> bool {
-    match kind {
+    match group.kind {
         ExtglobKind::ExactlyOne => {
-            match_extglob_alternative(alternatives, rest, path, path_index, options)
+            match_extglob_alternative(program, group, path, path_index, options, visited)
         }
         ExtglobKind::Optional => {
-            match_extglob_from(rest, path, 0, path_index, options)
-                || match_extglob_alternative(alternatives, rest, path, path_index, options)
+            match_extglob_from(program, path, group.rest, path_index, options, visited)
+                || match_extglob_alternative(program, group, path, path_index, options, visited)
         }
         ExtglobKind::ZeroOrMore => {
-            match_extglob_from(rest, path, 0, path_index, options)
-                || match_extglob_repeated(
-                    alternatives,
-                    rest,
-                    path,
-                    path_index,
-                    options,
-                    &mut HashSet::new(),
-                )
+            match_extglob_from(program, path, group.rest, path_index, options, visited)
+                || match_extglob_repetition(program, group, path, path_index, options, visited)
         }
-        ExtglobKind::OneOrMore => match_extglob_repeated(
-            alternatives,
-            rest,
-            path,
-            path_index,
-            options,
-            &mut HashSet::new(),
-        ),
+        ExtglobKind::OneOrMore => {
+            match_extglob_repetition(program, group, path, path_index, options, visited)
+        }
         ExtglobKind::Negated => {
             for end in path_index..=extglob_component_end(path, path_index, options) {
-                if alternatives.iter().all(|alternative| {
+                if group.alternatives.iter().all(|alternative| {
                     !match_extglob_alternative_exact(alternative, &path[path_index..end], options)
-                }) && match_extglob_from(rest, path, 0, end, options)
+                }) && match_extglob_from(program, path, group.rest, end, options, visited)
                 {
                     return true;
                 }
@@ -2302,38 +2561,48 @@ fn match_extglob_group(
     }
 }
 
-fn match_extglob_alternative(
-    alternatives: &[&[u8]],
-    rest: &[u8],
+/// Runs a repetition under its own visited frame.
+///
+/// The frame replaces the hash set the interpreter built per group encounter.
+/// It is a stack because a repetition can reach another one through its rest,
+/// and each needs its own set of already-tried positions.
+fn match_extglob_repetition(
+    program: &CompiledExtglob,
+    group: &ExtglobGroup,
     path: &[u8],
     path_index: usize,
     options: PatternOptions,
+    visited: &mut Vec<u64>,
 ) -> bool {
-    alternatives.iter().any(|alternative| {
-        (path_index..=extglob_component_end(path, path_index, options)).any(|end| {
-            match_extglob_alternative_exact(alternative, &path[path_index..end], options)
-                && match_extglob_from(rest, path, 0, end, options)
-        })
-    })
+    let base = push_visited(visited, path.len() + 1);
+    let matched = match_extglob_repeated(program, group, path, path_index, options, visited, base);
+    visited.truncate(base);
+    matched
 }
 
 fn match_extglob_repeated(
-    alternatives: &[&[u8]],
-    rest: &[u8],
+    program: &CompiledExtglob,
+    group: &ExtglobGroup,
     path: &[u8],
     path_index: usize,
     options: PatternOptions,
-    visited: &mut HashSet<usize>,
+    visited: &mut Vec<u64>,
+    base: usize,
 ) -> bool {
-    if !visited.insert(path_index) {
+    if !visit(visited, base, path_index) {
         return false;
     }
-    for alternative in alternatives {
-        for end in path_index..=extglob_component_end(path, path_index, options) {
+    for alternative in &group.alternatives {
+        for end in extglob_alternative_ends(alternative, path, path_index, options)
+            .into_iter()
+            .flatten()
+        {
             if match_extglob_alternative_exact(alternative, &path[path_index..end], options)
-                && (match_extglob_from(rest, path, 0, end, options)
+                && (match_extglob_from(program, path, group.rest, end, options, visited)
                     || (end > path_index
-                        && match_extglob_repeated(alternatives, rest, path, end, options, visited)))
+                        && match_extglob_repeated(
+                            program, group, path, end, options, visited, base,
+                        )))
             {
                 return true;
             }
@@ -2342,23 +2611,73 @@ fn match_extglob_repeated(
     false
 }
 
+fn match_extglob_alternative(
+    program: &CompiledExtglob,
+    group: &ExtglobGroup,
+    path: &[u8],
+    path_index: usize,
+    options: PatternOptions,
+    visited: &mut Vec<u64>,
+) -> bool {
+    for alternative in &group.alternatives {
+        for end in extglob_alternative_ends(alternative, path, path_index, options)
+            .into_iter()
+            .flatten()
+        {
+            if match_extglob_alternative_exact(alternative, &path[path_index..end], options)
+                && match_extglob_from(program, path, group.rest, end, options, visited)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Matches one compiled alternative against the whole of `path`.
+///
+/// The component policy comes from the caller, reproducing the entry point the
+/// per-match compile picked: `is_match_glob_path` once the root is
+/// component-local, `is_match` otherwise.
 fn match_extglob_alternative_exact(
-    alternative: &[u8],
+    alternative: &ExtglobAlternative,
     path: &[u8],
     options: PatternOptions,
 ) -> bool {
-    let options = PatternOptions {
+    if alternative.width.is_some_and(|width| width != path.len()) {
+        return false;
+    }
+    let Some(alternatives) = &alternative.compiled else {
+        return false;
+    };
+    let mut options = PatternOptions {
         braces: false,
         extglob: false,
         ..options
     };
-    Pattern::compile(alternative, options).is_ok_and(|pattern| {
-        if options.root_component_wildcards {
-            pattern.is_match_glob_path(path)
-        } else {
-            pattern.is_match(path)
-        }
-    })
+    if options.root_component_wildcards {
+        options.component_wildcards = true;
+    }
+    Pattern::match_alternatives(alternatives, options, path)
+}
+
+/// End offsets worth trying for one alternative.
+///
+/// A fixed-width alternative can only accept a substring of that width, so
+/// every other offset in the component would be rejected on length alone.
+fn extglob_alternative_ends(
+    alternative: &ExtglobAlternative,
+    path: &[u8],
+    path_index: usize,
+    options: PatternOptions,
+) -> Option<RangeInclusive<usize>> {
+    let component_end = extglob_component_end(path, path_index, options);
+    let Some(width) = alternative.width else {
+        return Some(path_index..=component_end);
+    };
+    // `None` where a fixed-width alternative cannot fit at all.
+    let end = path_index.checked_add(width)?;
+    (end <= component_end).then_some(end..=end)
 }
 
 fn extglob_component_end(path: &[u8], path_index: usize, options: PatternOptions) -> usize {
@@ -2375,7 +2694,10 @@ fn extglob_component_end(path: &[u8], path_index: usize, options: PatternOptions
 
 #[cfg(test)]
 mod tests {
-    use super::{FailedStates, FastPath, Pattern, PatternOptions, Token, scratch_capacities};
+    use super::{
+        FailedStates, FastPath, Pattern, PatternOptions, Token, extglob_visited_capacity,
+        scratch_capacities,
+    };
 
     fn compile(pattern: &str) -> Pattern {
         Pattern::compile(pattern, PatternOptions::default()).unwrap()
@@ -2769,6 +3091,101 @@ mod tests {
         )
         .expect("period-enabled optional extglob compiles");
         assert!(hidden.is_match(".c"));
+    }
+
+    #[test]
+    fn extglob_programs_are_compiled_only_where_the_syntax_is_present() {
+        let options = PatternOptions::default().extglob(true);
+        let with_group = Pattern::compile("@(a|b)c", options).expect("group compiles");
+        assert!(with_group.alternatives[0].extglob.is_some());
+
+        // The walker enables extglob for every traversal pattern, so a pattern
+        // without the syntax must not carry a program — nor pay for a scan.
+        let without_group = Pattern::compile("src/**/*.ts", options).expect("plain compiles");
+        assert!(without_group.alternatives[0].extglob.is_none());
+
+        // The option gates it: the same bytes are ordinary text without it.
+        let disabled =
+            Pattern::compile("@(a|b)c", PatternOptions::default()).expect("plain compiles");
+        assert!(disabled.alternatives[0].extglob.is_none());
+        assert!(disabled.is_match("@(a|b)c"));
+    }
+
+    #[test]
+    fn extglob_alternatives_carry_a_fixed_width_only_when_they_have_one() {
+        let options = PatternOptions::default().extglob(true);
+        let pattern = Pattern::compile("@(foo|b?|c*)", options).expect("group compiles");
+        let program = pattern.alternatives[0]
+            .extglob
+            .as_ref()
+            .expect("the pattern carries a group");
+        let widths: Vec<Option<usize>> = program.groups[0]
+            .alternatives
+            .iter()
+            .map(|alternative| alternative.width)
+            .collect();
+        // `foo` is three bytes, `b?` is two, and a star makes `c*` vary.
+        assert_eq!(widths, vec![Some(3), Some(2), None]);
+    }
+
+    #[test]
+    fn extglob_matches_reuse_the_thread_local_visited_buffer() {
+        // The repetition kinds are the ones that used to build a hash set per
+        // group encounter.
+        let options = PatternOptions::default().extglob(true);
+        let pattern = Pattern::compile("+(a|ab)c", options).expect("repetition compiles");
+        let candidate = "aababc";
+        for _ in 0..8 {
+            assert!(pattern.is_match(candidate));
+        }
+        let warm = extglob_visited_capacity();
+        assert!(warm > 0, "a repetition must have used the visited buffer");
+        for _ in 0..1_000 {
+            assert!(pattern.is_match(candidate));
+        }
+        assert_eq!(
+            extglob_visited_capacity(),
+            warm,
+            "steady-state extglob matching must not grow the visited buffer"
+        );
+    }
+
+    #[test]
+    fn extglob_alternation_agrees_with_braces_over_exhaustive_byte_words() {
+        // `@(x|y)` and `{x,y}` are two spellings of the same alternation, so
+        // they must accept the same words. The extglob form is the one that
+        // changed representation.
+        let extglob = Pattern::compile(
+            "@(a|bc)d",
+            PatternOptions::default().extglob(true).match_hidden(true),
+        )
+        .expect("extglob alternation compiles");
+        let braces = Pattern::compile(
+            "{a,bc}d",
+            PatternOptions::default().braces(true).match_hidden(true),
+        )
+        .expect("brace alternation compiles");
+        for candidate in byte_words(b"abcd", 4) {
+            assert_eq!(
+                extglob.is_match(&candidate),
+                braces.is_match(&candidate),
+                "spellings disagree on {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extglob_reads_an_escaped_group_opener_as_text() {
+        // A backslash before a group opener is the corner where the walk can
+        // land on the escaped byte itself, which is a group start again.
+        let options = PatternOptions::default().extglob(true);
+        let pattern = Pattern::compile("x\\@(a|b)@(c)", options).expect("pattern compiles");
+        assert!(pattern.is_match("x@(a|b)c"));
+        assert!(!pattern.is_match("xac"));
+
+        let no_escapes = Pattern::compile("x\\@(a|b)@(c)", options.escape(false))
+            .expect("pattern compiles without escapes");
+        assert!(no_escapes.is_match("x\\ac"));
     }
 
     #[test]
