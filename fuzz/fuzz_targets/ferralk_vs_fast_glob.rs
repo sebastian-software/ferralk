@@ -204,6 +204,12 @@ fn class_end(pattern: &[u8], open: usize) -> Option<usize> {
                         return None;
                     }
                     (escaped, scan + 3)
+                } else if matches!(next, b'/' | b'{' | b'}') {
+                    // The separator and brace bytes are excluded as members
+                    // above; consuming one as a range endpoint would smuggle
+                    // it past that rule (`[0-{src,9]` slipped through and let
+                    // brace expansion rewrite the class, found on PR #45).
+                    return None;
                 } else {
                     (next, scan + 2)
                 };
