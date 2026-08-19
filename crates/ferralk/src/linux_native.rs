@@ -9,11 +9,12 @@
 
 use std::{
     cell::RefCell,
-    ffi::{OsString, c_long, c_void},
-    fs::{self, File},
+    ffi::{OsStr, c_long, c_void},
+    fs::{self, File, OpenOptions},
     io,
-    os::unix::{ffi::OsStringExt, io::AsRawFd},
+    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawFd},
     path::Path,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use super::BackendEntry;
@@ -25,6 +26,28 @@ const NAME_OFFSET: usize = 19;
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
+// Types that are neither a directory nor a symlink. Knowing that is the whole
+// question here, so these need no stat.
+const DT_FIFO: u8 = 1;
+const DT_CHR: u8 = 2;
+const DT_BLK: u8 = 6;
+const DT_SOCK: u8 = 12;
+
+/// `O_DIRECTORY`. Most architectures take it from `asm-generic`; 32-bit ARM
+/// defines its own value.
+#[cfg(not(target_arch = "arm"))]
+const O_DIRECTORY: i32 = 0o200_000;
+#[cfg(target_arch = "arm")]
+const O_DIRECTORY: i32 = 0o40_000;
+
+/// Set once the kernel reports that `getdents64` is unavailable.
+///
+/// Whether the syscall exists is a property of the kernel and the build, not
+/// of one directory, so probing again for every directory only pays a failed
+/// syscall and a second open. A filesystem-specific refusal is rarer than a
+/// missing syscall; per-device memoization would need the device id before the
+/// first read, which costs the stat this latch exists to avoid.
+static GETDENTS_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
 std::thread_local! {
     static DIRECTORY_BUFFER: RefCell<Box<[u8; BUFFER_SIZE]>> = RefCell::new(Box::new([0; BUFFER_SIZE]));
@@ -44,14 +67,41 @@ unsafe extern "C" {
 }
 
 pub(super) fn read_directory(path: &Path) -> io::Result<Vec<BackendEntry>> {
-    DIRECTORY_BUFFER.with(|buffer| {
+    if GETDENTS_UNSUPPORTED.load(Ordering::Relaxed) {
+        return Err(unsupported("getdents64 is unavailable on this system"));
+    }
+    let result = DIRECTORY_BUFFER.with(|buffer| {
         let mut buffer = buffer.borrow_mut();
         read_directory_with_buffer(path, &mut buffer[..])
-    })
+    });
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == io::ErrorKind::Unsupported)
+    {
+        GETDENTS_UNSUPPORTED.store(true, Ordering::Relaxed);
+    }
+    result
+}
+
+fn unsupported(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, message)
+}
+
+/// Opens a directory for reading, refusing anything that is not one.
+///
+/// `O_DIRECTORY` makes the open fail with `ENOTDIR` instead of blocking when
+/// the scheduled path was replaced by a FIFO between scheduling and open.
+/// `O_NOFOLLOW` is deliberately absent: a walk that follows symlinks has to be
+/// able to open through one.
+fn open_directory(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY)
+        .open(path)
 }
 
 fn read_directory_with_buffer(path: &Path, buffer: &mut [u8]) -> io::Result<Vec<BackendEntry>> {
-    let directory = File::open(path)?;
+    let directory = open_directory(path)?;
     let mut entries = Vec::new();
     loop {
         let byte_count = read_batch(&directory, buffer)?;
@@ -118,13 +168,16 @@ fn parse_records(
     entries: &mut Vec<BackendEntry>,
 ) -> io::Result<()> {
     for_each_record(records, |name, directory_type| {
-        let path = directory.join(OsString::from_vec(name.to_vec()));
-        let (is_dir, is_symlink) = entry_kind(&path, directory_type)?;
-        entries.push(BackendEntry {
-            path,
-            is_dir,
-            is_symlink,
-        });
+        let path = directory.join(OsStr::from_bytes(name));
+        // An entry that vanished between the read and its stat costs that one
+        // entry; the rest of the listing is still valid and is returned.
+        if let Some((is_dir, is_symlink)) = entry_kind(&path, directory_type)? {
+            entries.push(BackendEntry {
+                path,
+                is_dir,
+                is_symlink,
+            });
+        }
         Ok(())
     })
 }
@@ -178,16 +231,35 @@ fn for_each_record(
     Ok(())
 }
 
-fn entry_kind(path: &Path, directory_type: u8) -> io::Result<(bool, bool)> {
+/// Classifies one entry, or reports that it no longer exists.
+///
+/// `Ok(None)` means the entry disappeared or became unreadable between the
+/// directory read and its stat. That costs one entry rather than the whole
+/// listing, which is what a caller racing with a deletion needs.
+fn entry_kind(path: &Path, directory_type: u8) -> io::Result<Option<(bool, bool)>> {
     match directory_type {
-        DT_DIR => Ok((true, false)),
-        DT_REG => Ok((false, false)),
-        DT_LNK => Ok((false, true)),
-        _ => {
-            let file_type = fs::symlink_metadata(path)?.file_type();
-            Ok((file_type.is_dir(), file_type.is_symlink()))
-        }
+        DT_DIR => Ok(Some((true, false))),
+        DT_REG | DT_FIFO | DT_CHR | DT_BLK | DT_SOCK => Ok(Some((false, false))),
+        DT_LNK => Ok(Some((false, true))),
+        // `DT_UNKNOWN`, and any type this build does not name, need one stat.
+        _ => match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                Ok(Some((file_type.is_dir(), file_type.is_symlink())))
+            }
+            Err(error) if is_vanished_entry(&error) => Ok(None),
+            Err(error) => Err(error),
+        },
     }
+}
+
+/// Whether a per-entry stat failure describes that entry rather than the
+/// directory. A genuine fault, `EIO` for instance, still ends the read.
+fn is_vanished_entry(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::NotADirectory
+    )
 }
 
 fn malformed_record() -> io::Error {
@@ -207,7 +279,8 @@ mod tests {
     use crate::{DirectoryBackend, ErrorPolicy, StdBackend, WalkEntry, WalkOptions, Walker};
 
     use super::{
-        BackendEntry, DT_DIR, DT_REG, NAME_OFFSET, TYPE_OFFSET, parse_records, read_directory,
+        BackendEntry, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG, DT_SOCK, NAME_OFFSET, TYPE_OFFSET,
+        entry_kind, open_directory, parse_records, read_directory,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -243,6 +316,54 @@ mod tests {
             *byte = b'x';
         }
         assert!(parse_records(Path::new("/tmp"), &missing_nul, &mut entries).is_err());
+    }
+
+    #[test]
+    fn a_vanished_entry_costs_one_entry_and_not_the_listing() {
+        let missing = format!(
+            "ferralk-vanished-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        );
+        // `DT_UNKNOWN` forces the stat that races with the deletion.
+        let mut records = record(missing.as_bytes(), 0);
+        records.extend(record(b"survivor", DT_REG));
+        let mut entries: Vec<BackendEntry> = Vec::new();
+
+        parse_records(Path::new("/tmp"), &records, &mut entries)
+            .expect("a vanished entry does not end the listing");
+
+        assert_eq!(entries.len(), 1, "only the vanished entry is dropped");
+        assert!(entries[0].path.ends_with("survivor"));
+    }
+
+    #[test]
+    fn special_file_types_are_classified_without_a_stat() {
+        // The path does not exist, so any stat would fail. Reaching a verdict
+        // proves these types are decided from the record alone.
+        let absent = Path::new("/ferralk-nonexistent-special");
+        for directory_type in [DT_FIFO, DT_CHR, DT_BLK, DT_SOCK] {
+            assert_eq!(
+                entry_kind(absent, directory_type).expect("no stat is attempted"),
+                Some((false, false))
+            );
+        }
+    }
+
+    #[test]
+    fn opening_a_non_directory_fails_instead_of_blocking() {
+        // Without `O_DIRECTORY` opening a FIFO blocks until a writer appears,
+        // which hangs the worker when a scheduled directory is swapped for
+        // one. A regular file shows the same refusal without needing mkfifo.
+        let path = std::env::temp_dir().join(format!(
+            "ferralk-not-a-directory-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, b"fixture").expect("write fixture file");
+        let error = open_directory(&path).expect_err("a regular file is not a directory");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
