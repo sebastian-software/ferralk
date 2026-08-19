@@ -72,6 +72,31 @@ fn parse_records(
     records: &[u8],
     entries: &mut Vec<BackendEntry>,
 ) -> io::Result<()> {
+    for_each_record(records, |name, directory_type| {
+        let path = directory.join(OsString::from_vec(name.to_vec()));
+        let (is_dir, is_symlink) = entry_kind(&path, directory_type)?;
+        entries.push(BackendEntry {
+            path,
+            is_dir,
+            is_symlink,
+        });
+        Ok(())
+    })
+}
+
+/// Validates raw Darwin directory records without touching the filesystem.
+///
+/// This is exposed only for the feature-gated cargo-fuzz target; normal walker
+/// callers never observe raw records.
+#[doc(hidden)]
+pub fn fuzz_validate_records(records: &[u8]) {
+    let _ = for_each_record(records, |_, _| Ok(()));
+}
+
+fn for_each_record(
+    records: &[u8],
+    mut visit: impl FnMut(&[u8], u8) -> io::Result<()>,
+) -> io::Result<()> {
     let mut offset = 0;
     while offset < records.len() {
         let record = records.get(offset..).ok_or_else(malformed_record)?;
@@ -99,19 +124,13 @@ fn parse_records(
         offset = offset
             .checked_add(record_length)
             .ok_or_else(malformed_record)?;
-        if name.is_empty() || name == b"." || name == b".." || name.contains(&0) {
-            if name.contains(&0) {
-                return Err(malformed_record());
-            }
+        if name.is_empty() || name == b"." || name == b".." {
             continue;
         }
-        let path = directory.join(OsString::from_vec(name.to_vec()));
-        let (is_dir, is_symlink) = entry_kind(&path, record[TYPE_OFFSET])?;
-        entries.push(BackendEntry {
-            path,
-            is_dir,
-            is_symlink,
-        });
+        if name.contains(&0) || name.contains(&b'/') {
+            return Err(malformed_record());
+        }
+        visit(name, record[TYPE_OFFSET])?;
     }
     Ok(())
 }

@@ -27,6 +27,9 @@ pub use ferralk_glob;
 #[cfg(all(feature = "native-macos", target_os = "macos"))]
 #[allow(unsafe_code)]
 mod macos_native;
+#[cfg(all(feature = "native-macos", target_os = "macos"))]
+#[doc(hidden)]
+pub use macos_native::fuzz_validate_records as fuzz_validate_macos_dirent_records;
 mod parallel;
 mod scheduler;
 

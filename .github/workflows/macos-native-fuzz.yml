@@ -1,0 +1,21 @@
+name: macOS native fuzz
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: Maximum fuzz duration in seconds
+        required: true
+        default: "300"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz run macos_dirent_parser -- -max_total_time=${{ inputs.max_total_time }}

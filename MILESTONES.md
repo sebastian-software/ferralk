@@ -130,7 +130,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 - [ ] `getattrlistbulk` batch metadata with capability detection and portable
       fallback (SMB/FUSE)
 - [x] Bounds-checked record parsing with module-level invariants
-- [ ] Fuzz the record decoder
+- [x] Fuzz the record decoder
 - [ ] Differential tests portable vs native; sanitizers in CI
 - [ ] Benchmark gate on macOS
 
@@ -157,8 +157,9 @@ specific action needed to clear each one are consolidated in
   an unsupported syscall. Direct parser and native-vs-portable reader tests
   cover the safe boundary. On the shared filtered fixture, native serial
   traversal measures about 1.31 ms locally after avoiding metadata fallback
-  for `DT_REG`; `getattrlistbulk`, native fuzzing, and the macOS benchmark gate
-  remain open.
+  for `DT_REG`. The feature-gated, syscall-free `macos_dirent_parser`
+  cargo-fuzz target and macOS manual workflow now exercise the raw parser;
+  `getattrlistbulk` and the macOS benchmark gate remain open.
 
 ### 2026-08-18 — M0 foundation established
 
