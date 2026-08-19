@@ -2157,6 +2157,9 @@ mod tests {
         fixture.write("src/generated.tmp");
         fixture.write("ignored/skip.rs");
         fixture.write(".hidden/skip.rs");
+        for index in 0..192 {
+            fixture.write(format!("many/{index:03}-{}", "x".repeat(180)));
+        }
         fixture.write(".gitignore");
         fs::write(fixture.root.join(".gitignore"), b"ignored/\n").expect("write ignore rule");
         symlink("src", fixture.root.join("source-link")).expect("create directory symlink");

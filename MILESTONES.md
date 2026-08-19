@@ -193,8 +193,9 @@ specific action needed to clear each one are consolidated in
 - Replaced the single-fixture parity check with a shared native/portable Walker
   option matrix. It covers baseline traversal, metadata, file- and
   directory-only filters, hidden-path skipping, symlink following, and maximum
-  depth while asserting relative paths, entry kinds, depths, symlink status,
-  and requested metadata. It executes locally for `native-macos` and
+  depth. Its fixture also has a directory large enough to span the native
+  32-KiB read buffer. It asserts relative paths, entry kinds, depths, symlink
+  status, and requested metadata. It executes locally for `native-macos` and
   cross-compiles with the Linux-native test configuration; broader filesystem
   corpus and sanitizer-runtime evidence remain open.
 
