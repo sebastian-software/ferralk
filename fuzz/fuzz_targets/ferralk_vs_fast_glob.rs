@@ -108,7 +108,7 @@ fn in_shared_subset(pattern: &[u8]) -> bool {
                 continue;
             }
             b'[' => {
-                let Some(next) = class_end(pattern, index) else {
+                let Some(next) = class_end(pattern, index, brace_depth > 0) else {
                     return false;
                 };
                 index = next;
@@ -175,7 +175,13 @@ fn is_shared_escape(byte: u8) -> bool {
 }
 
 /// Returns the index just past a shared-syntax character class.
-fn class_end(pattern: &[u8], open: usize) -> Option<usize> {
+///
+/// Inside a brace group a class may not contain a comma: brace expansion in
+/// ferralk (like bash) splits alternatives on every comma without looking at
+/// brackets, while fast-glob keeps the class atomic — `{,[a,b]}[c]` vs `a`
+/// is true here and false there once a later `]` lets the split halves
+/// compile.
+fn class_end(pattern: &[u8], open: usize, inside_brace: bool) -> Option<usize> {
     let mut scan = open + 1;
     // A negated class implicitly contains the separator, which only fast-glob
     // lets a class accept.
@@ -199,6 +205,7 @@ fn class_end(pattern: &[u8], open: usize) -> Option<usize> {
             // Only fast-glob lets a class accept a separator, and brace
             // expansion inside a class rewrites the class itself.
             Some(b'/' | b'{' | b'}') => return None,
+            Some(b',') if inside_brace => return None,
             Some(b'-') => {
                 // A `-` with nothing before it, or directly before the closing
                 // bracket, is an ordinary member rather than a range.
@@ -218,11 +225,11 @@ fn class_end(pattern: &[u8], open: usize) -> Option<usize> {
                         return None;
                     }
                     (escaped, scan + 3)
-                } else if matches!(next, b'/' | b'{' | b'}') {
-                    // The separator and brace bytes are excluded as members
-                    // above; consuming one as a range endpoint would smuggle
-                    // it past that rule (`[0-{src,9]` slipped through and let
-                    // brace expansion rewrite the class, found on PR #45).
+                } else if matches!(next, b'/' | b'{' | b'}') || (next == b',' && inside_brace) {
+                    // Bytes excluded as members must not slip in as range
+                    // endpoints either (`[0-{src,9]` did exactly that, found
+                    // on PR #45; a comma endpoint inside a brace group would
+                    // reopen the split-vs-atomic divergence the same way).
                     return None;
                 } else {
                     (next, scan + 2)

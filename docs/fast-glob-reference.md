@@ -32,6 +32,7 @@ shape of the pattern, so a fuzz failure is always a new finding.
 | Brace nesting depth | — | nested | capped | More than one open brace |
 | More than ten brace groups | `{a,b}` × 11 vs `b` × 11 | `true` | `false` | More than ten groups in a pattern |
 | A comma outside a brace group stays an alternative separator | `{}{},` vs `` | `false` | `true` | Any comma at brace depth zero |
+| Brace expansion splits inside a class | `{,[a,b]}[c]` vs `a` | `true` | `false` | Any comma inside a class at brace depth > 0 (member or range endpoint) |
 
 The comma row is a fast-glob defect rather than a design difference: after two
 brace groups close, the following comma is still read as a separator, so
