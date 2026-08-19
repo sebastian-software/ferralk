@@ -1,0 +1,73 @@
+name: Walker benchmarks
+
+# The wall-time lane. Walker benches touch the filesystem and run on several
+# threads, which CodSpeed's simulation instrument serializes, so a
+# parallel-versus-serial comparison there measures instruction count instead of
+# speedup. CodSpeed's walltime instrument would be the natural home, but it
+# requires `runs-on: codspeed-macro`, a dedicated bare-metal runner available
+# only to organizations that opt in. Until this repository has one, criterion
+# measures wall time here and the medians are published as a job summary and an
+# artifact.
+#
+# A shared GitHub runner is noisy: read these numbers as indicative, and
+# compare runs on the same lane rather than treating a single delta as a
+# regression. Switching to CodSpeed later is a two-line change — set
+# `runs-on: codspeed-macro` and hand the same command to CodSpeedHQ/action
+# with `mode: walltime`.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  walltime:
+    name: walker walltime (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: portable
+            features: ""
+          - lane: native-linux
+            features: "--features native-linux"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Shorter than criterion's defaults so the lane stays inside a pull
+      # request's budget; the sample count is still large enough for a median.
+      - name: Measure
+        shell: bash
+        run: >-
+          cargo bench -p bench --bench walker ${{ matrix.features }} --
+          --warm-up-time 1 --measurement-time 5 --sample-size 20
+          --output-format bencher | tee walker-${{ matrix.lane }}.txt
+      - name: Publish the medians
+        if: always()
+        run: |
+          {
+            echo "### Walker wall time — ${{ matrix.lane }}"
+            echo
+            echo '| Benchmark | ns/iter | +/- |'
+            echo '| --- | ---: | ---: |'
+            sed -n 's/^test \(.*\) \.\.\. bench: *\([0-9,]*\) ns\/iter (+\/- \([0-9,]*\))$/| `\1` | \2 | \3 |/p' \
+              walker-${{ matrix.lane }}.txt
+            echo
+            echo 'Shared runner, warm page cache. Indicative, not a regression gate.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the raw measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: walker-walltime-${{ matrix.lane }}
+          path: walker-${{ matrix.lane }}.txt
+          if-no-files-found: warn

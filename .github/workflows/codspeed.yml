@@ -20,9 +20,12 @@ jobs:
           channel: stable
           cache-target: release
           bins: cargo-codspeed
+      # Matcher benches only. The walker benches do real filesystem work on
+      # several threads, which the simulation instrument serializes and cannot
+      # model; they run in the wall-time lane in walker-bench.yml.
       - name: Build benchmarks
-        run: cargo codspeed build -p bench
+        run: cargo codspeed build -p bench --bench matcher
       - uses: CodSpeedHQ/action@v5
         with:
           mode: simulation
-          run: cargo codspeed run -p bench
+          run: cargo codspeed run -p bench --bench matcher
