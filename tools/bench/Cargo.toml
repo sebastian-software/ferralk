@@ -16,7 +16,7 @@ zlob-oracle = ["dep:zlob"]
 zlob = { version = "=1.6.3", optional = true }
 
 [dev-dependencies]
-codspeed-criterion-compat = "5.0.1"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 ferralk = { path = "../../crates/ferralk" }
 ferralk-glob = { path = "../../crates/ferralk-glob" }
 fast-glob = "=1.1.0"

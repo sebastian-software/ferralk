@@ -30,11 +30,12 @@
 
 use std::{
     fs,
+    hint::black_box,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use codspeed_criterion_compat::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ferralk::{WalkOptions, Walker};
 use globset::{Glob, GlobSetBuilder};
 use ignore::{WalkBuilder, WalkState, overrides::OverrideBuilder};

@@ -33,12 +33,12 @@ jobs:
       matrix:
         target: [pattern_parser, pattern_matcher, ferralk_vs_fast_glob]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master branch
         with:
           toolchain: nightly-2026-08-04
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
         with:
           tool: cargo-fuzz
       # cargo-fuzz defaults to the target it was itself built for, and the
@@ -51,7 +51,7 @@ jobs:
       # upload the reproducer only exists in the log (PR #43 taught us that).
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: glob-fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/

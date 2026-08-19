@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-use codspeed_criterion_compat::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use zlob::{ZlobFlags, ZlobPattern};
 
 fn matcher_zlob(c: &mut Criterion) {

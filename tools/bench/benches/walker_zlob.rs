@@ -2,12 +2,13 @@
 
 use std::{
     fs,
+    hint::black_box,
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use codspeed_criterion_compat::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use zlob::{
     ZlobFlags,
     walk::{WalkBuilder, WalkFlags},

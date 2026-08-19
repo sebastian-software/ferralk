@@ -1,12 +1,11 @@
 #![forbid(unsafe_code)]
 //! Walker benchmarks, measured as wall time.
 //!
-//! These benches do real filesystem work and use several threads, which
-//! CodSpeed's simulation instrument cannot model: it serializes threads and
-//! does not reproduce syscall cost, so a parallel-versus-serial comparison
-//! there measures instruction count rather than speedup. They therefore run in
-//! the wall-time lane in `.github/workflows/walker-bench.yml`, not in the
-//! CodSpeed simulation lane.
+//! These benches do real filesystem work and use several threads, so elapsed
+//! time is the only unit that says anything about them: an instruction count
+//! would report the cost of a parallel walk as though it had run serially.
+//! They run in the wall-time lane in `.github/workflows/walker-bench.yml`,
+//! which since 2026-08-19 is the repository's only automated performance lane.
 //!
 //! **Cache assumption:** every fixture is written immediately before the
 //! measurement, so its directory entries and inodes are in the page cache.
@@ -15,12 +14,13 @@
 
 use std::{
     fs,
+    hint::black_box,
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use codspeed_criterion_compat::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ferralk::{WalkOptions, Walker};
 use ignore::{WalkBuilder, WalkState, overrides::OverrideBuilder};
 
