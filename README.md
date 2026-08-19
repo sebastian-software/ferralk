@@ -29,6 +29,38 @@ ferralk-glob = { git = "https://github.com/sebastian-software/ferralk", rev = "0
 Pin a revision for repeatable builds. The release PR and crates.io publishing
 are intentionally separate from development builds.
 
+## Local benchmark snapshot
+
+The following macOS measurements use Rust 1.95.0 and Criterion's default
+100-sample configuration. They are a local comparison, not a portable promise
+or a substitute for the CodSpeed series. Matcher values use the common
+`src/**/*.rs` syntax; lower is better.
+
+| Matcher | Match | Non-match |
+| --- | ---: | ---: |
+| Ferralk (compiled) | 12.49 ns | 3.07 ns |
+| zlob 1.6.3 (compiled) | 35.65 ns | 2.59 ns |
+| globset (compiled) | 38.36 ns | 37.98 ns |
+| fast-glob (interpreted) | 98.94 ns | 108.61 ns |
+
+On this common syntax Ferralk is 0.35× zlob for matches and 1.19× zlob for
+non-matches, within the local 1.5× zlob target. It is faster than both globset
+and fast-glob in both cases.
+
+The Walker comparison uses the checked-in 16×4 filtered filesystem fixture;
+lower is better.
+
+| Walker | Time |
+| --- | ---: |
+| Ferralk serial | 1.48 ms |
+| Ferralk parallel | 1.72 ms |
+| `ignore` parallel | 2.66 ms |
+| zlob parallel | 0.95 ms |
+
+Ferralk parallel is about 35% faster than `ignore` on this fixture, while zlob
+is about 1.81× faster than Ferralk. Broader fixtures and the remote CodSpeed
+comparison remain the release evidence.
+
 ## Quick start
 
 Compile a pattern once and match it many times. Syntax that changes meaning is
