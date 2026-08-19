@@ -190,10 +190,23 @@ specific action needed to clear each one are consolidated in
   `NOTICE` instead provide the visible, durable attribution: Ferralk is an
   independently developed project inspired by zlob 1.6.3. This completes the
   attribution action without creating unsolicited correspondence.
-- Prepared the local macOS comparison: `cargo bench --no-run -p bench --features
-  zlob-oracle --bench matcher --bench matcher_zlob --bench walker --bench
-  walker_zlob` completes successfully. The actual measured run remains pending
-  so it can be performed on the maintainer's Mac under an observed idle state.
+- Ran the local macOS comparison with Rust 1.95.0 and Criterion's default
+  100-sample measurement. On the common `src/**/*.rs` syntax, Ferralk measured
+  12.49 ns for a match and 3.07 ns for a non-match, versus zlob at 35.65 ns and
+  2.59 ns, `globset` at 38.36 ns and 37.98 ns, and interpreted `fast-glob` at
+  98.94 ns and 108.61 ns. Ferralk therefore meets the local M1 budget
+  (0.35×/1.19× zlob, and faster than `fast-glob`); the CodSpeed evidence row
+  remains open.
+- On the checked-in 16×4 filtered Walker fixture, Ferralk serial measured
+  1.48 ms, Ferralk parallel 1.72 ms, parallel `ignore` 2.66 ms, and zlob
+  parallel 0.95 ms. Ferralk is about 35% faster than `ignore` here but 1.81×
+  zlob, so this one local fixture does not clear the broader M3 performance
+  gate.
+- The manually dispatched zlob CodSpeed workflow compiled successfully but
+  failed at execution because `cargo codspeed run` rejects the workflow's
+  `--features zlob-oracle` argument. This is a small workflow configuration
+  correction, not a Ferralk/zlob build or benchmark failure; it remains open
+  until the remote comparison is rerun.
 
 ### 2026-08-19 — Public repository and standard CI validated
 
