@@ -718,6 +718,9 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   on crates.io; the package resolver reports it absent from the registry.
   This confirms the documented publication order and leaves only maintainer
   registry authority as the blocker, not a local package defect.
+- Verified the public API documentation with `cargo doc --workspace --no-deps`
+  after the matcher and Walker API additions; every workspace crate renders
+  successfully with its intra-doc links resolved locally.
 - Recorded the final unported assertion from `test_absolute_paths.zig` as a
   deliberate C iterator-surface exclusion: without `PERIOD`, its literal
   hidden brace alternative is filtered during directory enumeration and has no
