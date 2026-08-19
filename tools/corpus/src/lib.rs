@@ -45,8 +45,22 @@ pub struct Case {
     /// Git oracle. Used only by `ignore.jsonl` cases.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore_rules: Vec<String>,
-    /// Whether the expression accepts the candidate path.
+    /// Whether the expression accepts the candidate path. A
+    /// [`CaseKind::CompileError`] case never accepts and records `false`.
     pub expected: bool,
+    /// Expected byte offset of the rejected construct for a
+    /// [`CaseKind::CompileError`] case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_offset: Option<usize>,
+    /// Expected stable error text for a [`CaseKind::CompileError`] case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// Restricts a case to the platform whose separator set it describes.
+    ///
+    /// Absent means the verdict is platform-independent and every host
+    /// replays it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<Platform>,
     /// Result produced by the named external oracle when it intentionally
     /// differs from ferralk's documented policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,6 +92,44 @@ pub enum CaseKind {
     MatchPathIndices,
     /// Returns accepted input positions after stripping an explicit base directory.
     MatchPathIndicesAt,
+    /// A pattern the compiler must reject, optionally at a recorded offset
+    /// and with a recorded message.
+    CompileError,
+}
+
+/// The path-separator platform a case is written for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Platform {
+    /// Only `/` separates path components.
+    Posix,
+    /// Both `/` and `\\` separate path components.
+    Windows,
+}
+
+impl Platform {
+    /// Whether this platform is the one the current build targets.
+    #[must_use]
+    pub const fn is_host(self) -> bool {
+        match self {
+            Self::Posix => !cfg!(windows),
+            Self::Windows => cfg!(windows),
+        }
+    }
+}
+
+impl Case {
+    /// Whether the current host must replay this case.
+    ///
+    /// A case without a [`Platform`] runs everywhere; a platform-specific one
+    /// is skipped on every other host, where its verdict does not hold.
+    #[must_use]
+    pub fn runs_on_host(&self) -> bool {
+        match self.platform {
+            None => true,
+            Some(platform) => platform.is_host(),
+        }
+    }
 }
 
 /// Provenance of a corpus result.
@@ -228,7 +280,7 @@ fn push_escape(result: &mut String, byte: u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Case, CaseKind, decode_bytes, encode_bytes};
+    use super::{Case, CaseKind, Platform, decode_bytes, encode_bytes};
 
     #[test]
     fn byte_codec_round_trips_mixed_utf8_and_non_utf8() {
@@ -253,5 +305,58 @@ mod tests {
         .unwrap();
 
         assert_eq!(case.kind, CaseKind::Matcher);
+        assert_eq!(case.platform, None);
+        assert!(case.runs_on_host());
+        assert_eq!(case.error_offset, None);
+        assert_eq!(case.error_message, None);
+    }
+
+    #[test]
+    fn compile_error_cases_carry_an_optional_offset_and_message() {
+        let case: Case = serde_json::from_str(
+            r#"{"id":"error-unclosed","kind":"compile_error","pattern":"[abc","path":"","expected":false,"error_offset":0,"error_message":"unclosed character class","source":"handwritten"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(case.kind, CaseKind::CompileError);
+        assert_eq!(case.error_offset, Some(0));
+        assert_eq!(
+            case.error_message.as_deref(),
+            Some("unclosed character class")
+        );
+        assert!(case.runs_on_host());
+    }
+
+    #[test]
+    fn platform_cases_run_only_on_their_own_host() {
+        let windows: Case = serde_json::from_str(
+            r#"{"id":"sep-windows","pattern":"a/b","path":"a\\x5Cb","expected":true,"platform":"windows","source":"handwritten"}"#,
+        )
+        .unwrap();
+        let posix = Case {
+            id: "sep-posix".to_owned(),
+            platform: Some(Platform::Posix),
+            expected: false,
+            ..windows.clone()
+        };
+
+        assert_eq!(windows.platform, Some(Platform::Windows));
+        assert_eq!(decode_bytes(&windows.path).unwrap(), b"a\\b");
+        assert_eq!(windows.runs_on_host(), cfg!(windows));
+        assert_eq!(posix.runs_on_host(), !cfg!(windows));
+        assert!(windows.runs_on_host() != posix.runs_on_host());
+    }
+
+    #[test]
+    fn optional_schema_fields_stay_absent_when_unused() {
+        let case: Case = serde_json::from_str(
+            r#"{"id":"legacy","pattern":"*.rs","path":"lib.rs","expected":true,"source":"handwritten"}"#,
+        )
+        .unwrap();
+
+        let encoded = serde_json::to_string(&case).unwrap();
+        assert!(!encoded.contains("platform"), "{encoded}");
+        assert!(!encoded.contains("error_offset"), "{encoded}");
+        assert!(!encoded.contains("error_message"), "{encoded}");
     }
 }

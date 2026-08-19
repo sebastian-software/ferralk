@@ -14,6 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ids = HashSet::new();
     let mut cases = 0_usize;
     let mut replayed = 0_usize;
+    let mut skipped = 0_usize;
     for file in files {
         let is_ignore_topic = file.file_name().is_some_and(|name| name == "ignore.jsonl");
         for (line_number, line) in fs::read_to_string(&file)?.lines().enumerate() {
@@ -45,6 +46,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     line_number + 1
                 )
             })?;
+            if case.kind != CaseKind::CompileError
+                && (case.error_offset.is_some() || case.error_message.is_some())
+            {
+                return Err(format!(
+                    "{}:{}: error_offset and error_message belong to a compile_error case",
+                    file.display(),
+                    line_number + 1
+                )
+                .into());
+            }
+            if !case.runs_on_host() {
+                // The verdict describes another separator platform, where a
+                // different host replays it.
+                skipped += 1;
+                cases += 1;
+                continue;
+            }
             if !is_ignore_topic {
                 let options = options_from_flags(&case.flags)
                     .map_err(|error| format!("{}:{}: {error}", file.display(), line_number + 1))?;
@@ -55,6 +73,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         })?
                         .is_match(path),
                     CaseKind::HasWildcards => Pattern::has_wildcards(pattern, options),
+                    CaseKind::CompileError => replay_compile_error(&case, pattern, options)
+                        .map_err(|error| {
+                            format!("{}:{}: {error}", file.display(), line_number + 1)
+                        })?,
                     CaseKind::MatchPaths | CaseKind::MatchPathsAt => {
                         let paths = case
                             .paths
@@ -97,6 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             CaseKind::Matcher
                             | CaseKind::HasWildcards
+                            | CaseKind::CompileError
                             | CaseKind::MatchPathIndices
                             | CaseKind::MatchPathIndicesAt => unreachable!(),
                         };
@@ -145,6 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             CaseKind::Matcher
                             | CaseKind::HasWildcards
+                            | CaseKind::CompileError
                             | CaseKind::MatchPaths
                             | CaseKind::MatchPathsAt => unreachable!(),
                         };
@@ -177,8 +201,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("validated {cases} corpus cases; replayed {replayed} operation cases from {root}");
+    println!(
+        "validated {cases} corpus cases; replayed {replayed} operation cases from {root}; \
+         skipped {skipped} cases written for another platform"
+    );
     Ok(())
+}
+
+/// Replays a `compile_error` case and returns its always-rejecting verdict.
+fn replay_compile_error(
+    case: &Case,
+    pattern: Vec<u8>,
+    options: PatternOptions,
+) -> Result<bool, String> {
+    if case.expected {
+        return Err("a compile_error case must record expected false".to_owned());
+    }
+    let error = match Pattern::compile(pattern, options) {
+        Err(error) => error,
+        Ok(_) => return Err(format!("{} compiled but must be rejected", case.pattern)),
+    };
+    if let Some(offset) = case.error_offset
+        && error.offset() != offset
+    {
+        return Err(format!(
+            "expected error offset {offset}, got {} for {}",
+            error.offset(),
+            case.pattern
+        ));
+    }
+    if let Some(message) = case.error_message.as_deref()
+        && error.message() != message
+    {
+        return Err(format!(
+            "expected error message {message:?}, got {:?} for {}",
+            error.message(),
+            case.pattern
+        ));
+    }
+    Ok(case.expected)
 }
 
 fn options_from_flags(flags: &[String]) -> Result<PatternOptions, String> {

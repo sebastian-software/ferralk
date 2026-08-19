@@ -7,7 +7,7 @@
   "required": ["id", "pattern", "path", "expected", "source"],
   "properties": {
     "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
-    "kind": { "enum": ["matcher", "has_wildcards", "match_paths", "match_paths_at", "match_path_indices", "match_path_indices_at"], "default": "matcher" },
+    "kind": { "enum": ["matcher", "has_wildcards", "match_paths", "match_paths_at", "match_path_indices", "match_path_indices_at", "compile_error"], "default": "matcher" },
     "paths": { "type": "array", "items": { "type": "string" }, "default": [] },
     "matches": { "type": "array", "items": { "type": "string" }, "default": [] },
     "oracle_matches": { "type": "array", "items": { "type": "string" } },
@@ -20,6 +20,9 @@
     "ignore_rules": { "type": "array", "items": { "type": "string" }, "default": [] },
     "expected": { "type": "boolean" },
     "oracle_expected": { "type": "boolean" },
+    "error_offset": { "type": "integer", "minimum": 0 },
+    "error_message": { "type": "string" },
+    "platform": { "enum": ["posix", "windows"] },
     "source": { "enum": ["zlob_1_6_3", "fast_glob", "git_check_ignore", "handwritten"] },
     "disputed": { "type": "boolean", "default": false },
     "note": { "type": "string" }
