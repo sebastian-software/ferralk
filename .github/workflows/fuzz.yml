@@ -29,4 +29,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - run: cargo fuzz run ${{ inputs.target }} -- -max_total_time=${{ inputs.max_total_time }}
+      # The prebuilt cargo-fuzz is a musl binary and defaults to its own target,
+      # where the sanitizer cannot link against a static libc. Name the runner's
+      # host target, which is what a source-built cargo-fuzz picked by itself.
+      - run: >-
+          cargo fuzz run --target x86_64-unknown-linux-gnu ${{ inputs.target }}
+          -- -max_total_time=${{ inputs.max_total_time }}
