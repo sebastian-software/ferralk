@@ -1,5 +1,8 @@
 name: fuzz
 
+# Manual single-target runs with a custom budget. `glob-fuzz.yml` runs every
+# glob target automatically on pull requests and nightly.
+
 on:
   workflow_dispatch:
     inputs:
@@ -11,6 +14,7 @@ on:
         options:
           - pattern_parser
           - pattern_matcher
+          - ferralk_vs_fast_glob
       max_total_time:
         description: Maximum fuzz duration in seconds
         required: true
@@ -24,7 +28,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-04
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:

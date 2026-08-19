@@ -9,8 +9,11 @@ rust-version = "1.93"
 cargo-fuzz = true
 
 [dependencies]
+corpus = { path = "../tools/corpus" }
+fast-glob = "=1.1.0"
 ferralk-glob = { path = "../crates/ferralk-glob" }
 libfuzzer-sys = "0.4"
+serde_json = "1.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ferralk = { path = "../crates/ferralk", features = ["native-macos"] }
@@ -28,6 +31,13 @@ bench = false
 [[bin]]
 name = "pattern_matcher"
 path = "fuzz_targets/pattern_matcher.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ferralk_vs_fast_glob"
+path = "fuzz_targets/ferralk_vs_fast_glob.rs"
 test = false
 doc = false
 bench = false
