@@ -353,21 +353,20 @@ Required corpora:
 6. symlink cycles, unreadable directories, and files removed during traversal;
 7. real manifests captured from at least three consumer repositories.
 
-Initial release budgets:
+Comparison criteria:
 
-- portable matcher: no more than 1.5x zlob 1.6.3 median on the agreed matcher
-  corpus;
-- portable matcher on the common syntax subset (no extglob): within 1.25x of
-  the `fast-glob` median on patterns both dialects support;
-- portable walker (1.0 gate): faster than parallel `ignore` with subtree
-  pruning on all traversal corpora, and within 2x zlob on dependency-heavy
-  warm-cache walks;
-- optimized native backends (post-1.0, macOS and Linux only): within 20% of
-  zlob's median on that operating system, with no p95 regression larger than
-  35%;
-- no correctness or error-reporting relaxation to meet a performance target.
+- record portable matcher results against Rust baselines (`globset` and
+  `fast-glob`) on their shared syntax subset;
+- record portable Walker results against `ignore` on the same fixture;
+- retain the optional zlob comparison as useful context, but never as the sole
+  baseline: it requires Zig and has a different implementation boundary;
+- record native-backend measurements per supported platform when they inform a
+  change;
+- never relax correctness or error reporting for a faster result.
 
-These are release gates, not promises that every filesystem will behave alike.
+Measurements are decision support, not release, CI, or p95 performance gates.
+They make trade-offs visible without claiming that every filesystem or workload
+has one universal winner.
 
 ## Test strategy
 
@@ -453,8 +452,8 @@ Exit criterion: disputed or undefined semantics are documented as open cases.
 - differential/property/fuzz tests;
 - portable optimizations.
 
-Exit criterion: agreed matcher corpus passes and meets the portable matcher
-budget.
+Exit criterion: agreed matcher corpus passes; benchmark evidence is
+reproducible and its scope is documented.
 
 ### Phase 2: Portable walker — 3–4 weeks
 
@@ -482,11 +481,11 @@ corpus; no hangs or lost errors under stress.
 - macOS backend first, Linux second, each independently reviewable;
 - no Windows backend (portable only);
 - runtime fallbacks and backend differential tests;
-- platform benchmark gates.
+- repeatable platform measurements when a native change needs evaluation.
 
-Exit criterion: each backend independently meets safety, parity, and
-performance gates. 1.0 does not wait for this phase; backends ship as
-feature-gated 1.x releases.
+Exit criterion: each backend independently meets safety and parity criteria.
+Its measurements are reproducible and documented. 1.0 does not wait for this
+phase; backends ship as feature-gated 1.x releases.
 
 ### Phase 5: Stabilization and a later public release — 2–4 weeks
 
@@ -509,8 +508,8 @@ agreement, or maintainer outreach is required or implied. Compatibility with
 zlob is a documented profile ("compatible with X, documented divergences Y"),
 never a drop-in claim.
 
-Releases start at `0.x`; 1.0 requires a stable API and the portable
-performance gate on all platforms. Compatibility claims are made per API area:
+Releases start at `0.x`; 1.0 requires a stable API, documented compatibility,
+and the normal validation suite. Compatibility claims are made per API area:
 matcher, walker, and ignores. Native fast paths ship as feature-gated 1.x
 releases and remain opt-in until they have production use on their platform.
 

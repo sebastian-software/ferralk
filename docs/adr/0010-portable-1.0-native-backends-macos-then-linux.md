@@ -1,6 +1,6 @@
 # ADR-0010: Portable-only 1.0; native backends macOS → Linux; Windows tier 2
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-08-19)
 - **Date:** 2026-08-18
 
 ## Context
@@ -13,21 +13,21 @@ is not a performance target for us.
 
 ## Decision
 
-- 1.0 ships portable (`std::fs`) on all platforms; its performance gate is
-  "faster than parallel `ignore` + pruning on all traversal corpora".
+- 1.0 ships portable (`std::fs`) on all platforms. Performance is assessed
+  through reproducible comparison measurements, not a release gate.
 - Native backends are post-1.0, feature-gated 1.x releases: macOS first
   (`getdirentries64`/`getattrlistbulk`; daily dogfooding), Linux second
   (`getdents64`).
 - Windows is a tier-2 target: built and tested in CI on the portable backend,
-  full matching correctness (ADR-0005), but no native backend and no
-  performance gates — permanently, unless demand changes.
+  full matching correctness (ADR-0005), but no native backend.
 
 ## Consequences
 
 - API stability is decoupled from unsafe backend work; each backend is
   independently reviewable and can miss a release without blocking anything.
 - Windows users get correctness and portable speed only.
-- The 20%-of-zlob native gate applies per platform, macOS and Linux only.
+- Native macOS and Linux measurements inform implementation decisions but do
+  not impose zlob-relative, p95, CI, or release thresholds.
 - Native metadata continues to expose `std::fs::Metadata`; `statx` is deferred
   until a distinct native-attribute API is approved, rather than adding a
   second syscall without a public result.

@@ -23,7 +23,7 @@ considered only if profiling proves a gap these primitives cannot close.
 ## Consequences
 
 - Zero unsafe code in the matcher; runtime feature detection for free.
-- Early matcher benchmarks may trail zlob until tuning; the release budget
-  (≤1.5x zlob median) applies at release, not during the port.
+- Early matcher benchmarks may trail zlob until tuning; comparisons inform
+  profiling priorities but do not form a release gate.
 - If a gap ever demands intrinsics, `forbid` relaxes to `deny` with a scoped
   `allow` in one SIMD module — a deliberate, reviewable step.

@@ -118,5 +118,5 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 The checked-in JSONL corpus is the behavioural source of truth. Read
 [corpus-format.md](corpus-format.md) before adding a case. Fuzz targets live in
-[`fuzz/`](../fuzz/README.md); benchmark and external-evidence requirements are
-kept separate in [external-release-gates.md](external-release-gates.md).
+[`fuzz/`](../fuzz/README.md); benchmark evidence and other deferred follow-up
+are tracked in [GitHub](https://github.com/sebastian-software/ferralk/issues).
