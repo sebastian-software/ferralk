@@ -763,3 +763,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   excluding extensionless files and `.git`. The public Walker now proves the
   expected set in serial, parallel, and streaming modes; the source-suite
   aggregate remains open for its explicitly excluded callback surfaces.
+- Ported zlob's scoped-unreadable-directory prune regression into the public
+  Unix integration suite. An aborting walk constrained to `src/**/*.rs`
+  returns `src/a.rs` without opening its unreadable `locked` sibling; the test
+  skips root execution because root intentionally bypasses the mode-bit proof.
