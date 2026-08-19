@@ -5,7 +5,10 @@ roughly correspond to one PR. A milestone is done when every box is checked
 and its exit criterion holds. Architecture: [RFC](RFC-zig-free-zlob-port.md);
 individual decisions: [ADRs](docs/adr/README.md).
 
-Milestones M0–M4 are sequential; M5 starts only after 1.0 (ADR-0010).
+Milestones M0–M3 are sequential. M4 is release-readiness work, not a promise
+of an imminent 1.0; stable-release timing and versioning remain an explicit
+maintainer decision. M5 starts only after that stable scope is chosen
+(ADR-0010).
 
 ---
 
@@ -62,7 +65,8 @@ matcher ≤1.5x zlob median, ≤1.25x `fast-glob` median on the common subset.
 - [x] Profile, then apply memchr/memmem hot-path primitives — ADR-0008
 - [ ] Matcher benchmarks vs zlob, `fast-glob`, and `globset` in CodSpeed;
       verify both budgets — ADR-0013
-- [ ] Publish `ferralk-glob` 0.1
+- [ ] Prepare the first public `ferralk-glob` release (version intentionally
+      undecided)
 
 ## M2 — Portable walker (RFC Phase 2, ~3–4 weeks)
 
@@ -82,7 +86,8 @@ preservation, structured errors.
 - [x] Streaming iterator with cancellation; `collect()` result shape
 - [x] Filesystem fixture builders + integration tests (unreadable dirs,
       disappearing files, non-UTF-8 names)
-- [ ] Publish `ferralk` 0.1 (serial)
+- [ ] Prepare the first public `ferralk` release (serial; version intentionally
+      undecided)
 
 ## M3 — Ignore semantics & parallel scheduler (RFC Phase 3, ~3–5 weeks)
 
@@ -104,12 +109,13 @@ faster than parallel `ignore` + pruning on all traversal corpora.
       worker-start failure
 - [x] Invariant test: parallel == serial result multiset
 - [ ] Walker benchmarks vs parallel `ignore` and zlob in CodSpeed; verify the
-      1.0 gate
+      portable performance gate
 
-## M4 — Stabilization & 1.0 (RFC Phase 5, ~2–4 weeks)
+## M4 — Stabilization & release readiness (RFC Phase 5, timing undecided)
 
-**Exit criterion:** 1.0 published, portable on all platforms, Windows tier-2
-CI green — ADR-0010.
+**Exit criterion:** portable API and downstream integration are ready for a
+maintainer-selected public release; Windows tier-2 CI is green. A 1.0 date is
+intentionally not part of this milestone — ADR-0010.
 
 - [x] Compatibility guide: zlob API mapping and all deliberate divergences
 - [ ] Downstream trial: integrate into Palamedes, fold feedback back
@@ -118,9 +124,10 @@ CI green — ADR-0010.
 - [x] Oracle retirement check: corpus is self-sufficient, Zig-free CI
       confirmed — ADR-0007
 - [ ] Publish benchmarks
-- [ ] Release `ferralk-glob` 1.0 and `ferralk` 1.0
+- [ ] Decide the first stable-release version and timing after downstream and
+      benchmark evidence is available
 
-## M5 — Native backends (RFC Phase 4, post-1.0, ~6–12 weeks)
+## M5 — Native backends (RFC Phase 4, post-stable-release, ~6–12 weeks)
 
 **Exit criterion per backend:** safety review passed, portable/native parity
 on the corpus, within 20% of zlob median on that platform, p95 regression
@@ -153,6 +160,16 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 The current external-release prerequisites, their local evidence, and the
 specific action needed to clear each one are consolidated in
 [`docs/external-release-gates.md`](docs/external-release-gates.md).
+
+### 2026-08-19 — Consumer documentation and release timing clarified
+
+- Added the root README, usage guide, and documentation index with current
+  matcher and walker examples, conservative defaults, platform scope, and
+  validation commands. The compatibility guide remains the migration reference
+  rather than the primary getting-started path.
+- Reframed M4 as release readiness: no first-public-release version or 1.0 date
+  is implied. Benchmark evidence and the Palamedes downstream trial remain
+  prerequisites for a later maintainer decision.
 
 ### 2026-08-19 — Public repository and standard CI validated
 
