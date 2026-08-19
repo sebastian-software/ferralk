@@ -239,8 +239,7 @@ mod tests {
         assert!(parse_records(Path::new("/tmp"), &zero_length, &mut entries).is_err());
 
         let mut missing_nul = record(b"name", DT_REG);
-        let type_offset = missing_nul.len() - 1;
-        for byte in &mut missing_nul[NAME_OFFSET..type_offset] {
+        for byte in &mut missing_nul[NAME_OFFSET..] {
             *byte = b'x';
         }
         assert!(parse_records(Path::new("/tmp"), &missing_nul, &mut entries).is_err());

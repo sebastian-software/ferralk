@@ -88,6 +88,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v7

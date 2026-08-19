@@ -8,6 +8,7 @@
 //! through UTF-8.
 
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     collections::{HashMap, HashSet},
     error::Error,
@@ -466,6 +467,26 @@ fn has_hidden_component(path: &[u8]) -> bool {
         .any(|component| component.first() == Some(&b'.'))
 }
 
+/// Gives glob matchers a root-relative path with `/` separators on every
+/// platform. Native `Path` values retain their platform representation; only
+/// the byte-oriented pattern language is normalized.
+fn glob_path_bytes(path: &Path) -> Cow<'_, [u8]> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    #[cfg(windows)]
+    {
+        Cow::Owned(
+            bytes
+                .iter()
+                .map(|&byte| if byte == b'\\' { b'/' } else { byte })
+                .collect(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        Cow::Borrowed(bytes)
+    }
+}
+
 fn traversal_pattern_options() -> PatternOptions {
     PatternOptions::default()
         .braces(true)
@@ -776,8 +797,8 @@ impl WalkStream {
         if !self.walker.includes_depth(relative) {
             return None;
         }
-        let bytes = relative.as_os_str().as_encoded_bytes();
-        if self.walker.options.skip_hidden && has_hidden_component(bytes) {
+        let bytes = glob_path_bytes(relative);
+        if self.walker.options.skip_hidden && has_hidden_component(bytes.as_ref()) {
             return None;
         }
         if should_skip_git_directory(&self.walker, &entry.path) {
@@ -787,7 +808,7 @@ impl WalkStream {
             .walker
             .excludes
             .iter()
-            .any(|pattern| pattern.matches(bytes, entry.is_dir))
+            .any(|pattern| pattern.matches(bytes.as_ref(), entry.is_dir))
         {
             return None;
         }
@@ -806,7 +827,7 @@ impl WalkStream {
                 Err(source) => return self.error("metadata", entry.path, source),
             }
         }
-        if !entry.is_dir && !self.walker.may_include_file(bytes) {
+        if !entry.is_dir && !self.walker.may_include_file(bytes.as_ref()) {
             return None;
         }
         if entry.is_dir
@@ -814,8 +835,8 @@ impl WalkStream {
                 .walker
                 .excludes
                 .iter()
-                .any(|pattern| pattern.covers_subtree(bytes))
-            && self.walker.may_descend_path(relative, bytes)
+                .any(|pattern| pattern.covers_subtree(bytes.as_ref()))
+            && self.walker.may_descend_path(relative, bytes.as_ref())
         {
             self.pending_directories.push(entry.path.clone());
         }
@@ -824,7 +845,7 @@ impl WalkStream {
                 .walker
                 .includes
                 .iter()
-                .any(|pattern| pattern.matches(bytes, entry.is_dir))
+                .any(|pattern| pattern.matches(bytes.as_ref(), entry.is_dir))
         {
             return None;
         }
@@ -950,8 +971,8 @@ impl<'walker> WalkState<'walker> {
         if !self.walker.includes_depth(relative) {
             return Ok(());
         }
-        let bytes = relative.as_os_str().as_encoded_bytes();
-        if self.walker.options.skip_hidden && has_hidden_component(bytes) {
+        let bytes = glob_path_bytes(relative);
+        if self.walker.options.skip_hidden && has_hidden_component(bytes.as_ref()) {
             return Ok(());
         }
         if should_skip_git_directory(self.walker, &entry.path) {
@@ -961,7 +982,7 @@ impl<'walker> WalkState<'walker> {
             .walker
             .excludes
             .iter()
-            .any(|pattern| pattern.matches(bytes, entry.is_dir))
+            .any(|pattern| pattern.matches(bytes.as_ref(), entry.is_dir))
         {
             return Ok(());
         }
@@ -983,7 +1004,7 @@ impl<'walker> WalkState<'walker> {
                 }
             }
         }
-        if !entry.is_dir && !self.walker.may_include_file(bytes) {
+        if !entry.is_dir && !self.walker.may_include_file(bytes.as_ref()) {
             return Ok(());
         }
         if entry.is_dir
@@ -991,8 +1012,8 @@ impl<'walker> WalkState<'walker> {
                 .walker
                 .excludes
                 .iter()
-                .any(|pattern| pattern.covers_subtree(bytes))
-            && self.walker.may_descend_path(relative, bytes)
+                .any(|pattern| pattern.covers_subtree(bytes.as_ref()))
+            && self.walker.may_descend_path(relative, bytes.as_ref())
         {
             self.walk_directory(backend, entry.path.clone())?;
         }
@@ -1019,7 +1040,7 @@ impl<'walker> WalkState<'walker> {
                     .walker
                     .includes
                     .iter()
-                    .any(|pattern| pattern.matches(bytes, entry.is_dir)))
+                    .any(|pattern| pattern.matches(bytes.as_ref(), entry.is_dir)))
         {
             if git_ignored {
                 return Ok(());
