@@ -1869,18 +1869,23 @@ fn flush_literals(tokens: &mut Vec<Token>, literals: &mut Vec<u8>) {
 /// a pattern needing more is a matching problem even where it fits in memory.
 const MAX_BRACE_ALTERNATIVES: usize = 1 << 12;
 
-/// Expands brace groups into one pattern per combination.
+/// Bytes brace expansion may write before a pattern is rejected.
 ///
-/// The work list replaces recursion, which used to be one frame per brace group
-/// and overflowed the stack on a pattern of many small groups. Popping from the
-/// back with the alternatives pushed in reverse keeps the original order: every
-/// combination of the first group is emitted before the second group's.
+/// The alternative count alone does not bound the work. Expansion rewrites the
+/// whole pattern once per group it resolves, so a pattern of many one-way
+/// groups costs the square of its length while expanding to a single
+/// alternative: `{a}` repeated 200,000 times is 600 KB and took 11.8 s. And a
+/// pattern inside the alternative budget still materialises that budget times
+/// its own length, so 4096 alternatives of a 100 KB pattern is 400 MB and a
+/// second, however few groups produced them.
 ///
-/// `expanded.len() + pending.len()` only ever grows and every pending entry
-/// yields at least one alternative, so it is a running lower bound on the final
-/// count. Checking it before each push therefore rejects exactly the patterns
-/// whose expansion would pass [`MAX_BRACE_ALTERNATIVES`], and bounds the work
-/// and the memory rather than only the result.
+/// Counting the bytes written bounds both, because both are the same quantity:
+/// what expansion copies. 64 MiB is roughly 10 ms of copying, and orders of
+/// magnitude past any real pattern — a language's extension list against a path
+/// glob is a few hundred bytes, and even the largest expansion the alternative
+/// budget admits is under a megabyte at a realistic pattern length.
+const MAX_BRACE_EXPANSION_BYTES: usize = 1 << 26;
+
 /// Expands brace alternatives into the plain patterns a pattern stands for.
 ///
 /// [`Pattern::compile`] expands braces before it compiles anything; this
@@ -1905,10 +1910,11 @@ const MAX_BRACE_ALTERNATIVES: usize = 1 << 12;
 /// # Errors
 ///
 /// Reports a pattern that asks for more than [`MAX_BRACE_ALTERNATIVES`]
-/// alternatives, so a caller never has to assume the expansion succeeds. Glob
-/// syntax is not checked here: an unclosed brace is ordinary text, the way
-/// [`Pattern::compile`] treats it, and anything else malformed is reported when
-/// the alternative it belongs to is compiled.
+/// alternatives, or whose expansion would write more than
+/// [`MAX_BRACE_EXPANSION_BYTES`], so a caller never has to assume the expansion
+/// succeeds. Glob syntax is not checked here: an unclosed brace is ordinary
+/// text, the way [`Pattern::compile`] treats it, and anything else malformed is
+/// reported when the alternative it belongs to is compiled.
 pub fn expand_braces(
     pattern: impl AsRef<[u8]>,
     options: PatternOptions,
@@ -1920,6 +1926,24 @@ pub fn expand_braces(
     expand_brace_alternatives(pattern, options.escape)
 }
 
+/// Expands brace groups into one pattern per combination.
+///
+/// The work list replaces recursion, which used to be one frame per brace group
+/// and overflowed the stack on a pattern of many small groups. Popping from the
+/// back with the alternatives pushed in reverse keeps the original order: every
+/// combination of the first group is emitted before the second group's.
+///
+/// `expanded.len() + pending.len()` only ever grows and every pending entry
+/// yields at least one alternative, so it is a running lower bound on the final
+/// count. Checking it before each push therefore rejects exactly the patterns
+/// whose expansion would pass [`MAX_BRACE_ALTERNATIVES`], and bounds the memory
+/// rather than only the result.
+///
+/// The bytes written are counted against [`MAX_BRACE_EXPANSION_BYTES`] the same
+/// way, and that is what bounds the time: rewriting the whole pattern per group
+/// is quadratic in its length even where it expands to one alternative. The
+/// running total only grows too, so stopping at the first write that passes the
+/// limit rejects exactly the patterns whose finished expansion would.
 fn expand_brace_alternatives(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8>>, PatternError> {
     let Some(first_open) = first_unescaped_brace(pattern, escapes) else {
         return Ok(vec![pattern.to_vec()]);
@@ -1927,6 +1951,7 @@ fn expand_brace_alternatives(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8
 
     let mut expanded: Vec<Vec<u8>> = Vec::new();
     let mut pending: Vec<Vec<u8>> = vec![pattern.to_vec()];
+    let mut written = pattern.len();
     while let Some(current) = pending.pop() {
         let Some(open) = first_unescaped_brace(&current, escapes) else {
             expanded.push(current);
@@ -1948,8 +1973,15 @@ fn expand_brace_alternatives(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8
                     message: "too many brace alternatives",
                 });
             }
-            let mut combined =
-                Vec::with_capacity(open + alternative.len() + current.len() - close - 1);
+            let length = open + alternative.len() + current.len() - close - 1;
+            written = written.saturating_add(length);
+            if written > MAX_BRACE_EXPANSION_BYTES {
+                return Err(PatternError {
+                    offset: first_open,
+                    message: "brace expansion is too large",
+                });
+            }
+            let mut combined = Vec::with_capacity(length);
             combined.extend_from_slice(&current[..open]);
             combined.extend_from_slice(alternative);
             combined.extend_from_slice(&current[close + 1..]);
@@ -3012,11 +3044,54 @@ mod tests {
     #[test]
     fn brace_expansion_survives_many_small_groups() {
         // One alternative per group keeps the count at 1 however deep it goes,
-        // so only the expansion's own recursion used to fail here.
+        // so only the expansion's own recursion used to fail here. The work
+        // budget now stops such a pattern long before the depth would matter,
+        // so this stays inside it.
         let options = PatternOptions::default().braces(true);
-        let pattern = "{a}".repeat(20_000);
+        let pattern = "{a}".repeat(2_000);
         let compiled = Pattern::compile(&pattern, options).unwrap();
-        assert!(compiled.is_match("a".repeat(20_000)));
+        assert!(compiled.is_match("a".repeat(2_000)));
+    }
+
+    #[test]
+    fn brace_expansion_stops_at_the_work_budget() {
+        let options = PatternOptions::default().braces(true);
+
+        // One alternative per group: the count budget never fires, because the
+        // expansion is a single alternative however many groups produced it.
+        // Rewriting the whole pattern per group is what costs, and it is
+        // quadratic in the length: `{a}` x 200,000 took 11.8 s.
+        let degenerate = "{a}".repeat(200_000);
+        let error = Pattern::compile(&degenerate, options).unwrap_err();
+        assert_eq!(error.message(), "brace expansion is too large");
+        assert_eq!(error.offset(), 0);
+
+        // Inside the alternative budget but not inside the work budget: 4096
+        // alternatives of a 10 KB pattern is 80 MB of rewriting.
+        let wide = format!("{}{}", "x".repeat(10_000), "{a,b}".repeat(12));
+        let error = Pattern::compile(&wide, options).unwrap_err();
+        assert_eq!(error.message(), "brace expansion is too large");
+        assert_eq!(error.offset(), 10_000);
+
+        // The same shape at a realistic length still compiles, and so does the
+        // largest alternative count the other budget admits.
+        let narrow = format!("{}{}", "x".repeat(1_000), "{a,b}".repeat(12));
+        assert!(Pattern::compile(&narrow, options).is_ok());
+        assert!(Pattern::compile("{a,b}".repeat(12), options).is_ok());
+
+        // Without brace expansion the same bytes are ordinary text.
+        assert!(Pattern::compile(&degenerate, PatternOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn brace_expansion_budgets_are_reported_apart() {
+        // The two limits answer different questions and must stay
+        // distinguishable: how many alternatives, and how much copying.
+        let options = PatternOptions::default().braces(true);
+        let many = Pattern::compile("{a,b}".repeat(13), options).unwrap_err();
+        assert_eq!(many.message(), "too many brace alternatives");
+        let large = Pattern::compile("{a}".repeat(200_000), options).unwrap_err();
+        assert_eq!(large.message(), "brace expansion is too large");
     }
 
     #[test]

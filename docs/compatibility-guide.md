@@ -122,6 +122,15 @@ Ordinary wildcards never cross a path-component boundary there; use recursive
   second iteratively. The boundary is recorded as `compile_error` corpus cases
   (`error-brace-budget-*`, issue #42), which the zlob adapter skips because the
   oracle has no error to compare against.
+- Brace expansion is budgeted a second way, in bytes. Expansion rewrites the
+  whole pattern once per group it resolves, so the alternative count alone does
+  not bound the work: 200,000 one-way groups are 600 KB, expand to a single
+  alternative, and took 11.8 s, while 4096 alternatives of a 100 KB pattern is
+  400 MB and a second however few groups produced them. A pattern whose
+  expansion would write more than 64 MiB is rejected with
+  `brace expansion is too large` at the same offset. Neither reference bounds
+  this either. The boundary is recorded as `error-brace-work-*` corpus cases
+  (issue #54).
 
 ## Defaults to review
 
