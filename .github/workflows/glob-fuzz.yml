@@ -47,3 +47,12 @@ jobs:
       - run: >-
           cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }}
           -- -max_total_time=$MAX_TOTAL_TIME
+      # A failing run writes its input under fuzz/artifacts; without this
+      # upload the reproducer only exists in the log (PR #43 taught us that).
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: glob-fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
