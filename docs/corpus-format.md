@@ -23,6 +23,7 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | `flags` | no | Ordered behaviour switches from the compatibility matrix. |
 | `ignore_rules` | no | Lines written to a synthetic `.gitignore` for an ignore case. |
 | `nested_ignore_rules` | no | Further `.gitignore` files below the root, each with its `directory` and `rules`. |
+| `exclude_rules` | no | Repository-wide rules written to `.git/info/exclude`; every ignore file overrides them. |
 | `expected` | yes | Whether the expression accepts the candidate. |
 | `oracle_expected` | no | The external-oracle result when it deliberately differs from `expected`. |
 | `error_offset` | no | Byte offset the rejected construct must be reported at, for a `compile_error` case. |

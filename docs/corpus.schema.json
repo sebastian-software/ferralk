@@ -18,6 +18,7 @@
     "path": { "type": "string" },
     "flags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "default": [] },
     "ignore_rules": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "exclude_rules": { "type": "array", "items": { "type": "string" }, "default": [] },
     "nested_ignore_rules": {
       "type": "array",
       "default": [],

@@ -10,11 +10,11 @@
 //! report. The only stat that runs earlier is the symlink resolution, because
 //! whether a link points at a directory is itself an input to the filters.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
 use super::{
-    BackendEntry, DirectoryBackend, GitIgnoreNode, WalkEntry, Walker, glob_path_bytes,
-    has_hidden_component, is_git_ignored, should_skip_git_directory,
+    BackendEntry, DirectoryBackend, WalkEntry, Walker, gitignore::IgnoreScope, glob_path_bytes,
+    has_hidden_component, should_skip_git_directory,
 };
 
 /// What a frontend has to do with one directory entry.
@@ -22,20 +22,28 @@ pub(crate) enum EntryAction {
     /// The entry is filtered away: nothing to traverse, nothing to emit.
     Skip,
     /// Traverse into this directory; the directory itself is not emitted.
-    Descend(PathBuf),
+    Descend(DirectoryTask),
     /// Emit this entry; there is nothing to traverse into.
     Emit(WalkEntry),
-    /// Traverse into this directory and emit it as well. Frontends that need
-    /// the path for both take their copy from the entry.
-    DescendAndEmit(WalkEntry),
+    /// Traverse into this directory and emit it as well.
+    DescendAndEmit(WalkEntry, DirectoryTask),
     /// A filesystem call failed. The error policy, which each frontend applies
     /// its own way, decides what happens next. A directory that was already
     /// cleared for traversal is still reported, so a failed stat cannot
     /// silently prune a subtree.
     Failed {
         failure: EntryFailure,
-        descend: Option<PathBuf>,
+        descend: Option<DirectoryTask>,
     },
+}
+
+/// A directory the walk still has to visit, carrying the ignore state it
+/// inherits. Its own ignore files join the chain when the walk enters it, which
+/// happens exactly once per directory and therefore exactly once per walk.
+#[derive(Debug)]
+pub(crate) struct DirectoryTask {
+    pub(crate) path: PathBuf,
+    pub(crate) ignores: IgnoreScope,
 }
 
 /// A filesystem call that failed while classifying one entry.
@@ -43,20 +51,6 @@ pub(crate) struct EntryFailure {
     pub(crate) operation: &'static str,
     pub(crate) path: PathBuf,
     pub(crate) source: std::io::Error,
-}
-
-/// Per-worker memoization for the pipeline. Frontends own one of these and
-/// hand it back on every call, which keeps what is memoized an implementation
-/// detail of this module rather than something the three of them agree on.
-#[derive(Debug, Default)]
-pub(crate) struct EntryCaches {
-    gitignore: HashMap<PathBuf, Arc<GitIgnoreNode>>,
-}
-
-impl EntryCaches {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
 }
 
 /// Whether an entry that survived the traversal filters is part of the result
@@ -84,7 +78,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     walker: &Walker,
     backend: &B,
     mut entry: BackendEntry,
-    caches: &mut EntryCaches,
+    ignores: &IgnoreScope,
 ) -> EntryAction {
     let relative = entry
         .path
@@ -114,7 +108,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     {
         return EntryAction::Skip;
     }
-    let git_ignored = is_git_ignored(walker, &entry.path, entry.is_dir, &mut caches.gitignore);
+    let git_ignored = ignores.is_ignored(&entry.path, entry.is_dir);
     if git_ignored && !entry.is_dir {
         return EntryAction::Skip;
     }
@@ -139,7 +133,10 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         return EntryAction::Skip;
     }
 
+    // An ignored directory is not entered, the way Git does not enter one:
+    // its contents are ignored whatever the ignore files inside it say.
     let descend = entry.is_dir
+        && !git_ignored
         && !walker
             .excludes
             .iter()
@@ -147,9 +144,15 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         && walker.may_descend_at(depth, bytes.as_ref());
     let emit = should_emit(walker, &entry, bytes.as_ref(), git_ignored);
 
+    // The rules a subtree inherits travel with it, so the frontends never
+    // re-derive them.
+    let task = |path| DirectoryTask {
+        path,
+        ignores: ignores.clone(),
+    };
     if !emit {
         if descend {
-            return EntryAction::Descend(entry.path);
+            return EntryAction::Descend(task(entry.path));
         }
         return EntryAction::Skip;
     }
@@ -159,7 +162,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
             Ok(metadata) => Some(metadata),
             Err(source) => {
                 return EntryAction::Failed {
-                    descend: descend.then(|| entry.path.clone()),
+                    descend: descend.then(|| task(entry.path.clone())),
                     failure: EntryFailure {
                         operation: "symlink_metadata",
                         path: entry.path,
@@ -179,7 +182,8 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         metadata,
     };
     if descend {
-        EntryAction::DescendAndEmit(walk_entry)
+        let task = task(walk_entry.path.clone());
+        EntryAction::DescendAndEmit(walk_entry, task)
     } else {
         EntryAction::Emit(walk_entry)
     }

@@ -51,6 +51,12 @@ pub struct Case {
     /// file overrides a shallower one. Only these records can express that.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nested_ignore_rules: Vec<NestedIgnoreFile>,
+    /// Repository-wide excludes, written to `.git/info/exclude`.
+    ///
+    /// Git reads them before any `.gitignore`, so every ignore file overrides
+    /// them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_rules: Vec<String>,
     /// Whether the expression accepts the candidate path. A
     /// [`CaseKind::CompileError`] case never accepts and records `false`.
     pub expected: bool,

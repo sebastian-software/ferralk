@@ -9,6 +9,7 @@ fn ignore_corpus_replays_against_git_check_ignore() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/ignore.jsonl");
     let mut cases = 0_usize;
     let mut nested_cases = 0_usize;
+    let mut exclude_cases = 0_usize;
     for (line_number, line) in fs::read_to_string(&path)
         .expect("read ignore corpus")
         .lines()
@@ -31,9 +32,17 @@ fn ignore_corpus_replays_against_git_check_ignore() {
         if !nested.is_empty() {
             nested_cases += 1;
         }
+        if !case.exclude_rules.is_empty() {
+            exclude_cases += 1;
+        }
         assert_eq!(
-            harness::git_check_ignore_nested(&case.ignore_rules, &nested, candidate)
-                .expect("run git check-ignore"),
+            harness::git_check_ignore_layered(
+                &case.ignore_rules,
+                &nested,
+                &case.exclude_rules,
+                candidate
+            )
+            .expect("run git check-ignore"),
             case.expected,
             "{}:{}: {}",
             path.display(),
@@ -46,5 +55,9 @@ fn ignore_corpus_replays_against_git_check_ignore() {
     assert!(
         nested_cases > 0,
         "the ignore corpus must exercise nested .gitignore precedence"
+    );
+    assert!(
+        exclude_cases > 0,
+        "the ignore corpus must exercise .git/info/exclude"
     );
 }

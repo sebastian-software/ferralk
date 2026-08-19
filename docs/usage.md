@@ -78,7 +78,9 @@ if result.was_cancelled() {
 Important defaults:
 
 - `.gitignore` and `.ignore` files are considered only after
-  `respect_git_ignore(true)`.
+  `respect_git_ignore(true)`, together with the walk root's
+  `.git/info/exclude`, which they override. The file closest to an entry
+  decides, as in Git.
 - Symlinks are not followed unless `WalkOptions::follow_symlinks(true)` is
   selected; a canonical-path guard prevents directory cycles.
 - `ErrorPolicy::Collect` is the default. It returns accepted entries and

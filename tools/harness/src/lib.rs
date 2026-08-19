@@ -29,6 +29,19 @@ pub fn git_check_ignore_nested(
     nested: &[(&str, &[String])],
     candidate: &str,
 ) -> io::Result<bool> {
+    git_check_ignore_layered(rules, nested, &[], candidate)
+}
+
+/// Evaluates a candidate against every ignore source of one repository.
+///
+/// `excludes` are the repository-wide rules in `.git/info/exclude`, which Git
+/// reads before any `.gitignore`, so every ignore file overrides them.
+pub fn git_check_ignore_layered(
+    rules: &[String],
+    nested: &[(&str, &[String])],
+    excludes: &[String],
+    candidate: &str,
+) -> io::Result<bool> {
     let repository = TemporaryRepository::create()?;
     run_git(repository.path(), ["init", "--quiet"])?;
     fs::write(repository.path().join(".gitignore"), rules.join("\n"))?;
@@ -36,6 +49,11 @@ pub fn git_check_ignore_nested(
         let directory = repository.path().join(directory);
         fs::create_dir_all(&directory)?;
         fs::write(directory.join(".gitignore"), rules.join("\n"))?;
+    }
+    if !excludes.is_empty() {
+        let info = repository.path().join(".git/info");
+        fs::create_dir_all(&info)?;
+        fs::write(info.join("exclude"), excludes.join("\n"))?;
     }
 
     let candidate_path = repository.path().join(candidate);
