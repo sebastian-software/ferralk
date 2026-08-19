@@ -104,6 +104,12 @@ Ordinary wildcards never cross a path-component boundary there; use recursive
   unmodified instead of appending display-only separators.
 - `zlob_at` maps naturally to `Walker::new(root)`, but there is no separate
   descriptor-relative entry point yet.
+- Backslash escapes inside character classes follow bash and glibc/BSD
+  `fnmatch`: an escaped `-` is a literal member and never a range operator
+  (`[a\-z]` is exactly `{a, -, z}`). zlob 1.6.3 performs no escape processing
+  inside classes and reads the backslash as an ordinary range endpoint. The
+  diverging verdicts are recorded as `disputed` corpus cases with
+  `oracle_expected` (`class-006/008/009/012/016/024/025`, issue #16).
 
 ## Defaults to review
 
