@@ -205,8 +205,10 @@ specific action needed to clear each one are consolidated in
 - The manually dispatched zlob CodSpeed workflow compiled successfully but
   failed at execution because `cargo codspeed run` rejects the workflow's
   `--features zlob-oracle` argument. The workflow now supplies that feature
-  only to the build step; successful remote comparison evidence remains pending
-  until the corrected workflow is rerun.
+  only to the build step. The corrected
+  [CodSpeed run](https://github.com/sebastian-software/ferralk/actions/runs/32232276481)
+  passed end-to-end; reviewing and retaining the resulting CodSpeed comparison
+  evidence remains the final open part of the M1/M3 benchmark rows.
 
 ### 2026-08-19 — Public repository and standard CI validated
 
