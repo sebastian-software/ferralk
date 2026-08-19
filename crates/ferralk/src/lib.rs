@@ -30,6 +30,15 @@ mod linux_native;
 #[cfg(all(feature = "native-macos", target_os = "macos"))]
 #[allow(unsafe_code)]
 mod macos_native;
+/// Differential parity between the active native backend and the portable one.
+#[cfg(all(
+    test,
+    any(
+        all(feature = "native-macos", target_os = "macos"),
+        all(feature = "native-linux", target_os = "linux")
+    )
+))]
+mod native_parity;
 #[cfg(all(feature = "native-linux", target_os = "linux"))]
 #[doc(hidden)]
 pub use linux_native::fuzz_validate_records as fuzz_validate_linux_dirent_records;
