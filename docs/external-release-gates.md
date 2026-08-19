@@ -6,9 +6,12 @@ is GitHub:
 
 | Topic | Tracking issue |
 | --- | --- |
-| Reproducible benchmark evidence with Rust baselines | [#10](https://github.com/sebastian-software/ferralk/issues/10) |
 | Broader native filesystem parity corpus | [#12](https://github.com/sebastian-software/ferralk/issues/12) |
 | Feedback from the Palamedes integration trial | [#13](https://github.com/sebastian-software/ferralk/issues/13) |
 
 The native validation workflows run automatically for pull requests. Their
 purpose is safety and behavioural parity, not a performance threshold.
+
+Benchmark evidence lives in [benchmark evidence](benchmark-evidence.md): what
+each lane measures, how to reproduce it, and how ferralk compares with the Rust
+baselines and with zlob. None of it gates a release.

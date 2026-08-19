@@ -71,3 +71,42 @@ jobs:
           name: walker-walltime-${{ matrix.lane }}
           path: walker-${{ matrix.lane }}.txt
           if-no-files-found: warn
+
+  # The engine comparison from docs/benchmark-evidence.md. It builds a 53k-file
+  # tree and runs every arm over it, which is too much work for every pull
+  # request and answers a question that does not change per commit, so it runs
+  # on request. Rust-only: the zlob arm needs Zig and stays a local or
+  # manual-dispatch concern, see zlob-benchmark.yml.
+  comparison:
+    name: engine comparison (portable)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Measure
+        shell: bash
+        run: >-
+          cargo bench -p bench --bench walker_palamedes --
+          --output-format bencher | tee walker-palamedes.txt
+      - name: Publish the medians
+        if: always()
+        run: |
+          {
+            echo "### Engine comparison — repository shape"
+            echo
+            echo '| Benchmark | ns/iter | +/- |'
+            echo '| --- | ---: | ---: |'
+            sed -n 's/^test \(.*\) \.\.\. bench: *\([0-9,]*\) ns\/iter (+\/- \([0-9,]*\))$/| `\1` | \2 | \3 |/p' \
+              walker-palamedes.txt
+            echo
+            echo 'Shared runner, warm page cache. Indicative, not a regression gate.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the raw measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: walker-palamedes
+          path: walker-palamedes.txt
+          if-no-files-found: warn
