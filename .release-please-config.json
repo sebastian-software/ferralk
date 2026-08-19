@@ -61,7 +61,7 @@
       "changelog-path": "CHANGELOG.md",
       "version-file": ".release-please-version",
       "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": false,
       "extra-files": [
         {
           "type": "toml",
