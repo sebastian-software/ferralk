@@ -72,6 +72,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             format!("{}:{}: {error}", file.display(), line_number + 1)
                         })?
                         .is_match(path),
+                    CaseKind::MatchGlobPath => Pattern::compile(pattern, options)
+                        .map_err(|error| {
+                            format!("{}:{}: {error}", file.display(), line_number + 1)
+                        })?
+                        .is_match_glob_path(path),
                     CaseKind::HasWildcards => Pattern::has_wildcards(pattern, options),
                     CaseKind::CompileError => replay_compile_error(&case, pattern, options)
                         .map_err(|error| {
@@ -120,6 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             CaseKind::Matcher
                             | CaseKind::HasWildcards
                             | CaseKind::CompileError
+                            | CaseKind::MatchGlobPath
                             | CaseKind::MatchPathIndices
                             | CaseKind::MatchPathIndicesAt => unreachable!(),
                         };
@@ -169,6 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             CaseKind::Matcher
                             | CaseKind::HasWildcards
                             | CaseKind::CompileError
+                            | CaseKind::MatchGlobPath
                             | CaseKind::MatchPaths
                             | CaseKind::MatchPathsAt => unreachable!(),
                         };
