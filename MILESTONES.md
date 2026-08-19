@@ -140,7 +140,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 ### Linux (second)
 
 - [x] Batched `getdents64` backend behind a feature flag
-- [ ] `statx` only where metadata is requested
+- [x] Preserve the opaque `std::fs::Metadata` contract; defer `statx` until a
+      native-attribute API is explicitly approved
 - [x] Bounds-checked record parsing and fuzz target
 - [ ] Miri where executable
 - [x] Native/portable Walker differential option matrix
@@ -160,6 +161,10 @@ specific action needed to clear each one are consolidated in
   contract; C ABI, dlopen/TLS, callbacks, C result-buffer, and libc-shell
   tests are explicit non-goals rather than incomplete ports. The test-suite
   audit retains the exact source mapping and exclusions.
+- Confirmed the Linux metadata boundary: `WalkOptions::metadata(true)` keeps
+  returning `std::fs::Metadata`; Ferralk will not add a redundant `statx`
+  syscall or a native-attribute API in this milestone. A future API proposal
+  is required before revisiting that optimization.
 
 ### 2026-08-19 — M5 native macOS backend started
 

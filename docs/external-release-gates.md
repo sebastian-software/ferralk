@@ -14,7 +14,6 @@ repository.
 | M3 CodSpeed Walker gate | Local fixture medians and `.github/workflows/zlob-benchmark.yml` cover the intended series. | Dispatch the remote comparison and confirm the 1.0 threshold. |
 | M5 macOS native validation | Bounds-checked readers, parser fuzz target, parity option matrix, and a local median within the 20% zlob target are committed. | Run the macOS native CI, sanitizer workflow, filesystem corpus, and stable benchmark series; retain p95 evidence. |
 | M5 Linux native validation | `getdents64` parser, fuzz target, parity matrix, and focused Miri workflow are committed; the test configuration cross-checks from macOS. | Run Ubuntu native CI, parser Miri, sanitizer/fuzz workflow, filesystem corpus, and stable benchmark series. |
-| M5 Linux `statx` | The native reader preserves `WalkOptions::metadata(true)` by returning `std::fs::Metadata`; raw `statx` data cannot construct that opaque type. | Approve a native-attribute public API or revised metadata contract before adding `statx`. |
 | Downstream Palamedes trial | Public API, compatibility guide, package preflight, and local benchmarks are available. | Access to the Palamedes integration target and its maintainer feedback. |
 | Benchmark publication and 1.0 release | Local benchmark suite, CodSpeed workflows, API review, and packaging preflight are in the repository. | Accepted remote benchmark evidence and release/publishing authority. |
 
@@ -25,16 +24,11 @@ ADR-0010. The macOS name/type `getdirentries64` and `getattrlistbulk` paths,
 including record fuzzing and an unsupported-filesystem fallback, are now
 implemented. The feature-gated Linux `getdents64` path is locally
 cross-compiled and its parser fuzz target is committed; Ubuntu execution,
-`statx`, native parity/sanitizer series, and performance gates remain post-1.0
-work.
+native parity/sanitizer series, and performance gates remain post-1.0 work.
 
-The Linux `statx` checkbox also has an explicit API dependency: Ferralk's
-current `WalkOptions::metadata(true)` contract returns opaque
-`std::fs::Metadata`, which cannot be constructed from raw `statx` fields.
-Adding a `statx` call before the required portable metadata query would add a
-second syscall without improving the public result. A future native-attribute
-surface or revised metadata model is therefore required before that checkbox
-can be completed; the current native reader intentionally preserves the
-correct portable metadata contract instead.
+The Linux metadata decision is settled for this milestone: Ferralk preserves
+the opaque `std::fs::Metadata` contract and does not add a redundant `statx`
+syscall. Any future native-attribute surface or revised metadata model is a
+separate API proposal.
 None is a prerequisite for the portable release or evidence of a current
 implementation failure.

@@ -28,3 +28,6 @@ is not a performance target for us.
   independently reviewable and can miss a release without blocking anything.
 - Windows users get correctness and portable speed only.
 - The 20%-of-zlob native gate applies per platform, macOS and Linux only.
+- Native metadata continues to expose `std::fs::Metadata`; `statx` is deferred
+  until a distinct native-attribute API is approved, rather than adding a
+  second syscall without a public result.
