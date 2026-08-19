@@ -33,6 +33,13 @@ jobs:
       - name: Validate the workspace
         run: cargo test --locked
 
+      # The corpus is the behavioural contract, so a release cannot ship
+      # while it disagrees with the matcher.
+      - name: Replay the checked-in corpus
+        run: |
+          cargo test --locked -p corpus -p harness
+          cargo run --locked -p harness -- corpus
+
       - name: Package ferralk-glob
         run: cargo package --locked --no-verify -p ferralk-glob
 
