@@ -2163,6 +2163,8 @@ mod tests {
         fixture.write(".gitignore");
         fs::write(fixture.root.join(".gitignore"), b"ignored/\n").expect("write ignore rule");
         symlink("src", fixture.root.join("source-link")).expect("create directory symlink");
+        symlink("missing-target", fixture.root.join("dangling-link"))
+            .expect("create dangling symlink");
 
         let cases = [
             ("baseline", WalkOptions::default().sort(true)),
@@ -2198,13 +2200,24 @@ mod tests {
             let native = walker.clone().collect().expect("native walk succeeds");
             let (portable_entries, portable_errors) = collect_with_portable_backend(&walker);
 
-            assert!(native.errors().is_empty(), "native {name} errors");
-            assert!(portable_errors.is_empty(), "portable {name} errors");
             assert_eq!(
                 describe_entries(native.entries(), &fixture.root),
                 describe_entries(&portable_entries, &fixture.root),
                 "native {name} differs from portable"
             );
+            assert_eq!(
+                describe_errors(native.errors(), &fixture.root),
+                describe_errors(&portable_errors, &fixture.root),
+                "native {name} errors differ from portable"
+            );
+            if name == "follow_symlinks" {
+                assert_eq!(
+                    describe_errors(native.errors(), &fixture.root),
+                    vec![(PathBuf::from("dangling-link"), "metadata")]
+                );
+            } else {
+                assert!(native.errors().is_empty(), "native {name} errors");
+            }
         }
     }
 
@@ -2255,6 +2268,26 @@ mod tests {
                             metadata.file_type().is_symlink(),
                         )
                     }),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(any(
+        all(feature = "native-macos", target_os = "macos"),
+        all(feature = "native-linux", target_os = "linux")
+    ))]
+    fn describe_errors(errors: &[super::WalkError], root: &Path) -> Vec<(PathBuf, &'static str)> {
+        errors
+            .iter()
+            .map(|error| {
+                (
+                    error
+                        .path()
+                        .strip_prefix(root)
+                        .expect("error belongs to fixture")
+                        .to_path_buf(),
+                    error.operation(),
                 )
             })
             .collect()

@@ -197,9 +197,10 @@ specific action needed to clear each one are consolidated in
   directory-only filters, hidden-path skipping, symlink following, and maximum
   depth. Its fixture also has a directory large enough to span the native
   32-KiB read buffer. It asserts relative paths, entry kinds, depths, symlink
-  status, and requested metadata. It executes locally for `native-macos` and
-  cross-compiles with the Linux-native test configuration; broader filesystem
-  corpus and sanitizer-runtime evidence remain open.
+  status, requested metadata, and the `metadata` error for a followed dangling
+  symlink. It executes locally for `native-macos` and cross-compiles with the
+  Linux-native test configuration; broader filesystem corpus and
+  sanitizer-runtime evidence remain open.
 - Completed the M1 immutable-IR refactor: `Pattern::compile` now produces
   named, immutable `CompiledAlternative` values for both direct matching and
   the optional component-sensitive path-filter form. The path-filter compiler
