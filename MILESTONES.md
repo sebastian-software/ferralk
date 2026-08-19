@@ -776,3 +776,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   and `*/main.rs`. Equivalence tests retain the general matcher as the oracle;
   the new prefix form measures about 16.7 ns matching and 7.0 ns non-matching
   locally. Broader IR work and the external CodSpeed release gate remain open.
+- Removed the common general matcher's per-call memo allocation for state
+  spaces up to 128 token/path pairs: the failure matrix now uses inline bits,
+  while larger inputs retain the existing dense heap matrix. Direct storage
+  tests and the corpus preserve both variants' semantics; the added general
+  matcher benchmark measures about 116 ns matching and 371 ns non-matching.

@@ -600,34 +600,60 @@ impl Pattern {
 /// Memoized failed token/path pairs for one matcher invocation.
 ///
 /// The state space is dense by construction: token and path indices are both
-/// bounded by the input slices. A flat matrix avoids hashing and allocation per
-/// recursive probe while keeping the original backtracking semantics.
-struct FailedStates {
-    width: usize,
-    states: Vec<bool>,
+/// bounded by the input slices. Small matrices live directly in a matcher
+/// frame; larger inputs retain the flat heap matrix. Both avoid hashing while
+/// keeping the original backtracking semantics.
+enum FailedStates {
+    Inline { width: usize, states: u128 },
+    Heap { width: usize, states: Vec<bool> },
 }
 
 impl FailedStates {
     fn new(tokens: &[Token], path: &[u8]) -> Self {
         let width = path.len() + 1;
-        Self {
-            width,
-            states: vec![false; tokens.len() * width],
+        let state_count = tokens.len().saturating_mul(width);
+        if state_count <= u128::BITS as usize {
+            Self::Inline { width, states: 0 }
+        } else {
+            Self::Heap {
+                width,
+                states: vec![false; state_count],
+            }
         }
     }
 
     fn insert(&mut self, token_index: usize, path_index: usize) -> bool {
-        let state = &mut self.states[token_index * self.width + path_index];
-        if *state {
-            false
-        } else {
-            *state = true;
-            true
+        match self {
+            Self::Inline { width, states } => {
+                let mask = 1_u128 << (token_index * *width + path_index);
+                if *states & mask != 0 {
+                    false
+                } else {
+                    *states |= mask;
+                    true
+                }
+            }
+            Self::Heap { width, states } => {
+                let state = &mut states[token_index * *width + path_index];
+                if *state {
+                    false
+                } else {
+                    *state = true;
+                    true
+                }
+            }
         }
     }
 
     fn remove(&mut self, token_index: usize, path_index: usize) {
-        self.states[token_index * self.width + path_index] = false;
+        match self {
+            Self::Inline { width, states } => {
+                *states &= !(1_u128 << (token_index * *width + path_index));
+            }
+            Self::Heap { width, states } => {
+                states[token_index * *width + path_index] = false;
+            }
+        }
     }
 }
 
@@ -1701,7 +1727,7 @@ fn extglob_component_end(path: &[u8], path_index: usize, options: PatternOptions
 
 #[cfg(test)]
 mod tests {
-    use super::{FastPath, Pattern, PatternOptions};
+    use super::{FailedStates, FastPath, Pattern, PatternOptions, Token};
 
     fn compile(pattern: &str) -> Pattern {
         Pattern::compile(pattern, PatternOptions::default()).unwrap()
@@ -1877,6 +1903,25 @@ mod tests {
                 "prefixed star matches a path the unrestricted star rejects: {candidate:?}"
             );
         }
+    }
+
+    #[test]
+    fn failed_state_memos_use_inline_and_heap_storage_without_changing_membership() {
+        let tokens = vec![Token::Star];
+        let mut inline = FailedStates::new(&tokens, b"abc");
+        assert!(matches!(&inline, FailedStates::Inline { .. }));
+        assert!(inline.insert(0, 1));
+        assert!(!inline.insert(0, 1));
+        inline.remove(0, 1);
+        assert!(inline.insert(0, 1));
+
+        let tokens = vec![Token::Star; 2];
+        let mut heap = FailedStates::new(&tokens, &[b'a'; 64]);
+        assert!(matches!(&heap, FailedStates::Heap { .. }));
+        assert!(heap.insert(1, 63));
+        assert!(!heap.insert(1, 63));
+        heap.remove(1, 63);
+        assert!(heap.insert(1, 63));
     }
 
     #[test]

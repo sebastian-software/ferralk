@@ -128,6 +128,15 @@ fn matcher(c: &mut Criterion) {
         },
     );
 
+    let general = Pattern::compile("src/*[a-z]?*.rs", PatternOptions::default())
+        .expect("general benchmark pattern is valid");
+    c.bench_function("general_ir/ferralk_compiled/matching", |benchmark| {
+        benchmark.iter(|| black_box(general.is_match(black_box("src/deep/main.rs"))))
+    });
+    c.bench_function("general_ir/ferralk_compiled/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(general.is_match(black_box("src/deep/main.txt"))))
+    });
+
     let suffix_star = Pattern::compile("*.rs", PatternOptions::default())
         .expect("suffix-star benchmark pattern is valid");
     c.bench_function("single_star/ferralk_compiled/matching", |benchmark| {
