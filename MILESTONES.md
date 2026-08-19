@@ -183,8 +183,10 @@ specific action needed to clear each one are consolidated in
   `linux_dirent64` record and is exposed to a dedicated fuzz target. The
   x86_64-Linux target cross-compiles with tests and Clippy from this workspace;
   normal Ubuntu native CI plus manual fuzz/AddressSanitizer workflows are
-  committed but not yet externally run. `statx`, Linux differential execution,
-  and benchmark evidence remain open.
+  committed but not yet externally run. The manual Linux-native workflow now
+  also provisions Miri for the bounds-checked parser only; raw `getdents64`
+  calls require a real kernel and remain outside Miri's interpreter. `statx`,
+  Linux differential/Miri execution, and benchmark evidence remain open.
 - Added the corresponding serial Linux Walker differential test: it compares
   native and portable output across recursive filtering, exclusions, Gitignore,
   hidden paths, opt-in metadata, and a directory symlink. It cross-compiles on
