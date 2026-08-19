@@ -31,4 +31,4 @@ jobs:
       - uses: CodSpeedHQ/action@v5
         with:
           mode: simulation
-          run: cargo codspeed run -p bench --bench walker_zlob --bench matcher_zlob --features zlob-oracle
+          run: cargo codspeed run -p bench --bench walker_zlob --bench matcher_zlob
