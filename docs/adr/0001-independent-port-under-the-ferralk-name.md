@@ -17,8 +17,9 @@ quirks).
 ferralk is an independent crate family under sebastian-software, licensed MIT.
 zlob 1.6.3 serves as semantic oracle and benchmark bar; compatibility is a
 documented profile ("compatible with X, documented divergences Y"), never a
-drop-in claim. The zlob maintainer receives a courtesy notice only. zlob's MIT
-copyright notice is retained in ported modules and in a NOTICE file.
+drop-in claim. zlob is credited publicly in the README and NOTICE; no outbound
+message to its maintainer is required. zlob's MIT copyright notice is retained
+in ported modules and in a NOTICE file.
 
 ## Consequences
 

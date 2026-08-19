@@ -40,8 +40,8 @@ disputed or undefined zlob semantics are captured as flagged corpus cases.
 - [x] Build the `git check-ignore` oracle runner for ignore cases — ADR-0006
 - [x] Record disputed/undefined semantics as corpus cases with a `disputed`
       flag
-- [ ] Send the courtesy notice to the zlob maintainer — ADR-0001. A reviewed,
-      unsent draft is in [`docs/zlob-courtesy-note.md`](docs/zlob-courtesy-note.md).
+- [x] State zlob as the project inspiration in the README and preserve its
+      attribution and licensing provenance in `NOTICE` — ADR-0001
 
 ## M1 — Matcher port (RFC Phase 1, ~3–5 weeks)
 
@@ -186,10 +186,10 @@ specific action needed to clear each one are consolidated in
 - Both the generated lockstep-version release PR and the native-fuzz lockfile
   correction have merged. The workspace is now at the same `0.1.1` version for
   both publishable crates; no release or registry publication is implied.
-- Added a maintainer-reviewable, explicitly **unsent** courtesy note for zlob's
-  maintainer in [`docs/zlob-courtesy-note.md`](docs/zlob-courtesy-note.md).
-  Sending remains an external communication step and is deliberately not
-  marked complete by this draft.
+- The project deliberately does not contact zlob's maintainer. README and
+  `NOTICE` instead provide the visible, durable attribution: Ferralk is an
+  independently developed project inspired by zlob 1.6.3. This completes the
+  attribution action without creating unsolicited correspondence.
 - Prepared the local macOS comparison: `cargo bench --no-run -p bench --features
   zlob-oracle --bench matcher --bench matcher_zlob --bench walker --bench
   walker_zlob` completes successfully. The actual measured run remains pending
@@ -339,10 +339,10 @@ specific action needed to clear each one are consolidated in
   attribution, Rust/C APIs, flags, and test-suite paths are recorded in
   [`docs/zlob-1.6.3-reference.md`](docs/zlob-1.6.3-reference.md). This removes
   the prior source-coordinate blocker.
-- **Blocker — external actions:** sending a maintainer courtesy notice and
-  configuring repository-side Codecov/CodSpeed credentials require maintainer
-  authority. The committed workflows are ready; no external message or
-  repository setting has been changed.
+- **External action at the time:** configuring repository-side Codecov/CodSpeed
+  credentials required maintainer authority. The committed workflows were ready;
+  no repository setting had been changed. Public README/NOTICE attribution is
+  the settled zlob acknowledgement; no maintainer outreach is planned.
 
 ### 2026-08-18 — M1 matcher baseline started
 
