@@ -20,7 +20,10 @@ platform-runtime tests that are deliberately outside the two-crate Rust API
 | `test_libc_comparison.sh` | No direct equivalent | Shell/libc comparison is system-glob evidence, not Ferralk's API contract. |
 | private helper portions of `test_internal.zig`, `test_utils.zig` | No direct equivalent | Internal SIMD, allocation, and helper invariants are implementation details; performance-sensitive equivalents require profiling-backed work. |
 
-The broad M0 “port zlob's own test suite 1:1” item remains open. Closing it
-requires either a formal scope decision for the deliberate C/loader exclusions
-or an additional compatibility layer, neither of which is implied by the
-current Rust-only architecture.
+## Scope decision
+
+On 2026-08-19, the Rust-only boundary in ADR-0003 was explicitly confirmed for
+Ferralk 1.0. M0 is therefore complete for the public Rust-shaped test contract
+mapped above. C ABI, loader/TLS, callback, C-result-buffer, and libc-shell
+tests remain recorded non-goals, not incomplete ports. Any future compatibility
+layer requires a new product decision and a separate test-plan extension.

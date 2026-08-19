@@ -29,3 +29,11 @@ migration facade; a compatibility guide documents the API mapping instead.
   independently from the faster-moving walker.
 - Two versions to coordinate at release time.
 - Non-Rust consumers are out of scope for now.
+
+## Scope confirmation
+
+On 2026-08-19, the Rust-only boundary was reconfirmed for Ferralk 1.0. The
+frozen zlob corpus covers the public Rust-shaped semantics; C ABI, loader/TLS,
+callback, result-buffer, and libc-shell surfaces remain explicit non-goals.
+A future compatibility layer is a separate product decision rather than a
+compatibility requirement of these two crates.

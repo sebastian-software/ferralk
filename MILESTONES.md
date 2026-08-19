@@ -25,7 +25,9 @@ disputed or undefined zlob semantics are captured as flagged corpus cases.
       (encoder/decoder in Rust), JSON Schema documentation — ADR-0007
 - [x] Inventory the zlob 1.6.3 Rust and C APIs and all flags; write the
       compatibility matrix document
-- [ ] Port zlob's own test suite 1:1 into the corpus — ADR-0007
+- [x] Port zlob's public Rust-shaped test suite 1:1 into the corpus; C ABI,
+      loader, and callback surfaces are accepted Rust-only exclusions —
+      ADR-0003, ADR-0007
 - [x] Build the `oracle` crate (zlob 1.6.3 as dev-dependency) with a manually
       triggered corpus-regen workflow — ADR-0007
 - [x] Wire `fast-glob` (oxc) into the harness as second reference for the
@@ -150,6 +152,14 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 The current external-release prerequisites, their local evidence, and the
 specific action needed to clear each one are consolidated in
 [`docs/external-release-gates.md`](docs/external-release-gates.md).
+
+### 2026-08-19 — M0 Rust-only scope confirmed
+
+- Confirmed the accepted ADR-0003 boundary: Ferralk 1.0 remains Rust-only.
+  The corpus checklist is complete for the frozen zlob public Rust-shaped
+  contract; C ABI, dlopen/TLS, callbacks, C result-buffer, and libc-shell
+  tests are explicit non-goals rather than incomplete ports. The test-suite
+  audit retains the exact source mapping and exclusions.
 
 ### 2026-08-19 — M5 native macOS backend started
 
