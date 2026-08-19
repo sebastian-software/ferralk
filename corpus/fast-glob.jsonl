@@ -1,3 +1,39 @@
 {"id":"fastglob-001","pattern":"src/*.rs","path":"src/lib.rs","flags":[],"expected":true,"source":"fast_glob","note":"Common wildcard subset against Oxc fast-glob 1.1.0."}
 {"id":"fastglob-002","pattern":"file[0-9].rs","path":"file7.rs","flags":[],"expected":true,"source":"fast_glob","note":"Common bracket-class subset against Oxc fast-glob 1.1.0."}
 {"id":"fastglob-003","pattern":"{src,lib}/*.rs","path":"lib/main.rs","flags":["braces"],"expected":true,"source":"fast_glob","note":"Common nested-free brace subset against Oxc fast-glob 1.1.0."}
+{"id":"fastglob-004","pattern":"src/lib.rs","path":"src/lib.rs","flags":[],"expected":true,"source":"fast_glob","note":"Literal path, identical in both engines."}
+{"id":"fastglob-005","pattern":"src/lib.rs","path":"src/main.rs","flags":[],"expected":false,"source":"fast_glob","note":"A literal that does not match."}
+{"id":"fastglob-006","pattern":"src/?ib.rs","path":"src/lib.rs","flags":[],"expected":true,"source":"fast_glob","note":"A single-byte wildcard inside a component."}
+{"id":"fastglob-007","pattern":"src/?ib.rs","path":"src/liib.rs","flags":[],"expected":false,"source":"fast_glob","note":"The wildcard consumes exactly one byte."}
+{"id":"fastglob-008","pattern":"*.rs","path":"main.rs","flags":[],"expected":true,"source":"fast_glob","note":"Suffix wildcard on a single-component candidate."}
+{"id":"fastglob-009","pattern":"*.rs","path":"main.txt","flags":[],"expected":false,"source":"fast_glob","note":"The suffix decides the verdict."}
+{"id":"fastglob-010","pattern":"file[0-9].rs","path":"filex.rs","flags":[],"expected":false,"source":"fast_glob","note":"A byte outside the class is rejected by both engines."}
+{"id":"fastglob-011","pattern":"file[a-f].rs","path":"filec.rs","flags":[],"expected":true,"source":"fast_glob","note":"A letter range behaves the same in both engines."}
+{"id":"fastglob-012","pattern":"[]a]bc","path":"]bc","flags":[],"expected":true,"source":"fast_glob","note":"A leading ] is an ordinary class member in both engines."}
+{"id":"fastglob-013","pattern":"[]a]bc","path":"abc","flags":[],"expected":true,"source":"fast_glob","note":"The member after the leading ] matches too."}
+{"id":"fastglob-014","pattern":"{src,lib}/*.rs","path":"test/main.rs","flags":["braces"],"expected":false,"source":"fast_glob","note":"Neither brace alternative matches."}
+{"id":"fastglob-015","pattern":"a{b,c}d","path":"acd","flags":["braces"],"expected":true,"source":"fast_glob","note":"A brace group inside one component."}
+{"id":"fastglob-016","pattern":"a\\x5C*b","path":"a*b","flags":[],"expected":true,"source":"fast_glob","note":"A backslash before a metacharacter makes it literal in both engines."}
+{"id":"fastglob-017","pattern":"a\\x5C*b","path":"axb","flags":[],"expected":false,"source":"fast_glob","note":"The escaped star no longer acts as a wildcard."}
+{"id":"fastglob-018","pattern":"a\\x5C?b","path":"a?b","flags":[],"expected":true,"source":"fast_glob","note":"The same escape rule holds for the single-byte wildcard."}
+{"id":"fastglob-019","pattern":"a\\x5C[b","path":"a[b","flags":[],"expected":true,"source":"fast_glob","note":"An escaped bracket does not open a class."}
+{"id":"fastglob-020","pattern":"[a-c]*","path":"bxx","flags":[],"expected":true,"source":"fast_glob","note":"A class followed by a wildcard inside one component."}
+{"id":"fastglob-021","pattern":"*.rs","path":".hidden.rs","flags":["match_hidden"],"expected":true,"source":"fast_glob","note":"fast-glob has no leading-period rule, so ferralk needs match_hidden to agree."}
+{"id":"fastglob-022","pattern":"*","path":".hidden","flags":["match_hidden"],"expected":true,"source":"fast_glob","note":"The same parity holds for a bare wildcard against a hidden name."}
+{"id":"fastglob-023","pattern":"a?c","path":"abc","flags":[],"expected":true,"source":"fast_glob","note":"A single-byte wildcard between literals."}
+{"id":"fastglob-024","kind":"match_glob_path","pattern":"src/**/*.rs","path":"src/a/b/main.rs","flags":["recursive_double_star"],"expected":true,"source":"fast_glob","note":"Recursive ** spans directories in both engines."}
+{"id":"fastglob-025","kind":"match_glob_path","pattern":"src/**/*.rs","path":"src/main.rs","flags":["recursive_double_star"],"expected":true,"source":"fast_glob","note":"The recursive segment also spans zero directories here."}
+{"id":"fastglob-026","kind":"match_glob_path","pattern":"**/main.rs","path":"a/b/main.rs","flags":["recursive_double_star"],"expected":true,"source":"fast_glob","note":"A leading ** reaches any depth."}
+{"id":"fastglob-027","kind":"match_glob_path","pattern":"**","path":"a/b/c","flags":["recursive_double_star"],"expected":true,"source":"fast_glob","note":"A pattern that is nothing but ** accepts every candidate."}
+{"id":"fastglob-028","kind":"match_glob_path","pattern":"src/*.rs","path":"src/deep/main.rs","flags":[],"expected":false,"source":"fast_glob","note":"The separator rule: an ordinary wildcard stays inside one component. The fnmatch reading accepts this candidate, which is why the case is a match_glob_path one."}
+{"id":"fastglob-029","kind":"match_glob_path","pattern":"src/*/main.rs","path":"src/a/b/main.rs","flags":[],"expected":false,"source":"fast_glob","note":"A wildcard component matches exactly one component."}
+{"id":"fastglob-030","kind":"match_glob_path","pattern":"src/*/main.rs","path":"src/a/main.rs","flags":[],"expected":true,"source":"fast_glob","note":"The same pattern at the depth it describes."}
+{"id":"fastglob-031","kind":"match_glob_path","pattern":"a?c","path":"a/c","flags":[],"expected":false,"source":"fast_glob","note":"A single-byte wildcard never consumes a separator either."}
+{"id":"fastglob-032","kind":"match_glob_path","pattern":"s*/l*.rs","path":"src/lib.rs","flags":[],"expected":true,"source":"fast_glob","note":"Wildcards in two components, each staying inside its own."}
+{"id":"fastglob-033","kind":"match_glob_path","pattern":"a/**","path":"a","flags":["recursive_double_star"],"expected":true,"oracle_expected":false,"source":"fast_glob","disputed":true,"note":"A trailing ** component elides to nothing in ferralk; fast-glob requires at least one component. Found by the ferralk_vs_fast_glob differential target."}
+{"id":"fastglob-034","kind":"match_glob_path","pattern":"**/a","path":"aa","flags":["recursive_double_star"],"expected":true,"oracle_expected":false,"source":"fast_glob","disputed":true,"note":"ferralk's ** is an ordinary recursive wildcard and need not end on a component boundary; fast-glob reads ** only as a whole component."}
+{"id":"fastglob-035","pattern":"\\x5Cb","path":"b","flags":[],"expected":true,"oracle_expected":false,"source":"fast_glob","disputed":true,"note":"ferralk unescapes a backslash before an ordinary byte, so the pattern means the literal b; fast-glob leaves the pair unmatched."}
+{"id":"fastglob-036","pattern":"[[:alpha:]]","path":"a","flags":[],"expected":true,"oracle_expected":false,"source":"fast_glob","disputed":true,"note":"POSIX class names are ferralk-only; fast-glob reads the brackets literally."}
+{"id":"fastglob-037","kind":"match_glob_path","pattern":"[/]","path":"/","flags":[],"expected":false,"oracle_expected":true,"source":"fast_glob","disputed":true,"note":"Under the component-local policy no class may accept the separator; fast-glob lets it."}
+{"id":"fastglob-038","kind":"match_glob_path","pattern":"[!a]","path":"/","flags":[],"expected":false,"oracle_expected":true,"source":"fast_glob","disputed":true,"note":"A negated class implicitly contains the separator, which only fast-glob accepts."}
+{"id":"fastglob-039","pattern":"{}{},","path":"","flags":["braces"],"expected":false,"oracle_expected":true,"source":"fast_glob","disputed":true,"note":"A fast-glob defect rather than a design difference: after two brace groups close it still reads the comma as an alternative separator, so it accepts the empty candidate where ferralk matches the literal comma."}
