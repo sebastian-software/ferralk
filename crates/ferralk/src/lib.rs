@@ -511,8 +511,12 @@ struct TraversalPattern {
     matcher: Pattern,
     directories_only: bool,
     subtree_root: Option<Pattern>,
-    literal_root: Option<Vec<u8>>,
-    extension: Option<Vec<u8>>,
+    /// Literal root of every brace alternative, or `None` when one of them has
+    /// none. A prefilter that does not hold for every alternative would prune
+    /// something the pattern can still match.
+    literal_roots: Option<Vec<Vec<u8>>>,
+    /// Literal final extension of every brace alternative, on the same terms.
+    extensions: Option<Vec<Vec<u8>>>,
 }
 
 impl TraversalPattern {
@@ -532,12 +536,17 @@ impl TraversalPattern {
             .strip_suffix(b"/**")
             .map(|root| Pattern::compile(root, options))
             .transpose()?;
+        // The matcher expands braces before it compiles; the prefilters are
+        // derived from the same expansion, so `**/*.{ts,tsx}` keeps the
+        // extension filter and `{src,lib}/**` keeps its roots. A pattern
+        // without braces expands to itself, which is the previous behaviour.
+        let alternatives = ferralk_glob::expand_braces(pattern, options)?;
         Ok(Self {
             matcher: Pattern::compile(pattern, options)?,
             directories_only,
             subtree_root,
-            literal_root: literal_pattern_root(pattern),
-            extension: literal_extension(pattern),
+            literal_roots: prefilter_of_every_alternative(&alternatives, literal_pattern_root),
+            extensions: prefilter_of_every_alternative(&alternatives, literal_extension),
         })
     }
 
@@ -552,24 +561,53 @@ impl TraversalPattern {
     }
 
     fn could_match_descendant(&self, path: &[u8]) -> bool {
-        let Some(root) = &self.literal_root else {
+        let Some(roots) = &self.literal_roots else {
             return true;
         };
-        root == path
-            || root
-                .strip_prefix(path)
-                .is_some_and(|suffix| suffix.starts_with(b"/"))
-            || path
-                .strip_prefix(root.as_slice())
-                .is_some_and(|suffix| suffix.starts_with(b"/"))
+        roots
+            .iter()
+            .any(|root| shares_a_line_of_descent(root, path))
     }
 
     fn matches_extension(&self, path: &[u8]) -> bool {
-        let Some(extension) = &self.extension else {
+        let Some(extensions) = &self.extensions else {
             return true;
         };
-        final_extension(path).is_some_and(|candidate| candidate == extension)
+        final_extension(path)
+            .is_some_and(|candidate| extensions.iter().any(|extension| extension == candidate))
     }
+}
+
+/// Whether `path` is the literal root, or one of the two contains the other:
+/// only then can something under `path` still match.
+fn shares_a_line_of_descent(root: &[u8], path: &[u8]) -> bool {
+    root == path
+        || root
+            .strip_prefix(path)
+            .is_some_and(|suffix| suffix.starts_with(b"/"))
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with(b"/"))
+}
+
+/// Collects one prefilter value per brace alternative, or `None` as soon as an
+/// alternative has none. Pruning on a value that only some alternatives share
+/// would drop paths the pattern still matches, so the filter is either complete
+/// or off.
+fn prefilter_of_every_alternative(
+    alternatives: &[Vec<u8>],
+    of_alternative: impl Fn(&[u8]) -> Option<Vec<u8>>,
+) -> Option<Vec<Vec<u8>>> {
+    if alternatives.is_empty() {
+        return None;
+    }
+    let mut values = alternatives
+        .iter()
+        .map(|alternative| of_alternative(alternative))
+        .collect::<Option<Vec<_>>>()?;
+    values.sort_unstable();
+    values.dedup();
+    Some(values)
 }
 
 fn literal_pattern_root(pattern: &[u8]) -> Option<Vec<u8>> {
@@ -2165,6 +2203,84 @@ mod tests {
                 "walker verdict for corpus case {}",
                 case.id
             );
+        }
+    }
+
+    /// Both prefilters are derived from the expanded alternatives, and both go
+    /// quiet as soon as one alternative cannot contribute a value.
+    #[test]
+    fn brace_alternatives_carry_the_planner_prefilters() {
+        let sources = TraversalPattern::compile(b"**/*.{ts,tsx}").expect("valid brace pattern");
+        assert!(sources.matches_extension(b"src/app.ts"));
+        assert!(sources.matches_extension(b"src/app.tsx"));
+        assert!(!sources.matches_extension(b"src/app.js"));
+        assert!(!sources.matches_extension(b"src/app"));
+
+        let scoped = TraversalPattern::compile(b"{src,lib}/**/*.ts").expect("valid brace pattern");
+        assert!(scoped.could_match_descendant(b"src"));
+        assert!(scoped.could_match_descendant(b"lib"));
+        assert!(scoped.could_match_descendant(b"src/nested"));
+        assert!(!scoped.could_match_descendant(b"docs"));
+        assert!(!scoped.could_match_descendant(b"node_modules"));
+
+        let nested = TraversalPattern::compile(b"{src/{a,b},lib}/**").expect("valid brace pattern");
+        assert!(nested.could_match_descendant(b"src"));
+        assert!(nested.could_match_descendant(b"src/a"));
+        assert!(!nested.could_match_descendant(b"src/c"));
+
+        // One alternative without a literal root, or without a literal
+        // extension, switches the whole prefilter off rather than pruning what
+        // that alternative could still match.
+        let partial_root = TraversalPattern::compile(b"{src,*}/**/*.ts").expect("valid pattern");
+        assert!(partial_root.could_match_descendant(b"docs"));
+        let partial_extension = TraversalPattern::compile(b"**/*.{ts,*}").expect("valid pattern");
+        assert!(partial_extension.matches_extension(b"src/app.js"));
+    }
+
+    /// A braced include may return exactly what its alternatives return
+    /// together: the prefilters must not narrow that, and must not widen it.
+    #[test]
+    fn a_brace_include_returns_the_union_of_its_alternatives() {
+        let fixture = Fixture::new();
+        fixture.write("src/app.ts");
+        fixture.write("src/app.tsx");
+        fixture.write("src/app.js");
+        fixture.write("src/nested/deep.ts");
+        fixture.write("lib/util.ts");
+        fixture.write("lib/util.rs");
+        fixture.write("docs/guide.md");
+        fixture.write("docs/nested/notes.md");
+        fixture.write("node_modules/pkg/index.ts");
+
+        let walk = |pattern: &str| -> Vec<PathBuf> {
+            let result = Walker::new(&fixture.root)
+                .include(pattern)
+                .expect("valid include")
+                .options(WalkOptions::default().sort(true))
+                .collect()
+                .expect("walk succeeds");
+            relative_paths(result.entries(), &fixture.root)
+        };
+
+        for pattern in [
+            "**/*.{ts,tsx}",
+            "{src,lib}/**/*.ts",
+            "{src,docs}/**",
+            "src/{app,nested}*",
+            "{src,lib}/**/*.{ts,rs}",
+        ] {
+            let alternatives =
+                ferralk_glob::expand_braces(pattern, super::traversal_pattern_options())
+                    .expect("expandable pattern");
+            let mut union = alternatives
+                .iter()
+                .flat_map(|alternative| {
+                    walk(std::str::from_utf8(alternative).expect("ASCII fixture pattern"))
+                })
+                .collect::<Vec<_>>();
+            union.sort_unstable();
+            union.dedup();
+            assert_eq!(walk(pattern), union, "{pattern}");
         }
     }
 
