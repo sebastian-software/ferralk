@@ -240,11 +240,17 @@ specific action needed to clear each one are consolidated in
   release action: Release Please requires `.release-please-config.json`.
   The corrected dotfile is committed separately; no package, tag, release, or
   release PR was created by the failed run.
-- The corrected remote run succeeded and opened release PR #2. Its generated
-  `0.1.1` change set confirms the lockstep update of the workspace version,
-  both published crates, all six workspace lockfile packages, and the exact
-  internal dependency. The PR remains unmerged, so no GitHub release or
-  crates.io publication has been requested or performed.
+- The corrected remote run opened release PR #2. Its generated `0.1.1` change
+  set confirms the lockstep update of the workspace version, both published
+  crates, all six workspace lockfile packages, and the exact internal
+  dependency. That PR was merged but did not create a tag or GitHub release:
+  its component-less title did not match the configured `ferralk` component.
+- The unreleased historical PR is intentionally not back-published. Its
+  `autorelease: pending` label was removed and Release Please now starts from
+  the current `last-release-sha` with an explicit `ferralk` component and
+  release-PR title. Future `feat:`, `fix:`, or `perf:` commits can therefore
+  create a normal release PR without replaying the older history. Remove
+  `last-release-sha` after the first correctly completed future release.
 
 ### 2026-08-19 — M0 Rust-only scope confirmed
 
