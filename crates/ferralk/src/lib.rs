@@ -2637,7 +2637,10 @@ mod tests {
     fn collect_with_portable_backend(walker: &Walker) -> (Vec<WalkEntry>, Vec<super::WalkError>) {
         let mut state = super::WalkState::new(walker);
         state
-            .walk_directory(&super::StdBackend, walker.root.clone())
+            .walk_directory(
+                &super::StdBackend,
+                directory_task(walker, &super::StdBackend, walker.root.clone()),
+            )
             .expect("portable walk succeeds");
         if walker.options.sort {
             state

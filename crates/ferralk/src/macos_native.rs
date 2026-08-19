@@ -636,8 +636,12 @@ mod tests {
 
     fn collect_with_portable_backend(walker: &Walker) -> (Vec<WalkEntry>, Vec<crate::WalkError>) {
         let mut state = crate::WalkState::new(walker);
+        let task = crate::DirectoryTask {
+            path: walker.root.clone(),
+            ignores: crate::IgnoreScope::root(walker, &StdBackend),
+        };
         state
-            .walk_directory(&StdBackend, walker.root.clone())
+            .walk_directory(&StdBackend, task)
             .expect("portable walk succeeds");
         if walker.options.sort {
             state
