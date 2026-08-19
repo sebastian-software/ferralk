@@ -2,9 +2,9 @@
 
 use std::{
     any::Any,
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
 };
@@ -12,15 +12,17 @@ use std::{
 use crossbeam_deque::{Steal, Stealer, Worker};
 
 use super::{
-    BackendEntry, DirectoryBackend, ErrorPolicy, GitIgnoreNode, SystemBackend, WalkEntry,
-    WalkError, WalkResult, Walker, glob_path_bytes, has_hidden_component, is_git_ignored,
+    BackendEntry, DirectoryBackend, ErrorPolicy, WalkEntry, WalkError, WalkResult, Walker,
+    classify::{EntryAction, EntryCaches, classify_entry},
     scheduler::{Coordinator, Scheduler, WorkerSlot},
-    should_skip_git_directory,
 };
 
-pub(super) fn collect(walker: Walker) -> Result<WalkResult, WalkError> {
+pub(super) fn collect<B: DirectoryBackend + Sync>(
+    walker: Walker,
+    backend: &B,
+) -> Result<WalkResult, WalkError> {
     let walker = Arc::new(walker);
-    let shared = Arc::new(Shared::new(Arc::clone(&walker)));
+    let shared = Arc::new(Shared::new(Arc::clone(&walker), backend));
     let mut caller = WorkerScratch::new(0);
     let caller_slot = shared.coordinator.claim_caller_slot();
 
@@ -79,7 +81,7 @@ pub(super) fn collect(walker: Walker) -> Result<WalkResult, WalkError> {
 #[derive(Clone, Copy)]
 struct HelperPool<'scope, 'env> {
     scope: &'scope thread::Scope<'scope, 'env>,
-    shared: &'env Arc<Shared>,
+    shared: &'env Arc<Shared<'env>>,
     stealers: &'env [Stealer<PathBuf>],
     idle: &'env Mutex<Vec<WorkerScratch>>,
     shards: &'env Mutex<Vec<Vec<WalkEntry>>>,
@@ -159,8 +161,12 @@ fn finish(shared: Arc<Shared>, mut entries: Vec<WalkEntry>) -> Result<WalkResult
     })
 }
 
-struct Shared {
+struct Shared<'backend> {
     walker: Arc<Walker>,
+    /// Every filesystem call of the walk goes through here, which is what lets
+    /// a test mock drive the parallel frontend the same way it drives the
+    /// serial one.
+    backend: &'backend (dyn DirectoryBackend + Sync),
     scheduler: Scheduler<PathBuf>,
     /// Task accounting, worker slots and the parking protocol.
     coordinator: Coordinator,
@@ -172,11 +178,12 @@ struct Shared {
     visited_directories: Mutex<HashSet<PathBuf>>,
 }
 
-impl Shared {
-    fn new(walker: Arc<Walker>) -> Self {
+impl<'backend> Shared<'backend> {
+    fn new(walker: Arc<Walker>, backend: &'backend (dyn DirectoryBackend + Sync)) -> Self {
         let cancellation = walker.cancellation.clone().unwrap_or_default();
         Self {
             walker,
+            backend,
             scheduler: Scheduler::new(),
             coordinator: Coordinator::new(),
             cancellation,
@@ -242,7 +249,7 @@ struct WorkerScratch {
     /// idle scan can start next door and skip its own queue.
     index: usize,
     queue: Worker<PathBuf>,
-    gitignore_cache: HashMap<PathBuf, Arc<GitIgnoreNode>>,
+    caches: EntryCaches,
     entries: Vec<WalkEntry>,
 }
 
@@ -251,7 +258,7 @@ impl WorkerScratch {
         Self {
             index,
             queue: Worker::new_fifo(),
-            gitignore_cache: HashMap::new(),
+            caches: EntryCaches::new(),
             entries: Vec::new(),
         }
     }
@@ -341,7 +348,7 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, directory: Pat
     if shared.walker.options.follow_symlinks && !mark_directory(shared, &directory) {
         return;
     }
-    let entries = match SystemBackend.read_directory(&directory) {
+    let entries = match shared.backend.read_directory(&directory) {
         Ok(entries) => entries,
         Err(source) => {
             shared.record_error("read_dir", directory, source);
@@ -356,107 +363,32 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, directory: Pat
     }
 }
 
-fn mark_directory(shared: &Shared, directory: &PathBuf) -> bool {
-    match std::fs::canonicalize(directory) {
+fn mark_directory(shared: &Shared, directory: &Path) -> bool {
+    match shared.backend.canonicalize(directory) {
         Ok(canonical) => lock(&shared.visited_directories).insert(canonical),
         Err(source) => {
-            shared.record_error("canonicalize", directory.clone(), source);
+            shared.record_error("canonicalize", directory.to_path_buf(), source);
             false
         }
     }
 }
 
-fn process_entry(shared: &Shared, worker: &mut WorkerScratch, mut entry: BackendEntry) {
-    let relative = entry
-        .path
-        .strip_prefix(&shared.walker.root)
-        .unwrap_or(entry.path.as_path());
-    let depth = relative.components().count();
-    if !shared.walker.includes_depth(relative) {
-        return;
-    }
-    let bytes = glob_path_bytes(relative);
-    if shared.walker.options.skip_hidden && has_hidden_component(bytes.as_ref()) {
-        return;
-    }
-    if should_skip_git_directory(&shared.walker, &entry.path) {
-        return;
-    }
-    if shared
-        .walker
-        .excludes
-        .iter()
-        .any(|pattern| pattern.matches(bytes.as_ref(), entry.is_dir))
-    {
-        return;
-    }
-    let git_ignored = is_git_ignored(
-        &shared.walker,
-        &entry.path,
-        entry.is_dir,
-        &mut worker.gitignore_cache,
-    );
-    if git_ignored && !entry.is_dir {
-        return;
-    }
-    if entry.is_symlink && shared.walker.options.follow_symlinks {
-        match std::fs::metadata(&entry.path) {
-            Ok(metadata) => entry.is_dir = metadata.is_dir(),
-            Err(source) => {
-                shared.record_error("metadata", entry.path, source);
-                return;
+fn process_entry(shared: &Shared, worker: &mut WorkerScratch, entry: BackendEntry) {
+    match classify_entry(&shared.walker, shared.backend, entry, &mut worker.caches) {
+        EntryAction::Skip => {}
+        EntryAction::Descend(path) => shared.schedule(&worker.queue, path),
+        EntryAction::DescendAndEmit(entry) => {
+            shared.schedule(&worker.queue, entry.path.clone());
+            worker.entries.push(entry);
+        }
+        EntryAction::Emit(entry) => worker.entries.push(entry),
+        EntryAction::Failed { failure, descend } => {
+            if let Some(path) = descend {
+                shared.schedule(&worker.queue, path);
             }
+            shared.record_error(failure.operation, failure.path, failure.source);
         }
     }
-    if !entry.is_dir && !shared.walker.may_include_file(bytes.as_ref()) {
-        return;
-    }
-    if entry.is_dir
-        && !shared
-            .walker
-            .excludes
-            .iter()
-            .any(|pattern| pattern.covers_subtree(bytes.as_ref()))
-        && shared.walker.may_descend_path(relative, bytes.as_ref())
-    {
-        shared.schedule(&worker.queue, entry.path.clone());
-    }
-    if !shared.walker.includes.is_empty()
-        && !shared
-            .walker
-            .includes
-            .iter()
-            .any(|pattern| pattern.matches(bytes.as_ref(), entry.is_dir))
-    {
-        return;
-    }
-    if git_ignored {
-        return;
-    }
-    if shared.walker.options.directories_only && !entry.is_dir {
-        return;
-    }
-    if shared.walker.options.files_only && entry.is_dir {
-        return;
-    }
-    let metadata = if shared.walker.options.metadata {
-        match std::fs::symlink_metadata(&entry.path) {
-            Ok(metadata) => Some(metadata),
-            Err(source) => {
-                shared.record_error("symlink_metadata", entry.path, source);
-                return;
-            }
-        }
-    } else {
-        None
-    };
-    worker.entries.push(WalkEntry {
-        path: entry.path,
-        is_dir: entry.is_dir,
-        is_symlink: entry.is_symlink,
-        depth,
-        metadata,
-    });
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -639,7 +571,7 @@ mod tests {
     fn worker_panic_cancels_siblings_and_resumes_on_the_caller() {
         let cancellation = CancellationToken::default();
         let walker = Arc::new(Walker::new(".").cancellation(cancellation.clone()));
-        let shared = Arc::new(Shared::new(walker));
+        let shared = Arc::new(Shared::new(walker, &crate::SystemBackend));
 
         catch_worker_panic(&shared, || panic!("injected worker panic"));
         assert!(cancellation.is_cancelled());
