@@ -30,7 +30,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - run: cargo fuzz run macos_dirent_parser -- -max_total_time=$MAX_TOTAL_TIME
+      # cargo-fuzz defaults to the target it was itself built for, and the
+      # prebuilt binary is x86_64 while this runner is aarch64. Name the host
+      # target the sanitizer job already uses.
+      - run: >-
+          cargo fuzz run --target aarch64-apple-darwin macos_dirent_parser
+          -- -max_total_time=$MAX_TOTAL_TIME
 
   address-sanitizer:
     name: macOS AddressSanitizer

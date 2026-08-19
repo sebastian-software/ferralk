@@ -30,9 +30,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      # The prebuilt cargo-fuzz is a musl binary and defaults to its own target,
-      # where the sanitizer cannot link against a static libc. Name the runner's
-      # host target, which is what a source-built cargo-fuzz picked by itself.
+      # cargo-fuzz defaults to the target it was itself built for, and the
+      # prebuilt binary is musl, where the sanitizer cannot link against a
+      # static libc. Name the host target the sanitizer job already uses.
       - run: >-
           cargo fuzz run --target x86_64-unknown-linux-gnu linux_dirent_parser
           -- -max_total_time=$MAX_TOTAL_TIME
