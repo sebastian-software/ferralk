@@ -2,7 +2,7 @@
 
 use std::{fs, path::Path};
 
-use corpus::{Case, Source, decode_bytes};
+use corpus::{Case, CaseKind, Source, decode_bytes};
 use ferralk_glob::{Pattern, PatternOptions};
 
 #[test]
@@ -33,9 +33,20 @@ fn common_subset_replays_against_oxc_fast_glob() {
             path.display(),
             line_number + 1
         );
-        let ferralk = Pattern::compile(&pattern, options(&case.flags))
-            .unwrap_or_else(|error| panic!("{}:{}: {error}", path.display(), line_number + 1))
-            .is_match(&candidate);
+        let compiled = Pattern::compile(&pattern, options(&case.flags))
+            .unwrap_or_else(|error| panic!("{}:{}: {error}", path.display(), line_number + 1));
+        // fast-glob keeps an ordinary wildcard inside one path component, so a
+        // case about that policy is replayed against the component-local
+        // matcher; the fnmatch-style form is the default kind.
+        let ferralk = match case.kind {
+            CaseKind::Matcher => compiled.is_match(&candidate),
+            CaseKind::MatchGlobPath => compiled.is_match_glob_path(&candidate),
+            other => panic!(
+                "{}:{}: the fast-glob corpus has no replay for {other:?}",
+                path.display(),
+                line_number + 1
+            ),
+        };
         assert_eq!(
             ferralk,
             case.expected,

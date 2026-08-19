@@ -13,26 +13,47 @@ static TEMPORARY_REPOSITORY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Evaluates a candidate path against rules with Git's own ignore matcher.
 ///
-/// `rules` become the repository root's `.gitignore`; `files` are the further
-/// ignore files a case needs, such as a nested `.gitignore` or
-/// `.git/info/exclude`.
-///
 /// A new repository is created for each call so no caller state, global Git
 /// configuration, or checked-out repository changes the verdict.
-pub fn git_check_ignore(
+pub fn git_check_ignore(rules: &[String], candidate: &str) -> io::Result<bool> {
+    git_check_ignore_nested(rules, &[], candidate)
+}
+
+/// Evaluates a candidate against a root `.gitignore` plus deeper ones.
+///
+/// Git reads the ignore file closest to the candidate last, so a nested file
+/// overrides the root. `nested` names each further file by the directory that
+/// holds it, relative to the repository root.
+pub fn git_check_ignore_nested(
     rules: &[String],
-    files: &[corpus::IgnoreFile],
+    nested: &[(&str, &[String])],
+    candidate: &str,
+) -> io::Result<bool> {
+    git_check_ignore_layered(rules, nested, &[], candidate)
+}
+
+/// Evaluates a candidate against every ignore source of one repository.
+///
+/// `excludes` are the repository-wide rules in `.git/info/exclude`, which Git
+/// reads before any `.gitignore`, so every ignore file overrides them.
+pub fn git_check_ignore_layered(
+    rules: &[String],
+    nested: &[(&str, &[String])],
+    excludes: &[String],
     candidate: &str,
 ) -> io::Result<bool> {
     let repository = TemporaryRepository::create()?;
     run_git(repository.path(), ["init", "--quiet"])?;
     fs::write(repository.path().join(".gitignore"), rules.join("\n"))?;
-    for file in files {
-        let path = repository.path().join(&file.path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, file.rules.join("\n"))?;
+    for (directory, rules) in nested {
+        let directory = repository.path().join(directory);
+        fs::create_dir_all(&directory)?;
+        fs::write(directory.join(".gitignore"), rules.join("\n"))?;
+    }
+    if !excludes.is_empty() {
+        let info = repository.path().join(".git/info");
+        fs::create_dir_all(&info)?;
+        fs::write(info.join("exclude"), excludes.join("\n"))?;
     }
 
     let candidate_path = repository.path().join(candidate);
@@ -41,7 +62,9 @@ pub fn git_check_ignore(
     }
     fs::write(&candidate_path, [])?;
 
-    let status = Command::new("git")
+    let mut command = Command::new("git");
+    isolate(&mut command);
+    let status = command
         .arg("check-ignore")
         .arg("--no-index")
         .arg("--quiet")
@@ -59,11 +82,27 @@ pub fn git_check_ignore(
     }
 }
 
+/// Cuts a Git invocation off from every configuration outside the fixture.
+///
+/// Without this the developer's own `core.excludesFile` decides corpus
+/// verdicts: a global `*.log` rule silently ignores candidates the recorded
+/// rules never mention, and the same case then behaves differently in CI.
+fn isolate(command: &mut Command) {
+    command
+        // Git 2.32 and later read these instead of the real config files.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        // An excludes file named through the environment outranks the config.
+        .env_remove("GIT_DIR")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME");
+}
+
 fn run_git<'a>(directory: &Path, arguments: impl IntoIterator<Item = &'a str>) -> io::Result<()> {
-    let status = Command::new("git")
-        .args(arguments)
-        .current_dir(directory)
-        .status()?;
+    let mut command = Command::new("git");
+    isolate(&mut command);
+    let status = command.args(arguments).current_dir(directory).status()?;
     if status.success() {
         Ok(())
     } else {

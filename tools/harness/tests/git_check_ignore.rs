@@ -8,6 +8,8 @@ use corpus::{Case, Source, decode_bytes};
 fn ignore_corpus_replays_against_git_check_ignore() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/ignore.jsonl");
     let mut cases = 0_usize;
+    let mut nested_cases = 0_usize;
+    let mut exclude_cases = 0_usize;
     for (line_number, line) in fs::read_to_string(&path)
         .expect("read ignore corpus")
         .lines()
@@ -22,13 +24,26 @@ fn ignore_corpus_replays_against_git_check_ignore() {
         let candidate_bytes = decode_bytes(&case.path).expect("decode candidate path");
         let candidate = std::str::from_utf8(&candidate_bytes)
             .expect("Git oracle corpus paths must be valid UTF-8");
-        // A disputed case records Git's verdict in `oracle_expected` and
-        // ferralk's own policy in `expected`; the oracle is held to its own.
-        let expected_reference = case.oracle_expected.unwrap_or(case.expected);
+        let nested: Vec<(&str, &[String])> = case
+            .nested_ignore_rules
+            .iter()
+            .map(|file| (file.directory.as_str(), file.rules.as_slice()))
+            .collect();
+        if !nested.is_empty() {
+            nested_cases += 1;
+        }
+        if !case.exclude_rules.is_empty() {
+            exclude_cases += 1;
+        }
         assert_eq!(
-            harness::git_check_ignore(&case.ignore_rules, &case.ignore_files, candidate)
-                .expect("run git check-ignore"),
-            expected_reference,
+            harness::git_check_ignore_layered(
+                &case.ignore_rules,
+                &nested,
+                &case.exclude_rules,
+                candidate
+            )
+            .expect("run git check-ignore"),
+            case.expected,
             "{}:{}: {}",
             path.display(),
             line_number + 1,
@@ -37,4 +52,12 @@ fn ignore_corpus_replays_against_git_check_ignore() {
         cases += 1;
     }
     assert!(cases > 0, "the ignore corpus must contain Git-backed cases");
+    assert!(
+        nested_cases > 0,
+        "the ignore corpus must exercise nested .gitignore precedence"
+    );
+    assert!(
+        exclude_cases > 0,
+        "the ignore corpus must exercise .git/info/exclude"
+    );
 }

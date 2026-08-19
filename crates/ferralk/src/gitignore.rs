@@ -6,6 +6,10 @@
 //! file's directory. Directories without ignore files add nothing to the chain,
 //! which is why a tree without them costs nothing per entry.
 //!
+//! An ignored directory is not entered at all, which is both what Git does and
+//! why nothing below it can be re-included: the ignore files inside it are
+//! never read, so their negations never apply.
+//!
 //! The chain travels with the directory task rather than through a cache: every
 //! directory is visited exactly once, so the descent already builds each node
 //! exactly once, whatever the worker count. A shared cache would add
@@ -25,15 +29,12 @@ const IGNORE_FILES: [&str; 2] = [".gitignore", ".ignore"];
 /// ignore rules from the walk root downwards, so it reads the one there.
 const REPOSITORY_EXCLUDE_FILE: &str = ".git/info/exclude";
 
-/// The ignore rules in force inside one directory, plus that directory's own
-/// verdict, which its entries inherit.
+/// The ignore rules in force inside one directory.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IgnoreScope {
     /// Innermost directory with rules. Each node links to the next ancestor
     /// that has any; directories without ignore files never appear.
     rules: Option<Arc<IgnoreNode>>,
-    /// Whether the directory this scope describes is itself ignored.
-    ignored: bool,
 }
 
 impl IgnoreScope {
@@ -49,15 +50,6 @@ impl IgnoreScope {
             &walker.root,
             &[REPOSITORY_EXCLUDE_FILE],
         ))
-    }
-
-    /// The state a child directory inherits: the rules in force here, plus the
-    /// child's own verdict. Its ignore files join when the walk enters it.
-    pub(crate) fn inherit(&self, ignored: bool) -> Self {
-        Self {
-            rules: self.rules.clone(),
-            ignored,
-        }
     }
 
     /// Adds `directory`'s own ignore files to the chain. Called once, when the
@@ -92,12 +84,13 @@ impl IgnoreScope {
     /// Verdict for one entry of the directory this scope describes.
     ///
     /// The deepest ignore file with an opinion decides, which is Git's
-    /// precedence; with none, the entry inherits the directory's own verdict.
+    /// precedence. An entry below an ignored directory never reaches this: the
+    /// walk does not enter such a directory.
     pub(crate) fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        match &self.rules {
-            Some(node) => node.verdict(path, is_dir).unwrap_or(self.ignored),
-            None => self.ignored,
-        }
+        self.rules
+            .as_ref()
+            .and_then(|node| node.verdict(path, is_dir))
+            .unwrap_or(false)
     }
 
     /// Puts `rules` on the chain, unless they are empty: an empty matcher can
@@ -112,7 +105,6 @@ impl IgnoreScope {
                 rules,
                 parent: self.rules,
             })),
-            ignored: self.ignored,
         }
     }
 }

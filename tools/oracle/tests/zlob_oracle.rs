@@ -23,13 +23,15 @@ struct Skipped {
     non_utf8: usize,
     /// Rejected patterns are a ferralk contract with its own error taxonomy.
     compile_error: usize,
+    /// zlob has no component-local wildcard mode to compare against.
+    glob_path: usize,
     /// The verdict describes a separator platform this runner is not.
     platform: usize,
 }
 
 impl Skipped {
     fn total(&self) -> usize {
-        self.case_folding + self.non_utf8 + self.compile_error + self.platform
+        self.case_folding + self.non_utf8 + self.compile_error + self.glob_path + self.platform
     }
 }
 
@@ -44,7 +46,13 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
     let mut replayed = 0_usize;
     let mut skipped = Skipped::default();
     for file in files {
-        if file.file_name().is_some_and(|name| name == "ignore.jsonl") {
+        // Each topic names its own reference oracle, and `oracle_expected`
+        // records that oracle's verdict. Git owns the ignore topic and Oxc
+        // fast-glob owns its own, so neither is zlob's to replay.
+        if file
+            .file_name()
+            .is_some_and(|name| name == "ignore.jsonl" || name == "fast-glob.jsonl")
+        {
             continue;
         }
         for (line_number, line) in fs::read_to_string(&file)
@@ -63,6 +71,10 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
             }
             if case.kind == CaseKind::CompileError {
                 skipped.compile_error += 1;
+                continue;
+            }
+            if case.kind == CaseKind::MatchGlobPath {
+                skipped.glob_path += 1;
                 continue;
             }
             let Some(flags) = zlob_flags(&case.flags) else {
@@ -103,6 +115,7 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                             CaseKind::Matcher
                             | CaseKind::HasWildcards
                             | CaseKind::CompileError
+                            | CaseKind::MatchGlobPath
                             | CaseKind::MatchPathIndices
                             | CaseKind::MatchPathIndicesAt => unreachable!(),
                         }
@@ -139,6 +152,7 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                         CaseKind::Matcher
                         | CaseKind::HasWildcards
                         | CaseKind::CompileError
+                        | CaseKind::MatchGlobPath
                         | CaseKind::MatchPaths
                         | CaseKind::MatchPathsAt => unreachable!(),
                     }
@@ -156,7 +170,9 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                     );
                     case.expected
                 }
-                CaseKind::CompileError => unreachable!("compile-error cases are skipped above"),
+                CaseKind::CompileError | CaseKind::MatchGlobPath => {
+                    unreachable!("these kinds are skipped above")
+                }
             };
             assert_eq!(
                 actual,
@@ -173,11 +189,12 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
 
     println!(
         "replayed {replayed} corpus cases against zlob 1.6.3; skipped {} \
-         ({} case-folding, {} non-UTF-8, {} compile-error, {} other-platform)",
+         ({} case-folding, {} non-UTF-8, {} compile-error, {} glob-path, {} other-platform)",
         skipped.total(),
         skipped.case_folding,
         skipped.non_utf8,
         skipped.compile_error,
+        skipped.glob_path,
         skipped.platform
     );
     assert!(

@@ -41,15 +41,22 @@ pub struct Case {
     /// Behaviour switches in the compatibility matrix namespace.
     #[serde(default)]
     pub flags: Vec<String>,
-    /// Newline-delimited rules placed in the synthetic `.gitignore` at the
-    /// repository root by the Git oracle. Used only by `ignore.jsonl` cases.
+    /// Newline-delimited rules placed in the synthetic `.gitignore` by the
+    /// Git oracle. Used only by `ignore.jsonl` cases.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore_rules: Vec<String>,
-    /// Further ignore files the case needs, relative to the repository root:
-    /// nested `.gitignore` files and `.git/info/exclude`. Used only by
-    /// `ignore.jsonl` cases.
+    /// Further `.gitignore` files below the root, in the order Git reads them.
+    ///
+    /// Git consults the ignore file closest to the candidate last, so a deeper
+    /// file overrides a shallower one. Only these records can express that.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ignore_files: Vec<IgnoreFile>,
+    pub nested_ignore_rules: Vec<NestedIgnoreFile>,
+    /// Repository-wide excludes, written to `.git/info/exclude`.
+    ///
+    /// Git reads them before any `.gitignore`, so every ignore file overrides
+    /// them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_rules: Vec<String>,
     /// Whether the expression accepts the candidate path. A
     /// [`CaseKind::CompileError`] case never accepts and records `false`.
     pub expected: bool,
@@ -80,17 +87,6 @@ pub struct Case {
     pub note: Option<String>,
 }
 
-/// One ignore file of a case, beyond the repository root's `.gitignore`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IgnoreFile {
-    /// Location relative to the repository root, such as `src/.gitignore` or
-    /// `.git/info/exclude`.
-    pub path: String,
-    /// Newline-delimited rules written into that file.
-    pub rules: Vec<String>,
-}
-
 /// The operation a corpus record verifies.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +107,21 @@ pub enum CaseKind {
     /// A pattern the compiler must reject, optionally at a recorded offset
     /// and with a recorded message.
     CompileError,
+    /// A match under the component-local wildcard policy, where an ordinary
+    /// wildcard stays inside one path component and only `**` crosses a
+    /// separator. This is the filesystem-glob reading, not the fnmatch one.
+    MatchGlobPath,
+}
+
+/// One `.gitignore` file below the repository root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NestedIgnoreFile {
+    /// Directory holding the file, relative to the root and without a
+    /// trailing slash.
+    pub directory: String,
+    /// The file's rules, in order.
+    pub rules: Vec<String>,
 }
 
 /// The path-separator platform a case is written for.
@@ -374,5 +385,31 @@ mod tests {
         assert!(!encoded.contains("platform"), "{encoded}");
         assert!(!encoded.contains("error_offset"), "{encoded}");
         assert!(!encoded.contains("error_message"), "{encoded}");
+        assert!(!encoded.contains("nested_ignore_rules"), "{encoded}");
+    }
+
+    #[test]
+    fn glob_path_cases_name_the_component_local_reading() {
+        let case: Case = serde_json::from_str(
+            r#"{"id":"fastglob-028","kind":"match_glob_path","pattern":"src/*.rs","path":"src/deep/main.rs","expected":false,"source":"fast_glob"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(case.kind, CaseKind::MatchGlobPath);
+        assert!(case.nested_ignore_rules.is_empty());
+    }
+
+    #[test]
+    fn nested_ignore_files_carry_their_directory() {
+        let case: Case = serde_json::from_str(
+            r#"{"id":"ignore-014","pattern":"!keep.log","path":"sub/keep.log","ignore_rules":["*.log"],"nested_ignore_rules":[{"directory":"sub","rules":["!keep.log"]}],"expected":false,"source":"git_check_ignore"}"#,
+        )
+        .unwrap();
+
+        let [nested] = case.nested_ignore_rules.as_slice() else {
+            panic!("expected exactly one nested ignore file");
+        };
+        assert_eq!(nested.directory, "sub");
+        assert_eq!(nested.rules, ["!keep.log"]);
     }
 }

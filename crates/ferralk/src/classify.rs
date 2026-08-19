@@ -133,7 +133,10 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         return EntryAction::Skip;
     }
 
+    // An ignored directory is not entered, the way Git does not enter one:
+    // its contents are ignored whatever the ignore files inside it say.
     let descend = entry.is_dir
+        && !git_ignored
         && !walker
             .excludes
             .iter()
@@ -141,11 +144,11 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         && walker.may_descend_at(depth, bytes.as_ref());
     let emit = should_emit(walker, &entry, bytes.as_ref(), git_ignored);
 
-    // The state a subtree inherits is decided here, so the frontends never
-    // re-derive it.
+    // The rules a subtree inherits travel with it, so the frontends never
+    // re-derive them.
     let task = |path| DirectoryTask {
         path,
-        ignores: ignores.inherit(git_ignored),
+        ignores: ignores.clone(),
     };
     if !emit {
         if descend {
