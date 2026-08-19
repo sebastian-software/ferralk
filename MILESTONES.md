@@ -116,20 +116,24 @@ faster than parallel `ignore` + pruning on all traversal corpora.
 
 ## M4 — Stabilization & release readiness (RFC Phase 5, timing undecided)
 
-**Exit criterion:** portable API and downstream integration are ready for a
-maintainer-selected public release; Windows tier-2 CI is green. A 1.0 date is
-intentionally not part of this milestone — ADR-0010.
+**Exit criterion:** portable API, documentation, and release process are ready
+for a maintainer-selected public release; Windows tier-2 CI is green. A 1.0
+date is intentionally not part of this milestone — ADR-0010.
 
 - [x] Compatibility guide: zlob API mapping and all deliberate divergences
-- [ ] Separate follow-up: integrate into Palamedes and fold feedback back.
-      It is no longer a gate for completing the portable RFC implementation.
 - [x] MSRV and feature audit; API review (cargo-semver-checks in CI)
 - [x] Dependency and unsafe audit (expected: zero unsafe before M5)
 - [x] Oracle retirement check: corpus is self-sufficient, Zig-free CI
       confirmed — ADR-0007
 - [ ] Publish benchmarks
-- [ ] Decide the first stable-release version and timing after downstream and
-      benchmark evidence is available
+- [ ] Decide the first stable-release version and timing after benchmark
+      evidence is available
+
+### Separate downstream follow-up (not a milestone gate)
+
+- [ ] Integrate into Palamedes and fold feedback back. This may inform a later
+      release, but it is not a prerequisite for the portable RFC or M4 release
+      readiness.
 
 ## M5 — Native backends (RFC Phase 4, post-stable-release, ~6–12 weeks)
 
