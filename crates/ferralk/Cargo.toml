@@ -10,6 +10,9 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+native-macos = []
+
 [dependencies]
 crossbeam-deque = "0.8"
 ferralk-glob = { path = "../ferralk-glob", version = "0.1.0" }

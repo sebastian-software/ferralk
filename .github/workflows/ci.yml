@@ -57,10 +57,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-audit --locked
       - run: cargo audit
-      - name: Forbid unsafe Rust before native backends
+      - name: Forbid unsafe Rust outside native backend modules
         run: |
-          if rg -n '\bunsafe\b' --glob '*.rs' --glob '!target/**' .; then
-            echo 'unsafe Rust is reserved for the post-1.0 native backend milestone.'
+          if rg -n '\bunsafe\b' --glob '*.rs' --glob '!target/**' --glob '!crates/ferralk/src/macos_native.rs' .; then
+            echo 'unsafe Rust is permitted only in an audited native backend module.'
             exit 1
           fi
 

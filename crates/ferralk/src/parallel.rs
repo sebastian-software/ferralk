@@ -16,8 +16,8 @@ use std::{
 use crossbeam_deque::{Steal, Stealer, Worker};
 
 use super::{
-    BackendEntry, DirectoryBackend, ErrorPolicy, GitIgnoreNode, StdBackend, WalkEntry, WalkError,
-    WalkResult, Walker, has_hidden_component, is_git_ignored, scheduler::Scheduler,
+    BackendEntry, DirectoryBackend, ErrorPolicy, GitIgnoreNode, SystemBackend, WalkEntry,
+    WalkError, WalkResult, Walker, has_hidden_component, is_git_ignored, scheduler::Scheduler,
     should_skip_git_directory,
 };
 
@@ -300,7 +300,7 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, directory: Pat
     if shared.walker.options.follow_symlinks && !mark_directory(shared, &directory) {
         return;
     }
-    let entries = match StdBackend.read_directory(&directory) {
+    let entries = match SystemBackend.read_directory(&directory) {
         Ok(entries) => entries,
         Err(source) => {
             shared.record_error("read_dir", directory, source);

@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![doc = "Portable filesystem walking."]
 
 //! A safe std::fs walker with a portable `std::fs` backend.
@@ -24,6 +24,9 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 pub use ferralk_glob;
 
+#[cfg(all(feature = "native-macos", target_os = "macos"))]
+#[allow(unsafe_code)]
+mod macos_native;
 mod parallel;
 mod scheduler;
 
@@ -366,7 +369,7 @@ impl Walker {
         self
     }
 
-    /// Runs the portable backend to completion, using the configured workers.
+    /// Runs the selected filesystem backend to completion, using the configured workers.
     ///
     /// A panic inside a worker stops the sibling workers and is resumed on the
     /// calling thread after they have been joined.
@@ -374,7 +377,7 @@ impl Walker {
         if self.threads > 1 {
             return parallel::collect(self);
         }
-        let backend = StdBackend;
+        let backend = SystemBackend;
         let mut state = WalkState::new(&self);
         // Use the same injector-to-worker transfer as the forthcoming parallel
         // backend. The serial baseline owns one local queue and deliberately
@@ -649,6 +652,27 @@ impl DirectoryBackend for StdBackend {
     }
 }
 
+/// Selects the feature-gated native backend where it is available and the
+/// portable backend everywhere else.
+struct SystemBackend;
+
+impl DirectoryBackend for SystemBackend {
+    fn read_directory(&self, path: &Path) -> std::io::Result<Vec<BackendEntry>> {
+        #[cfg(all(feature = "native-macos", target_os = "macos"))]
+        {
+            match macos_native::read_directory(path) {
+                Ok(entries) => Ok(entries),
+                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                    StdBackend.read_directory(path)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        #[cfg(not(all(feature = "native-macos", target_os = "macos")))]
+        StdBackend.read_directory(path)
+    }
+}
+
 /// Incremental portable traversal produced by Walker stream.
 #[derive(Debug)]
 pub struct WalkStream {
@@ -705,7 +729,7 @@ impl WalkStream {
                 Err(source) => return self.error("canonicalize", directory, source),
             }
         }
-        match StdBackend.read_directory(&directory) {
+        match SystemBackend.read_directory(&directory) {
             Ok(entries) => {
                 self.pending_entries = entries.into();
                 None

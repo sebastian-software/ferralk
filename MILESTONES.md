@@ -126,7 +126,7 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 
 ### macOS (first)
 
-- [ ] `getdirentries64` backend behind a feature flag
+- [x] `getdirentries64` backend behind a feature flag
 - [ ] `getattrlistbulk` batch metadata with capability detection and portable
       fallback (SMB/FUSE)
 - [ ] Bounds-checked record parsing with module-level invariants; fuzz the
@@ -148,6 +148,15 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
 The current external-release prerequisites, their local evidence, and the
 specific action needed to clear each one are consolidated in
 [`docs/external-release-gates.md`](docs/external-release-gates.md).
+
+### 2026-08-19 — M5 native macOS backend started
+
+- Began M5 with the feature-gated macOS `native-macos` backend. Its isolated
+  `__getdirentries64` adapter owns the syscall buffer, bounds-checks every
+  Darwin record before reading its fields, and preserves portable fallback on
+  an unsupported syscall. Direct parser and native-vs-portable reader tests
+  cover the safe boundary; `getattrlistbulk`, native fuzzing, and the macOS
+  benchmark gate remain open.
 
 ### 2026-08-18 — M0 foundation established
 
