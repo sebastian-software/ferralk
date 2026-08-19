@@ -488,12 +488,15 @@ Exit criterion: each backend independently meets safety, parity, and
 performance gates. 1.0 does not wait for this phase; backends ship as
 feature-gated 1.x releases.
 
-### Phase 5: Stabilization and 1.0 — 2–4 weeks
+### Phase 5: Stabilization and a later public release — 2–4 weeks
 
 - compatibility guide documenting the zlob mapping and deliberate divergences;
-- downstream trial in Palamedes;
 - MSRV and feature audit;
 - release candidate, security review, and benchmark publication.
+
+The Palamedes integration trial is separate downstream follow-up work, not a
+Phase 5 exit criterion. Its feedback may inform a later release but does not
+block the portable RFC implementation or release readiness.
 
 The phases imply roughly 3–6 months for a hardened cross-platform port, with
 some operating-system work proceeding in parallel.
