@@ -13,7 +13,7 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | Field | Required | Meaning |
 |---|---:|---|
 | `id` | yes | Stable, topic-local identifier, for example `wildcard-001`. |
-| `kind` | no | `matcher` (default), `has_wildcards` for syntax preflight, `match_paths` / `_at` for borrowed list filtering, `match_path_indices` / `_at` for positions, or `compile_error` for a pattern the compiler must reject. |
+| `kind` | no | `matcher` (default), `match_glob_path` for the component-local reading, `has_wildcards` for syntax preflight, `match_paths` / `_at` for borrowed list filtering, `match_path_indices` / `_at` for positions, or `compile_error` for a pattern the compiler must reject. |
 | `paths` / `matches` | no | Input and Ferralk-selected path lists for `match_paths`, preserving input order. |
 | `oracle_matches` | no | zlob's selected list for a deliberate list-result divergence. |
 | `base_path` | no | Base directory stripped before matching each input path in a `match_paths_at` case. |
@@ -22,6 +22,7 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | `path` | yes | Candidate path using the byte codec below; empty for syntax-only records. |
 | `flags` | no | Ordered behaviour switches from the compatibility matrix. |
 | `ignore_rules` | no | Lines written to a synthetic `.gitignore` for an ignore case. |
+| `nested_ignore_rules` | no | Further `.gitignore` files below the root, each with its `directory` and `rules`. |
 | `expected` | yes | Whether the expression accepts the candidate. |
 | `oracle_expected` | no | The external-oracle result when it deliberately differs from `expected`. |
 | `error_offset` | no | Byte offset the rejected construct must be reported at, for a `compile_error` case. |
@@ -32,7 +33,7 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | `note` | no | Short explanation or cross-oracle disagreement. |
 
 The topic files are `basic.jsonl`, `braces.jsonl`, `bytes.jsonl`,
-`case-folding.jsonl`, `classes.jsonl`, `edge-cases.jsonl`, `errors.jsonl`,
+`case-folding.jsonl`, `classes.jsonl`, `dotfiles.jsonl`, `edge-cases.jsonl`, `errors.jsonl`,
 `extglob-suite.jsonl`, `fast-glob.jsonl`, `fnmatch.jsonl`,
 `glibc-recursive.jsonl`, `ignore.jsonl`, `match-paths.jsonl`,
 `path-matcher.jsonl`, `platform.jsonl`, `preflight.jsonl`, and
@@ -45,6 +46,28 @@ For `ignore.jsonl`, `pattern` is the primary rule for quick review and
 isolated repository, writes those lines into `.gitignore`, creates `path`, and
 uses `git check-ignore --no-index --quiet -- path`. This keeps nested/negated
 behaviour tied to Git rather than to ferralk implementation details.
+
+`nested_ignore_rules` adds `.gitignore` files below the root. Git consults the
+file closest to the candidate last, so a deeper file overrides a shallower one,
+and only these records can express that precedence.
+
+The oracle runs Git with `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and `HOME`
+neutralised. Without that the developer's own `core.excludesFile` decides
+corpus verdicts: a global `*.log` rule makes a case pass locally and fail in
+CI, or worse, pass in both for the wrong reason.
+
+## Two readings of one pattern
+
+A `matcher` case is the fnmatch reading zlob defines: an ordinary wildcard may
+cross a separator. A `match_glob_path` case is the filesystem-glob reading of
+`Pattern::is_match_glob_path`, where an ordinary wildcard stays inside one path
+component and only `**` crosses. The same pattern and candidate can appear
+under both kinds with different verdicts, and `corpus/fast-glob.jsonl` does
+exactly that, because fast-glob implements the component-local reading while
+zlob implements the fnmatch one.
+
+The zlob oracle skips `match_glob_path` cases: zlob has no component-local
+mode to compare against.
 
 ## Rejected patterns
 
@@ -106,10 +129,12 @@ harness nor a future matcher may discard disputed cases.
 The pinned oracle is a `&str`-based Rust API over zlob 1.6.3, so parts of the
 contract have no representation there. The adapter in
 [`../tools/oracle/tests/zlob_oracle.rs`](../tools/oracle/tests/zlob_oracle.rs)
-skips exactly four categories and prints a count for each: a
-`case_insensitive` case (zlob 1.6.3 has no case-folding flag), a case whose
-pattern, path, or candidate list is not UTF-8, a `compile_error` case, and a
-case written for another `platform`. A skipped case is not a weaker case: it
+skips five categories and prints a count for each: a `case_insensitive` case
+(zlob 1.6.3 has no case-folding flag), a case whose pattern, path, or candidate
+list is not UTF-8, a `compile_error` case, a `match_glob_path` case, and a case
+written for another `platform`. It also skips two whole topics, `ignore.jsonl`
+and `fast-glob.jsonl`, whose `oracle_expected` records a different oracle's
+verdict. A skipped case is not a weaker case: it
 still replays in normal CI through the harness, which is the ferralk
 contract. The adapter also asserts a minimum number of replayed cases, so a
 change that silently skips the whole corpus fails instead of passing quietly.
