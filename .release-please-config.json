@@ -92,6 +92,16 @@
         },
         {
           "type": "toml",
+          "path": "fuzz/Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value==\"ferralk\")].version"
+        },
+        {
+          "type": "toml",
+          "path": "fuzz/Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value==\"ferralk-glob\")].version"
+        },
+        {
+          "type": "toml",
           "path": "Cargo.lock",
           "jsonpath": "$.package[?(@.name.value==\"harness\")].version"
         },
