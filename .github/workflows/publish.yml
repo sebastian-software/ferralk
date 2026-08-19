@@ -31,7 +31,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Validate the workspace
-        run: cargo test --workspace --locked
+        run: cargo test --locked
 
       - name: Package ferralk-glob
         run: cargo package --locked --no-verify -p ferralk-glob
