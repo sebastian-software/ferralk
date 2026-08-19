@@ -172,6 +172,28 @@ fn matcher(c: &mut Criterion) {
             )
         })
     });
+    let deterministic_component_filter = Pattern::compile(
+        "src/[ab]?.[Rr][Ss]",
+        PatternOptions::default().case_insensitive(true),
+    )
+    .expect("deterministic component pattern is valid");
+    let deterministic_component_paths = [
+        "src/a1.rs",
+        "src/Bx.RS",
+        "src/c1.rs",
+        "src/a/.rs",
+        "src/.1.rs",
+        "src/a1.rs/extra",
+    ];
+    c.bench_function("path_filter/deterministic_component", |benchmark| {
+        benchmark.iter(|| {
+            black_box(
+                deterministic_component_filter
+                    .filter_paths(black_box(&deterministic_component_paths))
+                    .len(),
+            )
+        })
+    });
     c.bench_function("common/globset_compiled/matching", |benchmark| {
         benchmark.iter(|| black_box(globset.is_match(black_box(common_matching))))
     });

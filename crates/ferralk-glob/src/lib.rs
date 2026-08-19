@@ -271,8 +271,12 @@ impl Pattern {
         alternatives.iter().any(|alternative| {
             if options.extglob && contains_extglob(&alternative.raw, options.escape) {
                 match_extglob(&alternative.raw, path, options)
-            } else if !options.component_wildcards
-                && let Some(fast_path) = &alternative.fast_path
+            } else if let Some(fast_path) = &alternative.fast_path
+                && (!options.component_wildcards
+                    || matches!(
+                        fast_path,
+                        FastPath::LiteralTokens(_) | FastPath::DeterministicTokens(_)
+                    ))
             {
                 fast_path.is_match(path, options)
             } else {
@@ -405,7 +409,6 @@ impl Pattern {
                     .iter()
                     .cloned()
                     .map(|mut alternative| {
-                        alternative.fast_path = None;
                         let leading_dot_slash = alternative.raw.starts_with(b"./")
                             && matches!(alternative.tokens.as_slice(), [Token::Literal(dot), Token::Separator, ..] if dot == b".");
                         if leading_dot_slash {
@@ -415,6 +418,13 @@ impl Pattern {
                         if !options.recursive_double_star {
                             alternative.tokens = path_list_tokens(std::mem::take(&mut alternative.tokens));
                         }
+                        alternative.fast_path = FastPath::compile(
+                            &alternative.tokens,
+                            PatternOptions {
+                                component_wildcards: true,
+                                ..options
+                            },
+                        );
                         alternative
                     })
                     .collect()
@@ -728,9 +738,6 @@ enum FastPath {
 
 impl FastPath {
     fn compile(tokens: &[Token], options: PatternOptions) -> Option<Self> {
-        if options.component_wildcards {
-            return None;
-        }
         if tokens
             .iter()
             .all(|token| matches!(token, Token::Literal(_) | Token::Separator))
@@ -744,6 +751,9 @@ impl FastPath {
             )
         }) {
             return Some(Self::DeterministicTokens(tokens.to_vec()));
+        }
+        if options.component_wildcards {
+            return None;
         }
         match tokens {
             [Token::Star] => return Some(Self::Star),
@@ -839,7 +849,7 @@ impl FastPath {
             }
             Self::DeterministicTokens(tokens) => {
                 let mut path_index = 0;
-                for token in tokens {
+                for (token_index, token) in tokens.iter().enumerate() {
                     match token {
                         Token::Literal(literal) => {
                             let Some(candidate) = path.get(path_index..path_index + literal.len())
@@ -863,6 +873,11 @@ impl FastPath {
                             let Some(&byte) = path.get(path_index) else {
                                 return false;
                             };
+                            if Pattern::component_wildcard(tokens, token_index, options)
+                                && is_separator(byte)
+                            {
+                                return false;
+                            }
                             if !options.match_hidden
                                 && byte == b'.'
                                 && at_component_start(path, path_index)
@@ -875,7 +890,9 @@ impl FastPath {
                             let Some(&byte) = path.get(path_index) else {
                                 return false;
                             };
-                            if !class.matches(byte, options.case_insensitive)
+                            if (Pattern::component_wildcard(tokens, token_index, options)
+                                && is_separator(byte))
+                                || !class.matches(byte, options.case_insensitive)
                                 || (!options.match_hidden
                                     && byte == b'.'
                                     && at_component_start(path, path_index))
@@ -2247,6 +2264,64 @@ mod tests {
         let root_pattern =
             Pattern::compile("*.rs", PatternOptions::default()).expect("root pattern compiles");
         assert!(root_pattern.path_filter_alternatives.is_none());
+    }
+
+    #[test]
+    fn component_deterministic_fast_path_matches_the_general_matcher() {
+        let options = PatternOptions::default().case_insensitive(true);
+        let fast = Pattern::compile("src/[ab]?.[Rr][Ss]", options).expect("pattern compiles");
+        assert!(
+            fast.path_filter_alternatives
+                .as_ref()
+                .is_some_and(|alternatives| {
+                    matches!(
+                        alternatives[0].fast_path,
+                        Some(FastPath::DeterministicTokens(_))
+                    )
+                })
+        );
+        let mut general = fast.clone();
+        for alternative in &mut general.alternatives {
+            alternative.fast_path = None;
+        }
+        for alternative in general
+            .path_filter_alternatives
+            .as_mut()
+            .expect("component path filter is compiled")
+        {
+            alternative.fast_path = None;
+        }
+
+        let mut candidates = vec![
+            b"src/a1.rs".as_slice(),
+            b"src/Bx.RS".as_slice(),
+            b"src/c1.rs".as_slice(),
+            b"src/a/.rs".as_slice(),
+            b"src/.1.rs".as_slice(),
+            b"src/a1.rs/extra".as_slice(),
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+        candidates.extend(
+            byte_words(b"ab./rRsS", 4)
+                .into_iter()
+                .map(|suffix| [b"src/".as_slice(), suffix.as_slice()].concat()),
+        );
+        for candidate in candidates {
+            assert_eq!(
+                fast.is_match_path(&candidate),
+                general.is_match_path(&candidate),
+                "path-list candidate: {}",
+                String::from_utf8_lossy(&candidate)
+            );
+            assert_eq!(
+                fast.is_match_glob_path(&candidate),
+                general.is_match_glob_path(&candidate),
+                "glob-path candidate: {}",
+                String::from_utf8_lossy(&candidate)
+            );
+        }
     }
 
     #[test]

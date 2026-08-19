@@ -25,5 +25,14 @@ implemented. The feature-gated Linux `getdents64` path is locally
 cross-compiled and its parser fuzz target is committed; Ubuntu execution,
 `statx`, native parity/sanitizer series, and performance gates remain post-1.0
 work.
+
+The Linux `statx` checkbox also has an explicit API dependency: Ferralk's
+current `WalkOptions::metadata(true)` contract returns opaque
+`std::fs::Metadata`, which cannot be constructed from raw `statx` fields.
+Adding a `statx` call before the required portable metadata query would add a
+second syscall without improving the public result. A future native-attribute
+surface or revised metadata model is therefore required before that checkbox
+can be completed; the current native reader intentionally preserves the
+correct portable metadata contract instead.
 None is a prerequisite for the portable release or evidence of a current
 implementation failure.

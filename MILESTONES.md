@@ -191,6 +191,17 @@ specific action needed to clear each one are consolidated in
   the local x86_64-Linux target; its runtime evidence remains with the committed
   Ubuntu native CI job rather than being claimed from this macOS workspace.
 
+### 2026-08-19 — M1 component-aware deterministic IR
+
+- Extended the immutable deterministic matcher IR to component-sensitive Path-
+  List and Walker matches containing literals, `?`, and classes. The compiled
+  path rejects separators only where the general matcher applies the same
+  component rule; star and recursive syntax remain on the general path. An
+  exhaustive generated-candidate comparison retains that path as the semantic
+  oracle. The dedicated Criterion row measures the six-path component filter
+  at about 174 ns locally; external CodSpeed confirmation remains part of the
+  open M1 benchmark gate.
+
 ### 2026-08-18 — M0 foundation established
 
 - Completed the workspace boundary, license/NOTICE, repository automation, and
