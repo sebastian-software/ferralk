@@ -1,4 +1,8 @@
-name: zlob CodSpeed comparison
+name: zlob comparison
+
+# Manual context, never a gate. The zlob benches need Zig to build the pinned
+# oracle, so they stay off the pull-request path. Medians land in the job
+# summary and as an artifact, the same shape the walker wall-time lane uses.
 
 on:
   workflow_dispatch:
@@ -10,25 +14,54 @@ on:
 
 permissions:
   contents: read
-  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   benchmarks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - name: Set up Rust and cargo-codspeed
-        uses: moonrepo/setup-rust@v0
-        with:
-          channel: stable
-          cache-target: release
-          bins: cargo-codspeed
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.16.0
-      - name: Build zlob benchmarks
-        run: cargo codspeed build -p bench --bench walker_zlob --bench matcher_zlob --features zlob-oracle
-      - uses: CodSpeedHQ/action@v5
+      # See walker-bench.yml: a restored criterion directory can silence the
+      # measurement while the step still exits zero.
+      - name: Measure against zlob 1.6.3
+        shell: bash
+        run: |
+          rm -rf target/criterion
+          cargo bench -p bench --features zlob-oracle \
+            --bench walker_zlob --bench matcher_zlob -- \
+            --warm-up-time 1 --measurement-time 5 --sample-size 20 \
+            --output-format bencher | tee zlob-comparison.txt
+      - name: Check that the comparison actually measured something
+        shell: bash
+        run: |
+          if ! grep -q 'ns/iter' zlob-comparison.txt; then
+            echo "::error::the zlob comparison produced no measurements"
+            exit 1
+          fi
+      - name: Publish the medians
+        if: always()
+        run: |
+          {
+            echo '### zlob 1.6.3 comparison'
+            echo
+            echo '| Benchmark | ns/iter | +/- |'
+            echo '| --- | ---: | ---: |'
+            sed -n 's/^test \(.*\) \.\.\. bench: *\([0-9,]*\) ns\/iter (+\/- \([0-9,]*\))$/| `\1` | \2 | \3 |/p' \
+              zlob-comparison.txt
+            echo
+            echo 'Shared runner, warm page cache. Context, not a gate.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the raw measurements
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          mode: simulation
-          run: cargo codspeed run -p bench --bench walker_zlob --bench matcher_zlob
+          name: zlob-comparison
+          path: zlob-comparison.txt
+          if-no-files-found: warn

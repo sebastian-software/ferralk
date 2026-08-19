@@ -37,7 +37,8 @@ shape of the pattern, so a fuzz failure is always a new finding.
 The comma row is a fast-glob defect rather than a design difference: after two
 brace groups close, the following comma is still read as a separator, so
 `{}{},` accepts the empty candidate there and the literal `,` in ferralk. The
-differential fuzz target found it within a minute of its first run.
+differential fuzz target found it within a minute of its first run; reported
+upstream: <https://github.com/oxc-project/fast-glob/issues/165>.
 
 The ten-group row is a defect too, and a silent one: past ten brace groups
 fast-glob answers `false` for a pattern that matches, rather than reporting that
@@ -45,9 +46,10 @@ it gave up. The cap counts groups, not combinations — one group of two thousan
 alternatives is answered correctly, while eleven two-way groups miss even their
 first combination, which needs no backtracking at all. Found by the differential
 target on issue #42, once ferralk's own expansion budget replaced the cap the
-fuzz harness used to apply to both engines. It is the only reference that bounds
-brace expansion at all: zlob 1.6.3 and glibc `GLOB_BRACE` run until they exhaust
-the machine, and ferralk reports `too many brace alternatives`.
+fuzz harness used to apply to both engines; reported upstream:
+<https://github.com/oxc-project/fast-glob/issues/166>. It is the only reference
+that bounds brace expansion at all: zlob 1.6.3 and glibc `GLOB_BRACE` run until
+they exhaust the machine, and ferralk reports `too many brace alternatives`.
 
 Brace expansion happens before matching, so an alternative can concatenate
 with the surrounding text into a `**` that only ferralk reads recursively
