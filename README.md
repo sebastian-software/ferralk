@@ -8,8 +8,9 @@ need matching do not pay for traversal dependencies:
 - `ferralk` walks filesystems, applies root-relative include/exclude patterns,
   and re-exports `ferralk-glob`.
 
-Ferralk is independently developed. Its matcher and walker behaviour are
-checked against the frozen zlob 1.6.3 reference, but it is not source
+Ferralk is independently developed and inspired by
+[zlob 1.6.3](https://github.com/dmtrKovalenko/zlob). Its matcher and walker
+behaviour are checked against a frozen zlob reference, but it is not source
 compatible with zlob and deliberately has no C ABI.
 
 ## Status
@@ -113,6 +114,6 @@ for the corpus, fuzzing, and benchmark commands.
 
 ## License and attribution
 
-Ferralk is MIT licensed. It is an independent project whose behavioural
-reference is zlob 1.6.3; provenance and attribution are recorded in
-[NOTICE](NOTICE) and the [frozen reference](docs/zlob-1.6.3-reference.md).
+Ferralk is MIT licensed. It is an independent project inspired by zlob 1.6.3;
+provenance and attribution are recorded in [NOTICE](NOTICE) and the
+[frozen reference](docs/zlob-1.6.3-reference.md).

@@ -436,8 +436,8 @@ can execute, and cross-compilation checks.
   (release-please, renovate, codecov, CodSpeed).
 
 Licensing (MIT), repository (`sebastian-software/ferralk`), crate names, and
-the collaboration model (independent, upstream courtesy notice) are already
-decided.
+the collaboration model (independent, public zlob attribution without
+maintainer outreach) are already decided.
 
 Exit criterion: disputed or undefined semantics are documented as open cases.
 
@@ -500,11 +500,11 @@ some operating-system work proceeding in parallel.
 
 ## Migration and release strategy
 
-Decided: ferralk is an independent crate family under its own name. The zlob
-maintainer receives a courtesy notice; no naming, endorsement, or upstream
-agreement is required or implied. Compatibility with zlob is a documented
-profile ("compatible with X, documented divergences Y"), never a drop-in
-claim.
+Decided: ferralk is an independent crate family under its own name. The README
+and NOTICE credit zlob as an inspiration; no naming, endorsement, upstream
+agreement, or maintainer outreach is required or implied. Compatibility with
+zlob is a documented profile ("compatible with X, documented divergences Y"),
+never a drop-in claim.
 
 Releases start at `0.x`; 1.0 requires a stable API and the portable
 performance gate on all platforms. Compatibility claims are made per API area:
@@ -572,8 +572,8 @@ from the start.
 
 ## Resolved questions (design review 2026-08-18)
 
-1. Upstream acceptance — moot: ferralk is independent; the zlob maintainer
-   receives a courtesy notice.
+1. Upstream acceptance — moot: ferralk is independent and credits zlob
+   publicly; no maintainer outreach is required.
 2. Contractual zlob API stability — not applicable; compatibility is a
    documented profile, not a contract.
 3. MSRV — current stable minus two releases, declared via `rust-version` and
