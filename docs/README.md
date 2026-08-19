@@ -5,6 +5,7 @@ small working examples. This directory contains the durable technical record.
 
 | Document | Use it for |
 | --- | --- |
+| [Contributing](../CONTRIBUTING.md) | Repository policy: commit signing, and how a performance claim is evidenced. |
 | [Usage guide](usage.md) | Matcher and walker defaults, options, errors, and validation commands. |
 | [Compatibility guide](compatibility-guide.md) | Migrating supported zlob 1.6.3 behaviour to the Ferralk API. |
 | [Compatibility matrix](compatibility-matrix.md) | A precise capability-by-capability status. |

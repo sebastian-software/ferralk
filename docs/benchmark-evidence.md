@@ -12,22 +12,26 @@ records the same for releases.
 
 | Lane | What it measures | Where | Gating |
 | --- | --- | --- | --- |
-| Matcher, simulation | Instruction counts for compiled-pattern matching and compilation, against `globset` and `fast-glob` | [`codspeed.yml`](../.github/workflows/codspeed.yml), every pull request, reported to [CodSpeed](https://app.codspeed.io/sebastian-software/ferralk) | No |
+| Matcher, wall time | Compiled-pattern matching and compilation, against `globset` and `fast-glob` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
 | Walker, wall time | Warm-cache traversal of a synthetic tree, ferralk serial and parallel against `ignore` parallel | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request, medians in the job summary and as an artifact | No |
 | Engine comparison | One repository shape, every engine on the same query and the same file set | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), run on demand | No |
 | zlob context | The same matcher and walker shapes against zlob 1.6.3 | [`zlob-benchmark.yml`](../.github/workflows/zlob-benchmark.yml), manual dispatch only | No |
 
-**Why two instruments.** CodSpeed's simulation instrument counts instructions
-in a virtual machine. That is stable enough to compare two revisions of the same
-matcher on a shared runner, which is why the matcher lane lives there. It
-serializes threads and does not model syscall cost, so a parallel-versus-serial
-walker comparison in that instrument measures instruction count rather than
-speedup; the walker therefore measures wall time instead. CodSpeed's own
-walltime instrument would be the natural home for it, but that requires a
-dedicated `codspeed-macro` runner this repository does not have.
+**Why every lane measures wall time.** An earlier revision ran the matcher
+under CodSpeed's simulation instrument, which counts instructions in a virtual
+machine. It was removed on 2026-08-19: over the period it ran it produced four
+false alarms and no true finding, every one of them a stale baseline rather
+than a change in the code under test. For a library of this scope the
+back-to-back measurement a contributor takes on one machine, before and after,
+proved to be the evidence that actually caught things. Automated protection
+now comes from the walker wall-time lane, which runs on every pull request.
+
+That instrument was never right for the walker in any case: it serializes
+threads and does not model syscall cost, so a parallel-versus-serial comparison
+there measures instruction count rather than speedup.
 
 **What each lane does not establish.** The matcher lane says nothing about
-syscall-bound work, and instruction counts are not wall time. The walker lanes
+syscall-bound work. The walker lanes
 run on synthetic trees written immediately before measurement, so every result
 describes a warm page cache; cold-cache behaviour is a different measurement and
 is not made anywhere here. Shared runners are noisy: compare arms measured in

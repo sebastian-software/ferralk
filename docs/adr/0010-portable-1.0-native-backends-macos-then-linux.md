@@ -31,3 +31,14 @@ is not a performance target for us.
 - Native metadata continues to expose `std::fs::Metadata`; `statx` is deferred
   until a distinct native-attribute API is approved, rather than adding a
   second syscall without a public result.
+
+## Evidence, 2026-08-19
+
+The portable-first bet is confirmed. On scoped queries — the shape a consumer
+actually issues — ferralk measures about 4.3× zlob, because pruning avoids the
+work rather than performing it faster. zlob leads by about 20%, and only on
+full traversal, where there is nothing to prune. Choosing a portable core with
+native backends as an optimisation, rather than the reverse, is what made the
+pruning work available on every platform.
+
+Amendment only; the decision above is unchanged.

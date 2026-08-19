@@ -32,34 +32,39 @@ are intentionally separate from development builds.
 ## Local benchmark snapshot
 
 The following macOS measurements use Rust 1.95.0 and Criterion's default
-100-sample configuration. They are a local comparison, not a portable promise
-or a substitute for the CodSpeed series. Matcher values use the common
+100-sample configuration, taken on 2026-08-19 against the checked-in fixtures.
+They are a local comparison, not a portable promise.
+[Benchmark evidence](docs/benchmark-evidence.md) describes the lanes, what each
+does not establish, and how to reproduce them. Matcher values use the common
 `src/**/*.rs` syntax; lower is better.
 
 | Matcher | Match | Non-match |
 | --- | ---: | ---: |
-| Ferralk (compiled) | 12.49 ns | 3.07 ns |
-| zlob 1.6.3 (compiled) | 35.65 ns | 2.59 ns |
-| globset (compiled) | 38.36 ns | 37.98 ns |
-| fast-glob (interpreted) | 98.94 ns | 108.61 ns |
+| Ferralk (compiled) | 11.59 ns | 2.88 ns |
+| zlob 1.6.3 (compiled) | 34.74 ns | 2.36 ns |
+| globset (compiled) | 38.43 ns | 37.48 ns |
+| fast-glob (interpreted) | 98.75 ns | 108.18 ns |
 
-On this common syntax Ferralk is 0.35× zlob for matches and 1.19× zlob for
+On this common syntax Ferralk is 0.33× zlob for matches and 1.22× zlob for
 non-matches, within the local 1.5× zlob target. It is faster than both globset
 and fast-glob in both cases.
 
-The Walker comparison uses the checked-in 16×4 filtered filesystem fixture;
-lower is better.
+The Walker comparison uses the checked-in walker fixture — sixteen branches
+nested four levels deep, filtered — and lower is better.
 
 | Walker | Time |
 | --- | ---: |
 | Ferralk serial | 1.48 ms |
-| Ferralk parallel | 1.72 ms |
-| `ignore` parallel | 2.66 ms |
-| zlob parallel | 0.95 ms |
+| Ferralk parallel | 0.99 ms |
+| `ignore` parallel | 3.00 ms |
+| zlob parallel | 0.86 ms |
 
-Ferralk parallel is about 35% faster than `ignore` on this fixture, while zlob
-is about 1.81× faster than Ferralk. Broader fixtures and the remote CodSpeed
-comparison remain the release evidence.
+Ferralk parallel is about 3× faster than `ignore` on this fixture, while zlob
+is about 1.15× faster than Ferralk. That ordering is fixture-dependent: on a
+5120-file tree the wall-time lane measures `ignore` parallel level with Ferralk
+on Linux and behind it on macOS. Treat any single row as one shape, and see
+[benchmark evidence](docs/benchmark-evidence.md) for the lanes that carry the
+broader picture.
 
 ## Quick start
 
@@ -141,8 +146,10 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-See [the contributor-oriented guide](docs/usage.md#development-and-validation)
-for the corpus, fuzzing, and benchmark commands.
+See [CONTRIBUTING](CONTRIBUTING.md) for repository policy — commit signing and
+how performance claims are evidenced — and
+[the contributor-oriented guide](docs/usage.md#development-and-validation) for
+the corpus, fuzzing, and benchmark commands.
 
 ## License and attribution
 
