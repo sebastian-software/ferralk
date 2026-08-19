@@ -1,0 +1,49 @@
+name: Glob fuzz
+
+# Automatic coverage for the matcher's own fuzz targets: a short budget on
+# every pull request and a long one overnight. `fuzz.yml` stays the manual
+# entry point for running a single target with a custom budget.
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    # Long nightly run, off the pull-request budget.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: Maximum fuzz duration in seconds, per target
+        required: true
+        default: "900"
+
+permissions:
+  contents: read
+
+env:
+  # Pull requests stay bounded; the nightly run carries the long budget.
+  MAX_TOTAL_TIME: ${{ inputs.max_total_time || (github.event_name == 'schedule' && '900' || '60') }}
+
+jobs:
+  fuzz:
+    name: glob fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [pattern_parser, pattern_matcher, ferralk_vs_fast_glob]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-04
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # cargo-fuzz defaults to the target it was itself built for, and the
+      # prebuilt binary is musl, where the sanitizer cannot link against a
+      # static libc. Name this runner's host target instead.
+      - run: >-
+          cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }}
+          -- -max_total_time=$MAX_TOTAL_TIME
