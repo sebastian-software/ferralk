@@ -1172,6 +1172,36 @@ enum ClassMember {
     Posix(PosixClass),
 }
 
+/// One byte collected inside `[...]`, tagged with how it was written.
+///
+/// Bash and glibc `fnmatch` only treat an *unescaped* `-` as the range
+/// operator, so the escape has to be remembered until ranges are grouped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClassValue {
+    byte: u8,
+    escaped: bool,
+}
+
+impl ClassValue {
+    const fn literal(byte: u8) -> Self {
+        Self {
+            byte,
+            escaped: false,
+        }
+    }
+
+    const fn escaped(byte: u8) -> Self {
+        Self {
+            byte,
+            escaped: true,
+        }
+    }
+
+    const fn is_range_separator(self) -> bool {
+        self.byte == b'-' && !self.escaped
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PosixClass {
     Alnum,
@@ -1227,10 +1257,13 @@ fn parse_class(
         index += 1;
     }
 
-    let mut values = Vec::new();
+    // Each entry keeps the byte together with whether it reached the class
+    // through a backslash escape. Only an unescaped `-` separates a range, so
+    // the flag has to survive until `class_members` groups the entries.
+    let mut values: Vec<ClassValue> = Vec::new();
     let mut members = Vec::new();
     if pattern.get(index) == Some(&b']') {
-        values.push(b']');
+        values.push(ClassValue::literal(b']'));
         index += 1;
     }
     while let Some(&byte) = pattern.get(index) {
@@ -1270,10 +1303,10 @@ fn parse_class(
                     message: "trailing escape in character class",
                 });
             };
-            values.push(escaped);
+            values.push(ClassValue::escaped(escaped));
             index += 2;
         } else {
-            values.push(byte);
+            values.push(ClassValue::literal(byte));
             index += 1;
         }
     }
@@ -1304,15 +1337,21 @@ fn parse_posix_class(name: &[u8]) -> Option<PosixClass> {
     }
 }
 
-fn class_members(values: Vec<u8>) -> Vec<ClassMember> {
+fn class_members(values: Vec<ClassValue>) -> Vec<ClassMember> {
     let mut members = Vec::new();
     let mut index = 0;
     while index < values.len() {
-        if index + 2 < values.len() && values[index + 1] == b'-' {
-            members.push(ClassMember::Range(values[index], values[index + 2]));
+        // A range needs an unescaped `-` with an endpoint before the closing
+        // bracket. `[a\-z]`, `[a-]` and `[-a]` therefore stay literal, while an
+        // escaped byte may still bound a range as in `[\--0]` or `[a-\-]`.
+        if index + 2 < values.len() && values[index + 1].is_range_separator() {
+            members.push(ClassMember::Range(
+                values[index].byte,
+                values[index + 2].byte,
+            ));
             index += 3;
         } else {
-            members.push(ClassMember::Byte(values[index]));
+            members.push(ClassMember::Byte(values[index].byte));
             index += 1;
         }
     }
@@ -1816,6 +1855,73 @@ mod tests {
         assert!(compile("file[!0-9].rs").is_match("filex.rs"));
         assert!(compile("file[^0-9].rs").is_match("filex.rs"));
         assert!(!compile("file[!0-9].rs").is_match("file7.rs"));
+    }
+
+    #[test]
+    fn escaped_dash_in_a_class_is_a_literal_member() {
+        let pattern = compile(r"[a\-z]");
+        assert!(pattern.is_match("a"));
+        assert!(pattern.is_match("-"));
+        assert!(pattern.is_match("z"));
+        assert!(!pattern.is_match("b"));
+        assert!(!pattern.is_match("y"));
+        assert!(!pattern.is_match("\\"));
+    }
+
+    #[test]
+    fn escaped_dash_stays_literal_without_escape_processing() {
+        let options = PatternOptions::default().escape(false);
+        let pattern = Pattern::compile(r"[a\-z]", options).unwrap();
+        assert!(pattern.is_match("b"));
+        assert!(pattern.is_match("\\"));
+        assert!(!pattern.is_match("-"));
+    }
+
+    #[test]
+    fn escaped_class_members_still_bound_ranges() {
+        let low = compile(r"[\--0]");
+        assert!(low.is_match("-"));
+        assert!(low.is_match("0"));
+        assert!(!low.is_match("a"));
+        assert!(!low.is_match("\\"));
+
+        let reversed = compile(r"[a-\-]");
+        assert!(!reversed.is_match("a"));
+        assert!(!reversed.is_match("-"));
+        assert!(!reversed.is_match("\\"));
+
+        let escaped_start = compile(r"[\a-z]");
+        assert!(escaped_start.is_match("a"));
+        assert!(escaped_start.is_match("b"));
+        assert!(escaped_start.is_match("z"));
+        assert!(!escaped_start.is_match("-"));
+    }
+
+    #[test]
+    fn unescaped_edge_dashes_stay_literal() {
+        let trailing = compile("[a-]");
+        assert!(trailing.is_match("a"));
+        assert!(trailing.is_match("-"));
+        assert!(!trailing.is_match("b"));
+
+        let leading = compile("[-a]");
+        assert!(leading.is_match("a"));
+        assert!(leading.is_match("-"));
+        assert!(!leading.is_match("b"));
+
+        let both = compile("[-a-c-]");
+        assert!(both.is_match("-"));
+        assert!(both.is_match("b"));
+        assert!(!both.is_match("d"));
+    }
+
+    #[test]
+    fn negated_classes_honour_escaped_dashes() {
+        let pattern = compile(r"[!a\-z]");
+        assert!(!pattern.is_match("a"));
+        assert!(!pattern.is_match("-"));
+        assert!(!pattern.is_match("z"));
+        assert!(pattern.is_match("b"));
     }
 
     #[test]
