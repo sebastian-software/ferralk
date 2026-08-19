@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/sebastian-software/ferralk/compare/v0.1.1...v0.1.2) (2026-08-19)
+
+
+### Bug Fixes
+
+* **release:** recover release please baseline ([ddff26e](https://github.com/sebastian-software/ferralk/commit/ddff26efc1f1f555c5a6ff0146cc7ba28b6ba73b))
+
 ## [0.1.1](https://github.com/sebastian-software/ferralk/compare/v0.1.0...v0.1.1) (2026-08-19)
 
 
