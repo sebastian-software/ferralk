@@ -2225,6 +2225,56 @@ mod tests {
         all(feature = "native-macos", target_os = "macos"),
         all(feature = "native-linux", target_os = "linux")
     ))]
+    #[test]
+    fn native_backend_matches_portable_unreadable_directory_error() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let fixture = Fixture::new();
+        if fs::metadata(&fixture.root)
+            .expect("fixture root metadata")
+            .uid()
+            == 0
+        {
+            return;
+        }
+        fixture.write("visible.rs");
+        fixture.write("locked/secret.rs");
+        let locked = fixture.root.join("locked");
+        let original_permissions = fs::metadata(&locked)
+            .expect("locked directory metadata")
+            .permissions();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o0))
+            .expect("make locked directory unreadable");
+
+        let walker = Walker::new(&fixture.root)
+            .threads(1)
+            .error_policy(ErrorPolicy::Collect)
+            .options(WalkOptions::default().sort(true));
+        let native = walker.clone().collect().expect("native walk succeeds");
+        let (portable_entries, portable_errors) = collect_with_portable_backend(&walker);
+
+        fs::set_permissions(&locked, original_permissions)
+            .expect("restore locked directory permissions");
+        assert_eq!(
+            describe_entries(native.entries(), &fixture.root),
+            describe_entries(&portable_entries, &fixture.root),
+            "native unreadable-directory entries differ from portable"
+        );
+        assert_eq!(
+            describe_errors(native.errors(), &fixture.root),
+            describe_errors(&portable_errors, &fixture.root),
+            "native unreadable-directory errors differ from portable"
+        );
+        assert_eq!(
+            describe_errors(native.errors(), &fixture.root),
+            vec![(PathBuf::from("locked"), "read_dir")]
+        );
+    }
+
+    #[cfg(any(
+        all(feature = "native-macos", target_os = "macos"),
+        all(feature = "native-linux", target_os = "linux")
+    ))]
     type DescribedEntry = (PathBuf, bool, bool, usize, Option<(u64, bool, bool)>);
 
     #[cfg(any(
