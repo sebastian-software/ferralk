@@ -112,6 +112,22 @@ fn matcher(c: &mut Criterion) {
         benchmark.iter(|| black_box(static_star.is_match(black_box("src/lib/main.txt"))))
     });
 
+    let static_prefix_star = Pattern::compile("src/lib/*", PatternOptions::default())
+        .expect("static-prefix-star benchmark pattern is valid");
+    c.bench_function(
+        "static_prefix_star/ferralk_compiled/matching",
+        |benchmark| {
+            benchmark.iter(|| black_box(static_prefix_star.is_match(black_box("src/lib/main.rs"))))
+        },
+    );
+    c.bench_function(
+        "static_prefix_star/ferralk_compiled/non_matching",
+        |benchmark| {
+            benchmark
+                .iter(|| black_box(static_prefix_star.is_match(black_box("src/other/main.rs"))))
+        },
+    );
+
     let suffix_star = Pattern::compile("*.rs", PatternOptions::default())
         .expect("suffix-star benchmark pattern is valid");
     c.bench_function("single_star/ferralk_compiled/matching", |benchmark| {

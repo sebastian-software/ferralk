@@ -771,3 +771,8 @@ on the corpus, within 20% of zlob median on that platform, p95 regression
   Each immutable directory node now builds `.gitignore` first and `.ignore`
   second, so a later negation can re-include a path; a source-backed fixture
   proves precedence, nested rules, and serial/parallel/stream parity.
+- Broadened the immutable static single-star matcher path from middle-only
+  forms to component-prefixed and component-suffixed forms such as `src/lib/*`
+  and `*/main.rs`. Equivalence tests retain the general matcher as the oracle;
+  the new prefix form measures about 16.7 ns matching and 7.0 ns non-matching
+  locally. Broader IR work and the external CodSpeed release gate remain open.

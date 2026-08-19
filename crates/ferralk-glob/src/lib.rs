@@ -740,8 +740,7 @@ impl FastPath {
             _ => {}
         }
         if let Some(star_index) = tokens.iter().position(|token| matches!(token, Token::Star))
-            && star_index > 0
-            && star_index + 1 < tokens.len()
+            && tokens.len() > 1
             && tokens.iter().enumerate().all(|(index, token)| {
                 index == star_index || matches!(token, Token::Literal(_) | Token::Separator)
             })
@@ -2076,6 +2075,49 @@ mod tests {
                 general.is_match(&candidate),
                 "fast path differs for {candidate:?}"
             );
+        }
+    }
+
+    #[test]
+    fn static_star_edge_fast_paths_match_the_general_matcher() {
+        let options = PatternOptions::default().case_insensitive(true);
+        for (pattern, candidates) in [
+            (
+                "Src/Lib/*",
+                vec![
+                    b"src/lib/".as_slice(),
+                    b"src/lib/main.rs".as_slice(),
+                    b"SRC/LIB/MAIN.RS".as_slice(),
+                    b"src/lib/.hidden".as_slice(),
+                    b"src/lib/nested/main.rs".as_slice(),
+                    b"src/other/main.rs".as_slice(),
+                ],
+            ),
+            (
+                "*/Main.RS",
+                vec![
+                    b"main.rs".as_slice(),
+                    b"src/main.rs".as_slice(),
+                    b"SRC/DEEP/MAIN.RS".as_slice(),
+                    b".hidden/main.rs".as_slice(),
+                    b"src/main.txt".as_slice(),
+                ],
+            ),
+        ] {
+            let fast = Pattern::compile(pattern, options).expect("pattern compiles");
+            assert!(matches!(
+                fast.alternatives[0].fast_path,
+                Some(FastPath::StaticStar { .. })
+            ));
+            let mut general = fast.clone();
+            general.alternatives[0].fast_path = None;
+            for candidate in candidates {
+                assert_eq!(
+                    fast.is_match(candidate),
+                    general.is_match(candidate),
+                    "fast path differs for {pattern:?} against {candidate:?}"
+                );
+            }
         }
     }
 
