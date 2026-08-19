@@ -5,12 +5,8 @@ use std::{
     collections::{HashMap, HashSet},
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     path::PathBuf,
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
     thread,
-    time::Duration,
 };
 
 use crossbeam_deque::{Steal, Stealer, Worker};
@@ -18,26 +14,27 @@ use crossbeam_deque::{Steal, Stealer, Worker};
 use super::{
     BackendEntry, DirectoryBackend, ErrorPolicy, GitIgnoreNode, SystemBackend, WalkEntry,
     WalkError, WalkResult, Walker, glob_path_bytes, has_hidden_component, is_git_ignored,
-    scheduler::Scheduler, should_skip_git_directory,
+    scheduler::{Coordinator, Scheduler, WorkerSlot},
+    should_skip_git_directory,
 };
-
-const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 pub(super) fn collect(walker: Walker) -> Result<WalkResult, WalkError> {
     let walker = Arc::new(walker);
     let shared = Arc::new(Shared::new(Arc::clone(&walker)));
-    let mut caller = WorkerScratch::new();
+    let mut caller = WorkerScratch::new(0);
+    let caller_slot = shared.coordinator.claim_caller_slot();
 
     // The caller starts alone. Helpers are created only after the root made
     // parallel directory work available, as required by ADR-0009.
-    shared.begin_task();
+    shared.coordinator.begin_task();
     {
-        let _root_task = TaskGuard::claim(&shared);
+        let _root_task = shared.coordinator.claim_task();
         process_directory(&shared, &mut caller, walker.root.clone());
     }
     caller.flush_into(&shared.scheduler);
 
-    if shared.pending.load(Ordering::Acquire) == 0 {
+    if shared.coordinator.pending() == 0 {
+        drop(caller_slot);
         return finish(shared, caller.entries);
     }
 
@@ -45,8 +42,8 @@ pub(super) fn collect(walker: Walker) -> Result<WalkResult, WalkError> {
     // lock-free once the walk runs. Only the threads are lazy: a slot stays
     // unused until the backlog outgrows the workers that are already running,
     // which is what lets a tree that only fans out below the root widen too.
-    let spare = (0..walker.threads.saturating_sub(1))
-        .map(|_| WorkerScratch::new())
+    let spare = (1..walker.threads.max(1))
+        .map(WorkerScratch::new)
         .collect::<Vec<_>>();
     let mut stealers = Vec::with_capacity(spare.len() + 1);
     stealers.push(caller.queue.stealer());
@@ -72,6 +69,7 @@ pub(super) fn collect(walker: Walker) -> Result<WalkResult, WalkError> {
     for shard in lock(&shards).drain(..) {
         entries.extend(shard);
     }
+    drop(caller_slot);
     finish(shared, entries)
 }
 
@@ -90,28 +88,28 @@ struct HelperPool<'scope, 'env> {
 impl<'scope, 'env> HelperPool<'scope, 'env> {
     /// Starts helpers while queued directories outnumber the running workers
     /// and the thread budget has room. Cheap enough to call after every
-    /// directory: the common case is two atomic loads.
+    /// directory: a full pool costs the two atomic loads that reject the claim.
     fn grow(self) {
-        while self.needs_another_worker() {
+        while !self.shared.should_stop() {
+            let Some(slot) = self
+                .shared
+                .coordinator
+                .claim_worker_slot(self.shared.walker.threads)
+            else {
+                return;
+            };
+            // Dropping the slot here releases it again for a later attempt.
             let Some(scratch) = lock(self.idle).pop() else {
                 return;
             };
-            if !self.spawn(scratch) {
+            if !self.spawn(slot, scratch) {
                 return;
             }
         }
     }
 
-    fn needs_another_worker(self) -> bool {
-        if self.shared.should_stop() {
-            return false;
-        }
-        let active = self.shared.active_workers.load(Ordering::Acquire);
-        active < self.shared.walker.threads && self.shared.pending.load(Ordering::Acquire) > active
-    }
-
     /// Reports whether the pool may keep growing after this attempt.
-    fn spawn(self, scratch: WorkerScratch) -> bool {
+    fn spawn(self, slot: WorkerSlot<'env>, scratch: WorkerScratch) -> bool {
         #[cfg(test)]
         if should_fail_next_worker_spawn() {
             self.shared
@@ -119,10 +117,12 @@ impl<'scope, 'env> HelperPool<'scope, 'env> {
             lock(self.idle).push(scratch);
             return false;
         }
-        self.shared.active_workers.fetch_add(1, Ordering::AcqRel);
         let spawn = thread::Builder::new()
             .name("ferralk-worker".into())
             .spawn_scoped(self.scope, move || {
+                // The slot rides along so it is released when this helper ends,
+                // however it ends.
+                let _slot = slot;
                 let mut scratch = scratch;
                 run_worker_catching_panics(self, &mut scratch);
                 lock(self.shards).push(std::mem::take(&mut scratch.entries));
@@ -130,8 +130,8 @@ impl<'scope, 'env> HelperPool<'scope, 'env> {
         match spawn {
             // The scope joins the helper, so the handle is not needed here.
             Ok(_) => true,
+            // The closure, and with it the slot, is dropped on failure.
             Err(source) => {
-                self.shared.active_workers.fetch_sub(1, Ordering::AcqRel);
                 self.shared.record_startup_error(source);
                 false
             }
@@ -162,13 +162,9 @@ fn finish(shared: Arc<Shared>, mut entries: Vec<WalkEntry>) -> Result<WalkResult
 struct Shared {
     walker: Arc<Walker>,
     scheduler: Scheduler<PathBuf>,
-    pending: AtomicUsize,
-    /// Workers currently running, the caller included. Compared against the
-    /// pending count to decide whether another helper would find work.
-    active_workers: AtomicUsize,
+    /// Task accounting, worker slots and the parking protocol.
+    coordinator: Coordinator,
     cancellation: super::CancellationToken,
-    wake_lock: Mutex<()>,
-    wake: Condvar,
     errors: Mutex<Vec<WalkError>>,
     abort_error: Mutex<Option<WalkError>>,
     startup_error: Mutex<Option<WalkError>>,
@@ -182,11 +178,8 @@ impl Shared {
         Self {
             walker,
             scheduler: Scheduler::new(),
-            pending: AtomicUsize::new(0),
-            active_workers: AtomicUsize::new(1),
+            coordinator: Coordinator::new(),
             cancellation,
-            wake_lock: Mutex::new(()),
-            wake: Condvar::new(),
             errors: Mutex::new(Vec::new()),
             abort_error: Mutex::new(None),
             startup_error: Mutex::new(None),
@@ -195,20 +188,10 @@ impl Shared {
         }
     }
 
-    fn begin_task(&self) {
-        self.pending.fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn finish_task(&self) {
-        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.wake.notify_all();
-        }
-    }
-
     fn schedule(&self, worker: &Worker<PathBuf>, directory: PathBuf) {
-        self.begin_task();
+        self.coordinator.begin_task();
         worker.push(directory);
-        self.wake.notify_all();
+        self.coordinator.wake_waiters();
     }
 
     fn should_stop(&self) -> bool {
@@ -223,7 +206,7 @@ impl Shared {
                 if abort_error.is_none() {
                     *abort_error = Some(error);
                     self.cancellation.cancel();
-                    self.wake.notify_all();
+                    self.coordinator.wake_waiters();
                 }
             }
             ErrorPolicy::Skip => {}
@@ -240,7 +223,7 @@ impl Shared {
                 source,
             ));
             self.cancellation.cancel();
-            self.wake.notify_all();
+            self.coordinator.wake_waiters();
         }
     }
 
@@ -249,39 +232,24 @@ impl Shared {
         if panic.is_none() {
             *panic = Some(payload);
             self.cancellation.cancel();
-            self.wake.notify_all();
+            self.coordinator.wake_waiters();
         }
     }
 }
 
-/// Owns one in-flight task that `begin_task` already counted and releases it
-/// on drop, so a panic inside `process_directory` cannot strand the pending
-/// count and leave the sibling workers waiting for work that never completes.
-struct TaskGuard<'a> {
-    shared: &'a Shared,
-}
-
-impl<'a> TaskGuard<'a> {
-    fn claim(shared: &'a Shared) -> Self {
-        Self { shared }
-    }
-}
-
-impl Drop for TaskGuard<'_> {
-    fn drop(&mut self) {
-        self.shared.finish_task();
-    }
-}
-
 struct WorkerScratch {
+    /// Position of this worker's stealer in the shared stealer list, so the
+    /// idle scan can start next door and skip its own queue.
+    index: usize,
     queue: Worker<PathBuf>,
     gitignore_cache: HashMap<PathBuf, Arc<GitIgnoreNode>>,
     entries: Vec<WalkEntry>,
 }
 
 impl WorkerScratch {
-    fn new() -> Self {
+    fn new(index: usize) -> Self {
         Self {
+            index,
             queue: Worker::new_fifo(),
             gitignore_cache: HashMap::new(),
             entries: Vec::new(),
@@ -297,7 +265,6 @@ impl WorkerScratch {
 
 fn run_worker_catching_panics(pool: HelperPool<'_, '_>, worker: &mut WorkerScratch) {
     catch_worker_panic(pool.shared, || run_worker(pool, worker));
-    pool.shared.active_workers.fetch_sub(1, Ordering::AcqRel);
 }
 
 fn catch_worker_panic(shared: &Shared, work: impl FnOnce()) {
@@ -309,7 +276,7 @@ fn catch_worker_panic(shared: &Shared, work: impl FnOnce()) {
 fn run_worker(pool: HelperPool<'_, '_>, worker: &mut WorkerScratch) {
     let shared = pool.shared;
     while let Some(directory) = next_task(shared, worker, pool.stealers) {
-        let _task = TaskGuard::claim(shared);
+        let _task = shared.coordinator.claim_task();
         if !shared.should_stop() {
             process_directory(shared, worker, directory);
             // The directory may have opened the tree up, so re-check whether
@@ -321,33 +288,18 @@ fn run_worker(pool: HelperPool<'_, '_>, worker: &mut WorkerScratch) {
     }
 }
 
+/// Waits for the next directory. Cancellation ends the search right away:
+/// queued tasks are plain paths, so leaving them behind has no observable
+/// effect and the walk stops without draining the rest of the tree.
 fn next_task(
     shared: &Shared,
     worker: &WorkerScratch,
     stealers: &[Stealer<PathBuf>],
 ) -> Option<PathBuf> {
-    loop {
-        // Cancellation ends the search right away. Queued tasks are plain
-        // paths, so leaving them behind has no observable effect, and workers
-        // stop within one poll interval instead of draining the whole tree.
-        if shared.should_stop() {
-            return None;
-        }
-        if let Some(task) = try_take(shared, worker, stealers) {
-            return Some(task);
-        }
-        let guard = lock(&shared.wake_lock);
-        if shared.pending.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-        if let Some(task) = try_take(shared, worker, stealers) {
-            return Some(task);
-        }
-        let _ = shared
-            .wake
-            .wait_timeout(guard, CANCELLATION_POLL_INTERVAL)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-    }
+    shared.coordinator.wait_for_task(
+        || shared.should_stop(),
+        || try_take(shared, worker, stealers),
+    )
 }
 
 fn try_take(
@@ -360,15 +312,21 @@ fn try_take(
         .pop()
         .or_else(|| shared.scheduler.steal_into(&worker.queue))
         .or_else(|| {
-            stealers.iter().find_map(|stealer| {
-                loop {
-                    match stealer.steal() {
-                        Steal::Success(task) => break Some(task),
-                        Steal::Empty => break None,
-                        Steal::Retry => continue,
+            // Start next door and leave the own queue out: stealing from
+            // itself can only come up empty, and the offset keeps idle workers
+            // from all probing the same victim first.
+            let (head, tail) = stealers.split_at((worker.index + 1).min(stealers.len()));
+            tail.iter()
+                .chain(head.iter().take(worker.index))
+                .find_map(|stealer| {
+                    loop {
+                        match stealer.steal() {
+                            Steal::Success(task) => break Some(task),
+                            Steal::Empty => break None,
+                            Steal::Retry => continue,
+                        }
                     }
-                }
-            })
+                })
         })
 }
 
@@ -559,12 +517,16 @@ struct WorkerRendezvous {
 static WORKER_RENDEZVOUS: Mutex<Option<WorkerRendezvous>> = Mutex::new(None);
 
 #[cfg(test)]
-static WORKER_RENDEZVOUS_WAKE: Condvar = Condvar::new();
+static WORKER_RENDEZVOUS_WAKE: std::sync::Condvar = std::sync::Condvar::new();
 
 /// Bounds the barrier so a walk that stays narrow fails the assertion instead
 /// of blocking the suite.
 #[cfg(test)]
-const WORKER_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKER_RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Re-checks the barrier often enough that its own bound stays responsive.
+#[cfg(test)]
+const WORKER_RENDEZVOUS_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[cfg(test)]
 fn expect_worker_threads(root: PathBuf, expected: usize) {
@@ -611,7 +573,7 @@ fn join_worker_rendezvous(shared: &Shared) {
             return;
         }
         let (resumed, _) = WORKER_RENDEZVOUS_WAKE
-            .wait_timeout(state, CANCELLATION_POLL_INTERVAL)
+            .wait_timeout(state, WORKER_RENDEZVOUS_POLL)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state = resumed;
     }

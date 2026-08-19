@@ -1,0 +1,26 @@
+name: Loom
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Swaps the scheduler protocol in crates/ferralk/src/scheduler.rs onto loom's
+  # primitives, so the models below check the code the walker actually runs.
+  RUSTFLAGS: --cfg loom
+
+jobs:
+  loom:
+    name: scheduler protocol models
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Loom drives its own threads, so the models run one at a time. The run is
+      # exhaustive; set LOOM_MAX_PREEMPTIONS if the state space outgrows the job.
+      - run: cargo test -p ferralk --lib loom_models -- --test-threads=1 --nocapture
