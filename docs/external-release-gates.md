@@ -13,6 +13,9 @@ repository.
 | `ferralk-glob` 0.1 publication | `cargo package` and `cargo publish --dry-run` completed locally; the dry run is recorded in `MILESTONES.md`. | Crates.io maintainer authority to publish `ferralk-glob` 0.1. |
 | `ferralk` 0.1 publication | Cargo's local package verification correctly waits for the exact `ferralk-glob` version to exist on crates.io. | Publish `ferralk-glob` first, then publish `ferralk` with maintainer authority. |
 | M3 CodSpeed Walker gate | Local fixture medians and `.github/workflows/zlob-benchmark.yml` cover the intended series. | Dispatch the remote comparison and confirm the 1.0 threshold. |
+| M5 macOS native validation | Bounds-checked readers, parser fuzz target, parity option matrix, and a local median within the 20% zlob target are committed. | Run the macOS native CI, sanitizer workflow, filesystem corpus, and stable benchmark series; retain p95 evidence. |
+| M5 Linux native validation | `getdents64` parser, fuzz target, parity matrix, and focused Miri workflow are committed; the test configuration cross-checks from macOS. | Run Ubuntu native CI, parser Miri, sanitizer/fuzz workflow, filesystem corpus, and stable benchmark series. |
+| M5 Linux `statx` | The native reader preserves `WalkOptions::metadata(true)` by returning `std::fs::Metadata`; raw `statx` data cannot construct that opaque type. | Approve a native-attribute public API or revised metadata contract before adding `statx`. |
 | Downstream Palamedes trial | Public API, compatibility guide, package preflight, and local benchmarks are available. | Access to the Palamedes integration target and its maintainer feedback. |
 | Benchmark publication and 1.0 release | Local benchmark suite, CodSpeed workflows, API review, and packaging preflight are in the repository. | Accepted remote benchmark evidence and release/publishing authority. |
 
