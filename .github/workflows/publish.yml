@@ -4,6 +4,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Actually publish to crates.io (not just package)
+        type: boolean
+        default: false
 
 concurrency:
   group: publish-${{ github.event.release.tag_name || github.sha }}
@@ -44,11 +49,15 @@ jobs:
         run: cargo package --locked --no-verify -p ferralk-glob
 
       - name: Publish ferralk-glob
-        if: ${{ github.event_name == 'release' }}
+        if: ${{ github.event_name == 'release' || inputs.publish }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked -p ferralk-glob
 
       - name: Publish ferralk after registry sync
-        if: ${{ github.event_name == 'release' }}
+        if: ${{ github.event_name == 'release' || inputs.publish }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           for attempt in {1..10}; do
             if cargo publish --locked -p ferralk; then
