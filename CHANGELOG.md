@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.4.0](https://github.com/sebastian-software/ferralk/compare/v0.3.0...v0.4.0) (2026-08-20)
+
+
+### Features
+
+* **walker:** reach separator-crossing wildcards from the builder ([380dc7f](https://github.com/sebastian-software/ferralk/commit/380dc7f102f88c18d88e4c633778c8c8a5feae6e)), closes [#79](https://github.com/sebastian-software/ferralk/issues/79)
+* **walker:** rewrite absolute include and exclude patterns ([6315498](https://github.com/sebastian-software/ferralk/commit/6315498ab97c4ccdbaa1ebb0706862426b2c31b0)), closes [#78](https://github.com/sebastian-software/ferralk/issues/78)
+* **walker:** walk several roots with one walker and one pool ([9873c63](https://github.com/sebastian-software/ferralk/commit/9873c63cd7bcbc18b9cd5275b4dfe9de6521f4dc))
+
+
+### Bug Fixes
+
+* **walker:** build the linux native backend against multi-root tasks ([e9c7e01](https://github.com/sebastian-software/ferralk/commit/e9c7e013662954cb03da9427fb45b321e417fadd))
+* **walker:** prune a subtree only where its exclude reaches ([727e963](https://github.com/sebastian-software/ferralk/commit/727e963685a86cb6562f5ece5bc57a47c7f5976f))
+
+
+### Performance Improvements
+
+* **walker:** build the pool only once the floor unlocks a helper ([3e6547f](https://github.com/sebastian-software/ferralk/commit/3e6547f82c7d90c197e9ba017b66c4c6fa54c7cc)), closes [#81](https://github.com/sebastian-software/ferralk/issues/81)
+* **walker:** hand entries to the visitor without materializing them ([bbfdfd8](https://github.com/sebastian-software/ferralk/commit/bbfdfd88ba76e560b6144e467a8134218efdcaef)), closes [#73](https://github.com/sebastian-software/ferralk/issues/73)
+* **walker:** weigh work, not directories, before starting a pool ([0d192f0](https://github.com/sebastian-software/ferralk/commit/0d192f0966a0a23b48f7e4c68dc4d3c119e2666b)), closes [#76](https://github.com/sebastian-software/ferralk/issues/76)
+
 ## [0.3.0](https://github.com/sebastian-software/ferralk/compare/v0.2.0...v0.3.0) (2026-08-20)
 
 
