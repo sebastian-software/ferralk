@@ -105,6 +105,29 @@ Important defaults:
   decides, as in Git.
 - Symlinks are not followed unless `WalkOptions::follow_symlinks(true)` is
   selected; a canonical-path guard prevents directory cycles.
+- `files_only(true)` and `directories_only(true)` filter on the kind a
+  directory listing reports, and a listing reports a symlink as a symlink and
+  nothing about its target. So by default `files_only` keeps every symlink -
+  including a broken one and one pointing at a directory - and
+  `directories_only` keeps none of them. That matches zlob's
+  `ZLOB_WALK_NO_REPORT_DIRS`, which is why it is the default.
+
+  `WalkOptions::resolve_symlink_kind(true)` classifies symlink entries by their
+  target instead, which is what callers who mean `Path::is_file` want:
+
+  | the link points at | `files_only` | `directories_only` |
+  |---|---|---|
+  | a file | kept | dropped |
+  | a directory | dropped | kept |
+  | nothing (broken) | dropped | dropped |
+
+  It costs one `stat` per symlink entry, paid only when one of the two filters
+  is on and the walk is not already following symlinks. A broken link is
+  dropped without an error - there is no target, so it is neither kind - while
+  a `stat` that fails for any other reason leaves the kind unknown and is
+  reported through the `ErrorPolicy`. The entry's own `kind()` still reports
+  `Symlink` either way: the switch answers what the link points at, not what
+  the entry is.
 - `ErrorPolicy::Collect` is the default. It returns accepted entries and
   recoverable filesystem errors in one `WalkResult`.
 - Results are unsorted unless `WalkOptions::sort(true)` is set.
