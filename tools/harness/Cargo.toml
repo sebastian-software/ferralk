@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 corpus = { path = "../corpus" }
+ferralk = { path = "../../crates/ferralk" }
 ferralk-glob = { path = "../../crates/ferralk-glob" }
 serde_json.workspace = true
 

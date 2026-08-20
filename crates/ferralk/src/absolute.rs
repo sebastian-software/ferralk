@@ -1,0 +1,418 @@
+//! Rewriting absolute include and exclude patterns into root-relative ones.
+//!
+//! The walker matches root-relative bytes, while callers routinely hold
+//! absolute patterns: a build tool that knows a project lives at `/repo` writes
+//! `/repo/src/**/*.ts` rather than tracking which prefix the walk will strip.
+//! Every such caller ends up writing the same prefix arithmetic, and gets the
+//! edge cases wrong in the same places, so the walker does it once here.
+//!
+//! The rewrite is purely lexical. Nothing here touches the filesystem, so a
+//! pattern compiles without a `stat`, and no symlink or `..` is resolved
+//! behind the caller's back - which is also why a `..` in either the pattern or
+//! the root is rejected instead of being folded away.
+//!
+//! [`rewrite`] takes the root as an argument rather than reading it from a
+//! walker, so a future multi-root walk can rewrite one pattern once per root.
+//!
+//! One limitation follows from the pattern dialect rather than from this code:
+//! a walk root whose own name contains `*`, `?`, `[`, `{` or `\` cannot be
+//! spelled literally in front of a pattern, because those bytes are syntax
+//! there. Such a root is reported as unrewritable rather than guessed at, and
+//! the pattern has to be written relative to it.
+
+use ferralk_glob::PatternError;
+
+use crate::first_metacharacter;
+
+/// What an absolute pattern turned into for one walk root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Rewrite {
+    /// The pattern was not absolute. It is already in the walker's dialect and
+    /// is used unchanged.
+    Relative,
+    /// The pattern was absolute and named paths inside the root. These are the
+    /// equivalent root-relative pattern bytes.
+    Rooted(Vec<u8>),
+    /// The pattern was absolute and named paths outside the root, so no entry
+    /// this walk can produce will match it.
+    ///
+    /// This is a verdict, not a failure: a caller filtering one pattern list
+    /// across several roots expects the patterns for other roots to select
+    /// nothing here rather than to be rejected.
+    Outside,
+}
+
+/// Which spelling of an absolute path a rewrite is reading.
+///
+/// Carried as a value rather than read from `cfg!` at each use, so both
+/// spellings are exercised by the tests on whichever platform runs them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Syntax {
+    /// A leading separator makes a path absolute.
+    Posix,
+    /// A drive letter (`C:/`) or a UNC share (`//host/share`) does.
+    Windows,
+}
+
+impl Syntax {
+    /// The spelling this build's platform uses.
+    pub(crate) const NATIVE: Self = if cfg!(windows) {
+        Self::Windows
+    } else {
+        Self::Posix
+    };
+}
+
+/// Rewrites `pattern` for a walk rooted at `root`, or reports why it cannot.
+///
+/// `root` is the walk root as glob bytes - separators already normalized to
+/// `/`, which is what [`crate::glob_path_bytes`] produces on every platform.
+/// The pattern itself is read in the walker's dialect, where `/` separates
+/// components and `\` escapes, per ADR-0005.
+pub(crate) fn rewrite(pattern: &[u8], root: &[u8]) -> Result<Rewrite, PatternError> {
+    rewrite_in(pattern, root, Syntax::NATIVE)
+}
+
+pub(crate) fn rewrite_in(
+    pattern: &[u8],
+    root: &[u8],
+    syntax: Syntax,
+) -> Result<Rewrite, PatternError> {
+    let Some(pattern_prefix) = absolute_prefix(pattern, syntax) else {
+        return Ok(Rewrite::Relative);
+    };
+    let Some(root_prefix) = absolute_prefix(root, syntax) else {
+        // Relating an absolute pattern to a relative root would take the
+        // current directory, which is process state the walk does not read.
+        return Err(PatternError::new(
+            0,
+            "an absolute pattern needs an absolute walk root",
+        ));
+    };
+    if !roots_agree(&pattern[..pattern_prefix], &root[..root_prefix]) {
+        // A different drive or share. Nothing under this root can match.
+        return Ok(Rewrite::Outside);
+    }
+
+    // Rejected wherever it appears, not only above the root: `/a/b/../b/x.ts`
+    // is a path inside a root of `/a/b`, but the bytes left after removing the
+    // root would start with `..` and match no walk candidate at all. Silently
+    // selecting nothing there would be worse than saying so.
+    if let Some(at) = dot_dot_component(pattern) {
+        return Err(PatternError::new(
+            at,
+            "`..` in an absolute pattern is not resolved, because resolving it lexically would be wrong across a symlink",
+        ));
+    }
+
+    // A metacharacter anywhere ends the part of the pattern that is a plain
+    // path, and only a plain path can be compared against the root.
+    let magic = first_metacharacter(pattern);
+    let mut offset = pattern_prefix;
+    for root_component in components(&root[root_prefix..]) {
+        if root_component == b".." {
+            return Err(PatternError::new(
+                0,
+                "an absolute pattern needs a walk root without a `..` component",
+            ));
+        }
+        loop {
+            let Some((component, next)) = next_component(pattern, offset) else {
+                // The pattern named an ancestor of the root and stopped there,
+                // so it names one path and that path is not inside the walk.
+                return Ok(Rewrite::Outside);
+            };
+            if component.is_empty() || component == b"." {
+                offset = next;
+                continue;
+            }
+            if magic.is_some_and(|at| at < offset + component.len()) {
+                return Err(PatternError::new(
+                    offset,
+                    "a wildcard at or above the walk root cannot be made relative to it",
+                ));
+            }
+            if component != root_component {
+                return Ok(Rewrite::Outside);
+            }
+            offset = next;
+            break;
+        }
+    }
+
+    // The separator that joined the root to the rest belongs to neither, and a
+    // caller whose root already ended in one leaves two behind. A pattern may
+    // not start with a separator - walk candidates never do - so they come off
+    // here rather than becoming a pattern that matches nothing.
+    while let Some((component, next)) = next_component(pattern, offset) {
+        if !component.is_empty() && component != b"." {
+            break;
+        }
+        offset = next;
+    }
+
+    // Everything that names nothing has been skipped, so what is left is
+    // either a real component or nothing at all.
+    let remainder = &pattern[offset..];
+    if remainder.is_empty() {
+        return Err(PatternError::new(
+            offset,
+            "an absolute pattern that names the walk root itself selects nothing; add `/**` to select what is inside it",
+        ));
+    }
+    Ok(Rewrite::Rooted(remainder.to_vec()))
+}
+
+/// Length of the prefix that makes `bytes` absolute, if it is.
+///
+/// On Windows a single leading separator is deliberately not enough, matching
+/// the platform: `\tmp` is relative to the current drive, not absolute, so a
+/// pattern spelled that way keeps the root-relative reading it has today.
+fn absolute_prefix(bytes: &[u8], syntax: Syntax) -> Option<usize> {
+    match syntax {
+        Syntax::Posix => bytes.starts_with(b"/").then_some(1),
+        Syntax::Windows => {
+            if bytes.starts_with(b"//") {
+                return Some(2);
+            }
+            let drive = bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && bytes[2] == b'/';
+            drive.then_some(3)
+        }
+    }
+}
+
+/// Whether two absolute prefixes name the same root.
+///
+/// The only prefix with content of its own is a Windows drive letter, and a
+/// drive letter is not a filename: `C:` and `c:` are one drive however
+/// case-sensitively the names below them are matched.
+fn roots_agree(pattern_prefix: &[u8], root_prefix: &[u8]) -> bool {
+    pattern_prefix.eq_ignore_ascii_case(root_prefix)
+}
+
+/// Components of an already-absolute path's remainder, skipping the empties a
+/// doubled or trailing separator leaves behind, and `.` which names nothing.
+fn components(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    bytes
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty() && *component != b".")
+}
+
+/// The component starting at `offset`, and where the next one starts.
+///
+/// Splits on `/` only. `\` is an escape in the pattern dialect rather than a
+/// separator, and it is a metacharacter, so a pattern that spells its root with
+/// backslashes is reported as unrewritable instead of being silently mis-split.
+fn next_component(pattern: &[u8], offset: usize) -> Option<(&[u8], usize)> {
+    if offset >= pattern.len() {
+        return None;
+    }
+    let rest = &pattern[offset..];
+    match rest.iter().position(|byte| *byte == b'/') {
+        Some(separator) => Some((&rest[..separator], offset + separator + 1)),
+        None => Some((rest, pattern.len())),
+    }
+}
+
+/// Offset of the first `..` path component, if the pattern has one.
+///
+/// Components are split on `/` alone, so a `..` hidden inside a brace
+/// alternative is not found. That is deliberate: this rejects the spelling that
+/// looks like a path operation, not every byte sequence that could expand to
+/// one.
+fn dot_dot_component(pattern: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+    while let Some((component, next)) = next_component(pattern, offset) {
+        if component == b".." {
+            return Some(offset);
+        }
+        offset = next;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Rewrite, Syntax, rewrite_in};
+
+    /// Convenience for the common assertion: this rewrote to these bytes.
+    fn rooted(pattern: &str, root: &str, syntax: Syntax) -> String {
+        match rewrite_in(pattern.as_bytes(), root.as_bytes(), syntax) {
+            Ok(Rewrite::Rooted(bytes)) => String::from_utf8(bytes).expect("ASCII fixture"),
+            other => panic!("expected a rewrite, got {other:?}"),
+        }
+    }
+
+    fn verdict(pattern: &str, root: &str, syntax: Syntax) -> Rewrite {
+        rewrite_in(pattern.as_bytes(), root.as_bytes(), syntax).expect("no error expected")
+    }
+
+    fn message(pattern: &str, root: &str, syntax: Syntax) -> &'static str {
+        rewrite_in(pattern.as_bytes(), root.as_bytes(), syntax)
+            .expect_err("an error was expected")
+            .message()
+    }
+
+    #[test]
+    fn a_pattern_under_the_root_loses_exactly_the_root() {
+        assert_eq!(rooted("/a/b/src/*.ts", "/a/b", Syntax::Posix), "src/*.ts");
+        assert_eq!(rooted("/a/b/**/*.ts", "/a/b", Syntax::Posix), "**/*.ts");
+        assert_eq!(rooted("/a/b/**", "/a/b", Syntax::Posix), "**");
+        // A brace root from #20 survives, because the rewrite stops at the
+        // first metacharacter and the prefix before it is what it removes.
+        assert_eq!(
+            rooted("/a/b/{src,lib}/**/*.ts", "/a/b", Syntax::Posix),
+            "{src,lib}/**/*.ts"
+        );
+        // A trailing separator still means "directories only" afterwards.
+        assert_eq!(rooted("/a/b/build/", "/a/b", Syntax::Posix), "build/");
+    }
+
+    #[test]
+    fn separator_noise_on_either_side_is_ignored() {
+        assert_eq!(rooted("/a//b/src/*.ts", "/a/b", Syntax::Posix), "src/*.ts");
+        assert_eq!(rooted("/a/./b/src/*.ts", "/a/b", Syntax::Posix), "src/*.ts");
+        assert_eq!(rooted("/a/b/src/*.ts", "/a/b/", Syntax::Posix), "src/*.ts");
+        assert_eq!(
+            rooted("/a/b/src/*.ts", "/a//b//", Syntax::Posix),
+            "src/*.ts"
+        );
+        // A root that already ends in a separator leaves two at the join.
+        assert_eq!(rooted("/a/b//src/*.ts", "/a/b", Syntax::Posix), "src/*.ts");
+        assert_eq!(rooted("/a/b/./src/*.ts", "/a/b", Syntax::Posix), "src/*.ts");
+        assert_eq!(rooted("//a/b/src/*.ts", "/a/b", Syntax::Posix), "src/*.ts");
+    }
+
+    #[test]
+    fn a_pattern_that_cannot_reach_the_root_selects_nothing() {
+        // A sibling of the root.
+        assert_eq!(verdict("/a/c/**", "/a/b", Syntax::Posix), Rewrite::Outside);
+        // An unrelated tree.
+        assert_eq!(
+            verdict("/other/**", "/a/b", Syntax::Posix),
+            Rewrite::Outside
+        );
+        // An ancestor named exactly, which is one path and not inside the walk.
+        assert_eq!(verdict("/a", "/a/b", Syntax::Posix), Rewrite::Outside);
+        // A near miss that a byte-wise prefix test would have accepted: the
+        // root is `/a/b`, and `/a/bb` is a different directory.
+        assert_eq!(verdict("/a/bb/**", "/a/b", Syntax::Posix), Rewrite::Outside);
+    }
+
+    #[test]
+    fn a_relative_pattern_is_left_alone() {
+        assert_eq!(
+            verdict("src/*.ts", "/a/b", Syntax::Posix),
+            Rewrite::Relative
+        );
+        assert_eq!(verdict("**/*.ts", "/a/b", Syntax::Posix), Rewrite::Relative);
+        // On Windows a single leading separator is drive-relative, not
+        // absolute, so it keeps whatever meaning it has as a walker pattern.
+        assert_eq!(
+            verdict("/src/*.ts", "C:/a/b", Syntax::Windows),
+            Rewrite::Relative
+        );
+    }
+
+    #[test]
+    fn a_wildcard_at_or_above_the_root_is_rejected() {
+        // `/*/x.ts` could match inside the root or outside it; which is not
+        // decidable without matching, so the walker says so instead of
+        // guessing. Selecting nothing here would silently drop real matches.
+        assert_eq!(
+            message("/*/x.ts", "/a/b", Syntax::Posix),
+            "a wildcard at or above the walk root cannot be made relative to it"
+        );
+        assert_eq!(
+            message("/**/*.ts", "/a/b", Syntax::Posix),
+            "a wildcard at or above the walk root cannot be made relative to it"
+        );
+        // Sharing a component with the root's own name is the same problem:
+        // `b*` covers `b` and `bb` alike.
+        assert_eq!(
+            message("/a/b*/x.ts", "/a/b", Syntax::Posix),
+            "a wildcard at or above the walk root cannot be made relative to it"
+        );
+        // A wildcard below the root is fine; only the part being removed has
+        // to be literal.
+        assert_eq!(rooted("/a/b/*/x.ts", "/a/b", Syntax::Posix), "*/x.ts");
+    }
+
+    #[test]
+    fn dot_dot_is_rejected_on_both_sides() {
+        assert!(message("/a/b/../b/x.ts", "/a/b", Syntax::Posix).starts_with("`..`"));
+        assert_eq!(
+            message("/a/b/x.ts", "/a/b/../b", Syntax::Posix),
+            "an absolute pattern needs a walk root without a `..` component"
+        );
+        // Below the root it is rejected too. Removing `/a` would leave
+        // `b/../c/*.ts`, which matches no walk candidate, so the pattern would
+        // quietly select nothing instead of what it names.
+        assert!(message("/a/b/../c/*.ts", "/a", Syntax::Posix).starts_with("`..`"));
+    }
+
+    #[test]
+    fn naming_the_root_itself_is_rejected() {
+        for pattern in ["/a/b", "/a/b/", "/a/b/.", "/a//b//"] {
+            assert!(
+                message(pattern, "/a/b", Syntax::Posix)
+                    .starts_with("an absolute pattern that names"),
+                "{pattern} names the root"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absolute_pattern_needs_an_absolute_root() {
+        assert_eq!(
+            message("/a/b/*.ts", "relative/dir", Syntax::Posix),
+            "an absolute pattern needs an absolute walk root"
+        );
+        assert_eq!(
+            message("C:/a/*.ts", "a/b", Syntax::Windows),
+            "an absolute pattern needs an absolute walk root"
+        );
+    }
+
+    #[test]
+    fn windows_roots_are_read_the_way_windows_spells_them() {
+        assert_eq!(
+            rooted("C:/a/b/src/*.ts", "C:/a/b", Syntax::Windows),
+            "src/*.ts"
+        );
+        // A drive letter is not a filename, so its case does not decide.
+        assert_eq!(
+            rooted("c:/a/b/src/*.ts", "C:/a/b", Syntax::Windows),
+            "src/*.ts"
+        );
+        // Names below the drive are matched as written, per ADR-0005.
+        assert_eq!(
+            verdict("C:/a/B/src/*.ts", "C:/a/b", Syntax::Windows),
+            Rewrite::Outside
+        );
+        // Another drive is outside this walk.
+        assert_eq!(
+            verdict("D:/a/b/**", "C:/a/b", Syntax::Windows),
+            Rewrite::Outside
+        );
+        // UNC shares work the same way.
+        assert_eq!(
+            rooted("//host/share/a/**/*.ts", "//host/share/a", Syntax::Windows),
+            "**/*.ts"
+        );
+        assert_eq!(
+            verdict("//host/other/a/**", "//host/share/a", Syntax::Windows),
+            Rewrite::Outside
+        );
+        // A backslash is an escape in this dialect, not a separator, so a
+        // pattern spelled the way `Path::display` prints one is reported
+        // rather than silently mis-split.
+        assert_eq!(
+            message("C:/a\\b\\src\\*.ts", "C:/a/b", Syntax::Windows),
+            "a wildcard at or above the walk root cannot be made relative to it"
+        );
+    }
+}

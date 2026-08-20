@@ -351,6 +351,7 @@ version = "0.3.0"
 dependencies = [
  "corpus",
  "fast-glob",
+ "ferralk",
  "ferralk-glob",
  "serde_json",
 ]

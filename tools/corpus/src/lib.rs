@@ -25,9 +25,27 @@ pub struct Case {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oracle_matches: Option<Vec<String>>,
     /// Base directory stripped from input candidates for a
-    /// [`CaseKind::MatchPathsAt`] operation.
+    /// [`CaseKind::MatchPathsAt`] operation, and the walk root an absolute
+    /// pattern is rewritten against for a [`CaseKind::AbsolutePattern`] one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base_path: String,
+    /// The pattern a walker compiles after rewriting `pattern` for
+    /// `base_path`, for a [`CaseKind::AbsolutePattern`] case.
+    ///
+    /// Absent means the pattern names paths outside the root, so nothing the
+    /// walk produces can match it. A case that instead expects a rejection
+    /// records `error_message`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewritten: Option<String>,
+    /// Reads `pattern` and `base_path` with Windows path syntax - drive
+    /// letters and UNC shares - for a [`CaseKind::AbsolutePattern`] case,
+    /// whichever host replays it.
+    ///
+    /// This is not [`Case::platform`], which skips a case away from hosts that
+    /// spell paths differently. What makes a path absolute is a property of
+    /// the pattern being described, so both spellings are checked everywhere.
+    #[serde(default)]
+    pub windows_paths: bool,
     /// Ferralk-selected input positions for an index-list operation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub indices: Vec<usize>,
@@ -111,6 +129,10 @@ pub enum CaseKind {
     /// wildcard stays inside one path component and only `**` crosses a
     /// separator. This is the filesystem-glob reading, not the fnmatch one.
     MatchGlobPath,
+    /// An absolute walker pattern rewritten against a walk root: which
+    /// root-relative pattern it becomes, or that it can select nothing, or
+    /// that the rewrite is refused.
+    AbsolutePattern,
 }
 
 /// One `.gitignore` file below the repository root.

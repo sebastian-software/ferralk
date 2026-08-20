@@ -46,11 +46,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     line_number + 1
                 )
             })?;
-            if case.kind != CaseKind::CompileError
-                && (case.error_offset.is_some() || case.error_message.is_some())
+            if !matches!(
+                case.kind,
+                CaseKind::CompileError | CaseKind::AbsolutePattern
+            ) && (case.error_offset.is_some() || case.error_message.is_some())
             {
                 return Err(format!(
-                    "{}:{}: error_offset and error_message belong to a compile_error case",
+                    "{}:{}: error_offset and error_message belong to a rejection case",
                     file.display(),
                     line_number + 1
                 )
@@ -78,6 +80,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         })?
                         .is_match_glob_path(path),
                     CaseKind::HasWildcards => Pattern::has_wildcards(pattern, options),
+                    CaseKind::AbsolutePattern => {
+                        replay_absolute_pattern(&case).map_err(|error| {
+                            format!("{}:{}: {error}", file.display(), line_number + 1)
+                        })?
+                    }
                     CaseKind::CompileError => replay_compile_error(&case, pattern, options)
                         .map_err(|error| {
                             format!("{}:{}: {error}", file.display(), line_number + 1)
@@ -127,7 +134,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             | CaseKind::CompileError
                             | CaseKind::MatchGlobPath
                             | CaseKind::MatchPathIndices
-                            | CaseKind::MatchPathIndicesAt => unreachable!(),
+                            | CaseKind::MatchPathIndicesAt
+                            | CaseKind::AbsolutePattern => unreachable!(),
                         };
                         if selected
                             .iter()
@@ -177,7 +185,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             | CaseKind::CompileError
                             | CaseKind::MatchGlobPath
                             | CaseKind::MatchPaths
-                            | CaseKind::MatchPathsAt => unreachable!(),
+                            | CaseKind::MatchPathsAt
+                            | CaseKind::AbsolutePattern => unreachable!(),
                         };
                         if selected != case.indices {
                             return Err(format!(
@@ -247,6 +256,66 @@ fn replay_compile_error(
         ));
     }
     Ok(case.expected)
+}
+
+/// Replays one absolute-pattern rewrite: the pattern the walker ends up
+/// compiling for `base_path`, that nothing can match, or that it is refused.
+fn replay_absolute_pattern(case: &Case) -> Result<bool, String> {
+    let pattern =
+        decode_bytes(&case.pattern).map_err(|error| format!("invalid pattern: {error}"))?;
+    let root =
+        decode_bytes(&case.base_path).map_err(|error| format!("invalid base path: {error}"))?;
+    let expects_rejection = case.error_message.is_some() || case.error_offset.is_some();
+    if expects_rejection && case.rewritten.is_some() {
+        return Err("a rejected rewrite has no rewritten pattern".to_owned());
+    }
+    match ferralk::corpus_rewrite_absolute_pattern(&pattern, &root, case.windows_paths) {
+        Ok(rewritten) => {
+            if expects_rejection {
+                return Err(format!(
+                    "{} was accepted but must be rejected",
+                    case.pattern
+                ));
+            }
+            let expected = case
+                .rewritten
+                .as_deref()
+                .map(decode_bytes)
+                .transpose()
+                .map_err(|error| format!("invalid rewritten pattern: {error}"))?;
+            if rewritten != expected {
+                return Err(format!(
+                    "expected {expected:?}, got {rewritten:?} for {} under {}",
+                    case.pattern, case.base_path
+                ));
+            }
+            Ok(case.expected)
+        }
+        Err(error) => {
+            if !expects_rejection {
+                return Err(format!("{} was rejected: {error}", case.pattern));
+            }
+            if let Some(offset) = case.error_offset
+                && error.offset() != offset
+            {
+                return Err(format!(
+                    "expected error offset {offset}, got {} for {}",
+                    error.offset(),
+                    case.pattern
+                ));
+            }
+            if let Some(message) = case.error_message.as_deref()
+                && error.message() != message
+            {
+                return Err(format!(
+                    "expected error message {message:?}, got {:?} for {}",
+                    error.message(),
+                    case.pattern
+                ));
+            }
+            Ok(case.expected)
+        }
+    }
 }
 
 fn options_from_flags(flags: &[String]) -> Result<PatternOptions, String> {

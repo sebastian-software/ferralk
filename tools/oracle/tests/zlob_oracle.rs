@@ -25,13 +25,21 @@ struct Skipped {
     compile_error: usize,
     /// zlob has no component-local wildcard mode to compare against.
     glob_path: usize,
+    /// Rewriting an absolute pattern for a walk root is a walker contract, and
+    /// zlob has no walker.
+    absolute_pattern: usize,
     /// The verdict describes a separator platform this runner is not.
     platform: usize,
 }
 
 impl Skipped {
     fn total(&self) -> usize {
-        self.case_folding + self.non_utf8 + self.compile_error + self.glob_path + self.platform
+        self.case_folding
+            + self.non_utf8
+            + self.compile_error
+            + self.glob_path
+            + self.absolute_pattern
+            + self.platform
     }
 }
 
@@ -77,6 +85,10 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                 skipped.glob_path += 1;
                 continue;
             }
+            if case.kind == CaseKind::AbsolutePattern {
+                skipped.absolute_pattern += 1;
+                continue;
+            }
             let Some(flags) = zlob_flags(&case.flags) else {
                 skipped.case_folding += 1;
                 continue;
@@ -116,6 +128,7 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                             | CaseKind::HasWildcards
                             | CaseKind::CompileError
                             | CaseKind::MatchGlobPath
+                            | CaseKind::AbsolutePattern
                             | CaseKind::MatchPathIndices
                             | CaseKind::MatchPathIndicesAt => unreachable!(),
                         }
@@ -153,6 +166,7 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                         | CaseKind::HasWildcards
                         | CaseKind::CompileError
                         | CaseKind::MatchGlobPath
+                        | CaseKind::AbsolutePattern
                         | CaseKind::MatchPaths
                         | CaseKind::MatchPathsAt => unreachable!(),
                     }
@@ -170,7 +184,7 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                     );
                     case.expected
                 }
-                CaseKind::CompileError | CaseKind::MatchGlobPath => {
+                CaseKind::CompileError | CaseKind::MatchGlobPath | CaseKind::AbsolutePattern => {
                     unreachable!("these kinds are skipped above")
                 }
             };
@@ -189,12 +203,14 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
 
     println!(
         "replayed {replayed} corpus cases against zlob 1.6.3; skipped {} \
-         ({} case-folding, {} non-UTF-8, {} compile-error, {} glob-path, {} other-platform)",
+         ({} case-folding, {} non-UTF-8, {} compile-error, {} glob-path, \
+         {} absolute-pattern, {} other-platform)",
         skipped.total(),
         skipped.case_folding,
         skipped.non_utf8,
         skipped.compile_error,
         skipped.glob_path,
+        skipped.absolute_pattern,
         skipped.platform
     );
     assert!(

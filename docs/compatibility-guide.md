@@ -91,7 +91,58 @@ traversal filter that removes hidden entries before any pattern is consulted.
 Walker include patterns are root-relative. A leading `./` is accepted, and a
 trailing `/` selects matching directories only. Ordinary wildcards stay inside
 one path component by default; use recursive `**` to select descendants, or
-switch the whole walk to crossing wildcards as described next.
+switch the whole walk to crossing wildcards as described below. A pattern that
+starts at a filesystem root is understood as absolute and rewritten, as
+described next.
+
+### Absolute patterns, and the caller-side rewrite they replace
+
+A caller that knows where a project lives holds `/repo/src/**/*.ts` rather than
+`src/**/*.ts`, and until 0.4 had to strip the walk root itself before handing
+the pattern over. That arithmetic is short to write and easy to get subtly
+wrong — `/repo` against a root of `/repo` is not the same case as against
+`/repository`, and a root that ends in a separator leaves a doubled one at the
+join — so the walker now does it.
+
+`Walker::include` and `Walker::exclude` detect an absolute pattern and remove
+the walk root from it. Detection follows the platform: a leading `/` on Unix; a
+drive letter or a UNC share on Windows, where a single leading separator is
+drive-relative and so stays an ordinary walker pattern. Patterns are written
+with `/` on every platform per ADR-0005, `\` being an escape rather than a
+separator.
+
+| Pattern | Walk root | Result |
+| --- | --- | --- |
+| `/repo/src/**/*.ts` | `/repo` | `src/**/*.ts` |
+| `/repo/{src,lib}/**` | `/repo` | `{src,lib}/**`, brace roots intact |
+| `/repo//src/*.ts` | `/repo/` | `src/*.ts`, separator noise ignored |
+| `/repo/*/x.ts` | `/repo` | `*/x.ts`, a wildcard below the root is fine |
+| `/other/**` | `/repo` | selects nothing, and prunes nothing |
+| `/repo` | `/repo` | rejected: names the root; add `/**` |
+| `/**/*.ts` | `/repo` | rejected: wildcard at or above the root |
+| `/repo/../repo/x.ts` | `/repo` | rejected: `..` is not resolved |
+
+The three rejections are the shapes where guessing would silently select the
+wrong entries. A wildcard standing where the root's own components are may or
+may not cover the root, and deciding that needs matching rather than
+arithmetic; write the part below the root instead, where `**/*.ts` says what
+`/**/*.ts` was reaching for. A `..` is not folded away because folding it
+lexically is wrong across a symlink, and resolving it properly would mean
+touching the filesystem to compile a pattern. Naming the root itself selects
+nothing, because the walk emits what is inside the root.
+
+A pattern about a different tree is not an error, because a caller may hold one
+pattern list and run it against several roots. It selects nothing and — the
+part that matters for a walk — prunes nothing: an exclude that cannot reach
+this tree never closes a directory in it.
+
+**What this was before.** A pattern starting with `/` used to reach the matcher
+unchanged and match no candidate at all, because walk candidates are
+root-relative and never start with a separator. An absolute include therefore
+produced an empty walk and an absolute exclude did nothing. Nothing that
+previously selected entries selects different ones now; the patterns that
+change behaviour are the ones that selected nothing, which now either work or
+say why they cannot.
 
 ### Migrating patterns from globset or fast-glob
 

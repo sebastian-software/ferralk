@@ -105,6 +105,22 @@ pub struct PatternError {
 }
 
 impl PatternError {
+    /// Builds an error for a pattern a layer above the matcher rejected.
+    ///
+    /// Compilation produces these on its own; this exists for callers that
+    /// impose rules the pattern language cannot express, such as a walker
+    /// deciding that an absolute pattern cannot be rewritten for its root. Such
+    /// a caller already returns `PatternError`, and a second error type in the
+    /// same position would say nothing extra.
+    ///
+    /// `offset` is a byte offset into the pattern the caller was given, and
+    /// `message` describes the construct rather than the caller's own state, so
+    /// that [`Display`](fmt::Display) reads the same as a compilation error.
+    #[must_use]
+    pub const fn new(offset: usize, message: &'static str) -> Self {
+        Self { offset, message }
+    }
+
     /// Zero-based byte offset of the invalid construct.
     pub const fn offset(&self) -> usize {
         self.offset

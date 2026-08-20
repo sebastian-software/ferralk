@@ -13,10 +13,12 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | Field | Required | Meaning |
 |---|---:|---|
 | `id` | yes | Stable, topic-local identifier, for example `wildcard-001`. |
-| `kind` | no | `matcher` (default), `match_glob_path` for the component-local reading, `has_wildcards` for syntax preflight, `match_paths` / `_at` for borrowed list filtering, `match_path_indices` / `_at` for positions, or `compile_error` for a pattern the compiler must reject. |
+| `kind` | no | `matcher` (default), `match_glob_path` for the component-local reading, `has_wildcards` for syntax preflight, `match_paths` / `_at` for borrowed list filtering, `match_path_indices` / `_at` for positions, `compile_error` for a pattern the compiler must reject, or `absolute_pattern` for an absolute walker pattern rewritten against a walk root. |
 | `paths` / `matches` | no | Input and Ferralk-selected path lists for `match_paths`, preserving input order. |
 | `oracle_matches` | no | zlob's selected list for a deliberate list-result divergence. |
-| `base_path` | no | Base directory stripped before matching each input path in a `match_paths_at` case. |
+| `base_path` | no | Base directory stripped before matching each input path in a `match_paths_at` case, and the walk root an `absolute_pattern` case rewrites against. |
+| `rewritten` | no | The root-relative pattern an `absolute_pattern` case must produce. Absent means the pattern names paths outside the root and can select nothing. |
+| `windows_paths` | no | `true` if an `absolute_pattern` case is written in Windows path syntax. Unlike `platform`, this does not restrict the case to one host: what makes a path absolute is a property of the pattern, so both spellings are replayed everywhere. |
 | `indices` / `oracle_indices` | no | Ferralk and divergent-oracle input positions for a `match_path_indices` operation. |
 | `pattern` | yes | Glob or ignore expression using the byte codec below. |
 | `path` | yes | Candidate path using the byte codec below; empty for syntax-only records. |
@@ -26,8 +28,8 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | `exclude_rules` | no | Repository-wide rules written to `.git/info/exclude`; every ignore file overrides them. |
 | `expected` | yes | Whether the expression accepts the candidate. |
 | `oracle_expected` | no | The external-oracle result when it deliberately differs from `expected`. |
-| `error_offset` | no | Byte offset the rejected construct must be reported at, for a `compile_error` case. |
-| `error_message` | no | Stable error text a `compile_error` case must produce. |
+| `error_offset` | no | Byte offset the rejected construct must be reported at, for a `compile_error` or `absolute_pattern` case. |
+| `error_message` | no | Stable error text a `compile_error` or `absolute_pattern` case must produce. Its presence is what makes an `absolute_pattern` case a rejection. |
 | `platform` | no | `posix` or `windows`; restricts a separator-dependent verdict to one host. |
 | `source` | yes | `zlob_1_6_3`, `fast_glob`, `git_check_ignore`, or `handwritten`. |
 | `disputed` | no | `true` if evidence is recorded but ferralk policy is unsettled. |
@@ -66,6 +68,13 @@ component and only `**` crosses. The same pattern and candidate can appear
 under both kinds with different verdicts, and `corpus/fast-glob.jsonl` does
 exactly that, because fast-glob implements the component-local reading while
 zlob implements the fnmatch one.
+
+An `absolute_pattern` case describes `Walker::include` and `Walker::exclude`
+rewriting an absolute pattern for a walk root, and has three outcomes: it
+produces `rewritten`, it names paths outside the root and so can select nothing
+(neither `rewritten` nor `error_message`), or it is rejected with
+`error_message`. The zlob oracle skips these, having no walker to compare
+against.
 
 The zlob oracle skips `match_glob_path` cases: zlob has no component-local
 mode to compare against.
@@ -130,10 +139,11 @@ harness nor a future matcher may discard disputed cases.
 The pinned oracle is a `&str`-based Rust API over zlob 1.6.3, so parts of the
 contract have no representation there. The adapter in
 [`../tools/oracle/tests/zlob_oracle.rs`](../tools/oracle/tests/zlob_oracle.rs)
-skips five categories and prints a count for each: a `case_insensitive` case
+skips six categories and prints a count for each: a `case_insensitive` case
 (zlob 1.6.3 has no case-folding flag), a case whose pattern, path, or candidate
-list is not UTF-8, a `compile_error` case, a `match_glob_path` case, and a case
-written for another `platform`. It also skips two whole topics, `ignore.jsonl`
+list is not UTF-8, a `compile_error` case, a `match_glob_path` case, an
+`absolute_pattern` case (zlob has no walker), and a case written for another
+`platform`. It also skips two whole topics, `ignore.jsonl`
 and `fast-glob.jsonl`, whose `oracle_expected` records a different oracle's
 verdict. A skipped case is not a weaker case: it
 still replays in normal CI through the harness, which is the ferralk
