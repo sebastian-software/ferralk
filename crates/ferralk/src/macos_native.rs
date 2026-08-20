@@ -1,12 +1,28 @@
-//! macOS bulk-directory backend.
+//! macOS native directory backend.
 //!
 //! The only unsafe operations are Darwin syscalls. Per-thread owned buffers
 //! remain live for each call; every kernel record is bounds-checked before its
-//! fields or name are read. `getattrlistbulk` is preferred because it
-//! returns entry names and object types in batches. Filesystems that do not
-//! support it report an unsupported operation so the safe adapter can use the
-//! portable backend. The `getdirentries64` reader remains a separately tested
-//! parser regression boundary.
+//! fields or name are read.
+//!
+//! `getdirentries64` is the reader the walk uses. It is the core Darwin dirent
+//! syscall — every local filesystem serves it — and one record carries exactly
+//! what [`Listing::push`] stores: the entry name and its `d_type`.
+//!
+//! `getattrlistbulk` was the reader until 2026-08-20. It returns the same two
+//! facts in a richer per-entry record, and assembling that record is work the
+//! walk then throws away: nothing downstream of `Listing::push` harvests a bulk
+//! attribute, because a listing carries name, is-dir and is-symlink and nothing
+//! else. Measured on an M1 Pro over the 53k-file Palamedes fixture, routing to
+//! `getdirentries64` took the serial walk from 81.0 ms to 57.1 ms and the
+//! four-thread walk from 36.6 ms to 31.5 ms; see `docs/benchmark-evidence.md`.
+//!
+//! The bulk reader and its parser stay in the module as a regression boundary:
+//! `parse_bulk_record` is a fuzz target and both readers are checked against the
+//! portable backend by the parity test below. Nothing in the walk calls them.
+//!
+//! Either reader reports an unsupported operation as
+//! [`io::ErrorKind::Unsupported`], which is the safe adapter's signal to read
+//! the directory through the portable backend instead.
 
 use std::{
     cell::RefCell,
@@ -51,19 +67,24 @@ const VFIFO: u32 = 7;
 const ATTRIBUTE_SET_SIZE: usize = 5 * std::mem::size_of::<u32>();
 const ATTRIBUTE_RECORD_HEADER_SIZE: usize = std::mem::size_of::<u32>() + ATTRIBUTE_SET_SIZE;
 
-/// Set once the kernel reports that bulk attribute reads are unavailable.
+/// Set once the kernel reports that native directory reads are unavailable.
 ///
 /// Support is a property of the filesystem driver rather than of one
 /// directory, so probing again for every directory only pays a failed open, a
 /// failed syscall, and a second `opendir`. The latch is per process: a walk
-/// that crosses from a filesystem without bulk support onto one with it keeps
+/// that crosses from a filesystem without native support onto one with it keeps
 /// using the portable reader, which costs speed and never correctness. Keying
 /// it by `st_dev` instead would need the device id before the first read, and
 /// obtaining that costs the very syscall this avoids.
-static BULK_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+///
+/// `getdirentries64` refusing a filesystem outright is far less likely than
+/// `getattrlistbulk` was — it is the syscall `readdir` itself is built on — so
+/// this latch is expected to stay clear. It is kept because the fallback it
+/// guards is what makes an exotic filesystem a slow walk rather than a failed
+/// one, which is the semantics the bulk reader established.
+static NATIVE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
 std::thread_local! {
-    static BULK_BUFFER: RefCell<Box<[u8; BUFFER_SIZE]>> = RefCell::new(Box::new([0; BUFFER_SIZE]));
     static DIRENTRIES_BUFFER: RefCell<Box<[u8; BUFFER_SIZE]>> = RefCell::new(Box::new([0; BUFFER_SIZE]));
 }
 
@@ -96,18 +117,15 @@ unsafe extern "C" {
 }
 
 pub(super) fn read_directory(path: &Path, listing: &mut Listing) -> io::Result<()> {
-    if BULK_UNSUPPORTED.load(Ordering::Relaxed) {
-        return Err(unsupported("getattrlistbulk is unavailable on this system"));
+    if NATIVE_UNSUPPORTED.load(Ordering::Relaxed) {
+        return Err(unsupported("getdirentries64 is unavailable on this system"));
     }
-    let result = BULK_BUFFER.with(|buffer| {
-        let mut buffer = buffer.borrow_mut();
-        read_bulk_directory(path, &mut buffer[..], listing)
-    });
+    let result = read_direntries_directory(path, listing);
     if result
         .as_ref()
         .is_err_and(|error| error.kind() == io::ErrorKind::Unsupported)
     {
-        BULK_UNSUPPORTED.store(true, Ordering::Relaxed);
+        NATIVE_UNSUPPORTED.store(true, Ordering::Relaxed);
     }
     result
 }
@@ -129,7 +147,27 @@ fn open_directory(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-fn read_bulk_directory(path: &Path, buffer: &mut [u8], listing: &mut Listing) -> io::Result<()> {
+/// The `getattrlistbulk` reader, kept as the regression boundary the module
+/// documentation describes. The walk reads directories through
+/// [`read_direntries_directory`]; this one is exercised by the parity test and
+/// keeps [`parse_bulk_record`] reachable from something that runs it against a
+/// real filesystem rather than from the fuzz target alone.
+///
+/// It owns its buffer per call instead of borrowing a thread-local one. Nothing
+/// on a hot path calls it any more, so the buffer that existed to keep the walk
+/// allocation-free would only be a live 32 KiB per thread.
+#[cfg_attr(not(test), allow(dead_code))]
+fn read_bulk_directory(path: &Path, listing: &mut Listing) -> io::Result<()> {
+    let mut buffer = Box::new([0_u8; BUFFER_SIZE]);
+    read_bulk_directory_with_buffer(path, &mut buffer[..], listing)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn read_bulk_directory_with_buffer(
+    path: &Path,
+    buffer: &mut [u8],
+    listing: &mut Listing,
+) -> io::Result<()> {
     let directory = open_directory(path)?;
     listing.clear();
     let attributes = AttrList {
@@ -298,7 +336,7 @@ fn parse_bulk_record(record: &[u8]) -> io::Result<Option<(Range<usize>, Option<u
     let Some((&0, name)) = name_with_nul.split_last() else {
         return Err(malformed_bulk_record());
     };
-    if name.is_empty() || name.contains(&0) || name.contains(&b'/') {
+    if name.is_empty() || memchr::memchr2(0, b'/', name).is_some() {
         return Err(malformed_bulk_record());
     }
     // The name without its terminating nul, as a range into `record`.
@@ -355,7 +393,6 @@ fn bulk_entry_kind(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn read_direntries_directory(path: &Path, listing: &mut Listing) -> io::Result<()> {
     DIRENTRIES_BUFFER.with(|buffer| {
         let mut buffer = buffer.borrow_mut();
@@ -406,7 +443,6 @@ fn malformed_bulk_record() -> io::Error {
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_records(directory: &Path, records: &[u8], listing: &mut Listing) -> io::Result<()> {
     for_each_record(records, |name, directory_type| {
         let name = OsStr::from_bytes(name);
@@ -460,7 +496,9 @@ fn for_each_record(
         if name.is_empty() || name == b"." || name == b".." {
             continue;
         }
-        if name.contains(&0) || name.contains(&b'/') {
+        // One vectorised pass for both rejected bytes: this runs for every
+        // entry of every directory the walk reads.
+        if memchr::memchr2(0, b'/', name).is_some() {
             return Err(malformed_record());
         }
         visit(name, record[TYPE_OFFSET])?;
@@ -532,7 +570,7 @@ mod tests {
         ATTRIBUTE_RECORD_HEADER_SIZE, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG, DT_SOCK, Listing,
         NAME_OFFSET, VBLK, VCHR, VDIR, VFIFO, VSOCK, bulk_entry_kind, entry_kind,
         is_unsupported_bulk_error, open_directory, parse_bulk_record, parse_records,
-        read_directory, read_direntries_directory,
+        read_bulk_directory, read_directory, read_direntries_directory,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -772,15 +810,25 @@ mod tests {
                 .read_directory(&root, listing)
                 .expect("portable reader succeeds");
         });
+        // What the walk actually reads through.
         assert_eq!(
             describe(&|listing| {
-                read_directory(&root, listing).expect("bulk reader succeeds");
+                read_directory(&root, listing).expect("native reader succeeds");
             }),
             portable
         );
         assert_eq!(
             describe(&|listing| {
                 read_direntries_directory(&root, listing).expect("direntries reader succeeds");
+            }),
+            portable
+        );
+        // The bulk reader is no longer on any walk's path. It is still held to
+        // the same answer, which is what makes it a regression boundary rather
+        // than dead code kept for sentiment.
+        assert_eq!(
+            describe(&|listing| {
+                read_bulk_directory(&root, listing).expect("bulk reader succeeds");
             }),
             portable
         );
