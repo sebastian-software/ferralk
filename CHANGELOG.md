@@ -5,7 +5,6 @@
 
 ### Features
 
-* **walker:** classify symlink entries by their target on request ([1c46a54](https://github.com/sebastian-software/ferralk/commit/1c46a5443a72e90fb3c0e5687b23375eed3d8b58))
 * **walker:** classify symlink entries by their target on request ([e5027de](https://github.com/sebastian-software/ferralk/commit/e5027de3cafe80954c82d3b6e7742d099e40016e)), closes [#89](https://github.com/sebastian-software/ferralk/issues/89)
 
 ## [0.4.0](https://github.com/sebastian-software/ferralk/compare/v0.3.0...v0.4.0) (2026-08-20)
