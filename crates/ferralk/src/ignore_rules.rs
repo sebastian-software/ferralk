@@ -130,42 +130,62 @@ enum Component {
 /// Whether the rule's components match the whole candidate.
 ///
 /// The classic wildcard walk, one level up: `AnyDirs` stands for any run of
-/// components, every other component consumes exactly one. A trailing
-/// `AnyDirs` needs at least one component to consume, because `abc/**` covers
-/// what is inside `abc` rather than `abc` itself.
+/// components, every other component consumes exactly one, and a mismatch lets
+/// the last run swallow one component more. That keeps the work proportional to
+/// components times rule length; the recursive form this replaced was
+/// exponential in the number of `**` components, and rules come from files
+/// inside the tree being walked, so that was reachable input.
+///
+/// Whether a trailing `**` may match nothing is decided when the rule is
+/// parsed, not here: `abc/**` gains a component that requires something below
+/// `abc`.
 fn matches_components(components: &[Component], candidate: &[u8]) -> bool {
-    let Some((first, rest)) = components.split_first() else {
-        return candidate.is_empty();
-    };
-    match first {
-        Component::AnyDirs => {
-            if rest.is_empty() {
-                return !candidate.is_empty();
-            }
-            let mut remainder = candidate;
-            loop {
-                if matches_components(rest, remainder) {
-                    return true;
-                }
-                let Some(separator) = remainder.iter().position(|byte| *byte == b'/') else {
-                    return false;
-                };
-                remainder = &remainder[separator + 1..];
+    let mut index = 0;
+    let mut rest = candidate;
+    // Where the last `**` began: its position in the rule, and what it had not
+    // yet swallowed.
+    let mut run: Option<(usize, &[u8])> = None;
+
+    while !rest.is_empty() {
+        if let Some(Component::AnyDirs) = components.get(index) {
+            run = Some((index, rest));
+            index += 1;
+            continue;
+        }
+        if let Some(Component::Pattern(pattern)) = components.get(index) {
+            let (head, tail) = split_component(rest);
+            if pattern.is_match_glob_path(head) {
+                index += 1;
+                rest = tail;
+                continue;
             }
         }
-        Component::Pattern(pattern) => {
-            let (head, tail) = match candidate.iter().position(|byte| *byte == b'/') {
-                Some(separator) => (&candidate[..separator], Some(&candidate[separator + 1..])),
-                None => (candidate, None),
-            };
-            if !pattern.is_match_glob_path(head) {
-                return false;
-            }
-            match tail {
-                Some(remainder) => matches_components(rest, remainder),
-                None => rest.is_empty(),
-            }
+        // Either the rule ran out with candidate left, or this component does
+        // not match: both are for the last run to absorb, if there is one.
+        let Some((run_index, unswallowed)) = run else {
+            return false;
+        };
+        if unswallowed.is_empty() {
+            return false;
         }
+        let (_, tail) = split_component(unswallowed);
+        run = Some((run_index, tail));
+        index = run_index + 1;
+        rest = tail;
+    }
+
+    // The candidate is spent, so what is left of the rule may only be runs,
+    // which are allowed to match nothing.
+    components[index..]
+        .iter()
+        .all(|component| matches!(component, Component::AnyDirs))
+}
+
+/// Splits off the first path component; the tail is empty at the last one.
+fn split_component(candidate: &[u8]) -> (&[u8], &[u8]) {
+    match candidate.iter().position(|byte| *byte == b'/') {
+        Some(separator) => (&candidate[..separator], &candidate[separator + 1..]),
+        None => (candidate, &[]),
     }
 }
 
@@ -257,7 +277,19 @@ fn parse_rule(line: &str) -> Option<Rule> {
         {
             gate = Some(literal);
         }
-        components.push(compile_component(part)?);
+        let component = compile_component(part)?;
+        // Two runs in a row are one run, and collapsing them keeps the matcher
+        // from backtracking between them for nothing.
+        if matches!(component, Component::AnyDirs)
+            && matches!(components.last(), Some(Component::AnyDirs))
+        {
+            continue;
+        }
+        components.push(component);
+    }
+    if matches!(components.last(), Some(Component::AnyDirs)) {
+        // `abc/**` is what is inside `abc`, so one component has to follow.
+        components.push(compile_component("*")?);
     }
     // A body of nothing but separators is not a rule.
     if components.len() == usize::from(!anchored) {
@@ -612,6 +644,31 @@ mod tests {
             builder.build().matched(&candidate(root, "keep.log"), false),
             Some(true),
             "the later rule wins over the negation before it"
+        );
+    }
+
+    /// A rule with many runs, against a candidate built to make each one
+    /// backtrack.
+    ///
+    /// The recursive matcher this replaced was exponential in the number of
+    /// `**` components: eight of them against a deep path took longer than any
+    /// walk would wait, and a rule file inside the tree being walked is where
+    /// that input would come from. The bound is generous on purpose - the point
+    /// is the difference between milliseconds and never.
+    #[test]
+    fn many_runs_do_not_explode() {
+        let root = PathBuf::from("/fixture");
+        let mut builder = RuleSetBuilder::new(&root);
+        builder.add_line("**/a/**/a/**/a/**/a/**/a/**/a/**/a/**/x");
+        let rules = builder.build();
+        let deep = "a/".repeat(24) + "b";
+
+        let start = std::time::Instant::now();
+        assert_eq!(rules.matched(&candidate(&root, &deep), false), None);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "matching took {:?}",
+            start.elapsed()
         );
     }
 
