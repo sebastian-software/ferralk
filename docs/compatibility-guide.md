@@ -95,6 +95,74 @@ switch the whole walk to crossing wildcards as described below. A pattern that
 starts at a filesystem root is understood as absolute and rewritten, as
 described next.
 
+### Patterns are written with `/`, on every platform
+
+**A pattern is not a path.** In a pattern `\` is the escape character —
+on Windows too — so a pattern built by joining `PathBuf`s carries separators
+the matcher reads as "the next byte, literally":
+
+```rust
+// WRONG on Windows. `PathBuf::join` produces `C:\repo\src\**\*.ts`, where
+// every `\` escapes the byte after it: the pattern asks for a file whose
+// name contains a literal `*`, which Windows cannot even create.
+let pattern = root.join("src").join("**").join("*.ts");
+let walker = Walker::new(&root).include(pattern.to_string_lossy().as_ref())?;
+
+// RIGHT. Build the pattern as a pattern, and let the walker hold the path.
+let walker = Walker::new(&root).include("src/**/*.ts")?;
+# Ok::<(), ferralk::ferralk_glob::PatternError>(())
+```
+
+This is the ADR-0005 line seen from the pattern side: candidate *paths* accept
+both separators on Windows, patterns are written with `/`. The rule is not
+Windows-specific — `\` escapes on Linux and macOS as well — it is only on
+Windows that the platform hands you backslashes without being asked.
+
+**The walker refuses the shapes that cannot work.** Since 0.5.2,
+`Walker::include` and `Walker::exclude` reject a pattern that would demand a
+literal byte Windows forbids in a name, which is what a joined path asks for:
+
+| Pattern | On Windows | Why |
+| --- | --- | --- |
+| `C:\repo\src\**\*.ts` | rejected | drive prefix spelled with `\` |
+| `C:\repo\node_modules` | rejected | same, no wildcard needed |
+| `src\*.ts` | rejected | asks for a literal `*` in a name |
+| `\\server\share\x` | rejected | asks for a literal `\` |
+| `C:/repo/src/**/*.ts` | works | the spelling this dialect uses |
+| `a\b\c` | **accepted** | escaping an ordinary byte is legal; selects `abc` |
+| `[a\*]`, `{a,\*}` | **accepted** | inside a group the escape is one member; both still match `a` |
+
+The accepted rows are the limit of the check, and it is deliberate: refusing a
+pattern that works would be worse than the silence this replaces. Escaping an
+ordinary byte is legal syntax meaning the byte itself, so `a\b\c` really does
+select a file named `abc`. And inside a character class or an alternation an
+escaped byte is one member among several — `[a\*]` and `{a,\*}` both still
+select `a` — so the check reads only the plain text before the first `[`, `{`
+or extglob opener.
+
+One consequence is worth naming rather than hiding: a one-alternative group like
+`{a\*b}` could never match on Windows and is still accepted, because noticing it
+would mean parsing the group here and agreeing with the real parser about every
+nesting case. Unnoticed but correct beats noticed but lossy.
+
+What is refused is only what could never have matched, so nothing that used to
+select entries stops doing so. On Linux and macOS nothing is refused at all —
+there a file may genuinely be named `src*.ts`.
+
+**Converting a path you already hold.** Replace the separators, and remember
+that a path is not automatically a valid pattern: if any component contains
+`*`, `?`, `[` or `{`, those bytes are syntax and need escaping with `\`.
+
+```rust
+let as_pattern = root.to_string_lossy().replace('\\', "/");
+let walker = Walker::new(&root).include(format!("{as_pattern}/src/**/*.ts"))?;
+# Ok::<(), ferralk::ferralk_glob::PatternError>(())
+```
+
+Usually there is no need: `Walker::new(root)` already holds the path, and
+`include("src/**/*.ts")` is root-relative. Absolute patterns exist for callers
+that hold one, not as a way to spell a relative one.
+
 ### Several roots in one walk
 
 `Walker::add_root` and `Walker::add_roots` extend a walk to more than one tree.

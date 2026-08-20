@@ -84,6 +84,14 @@ Important defaults:
   reading `globset` and `fast-glob` use; see the
   [compatibility guide](compatibility-guide.md).
 
+- **Patterns use `/` on every platform, and `\` is the escape character** -
+  on Windows too. A pattern built by joining `PathBuf`s therefore does not mean
+  what it looks like: `root.join("src").join("*.ts")` produces `C:\root\src\*.ts`,
+  where `\*` asks for a literal `*` in a filename. Write `include("src/**/*.ts")`
+  and let `Walker::new(root)` hold the path. Windows rejects the shapes that
+  could never match, with a message saying so; see the
+  [compatibility guide](compatibility-guide.md#patterns-are-written-with--on-every-platform).
+
 - A walk may have several roots. `Walker::new(first).add_root(second)?` walks
   both trees with one thread pool, and `WalkEntry::root` says which root an
   entry came from. Patterns apply under every root, `depth` is counted from the

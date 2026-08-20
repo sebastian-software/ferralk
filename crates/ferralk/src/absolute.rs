@@ -63,16 +63,129 @@ impl Syntax {
     };
 }
 
+/// Bytes Windows forbids in a file or directory name.
+///
+/// `/` is left out because it is the separator the pattern dialect uses, and a
+/// backslash is in because a walker candidate never contains one: paths reach
+/// the matcher through [`crate::glob_path_bytes`], which turns every separator
+/// into `/`.
+const FORBIDDEN_IN_A_WINDOWS_NAME: [u8; 8] = *b"\\:*?\"<>|";
+
+/// Rejects a walker pattern that a Windows host can never match, when the
+/// reason is that it was written as a path.
+///
+/// Backslash is the escape character in this dialect on every platform, so a
+/// pattern built by joining `PathBuf`s on Windows does not fail - it quietly
+/// turns each separator into "the next byte, literally" and then matches
+/// nothing. That is the worst failure a pattern can have, and it cost the
+/// Palamedes adoption nineteen green-looking CI runs.
+///
+/// The test is deliberately narrow, because escaping an ordinary byte is legal
+/// syntax and means what it says. It fires only where the pattern would demand
+/// a literal byte Windows cannot put in a name, so nothing that could ever have
+/// matched is refused:
+///
+/// - a drive prefix spelled with a backslash, `X:\`, which asks for a component
+///   literally named `X:`. That is a property of the first three bytes and needs
+///   no reading of what follows.
+/// - `\` followed by one of [`FORBIDDEN_IN_A_WINDOWS_NAME`] **in plain literal
+///   text**, which asks for a literal `*`, `?`, `:` or `\` in a component - none
+///   of which a Windows path can contain. `C:\repo\src\**\*.ts` and `\\?\C:\x`
+///   are caught here.
+///
+/// The emphasis is the correction from the review of #94. Inside a character
+/// class or an alternation an escaped forbidden byte is one member among
+/// several: `[a\*]` still matches `a`, and `{a,\*}` still matches `a`. Refusing
+/// those would refuse patterns that work, which is the one thing this check may
+/// never do. The scan therefore stops at the first grouping construct and reads
+/// only the plain text before it.
+///
+/// Two kinds of pattern go unexamined as a result, both deliberately:
+///
+/// - `\` before an ordinary byte, `a\b\c`, a legal pattern for a file named
+///   `abc`.
+/// - anything after a `[`, `{` or extglob opener, including a one-alternative
+///   group like `{a\*b}` that could in fact never match. Unnoticed but correct
+///   beats noticed but lossy, and the alternative is a second parser here that
+///   would have to agree with the real one about every nesting case to stay
+///   sound.
+pub(crate) fn reject_path_shaped(pattern: &[u8], syntax: Syntax) -> Result<(), PatternError> {
+    if syntax != Syntax::Windows {
+        return Ok(());
+    }
+    if let Some(offset) = drive_prefix_with_backslash(pattern) {
+        return Err(PatternError::new(offset, PATH_SHAPED));
+    }
+    if let Some(offset) = escape_before_forbidden_byte(pattern) {
+        return Err(PatternError::new(offset, PATH_SHAPED));
+    }
+    Ok(())
+}
+
+/// Offset of an escape demanding a byte Windows forbids, read from plain
+/// literal text only.
+///
+/// Stops at the first byte that could open a group rather than skipping the
+/// group, because skipping means deciding where it ends, and disagreeing with
+/// the real parser about that would resume the scan *inside* a group - which is
+/// the lossy rejection being avoided. Stopping early costs only detection.
+fn escape_before_forbidden_byte(pattern: &[u8]) -> Option<usize> {
+    let mut index = 0;
+    while index < pattern.len() {
+        if pattern[index] == b'\\' {
+            // A trailing backslash is the pattern language's own error, and is
+            // reported where that is decided.
+            let escaped = *pattern.get(index + 1)?;
+            if FORBIDDEN_IN_A_WINDOWS_NAME.contains(&escaped) {
+                return Some(index);
+            }
+            index += 2;
+            continue;
+        }
+        if opens_a_group(pattern, index) {
+            return None;
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Whether the unescaped byte at `index` could begin a class, an alternation or
+/// an extglob group.
+///
+/// Asked without looking for the closer: an opener that never closes is a
+/// compilation error anyway, and treating it as a group here only ends the scan
+/// early.
+fn opens_a_group(pattern: &[u8], index: usize) -> bool {
+    match pattern[index] {
+        b'[' | b'{' => true,
+        b'@' | b'+' | b'!' | b'*' | b'?' => pattern.get(index + 1) == Some(&b'('),
+        _ => false,
+    }
+}
+
+/// The one message, so a caller matching on it has one string to match.
+const PATH_SHAPED: &str = "this looks like a Windows path rather than a pattern; write patterns with `/` separators, \
+     because `\\` is the escape character on every platform";
+
+/// Offset of a `X:\` drive prefix, if the pattern opens with one.
+fn drive_prefix_with_backslash(pattern: &[u8]) -> Option<usize> {
+    (pattern.len() >= 3
+        && pattern[0].is_ascii_alphabetic()
+        && pattern[1] == b':'
+        && pattern[2] == b'\\')
+        .then_some(0)
+}
+
 /// Rewrites `pattern` for a walk rooted at `root`, or reports why it cannot.
 ///
 /// `root` is the walk root as glob bytes - separators already normalized to
 /// `/`, which is what [`crate::glob_path_bytes`] produces on every platform.
 /// The pattern itself is read in the walker's dialect, where `/` separates
 /// components and `\` escapes, per ADR-0005.
-pub(crate) fn rewrite(pattern: &[u8], root: &[u8]) -> Result<Rewrite, PatternError> {
-    rewrite_in(pattern, root, Syntax::NATIVE)
-}
-
+///
+/// `syntax` is passed in rather than read from `cfg!` here, so the tests and
+/// the corpus can drive both spellings on whichever host runs them.
 pub(crate) fn rewrite_in(
     pattern: &[u8],
     root: &[u8],
@@ -254,6 +367,124 @@ mod tests {
         rewrite_in(pattern.as_bytes(), root.as_bytes(), syntax)
             .expect_err("an error was expected")
             .message()
+    }
+
+    fn rejection(pattern: &str, syntax: Syntax) -> Option<&'static str> {
+        super::reject_path_shaped(pattern.as_bytes(), syntax)
+            .err()
+            .map(|error| error.message())
+    }
+
+    /// The shapes a `PathBuf` join produces on Windows, which the dialect reads
+    /// as escapes and which therefore match nothing.
+    #[test]
+    fn a_windows_path_spelled_as_a_pattern_is_refused() {
+        for pattern in [
+            r"C:\repo\src\**\*.ts",
+            r"C:\repo\node_modules",
+            r"src\*.ts",
+            r"src\**\*.ts",
+            r"\\server\share\src\*.ts",
+            r"\\?\C:\repo\*.ts",
+        ] {
+            assert!(
+                rejection(pattern, Syntax::Windows)
+                    .is_some_and(|message| message.starts_with("this looks like a Windows path")),
+                "{pattern} must be refused on Windows"
+            );
+            // POSIX hosts keep every one of these: there a backslash is only
+            // ever an escape, and a file really can be named `src*.ts`.
+            assert_eq!(
+                rejection(pattern, Syntax::Posix),
+                None,
+                "{pattern} on POSIX"
+            );
+        }
+    }
+
+    /// The rule may only refuse patterns that could not have matched anyway.
+    #[test]
+    fn a_pattern_that_could_match_on_windows_is_kept() {
+        for pattern in [
+            // The spellings that work, which is most of the point.
+            "src/**/*.ts",
+            "C:/repo/src/**/*.ts",
+            "//server/share/src/*.ts",
+            "{src,lib}/**/*.ts",
+            // Escaping an ordinary byte is legal and means the byte itself.
+            // `a\b\c` selects a file named `abc` - odd, but it works, so it
+            // is not this rule's business.
+            r"a\b\c",
+            // Brackets and braces are legal in a Windows filename, so escaping
+            // them asks for something that can exist.
+            r"notes\[1\].txt",
+            r"literal\{braces\}.txt",
+            // A drive prefix written the way this dialect wants it.
+            "C:/repo",
+        ] {
+            assert_eq!(rejection(pattern, Syntax::Windows), None, "{pattern}");
+            assert_eq!(rejection(pattern, Syntax::Posix), None, "{pattern}");
+        }
+    }
+
+    /// An escaped forbidden byte inside a group is one member among several, so
+    /// the pattern can still match and must not be refused.
+    ///
+    /// This is the review finding on #94: the first version scanned raw bytes
+    /// and refused `[a\*]` and `{a,\*}`, both of which match `a`. A rejection
+    /// that removes working patterns is worse than the silence it replaced.
+    #[test]
+    fn an_escape_inside_a_group_is_not_a_path_separator() {
+        for pattern in [
+            // A class: `*` is one member, `a` is another.
+            r"[a\*]",
+            r"src/[a\*].ts",
+            // An alternation: `\*` is one branch, `a` is another.
+            r"{a,\*}",
+            r"src/{a,\*}.ts",
+            // Extglob groups alternate the same way.
+            r"@(a|\*)",
+            r"+(a|\*)",
+            r"!(a|\*)",
+            r"*(a|\*)",
+            r"?(a|\*)",
+            // The residue, stated so it is a decision and not a surprise: a
+            // one-alternative group could never match on Windows, and is still
+            // accepted, because reading it would mean parsing the group.
+            r"{a\*b}",
+        ] {
+            assert_eq!(
+                rejection(pattern, Syntax::Windows),
+                None,
+                "{pattern} can match, so it must not be refused"
+            );
+        }
+    }
+
+    /// The negative half of the same pair: what is refused stays refused.
+    ///
+    /// Restricting the scan to plain text must not cost the shapes the check
+    /// exists for, all of which reach the forbidden escape before any group.
+    #[test]
+    fn narrowing_the_scan_keeps_the_shapes_it_was_built_for() {
+        for pattern in [
+            r"C:\repo\*.ts",
+            r"src\*.ts",
+            r"C:\repo\src\**\*.ts",
+            r"\\server\share\src\*.ts",
+        ] {
+            assert!(
+                rejection(pattern, Syntax::Windows).is_some(),
+                "{pattern} can never match on Windows and must be refused"
+            );
+        }
+    }
+
+    /// A trailing backslash is the pattern language's own error, reported where
+    /// that is decided rather than guessed at here.
+    #[test]
+    fn a_trailing_backslash_is_left_to_the_compiler() {
+        assert_eq!(rejection(r"src\", Syntax::Windows), None);
     }
 
     #[test]
