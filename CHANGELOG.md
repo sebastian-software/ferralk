@@ -5,12 +5,9 @@
 
 ### Features
 
-* **walker:** reach separator-crossing wildcards from the builder ([22b6d4b](https://github.com/sebastian-software/ferralk/commit/22b6d4b06b9629de460a4093bcd3e6e5878e380a))
 * **walker:** reach separator-crossing wildcards from the builder ([380dc7f](https://github.com/sebastian-software/ferralk/commit/380dc7f102f88c18d88e4c633778c8c8a5feae6e)), closes [#79](https://github.com/sebastian-software/ferralk/issues/79)
-* **walker:** rewrite absolute include and exclude patterns ([6c2e712](https://github.com/sebastian-software/ferralk/commit/6c2e712d602c006fc431bdad012d26e56a85b57a))
 * **walker:** rewrite absolute include and exclude patterns ([6315498](https://github.com/sebastian-software/ferralk/commit/6315498ab97c4ccdbaa1ebb0706862426b2c31b0)), closes [#78](https://github.com/sebastian-software/ferralk/issues/78)
 * **walker:** walk several roots with one walker and one pool ([9873c63](https://github.com/sebastian-software/ferralk/commit/9873c63cd7bcbc18b9cd5275b4dfe9de6521f4dc))
-* **walker:** walk several roots with one walker and one pool ([7522701](https://github.com/sebastian-software/ferralk/commit/752270100632551d3f44c76f8aec3006e2aca128))
 
 
 ### Bug Fixes
@@ -21,11 +18,8 @@
 
 ### Performance Improvements
 
-* **walker:** build the pool only once the floor unlocks a helper ([683e4e5](https://github.com/sebastian-software/ferralk/commit/683e4e5b012b1bab183e058d84f7767a866b7e58))
 * **walker:** build the pool only once the floor unlocks a helper ([3e6547f](https://github.com/sebastian-software/ferralk/commit/3e6547f82c7d90c197e9ba017b66c4c6fa54c7cc)), closes [#81](https://github.com/sebastian-software/ferralk/issues/81)
-* **walker:** hand entries to the visitor without materializing them ([eea43c9](https://github.com/sebastian-software/ferralk/commit/eea43c915538c21a5696b560ad88a8890be3ffee))
 * **walker:** hand entries to the visitor without materializing them ([bbfdfd8](https://github.com/sebastian-software/ferralk/commit/bbfdfd88ba76e560b6144e467a8134218efdcaef)), closes [#73](https://github.com/sebastian-software/ferralk/issues/73)
-* **walker:** weigh work, not directories, before starting a pool ([2f65391](https://github.com/sebastian-software/ferralk/commit/2f653910d2e05b908ff1858e25a39d3ca19b47ea))
 * **walker:** weigh work, not directories, before starting a pool ([0d192f0](https://github.com/sebastian-software/ferralk/commit/0d192f0966a0a23b48f7e4c68dc4d3c119e2666b)), closes [#76](https://github.com/sebastian-software/ferralk/issues/76)
 
 ## [0.3.0](https://github.com/sebastian-software/ferralk/compare/v0.2.0...v0.3.0) (2026-08-20)
