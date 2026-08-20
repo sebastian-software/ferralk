@@ -158,28 +158,44 @@ impl Pattern {
         pattern: impl AsRef<[u8]>,
         options: PatternOptions,
     ) -> Result<Self, PatternError> {
-        let pattern = pattern.as_ref();
+        Self::compile_within(pattern.as_ref(), options, &mut IrBudget::new())
+    }
+
+    /// The compile every alternative shares, carrying the budget that bounds
+    /// their total.
+    ///
+    /// Brace expansion recurses through here once per alternative, and an
+    /// extglob group's alternatives recurse again, so one budget threaded down
+    /// is what makes the total observable at all: each call on its own looks
+    /// small.
+    fn compile_within(
+        pattern: &[u8],
+        options: PatternOptions,
+        budget: &mut IrBudget,
+    ) -> Result<Self, PatternError> {
         if options.braces {
             let parse_options = PatternOptions {
                 braces: false,
                 ..options
             };
-            let alternatives = expand_brace_alternatives(pattern, options.escape)?
-                .into_iter()
-                .map(|alternative| {
-                    Self::compile(alternative, parse_options).map(|pattern| pattern.alternatives)
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .flatten()
-                .collect();
-            return Ok(Self::from_alternatives(alternatives, options));
+            let mut alternatives = Vec::new();
+            for alternative in expand_brace_alternatives(pattern, options.escape)? {
+                let compiled = Self::compile_within(&alternative, parse_options, budget)?;
+                alternatives.extend(compiled.alternatives);
+            }
+            return Self::from_alternatives(alternatives, options, budget);
         }
         let mut tokens = Vec::new();
         let mut literals = Vec::new();
         let mut index = 0;
+        // Charged as the tokens appear rather than per byte: a literal run is
+        // one token however long it is, so billing bytes would reject patterns
+        // that compile to almost nothing.
+        let mut charged = 0;
 
         while index < pattern.len() {
+            budget.charge(tokens.len() - charged, 0)?;
+            charged = tokens.len();
             match pattern[index] {
                 b'/' => {
                     flush_literals(&mut tokens, &mut literals);
@@ -209,6 +225,9 @@ impl Pattern {
                 b'[' => {
                     flush_literals(&mut tokens, &mut literals);
                     let (class, next) = parse_class(pattern, index, options.escape)?;
+                    // A class token owns its member list, so it costs more than
+                    // the one unit the loop charges for the token itself.
+                    budget.charge(class.members.len(), 0)?;
                     tokens.push(Token::Class(class));
                     index = next;
                 }
@@ -230,16 +249,18 @@ impl Pattern {
             }
         }
         flush_literals(&mut tokens, &mut literals);
+        budget.charge(tokens.len() - charged, 0)?;
 
-        Ok(Self::from_alternatives(
+        Self::from_alternatives(
             vec![CompiledAlternative {
-                extglob: compile_extglob(pattern, options),
+                extglob: compile_extglob(pattern, options, budget)?,
                 raw: pattern.to_vec(),
                 fast_path: FastPath::compile(&tokens, options),
                 tokens,
             }],
             options,
-        ))
+            budget,
+        )
     }
 
     /// Reports whether a pattern is syntactically valid without retaining it.
@@ -461,7 +482,11 @@ impl Pattern {
         Self::match_alternatives(alternatives, options, path)
     }
 
-    fn from_alternatives(alternatives: Vec<CompiledAlternative>, options: PatternOptions) -> Self {
+    fn from_alternatives(
+        alternatives: Vec<CompiledAlternative>,
+        options: PatternOptions,
+        budget: &mut IrBudget,
+    ) -> Result<Self, PatternError> {
         let path_filter_alternatives = alternatives
             .iter()
             .any(|alternative| {
@@ -474,22 +499,28 @@ impl Pattern {
                     })
             })
             .then(|| {
+                // A second compiled copy of every alternative, so it costs the
+                // budget a second time.
                 alternatives
                     .iter()
-                    .map(|alternative| Self::compile_path_filter_alternative(alternative, options))
-                    .collect()
-            });
-        Self {
+                    .map(|alternative| {
+                        Self::compile_path_filter_alternative(alternative, options, budget)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        Ok(Self {
             alternatives,
             path_filter_alternatives,
             options,
-        }
+        })
     }
 
     fn compile_path_filter_alternative(
         alternative: &CompiledAlternative,
         options: PatternOptions,
-    ) -> CompiledAlternative {
+        budget: &mut IrBudget,
+    ) -> Result<CompiledAlternative, PatternError> {
         let leading_dot_slash = alternative.raw.starts_with(b"./")
             && matches!(alternative.tokens.as_slice(), [Token::Literal(dot), Token::Separator, ..] if dot == b".");
         let raw = if leading_dot_slash {
@@ -514,12 +545,14 @@ impl Pattern {
                 ..options
             },
         );
-        CompiledAlternative {
-            extglob: compile_extglob(&raw, options),
+        budget.charge(tokens.len(), 0)?;
+        let extglob = compile_extglob(&raw, options, budget)?;
+        Ok(CompiledAlternative {
+            extglob,
             raw,
             fast_path,
             tokens,
-        }
+        })
     }
 
     /// Explores the token/path state graph without native recursion.
@@ -1886,6 +1919,62 @@ const MAX_BRACE_ALTERNATIVES: usize = 1 << 12;
 /// budget admits is under a megabyte at a realistic pattern length.
 const MAX_BRACE_EXPANSION_BYTES: usize = 1 << 26;
 
+/// Compiled units one pattern may build before it is rejected.
+///
+/// The brace budgets bound the expanded pattern *text*: how many alternatives
+/// and how many bytes they add up to. Neither sees what compiling that text
+/// costs, and the compiled form is far larger than its source — a token per
+/// wildcard byte, and for an extglob a program step per byte offset of the
+/// alternative. Total compiled size is therefore
+/// *(units per alternative) x (alternatives)*, a third dimension the byte
+/// budget cannot express: 20 MB of expanded text became 1.9 GB of compiled
+/// program, from a 5 KB pattern that sat inside both other budgets.
+///
+/// A unit is one token, one program step, or one class member — a class token
+/// owns its member list, so it is charged for both. [`Token`] is 32 bytes and
+/// [`ExtglobStep`] is 40, pinned by a test so this arithmetic cannot go stale,
+/// which puts the ceiling around 40 MB of compiled program and tens of
+/// milliseconds of work. That is orders of magnitude past any real pattern: a
+/// language's extension list against a path glob is a few hundred units.
+const MAX_COMPILED_IR_UNITS: usize = 1 << 20;
+
+/// Tracks compiled units across every alternative of one [`Pattern::compile`].
+///
+/// Charged before each allocation rather than after, so a pattern that would
+/// pass the ceiling stops there instead of building its way past it first.
+/// The one message the compiled-size ceiling reports.
+const TOO_MUCH_COMPILED_IR: &str = "pattern compiles to too much";
+
+struct IrBudget {
+    remaining: usize,
+}
+
+impl IrBudget {
+    const fn new() -> Self {
+        Self {
+            remaining: MAX_COMPILED_IR_UNITS,
+        }
+    }
+
+    /// Charges `units`, reporting the pattern as too large if they run out.
+    ///
+    /// `offset` is where to point the error; every caller here compiles one
+    /// alternative of a pattern the caller never wrote, so it points at the
+    /// start of what they did write.
+    fn charge(&mut self, units: usize, offset: usize) -> Result<(), PatternError> {
+        match self.remaining.checked_sub(units) {
+            Some(remaining) => {
+                self.remaining = remaining;
+                Ok(())
+            }
+            None => Err(PatternError {
+                offset,
+                message: TOO_MUCH_COMPILED_IR,
+            }),
+        }
+    }
+}
+
 /// Expands brace alternatives into the plain patterns a pattern stands for.
 ///
 /// [`Pattern::compile`] expands braces before it compiles anything; this
@@ -2150,10 +2239,17 @@ struct ExtglobGroup {
 /// Compiles the extglob program for `pattern`, or `None` when it has no group.
 ///
 /// This subsumes the scan `is_match` used to repeat on every call.
-fn compile_extglob(pattern: &[u8], options: PatternOptions) -> Option<CompiledExtglob> {
+fn compile_extglob(
+    pattern: &[u8],
+    options: PatternOptions,
+    budget: &mut IrBudget,
+) -> Result<Option<CompiledExtglob>, PatternError> {
     if !options.extglob || !contains_extglob(pattern, options.escape) {
-        return None;
+        return Ok(None);
     }
+    // The step table is one entry per byte offset whatever the walk reaches, so
+    // it is charged in full before it is allocated.
+    budget.charge(pattern.len(), 0)?;
     let mut steps = vec![ExtglobStep::NoMatch; pattern.len()];
     let mut compiled = vec![false; pattern.len()];
     let mut groups = Vec::new();
@@ -2163,7 +2259,7 @@ fn compile_extglob(pattern: &[u8], options: PatternOptions) -> Option<CompiledEx
             continue;
         }
         compiled[index] = true;
-        let step = compile_extglob_step(pattern, index, options, &mut groups);
+        let step = compile_extglob_step(pattern, index, options, &mut groups, budget)?;
         match &step {
             ExtglobStep::Group(group) => pending.push(groups[*group].rest),
             ExtglobStep::Star { next } | ExtglobStep::Class { next, .. } => pending.push(*next),
@@ -2180,7 +2276,7 @@ fn compile_extglob(pattern: &[u8], options: PatternOptions) -> Option<CompiledEx
         }
         steps[index] = step;
     }
-    Some(CompiledExtglob { steps, groups })
+    Ok(Some(CompiledExtglob { steps, groups }))
 }
 
 /// Classifies one byte offset the way the interpreter classified it.
@@ -2189,26 +2285,27 @@ fn compile_extglob_step(
     index: usize,
     options: PatternOptions,
     groups: &mut Vec<ExtglobGroup>,
-) -> ExtglobStep {
+    budget: &mut IrBudget,
+) -> Result<ExtglobStep, PatternError> {
     if let Some(kind) = detect_extglob_at(pattern, index) {
         let open = index + 1;
         let Some(close) = closing_extglob_parenthesis(pattern, open, options.escape) else {
-            return ExtglobStep::UnclosedGroup {
+            return Ok(ExtglobStep::UnclosedGroup {
                 byte: pattern[index],
-            };
+            });
         };
-        let alternatives = split_extglob_alternatives(&pattern[open + 1..close], options.escape)
-            .into_iter()
-            .map(|alternative| compile_extglob_alternative(alternative, options))
-            .collect();
+        let mut alternatives = Vec::new();
+        for alternative in split_extglob_alternatives(&pattern[open + 1..close], options.escape) {
+            alternatives.push(compile_extglob_alternative(alternative, options, budget)?);
+        }
         groups.push(ExtglobGroup {
             kind,
             alternatives,
             rest: close + 1,
         });
-        return ExtglobStep::Group(groups.len() - 1);
+        return Ok(ExtglobStep::Group(groups.len() - 1));
     }
-    match pattern[index] {
+    Ok(match pattern[index] {
         b'*' => {
             let mut next = index + 1;
             while pattern.get(next) == Some(&b'*') {
@@ -2227,7 +2324,7 @@ fn compile_extglob_step(
             escaped: pattern[index + 1],
         },
         byte => ExtglobStep::Byte(byte),
-    }
+    })
 }
 
 /// Compiles one alternative as a whole-candidate pattern.
@@ -2236,7 +2333,11 @@ fn compile_extglob_step(
 /// a nested group inside an alternative stays ordinary text. The component
 /// policy is left off and supplied by the caller, which is what lets one
 /// compiled alternative serve `is_match` and `is_match_glob_path` alike.
-fn compile_extglob_alternative(alternative: &[u8], options: PatternOptions) -> ExtglobAlternative {
+fn compile_extglob_alternative(
+    alternative: &[u8],
+    options: PatternOptions,
+    budget: &mut IrBudget,
+) -> Result<ExtglobAlternative, PatternError> {
     let options = PatternOptions {
         braces: false,
         extglob: false,
@@ -2244,11 +2345,16 @@ fn compile_extglob_alternative(alternative: &[u8], options: PatternOptions) -> E
         root_component_wildcards: false,
         ..options
     };
-    let compiled = Pattern::compile(alternative, options)
-        .ok()
-        .map(|pattern| pattern.alternatives);
+    // A syntax error in one alternative is not a compile failure — it is an
+    // alternative that matches nothing, as it always was. Running out of budget
+    // is a different thing and has to reach the caller.
+    let compiled = match Pattern::compile_within(alternative, options, budget) {
+        Ok(pattern) => Some(pattern.alternatives),
+        Err(error) if error.message() == TOO_MUCH_COMPILED_IR => return Err(error),
+        Err(_) => None,
+    };
     let width = compiled.as_deref().and_then(fixed_token_width);
-    ExtglobAlternative { compiled, width }
+    Ok(ExtglobAlternative { compiled, width })
 }
 
 /// Total bytes the alternative consumes, when that is the same for every
@@ -3081,6 +3187,108 @@ mod tests {
 
         // Without brace expansion the same bytes are ordinary text.
         assert!(Pattern::compile(&degenerate, PatternOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn compiled_size_is_budgeted_across_every_alternative() {
+        let options = PatternOptions::default().braces(true).extglob(true);
+
+        // 4096 alternatives of a kilobyte each: inside the alternative budget
+        // and inside the expansion byte budget, but millions of compiled units.
+        let extglob = format!("@(a|b){}{}", "x".repeat(1_000), "{a,b}".repeat(12));
+        let error = Pattern::compile(&extglob, options).unwrap_err();
+        assert_eq!(error.message(), "pattern compiles to too much");
+
+        // The same dimension without extglob: one token per wildcard byte.
+        let wildcards = format!("{}{}", "?".repeat(1_000), "{a,b}".repeat(12));
+        let error =
+            Pattern::compile(&wildcards, PatternOptions::default().braces(true)).unwrap_err();
+        assert_eq!(error.message(), "pattern compiles to too much");
+
+        // A literal run is one token however long, so the same alternative
+        // count over the same number of bytes compiles.
+        let literals = format!("{}{}", "x".repeat(1_000), "{a,b}".repeat(12));
+        assert!(Pattern::compile(&literals, PatternOptions::default().braces(true)).is_ok());
+
+        // The budget is a compile-time ceiling, not a syntax rule.
+        assert!(Pattern::compile(&wildcards, PatternOptions::default()).is_ok());
+
+        // A separator before a wildcard makes the pattern carry a second
+        // compiled copy for the path-filter reading, which costs the budget a
+        // second time. The same pattern without one compiles.
+        let braces = PatternOptions::default().braces(true);
+        let single = format!("{}{}", "{a,b}".repeat(9), "?".repeat(700));
+        let doubled = format!("{}/{}", "{a,b}".repeat(9), "?".repeat(700));
+        assert!(Pattern::compile(&single, braces).is_ok());
+        assert_eq!(
+            Pattern::compile(&doubled, braces).unwrap_err().message(),
+            "pattern compiles to too much"
+        );
+    }
+
+    #[test]
+    fn compiled_size_budget_leaves_realistic_patterns_alone() {
+        let options = PatternOptions::default()
+            .braces(true)
+            .extglob(true)
+            .recursive_double_star(true);
+        for pattern in [
+            "src/**/+(main|lib).{rs,toml}",
+            "src/**/*.{js,jsx,ts,tsx,mjs,cjs}",
+            "src/{a,b}/{c,d}/*.{e,f}",
+            "**/@(foo|bar)/**/*.ts",
+        ] {
+            assert!(
+                Pattern::compile(pattern, options).is_ok(),
+                "{pattern} must stay inside the compiled-size ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn the_three_compile_budgets_are_reported_apart() {
+        // Each answers a different question — how many alternatives, how much
+        // text they add up to, and how much program that text becomes — so a
+        // caller can tell which ceiling it hit.
+        let options = PatternOptions::default().braces(true);
+        assert_eq!(
+            Pattern::compile("{a,b}".repeat(13), options)
+                .unwrap_err()
+                .message(),
+            "too many brace alternatives"
+        );
+        assert_eq!(
+            Pattern::compile("{a}".repeat(200_000), options)
+                .unwrap_err()
+                .message(),
+            "brace expansion is too large"
+        );
+        assert_eq!(
+            Pattern::compile(
+                format!("{}{}", "?".repeat(1_000), "{a,b}".repeat(12)),
+                options
+            )
+            .unwrap_err()
+            .message(),
+            "pattern compiles to too much"
+        );
+    }
+
+    #[test]
+    fn compiled_unit_sizes_match_what_the_budget_documents() {
+        // The ceiling is expressed in units, and its documentation converts
+        // that to memory. If a unit grows, the documented ceiling silently
+        // becomes a larger one.
+        assert_eq!(
+            size_of::<Token>(),
+            32,
+            "Token grew; the budget doc is stale"
+        );
+        assert_eq!(
+            size_of::<super::ExtglobStep>(),
+            40,
+            "ExtglobStep grew; the budget doc is stale"
+        );
     }
 
     #[test]

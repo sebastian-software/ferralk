@@ -138,6 +138,15 @@ Ordinary wildcards never cross a path-component boundary there; use recursive
   `brace expansion is too large` at the same offset. Neither reference bounds
   this either. The boundary is recorded as `error-brace-work-*` corpus cases
   (issue #54).
+- Compilation is budgeted a third way, in compiled units. Neither text budget
+  sees what compiling that text costs, and the compiled form is far larger than
+  its source: a token per wildcard byte, and for an extglob a program step per
+  byte offset of every alternative. A 5 KB pattern that sat inside both other
+  budgets compiled to 1.9 GB. A pattern whose compiled program would pass
+  1,048,576 units — roughly 40 MB — is rejected with
+  `pattern compiles to too much`. The dimension is reachable with and without
+  extglob syntax, and the boundary is recorded as `error-compiled-ir-*` corpus
+  cases (issue #74).
 
 ## Defaults to review
 
