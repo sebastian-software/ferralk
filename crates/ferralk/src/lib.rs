@@ -50,6 +50,12 @@ pub use macos_native::fuzz_validate_bulk_record as fuzz_validate_macos_bulk_reco
 pub use macos_native::fuzz_validate_records as fuzz_validate_macos_dirent_records;
 mod classify;
 mod gitignore;
+mod ignore_rules;
+
+/// Fuzz entry point for the gitignore rule layer (ADR-0014), exported the way
+/// the native dirent parsers are: for the harness in `fuzz/`, not for consumers.
+#[doc(hidden)]
+pub use ignore_rules::fuzz_rule as fuzz_ignore_rule;
 mod parallel;
 mod scheduler;
 
@@ -2260,14 +2266,11 @@ mod tests {
 
     /// Git-verified ignore cases the walker does not reproduce yet.
     ///
-    /// Both are recorded in `corpus/ignore.jsonl` because ADR-0006 makes Git
-    /// normative; the walker's ignore matcher is what needs to catch up.
-    ///
-    /// - `ignore-034`: a POSIX class name in a rule (`*.[[:digit:]]`) ignores
-    ///   the candidate in Git; the walker does not match it, because the
-    ///   `ignore` crate's matcher does not read class names inside a bracket
-    ///   expression.
-    const KNOWN_WALKER_GAPS: &[&str] = &["ignore-034"];
+    /// Empty since ADR-0014: the last entry was `ignore-034`, a POSIX class
+    /// name in a rule, which the borrowed matcher could not read and the
+    /// walker's own rule layer does. A case belongs here only while Git and
+    /// the walker are known to disagree, never as a way to quiet a failure.
+    const KNOWN_WALKER_GAPS: &[&str] = &[];
 
     #[test]
     fn git_ignore_corpus_replays_through_the_walker() {

@@ -44,6 +44,11 @@ pub fn git_check_ignore_layered(
 ) -> io::Result<bool> {
     let repository = TemporaryRepository::create()?;
     run_git(repository.path(), ["init", "--quiet"])?;
+    // `git init` turns on `core.ignorecase` when the filesystem folds case, so
+    // the same rule would decide differently on macOS and on Linux. ferralk
+    // matches bytes (ADR-0005), so the oracle is pinned to the same reading and
+    // the corpus means one thing on every host.
+    run_git(repository.path(), ["config", "core.ignorecase", "false"])?;
     fs::write(repository.path().join(".gitignore"), rules.join("\n"))?;
     for (directory, rules) in nested {
         let directory = repository.path().join(directory);

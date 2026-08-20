@@ -1,6 +1,7 @@
 name: Glob fuzz
 
-# Automatic coverage for the matcher's own fuzz targets: a short budget on
+# Automatic coverage for the matcher's own fuzz targets, and for the gitignore
+# rule layer that compiles onto it (ADR-0014): a short budget on
 # every pull request and a long one overnight. `fuzz.yml` stays the manual
 # entry point for running a single target with a custom budget.
 
@@ -31,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [pattern_parser, pattern_matcher, ferralk_vs_fast_glob]
+        target: [pattern_parser, pattern_matcher, ferralk_vs_fast_glob, ignore_rule_parser]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master branch

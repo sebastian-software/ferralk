@@ -17,9 +17,10 @@
 
 use std::{path::Path, sync::Arc};
 
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
-
-use super::{BackendEntry, DirectoryBackend, Walker};
+use super::{
+    BackendEntry, DirectoryBackend, Walker, glob_path_bytes,
+    ignore_rules::{RuleSet, RuleSetBuilder},
+};
 
 /// Ignore files of a directory, in increasing precedence: a later file wins.
 const IGNORE_FILES: [&str; 2] = [".gitignore", ".ignore"];
@@ -87,16 +88,19 @@ impl IgnoreScope {
     /// precedence. An entry below an ignored directory never reaches this: the
     /// walk does not enter such a directory.
     pub(crate) fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        self.rules
-            .as_ref()
-            .and_then(|node| node.verdict(path, is_dir))
-            .unwrap_or(false)
+        let Some(node) = self.rules.as_ref() else {
+            return false;
+        };
+        // Converted once for the whole chain: every set below slices its own
+        // prefix off these bytes.
+        let candidate = glob_path_bytes(path);
+        node.verdict(&candidate, is_dir).unwrap_or(false)
     }
 
     /// Puts `rules` on the chain, unless they are empty: an empty matcher can
     /// never have an opinion, so keeping it would only lengthen the walk of
     /// every entry below it.
-    fn link(self, rules: Gitignore) -> Self {
+    fn link(self, rules: RuleSet) -> Self {
         if rules.is_empty() {
             return self;
         }
@@ -111,7 +115,7 @@ impl IgnoreScope {
 
 #[derive(Debug)]
 struct IgnoreNode {
-    rules: Gitignore,
+    rules: RuleSet,
     parent: Option<Arc<IgnoreNode>>,
 }
 
@@ -120,14 +124,12 @@ impl IgnoreNode {
     /// the chain matches. Each node sees the path relative to its own
     /// directory, which the matcher strips, so this costs one match per ignore
     /// file in force rather than one per ancestor directory.
-    fn verdict(&self, path: &Path, is_dir: bool) -> Option<bool> {
-        let matched = self.rules.matched(path, is_dir);
-        if !matched.is_none() {
-            return Some(matched.is_ignore());
-        }
-        self.parent
-            .as_ref()
-            .and_then(|parent| parent.verdict(path, is_dir))
+    fn verdict(&self, candidate: &[u8], is_dir: bool) -> Option<bool> {
+        self.rules.matched(candidate, is_dir).or_else(|| {
+            self.parent
+                .as_ref()
+                .and_then(|parent| parent.verdict(candidate, is_dir))
+        })
     }
 }
 
@@ -139,23 +141,22 @@ fn read_rules<B: DirectoryBackend + ?Sized>(
     backend: &B,
     directory: &Path,
     files: &[&str],
-) -> Gitignore {
-    let mut builder = GitignoreBuilder::new(directory);
+) -> RuleSet {
+    let mut builder = RuleSetBuilder::new(directory);
     for file in files {
         let path = directory.join(file);
         if let Ok(contents) = backend.read_ignore_file(&path) {
-            add_rules(&mut builder, &path, &contents);
+            add_rules(&mut builder, &contents);
         }
     }
-    builder.build().unwrap_or_else(|_| Gitignore::empty())
+    builder.build()
 }
 
 /// Feeds one ignore file's lines to the builder.
 ///
-/// This mirrors what the `ignore` crate does when it reads the file itself: a
-/// leading byte-order mark is dropped the way Git drops it, and a line that is
-/// not UTF-8 ends the file, keeping the lines before it.
-fn add_rules(builder: &mut GitignoreBuilder, path: &Path, contents: &[u8]) {
+/// A leading byte-order mark is dropped the way Git drops it, and a line that
+/// is not UTF-8 ends the file, keeping the lines before it.
+fn add_rules(builder: &mut RuleSetBuilder, contents: &[u8]) {
     let text = match std::str::from_utf8(contents) {
         Ok(text) => text,
         Err(error) => {
@@ -173,6 +174,6 @@ fn add_rules(builder: &mut GitignoreBuilder, path: &Path, contents: &[u8]) {
         } else {
             line
         };
-        let _ = builder.add_line(Some(path.to_path_buf()), line);
+        builder.add_line(line);
     }
 }
