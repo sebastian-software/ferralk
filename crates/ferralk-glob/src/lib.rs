@@ -272,6 +272,7 @@ impl Pattern {
                 extglob: compile_extglob(pattern, options, budget)?,
                 raw: pattern.to_vec(),
                 fast_path: FastPath::compile(&tokens, options),
+                prefilter: Prefilter::compile(&tokens),
                 tokens,
             }],
             options,
@@ -323,7 +324,13 @@ impl Pattern {
             {
                 fast_path.is_match(path, options)
             } else {
-                Self::matches_general(&alternative.tokens, path, options)
+                // The engine explores before it consults the pattern's fixed
+                // ends, so a candidate that cannot possibly match is rejected
+                // here rather than after the whole state space has been walked.
+                !alternative
+                    .prefilter
+                    .rejects(path, options.case_insensitive)
+                    && Self::matches_general(&alternative.tokens, path, options)
             }
         })
     }
@@ -567,6 +574,7 @@ impl Pattern {
             extglob,
             raw,
             fast_path,
+            prefilter: Prefilter::compile(&tokens),
             tokens,
         })
     }
@@ -1260,6 +1268,128 @@ struct CompiledAlternative {
     /// carries extglob syntax and the option is on. Matching borrows it; the
     /// interpreter used to re-derive all of it from `raw` on every call.
     extglob: Option<CompiledExtglob>,
+    /// Necessary conditions on a candidate, read off `tokens` at compile time
+    /// and checked before the general engine runs. See [`Prefilter`].
+    prefilter: Prefilter,
+}
+
+/// Conditions every candidate the general engine accepts must already satisfy.
+///
+/// The engine is a memoized depth-first walk over (token, path position) pairs.
+/// Nothing in it consults the pattern's trailing literal before exploring, so
+/// `a*a*a*a*b` against a run of `a`s visits the whole state space and only then
+/// fails on the final `b`. These three facts are cheap to check up front and
+/// cannot turn a non-match into a match: each one is implied by a successful
+/// match rather than being a second opinion about one.
+///
+/// Soundness rests on the engine accepting only when it has consumed the entire
+/// candidate — `token_index == tokens.len() && path_index == path.len()`. The
+/// leading run of `Literal`/`Separator` tokens therefore has to match at
+/// position 0, the trailing run has to match at the end, and every token
+/// consumes at least the byte count counted in `min_length`.
+///
+/// The one token whose contribution is not fixed is the `Separator` of a
+/// trailing `.../**`: the engine lets it consume nothing and end the match
+/// there, which is how `dir/**` accepts `dir`. It can only ever be the
+/// second-to-last token, with a `RecursiveStar` behind it, so it can never sit
+/// inside a *trailing* run — a run that reaches the end of the token list would
+/// have to contain that `RecursiveStar`, which is neither a literal nor a
+/// separator. It can sit at the end of a *leading* run, and `min_length`
+/// counts it, so both of those subtract it explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Prefilter {
+    /// Bytes every match starts with, one per byte of the leading
+    /// `Literal`/`Separator` run.
+    prefix: Vec<u8>,
+    /// Bytes every match ends with, one per byte of the trailing run.
+    suffix: Vec<u8>,
+    /// Bytes the pattern consumes even when every star consumes nothing.
+    min_length: usize,
+}
+
+impl Prefilter {
+    fn compile(tokens: &[Token]) -> Self {
+        // `dir/**` matches `dir`, so the separator before a terminal `**` is
+        // the one token that may consume nothing.
+        let elidable_separator = tokens.len() >= 2
+            && matches!(
+                tokens[tokens.len() - 2..],
+                [Token::Separator, Token::RecursiveStar]
+            );
+        let fixed = |token: &&Token| matches!(token, Token::Literal(_) | Token::Separator);
+        let mut leading = tokens.iter().take_while(fixed).count();
+        if elidable_separator && leading + 1 == tokens.len() {
+            leading -= 1;
+        }
+        let trailing = tokens.iter().rev().take_while(fixed).count();
+        let min_length =
+            tokens.iter().map(token_min_length).sum::<usize>() - usize::from(elidable_separator);
+        let prefilter = Self {
+            prefix: run_bytes(&tokens[..leading]),
+            suffix: run_bytes(&tokens[tokens.len() - trailing..]),
+            min_length,
+        };
+        debug_assert!(
+            prefilter.min_length >= prefilter.prefix.len()
+                && prefilter.min_length >= prefilter.suffix.len(),
+            "the fixed runs are part of what the minimum length counts"
+        );
+        prefilter
+    }
+
+    /// Whether `path` fails a condition every match satisfies. A `true` here is
+    /// a rejection the engine would have reached the slow way.
+    fn rejects(&self, path: &[u8], case_insensitive: bool) -> bool {
+        if path.len() < self.min_length {
+            return true;
+        }
+        let tail = path.len() - self.suffix.len();
+        !run_matches(&self.prefix, &path[..self.prefix.len()], case_insensitive)
+            || !run_matches(&self.suffix, &path[tail..], case_insensitive)
+    }
+}
+
+/// Bytes a run of `Literal`/`Separator` tokens spells out, with a separator
+/// written as `/`. Any other token in `run` would be a caller bug and is
+/// counted as nothing, which keeps the run shorter and the filter weaker.
+fn run_bytes(run: &[Token]) -> Vec<u8> {
+    run.iter()
+        .flat_map(|token| match token {
+            Token::Literal(literal) => literal.as_slice(),
+            _ => b"/".as_slice(),
+        })
+        .copied()
+        .collect()
+}
+
+fn token_min_length(token: &Token) -> usize {
+    match token {
+        Token::Literal(literal) => literal.len(),
+        Token::Separator | Token::Any | Token::Class(_) => 1,
+        Token::Star | Token::PathStar | Token::RecursiveStar | Token::RecursivePrefix => 0,
+    }
+}
+
+fn run_matches(expected: &[u8], actual: &[u8], case_insensitive: bool) -> bool {
+    expected
+        .iter()
+        .zip(actual)
+        .all(|(&expected, &actual)| run_byte_matches(expected, actual, case_insensitive))
+}
+
+/// Whether one byte of a fixed run is satisfied by the candidate's byte.
+///
+/// A `Separator` token contributes `/` and accepts whatever the platform calls
+/// a separator, which is what the engine's separator arm does. A literal `/` --
+/// only reachable through an escape -- is then accepted a little more widely
+/// than the engine accepts it, on Windows only. Being more permissive is the
+/// safe direction for a filter that may only reject.
+fn run_byte_matches(expected: u8, actual: u8, case_insensitive: bool) -> bool {
+    if is_separator(expected) {
+        is_separator(actual)
+    } else {
+        bytes_equal(expected, actual, case_insensitive)
+    }
 }
 
 /// An allocation-free matcher for a common recursive-prefix/suffix shape.
@@ -2849,8 +2979,8 @@ fn extglob_component_end(path: &[u8], path_index: usize, options: PatternOptions
 #[cfg(test)]
 mod tests {
     use super::{
-        FailedStates, FastPath, Pattern, PatternOptions, Token, extglob_visited_capacity,
-        scratch_capacities,
+        FailedStates, FastPath, Pattern, PatternOptions, Prefilter, Token,
+        extglob_visited_capacity, scratch_capacities,
     };
 
     fn compile(pattern: &str) -> Pattern {
@@ -4086,6 +4216,134 @@ mod tests {
             "literal(",
             PatternOptions::default().extglob(true)
         ));
+    }
+
+    /// Strips every route around the general engine, leaving the prefilter as
+    /// the only thing between a candidate and the state walk.
+    fn only_the_general_engine(pattern: &mut Pattern) {
+        let alternatives = pattern
+            .alternatives
+            .iter_mut()
+            .chain(pattern.path_filter_alternatives.iter_mut().flatten());
+        for alternative in alternatives {
+            alternative.fast_path = None;
+        }
+    }
+
+    /// The same pattern with the prefilter neutralised, so the engine decides
+    /// on its own.
+    fn without_the_prefilter(pattern: &Pattern) -> Pattern {
+        let mut unfiltered = pattern.clone();
+        let alternatives = unfiltered
+            .alternatives
+            .iter_mut()
+            .chain(unfiltered.path_filter_alternatives.iter_mut().flatten());
+        for alternative in alternatives {
+            alternative.prefilter = Prefilter::default();
+        }
+        unfiltered
+    }
+
+    /// The prefilter may only reject what the general engine rejects.
+    ///
+    /// Every candidate is decided twice through the same engine — once with the
+    /// compiled prefilter in front of it, once with the prefilter neutralised —
+    /// across the three entry points that reach it, because each supplies its
+    /// own `PatternOptions` and the prefilter is derived without them. The fast
+    /// paths are removed from both copies so nothing routes around the engine
+    /// and turns the comparison into a tautology.
+    #[test]
+    fn the_prefilter_rejects_only_what_the_general_engine_rejects() {
+        let plain = PatternOptions::default();
+        let recursive = PatternOptions::default().recursive_double_star(true);
+        let folded = recursive.case_insensitive(true);
+        let cases: [(&str, PatternOptions); 16] = [
+            // The bench case: nothing in the engine consults the trailing `b`.
+            ("a*a*a*a*b", plain),
+            ("*a*a*", plain),
+            ("a*", plain),
+            ("*a", plain),
+            ("*", plain),
+            ("?a*b?", plain),
+            ("[ab]*b", plain),
+            ("a/*/b", plain),
+            ("a/**", recursive),
+            ("**/a", recursive),
+            ("**/*.b", recursive),
+            ("**", recursive),
+            ("a/**/b*b", recursive),
+            ("A/**/*.B", folded),
+            ("A*A*B", folded),
+            ("./a/**/b", recursive),
+        ];
+        let mut candidates = byte_words(b"ab./", 4);
+        candidates.push(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec());
+        candidates.push(b"a/b/a/b/a/b.b".to_vec());
+        candidates.push(b"A/B/A.B".to_vec());
+
+        for (source, options) in cases {
+            let mut filtered = Pattern::compile(source, options).expect("case pattern compiles");
+            only_the_general_engine(&mut filtered);
+            let unfiltered = without_the_prefilter(&filtered);
+            for candidate in &candidates {
+                for (entry, filtered, unfiltered) in [
+                    (
+                        "is_match",
+                        filtered.is_match(candidate),
+                        unfiltered.is_match(candidate),
+                    ),
+                    (
+                        "is_match_path",
+                        filtered.is_match_path(candidate),
+                        unfiltered.is_match_path(candidate),
+                    ),
+                    (
+                        "is_match_glob_path",
+                        filtered.is_match_glob_path(candidate),
+                        unfiltered.is_match_glob_path(candidate),
+                    ),
+                ] {
+                    assert_eq!(
+                        filtered, unfiltered,
+                        "{source} via {entry} disagrees with the unfiltered engine on {candidate:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// What the three facts are, on the shapes whose reading is not obvious.
+    ///
+    /// The separator before a terminal `**` is the one token that may consume
+    /// nothing, so it belongs to neither the leading run nor the minimum
+    /// length; `a/**` accepting `a` is what that buys.
+    #[test]
+    fn the_prefilter_leaves_out_the_separator_a_terminal_double_star_may_elide() {
+        let recursive = PatternOptions::default().recursive_double_star(true);
+        let terminal = Pattern::compile("ab/**", recursive).expect("terminal pattern compiles");
+        let prefilter = &terminal.alternatives[0].prefilter;
+        assert_eq!(
+            prefilter.prefix, b"ab",
+            "the elidable separator is left off"
+        );
+        assert_eq!(prefilter.suffix, b"", "a trailing run cannot hold a `**`");
+        assert_eq!(prefilter.min_length, 2, "the separator is not counted");
+        assert!(!prefilter.rejects(b"ab", false), "`ab/**` accepts `ab`");
+
+        // A separator anywhere else is an ordinary byte of the fixed run.
+        let inner = Pattern::compile("ab/**/cd", recursive).expect("inner pattern compiles");
+        let prefilter = &inner.alternatives[0].prefilter;
+        assert_eq!(prefilter.prefix, b"ab/");
+        assert_eq!(prefilter.suffix, b"cd");
+        assert_eq!(prefilter.min_length, 5);
+
+        // Stars are worth nothing, every other token its own bytes.
+        let mixed = Pattern::compile("a?[bc]*d", PatternOptions::default())
+            .expect("mixed pattern compiles");
+        let prefilter = &mixed.alternatives[0].prefilter;
+        assert_eq!(prefilter.prefix, b"a");
+        assert_eq!(prefilter.suffix, b"d");
+        assert_eq!(prefilter.min_length, 4);
     }
 
     fn byte_words(alphabet: &[u8], max_length: usize) -> Vec<Vec<u8>> {
