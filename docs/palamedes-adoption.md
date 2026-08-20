@@ -44,7 +44,7 @@ surviving the prune:
 | `ignore` serial — what palamedes had | 643.6 ms | 1.00x | 0.04x |
 | `ignore` pruned x4 — the #875 plan | 24.1 ms | 26.7x | 1.00x |
 | ferralk serial | 29.0 ms | 22.2x | 0.83x |
-| **ferralk x4** | **15.5 ms** | **41.6x** | **1.56x** |
+| **ferralk x4** | **15.5 ms** | **41.5x** | **1.56x** |
 
 A React/Next monorepo — 127,083 files on disk, 7,286 discovered, 14,947
 surviving the prune:
@@ -218,9 +218,10 @@ Walker::new(first)
     .threads(discovery_threads(config))
     .error_policy(ErrorPolicy::Skip)
     .options(WalkOptions::default().files_only(true).resolve_symlink_kind(true))
-    .add_roots(rest.iter())
-// plus the catalog's include and exclude patterns, absolute and unmodified,
-// then collect()
+    .add_roots(rest.iter())?
+// plus the catalog's include and exclude patterns, absolute and unmodified
+// (each `include`/`exclude` call returns Result and wants `?` too), then
+// collect()
 ```
 
 Three switches make ferralk read that catalog the way the previous stack did,
@@ -228,9 +229,9 @@ and each has a test that fails without it: `wildcard_mode(SeparatorCrossing)`
 because `globset` as palamedes builds it lets an ordinary wildcard cross `/`,
 `match_hidden(true)` because `globset` wildcards cover a leading period and this
 caller discovers hidden sources deliberately, and `resolve_symlink_kind(true)`
-for the `Path::is_file` reading. One sharp edge: unlike `match_hidden`,
-`wildcard_mode` does not recompile patterns already added, so it has to come
-before them.
+for the `Path::is_file` reading. Builder order does not matter for any of
+them: `wildcard_mode` is consulted when entries are matched, not when patterns
+compile, so setting it before or after the pattern calls yields the same walk.
 
 ### The line count went up
 
