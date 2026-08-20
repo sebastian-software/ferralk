@@ -140,7 +140,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         && !walker
             .excludes
             .iter()
-            .any(|pattern| pattern.covers_subtree(bytes.as_ref()))
+            .any(|pattern| pattern.covers_subtree(bytes.as_ref(), walker.wildcard_mode))
         && walker.may_descend_at(depth, bytes.as_ref());
     let emit = should_emit(walker, &entry, bytes.as_ref(), git_ignored);
 

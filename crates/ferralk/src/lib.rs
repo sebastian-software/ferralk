@@ -788,10 +788,19 @@ impl TraversalPattern {
         }
     }
 
-    fn covers_subtree(&self, path: &[u8]) -> bool {
-        self.subtree_root
-            .as_ref()
-            .is_some_and(|root| root.is_match(path))
+    /// Whether the exclude covers everything below `path`, so the walk may skip
+    /// opening it.
+    ///
+    /// The subtree root is asked under the same mode as the pattern itself.
+    /// Reading it as separator-crossing while the walk scopes wildcards to a
+    /// component prunes subtrees the exclude does not cover: `*.tmp/**` would
+    /// close `a/b.tmp` even though a component-scoped `*.tmp` cannot match the
+    /// component `a`.
+    fn covers_subtree(&self, path: &[u8], mode: WildcardMode) -> bool {
+        self.subtree_root.as_ref().is_some_and(|root| match mode {
+            WildcardMode::ComponentScoped => root.is_match_glob_path(path),
+            WildcardMode::SeparatorCrossing => root.is_match(path),
+        })
     }
 
     fn could_match_descendant(&self, path: &[u8]) -> bool {
@@ -2926,6 +2935,47 @@ mod tests {
         );
     }
 
+    /// Subtree pruning must decide what the per-entry exclude would have
+    /// decided, under either mode.
+    ///
+    /// `*.tmp/**` used to close `a/b.tmp` in both modes, because the subtree
+    /// root was always read as separator-crossing. In the default mode the
+    /// exclude does not reach that directory at all - `*.tmp` cannot match the
+    /// component `a` - so its contents went missing from the walk without any
+    /// pattern saying they should.
+    #[test]
+    fn subtree_pruning_agrees_with_the_exclude_it_came_from() {
+        let fixture = Fixture::new();
+        fixture.write("a/b.tmp/keep.rs");
+        fixture.write("b.tmp/gone.rs");
+        fixture.write("a/plain/keep.rs");
+
+        let walk = |mode: WildcardMode| -> Vec<PathBuf> {
+            let result = Walker::new(&fixture.root)
+                .wildcard_mode(mode)
+                .exclude("*.tmp/**")
+                .expect("valid exclude")
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("walk succeeds");
+            relative_paths(result.entries(), &fixture.root)
+        };
+
+        assert_eq!(
+            walk(WildcardMode::ComponentScoped),
+            vec![
+                PathBuf::from("a/b.tmp/keep.rs"),
+                PathBuf::from("a/plain/keep.rs"),
+            ],
+            "a nested `.tmp` directory is out of a component-scoped exclude's reach"
+        );
+        assert_eq!(
+            walk(WildcardMode::SeparatorCrossing),
+            vec![PathBuf::from("a/plain/keep.rs")],
+            "a crossing exclude reaches the nested one, and pruning may follow it"
+        );
+    }
+
     /// A literal that shares a component with a wildcard proves nothing about a
     /// directory, so the planner may not prune on it.
     ///
@@ -2980,16 +3030,25 @@ mod tests {
 
     #[test]
     fn prune_planner_only_accepts_explicit_whole_subtree_excludes() {
+        let scoped = WildcardMode::ComponentScoped;
         let subtree = traversal_pattern(b"src/**");
-        assert!(subtree.covers_subtree(b"src"));
-        assert!(!subtree.covers_subtree(b"src/nested"));
+        assert!(subtree.covers_subtree(b"src", scoped));
+        assert!(!subtree.covers_subtree(b"src/nested", scoped));
 
         let suffix = traversal_pattern(b"*.tmp");
-        assert!(!suffix.covers_subtree(b"cache"));
+        assert!(!suffix.covers_subtree(b"cache", scoped));
 
         let nested = traversal_pattern(b"**/target/**");
-        assert!(nested.covers_subtree(b"target"));
-        assert!(nested.covers_subtree(b"crates/ferralk/target"));
+        assert!(nested.covers_subtree(b"target", scoped));
+        assert!(nested.covers_subtree(b"crates/ferralk/target", scoped));
+
+        // The subtree root is read under the walk's own mode. A component-scoped
+        // `*.tmp` cannot match the component `a`, so `a/b.tmp` must stay open;
+        // a crossing one matches the whole path, so it may be closed.
+        let wildcard_subtree = traversal_pattern(b"*.tmp/**");
+        assert!(!wildcard_subtree.covers_subtree(b"a/b.tmp", scoped));
+        assert!(wildcard_subtree.covers_subtree(b"b.tmp", scoped));
+        assert!(wildcard_subtree.covers_subtree(b"a/b.tmp", WildcardMode::SeparatorCrossing));
 
         assert_eq!(
             literal_pattern_root(b"src/foo/*.rs"),
