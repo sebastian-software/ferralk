@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.0](https://github.com/sebastian-software/ferralk/compare/v0.2.0...v0.3.0) (2026-08-20)
+
+
+### Features
+
+* **walker:** expose match_hidden on the Walker builder ([c833f54](https://github.com/sebastian-software/ferralk/commit/c833f54a20080245aadaef69c5674276b17e666d)), closes [#63](https://github.com/sebastian-software/ferralk/issues/63)
+* **walker:** filter entries on the workers that produced them ([851d17b](https://github.com/sebastian-software/ferralk/commit/851d17bba664aa88a1ebbbbc8a93e5bba1bcbee0)), closes [#64](https://github.com/sebastian-software/ferralk/issues/64)
+* **walker:** own gitignore rule matching ([068a144](https://github.com/sebastian-software/ferralk/commit/068a144ebc7801959c10afb35f6fb2beefb61b42)), closes [#49](https://github.com/sebastian-software/ferralk/issues/49)
+
+
+### Bug Fixes
+
+* **glob:** bound how much program a pattern compiles to ([1e47041](https://github.com/sebastian-software/ferralk/commit/1e4704195fd54eedf28e7190446c3b6c118e8838)), closes [#74](https://github.com/sebastian-software/ferralk/issues/74)
+
+
+### Performance Improvements
+
+* **walker:** match ignore rules without recursion ([9413aad](https://github.com/sebastian-software/ferralk/commit/9413aad509e91a72628d2a16f12a4de1488dcd63))
+
 ## [0.2.0](https://github.com/sebastian-software/ferralk/compare/v0.1.2...v0.2.0) (2026-08-20)
 
 
