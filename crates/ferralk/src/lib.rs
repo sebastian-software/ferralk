@@ -650,10 +650,12 @@ impl Walker {
     /// separator, so a pattern built by joining `PathBuf`s on Windows asks for
     /// each separator's next byte literally and matches nothing. On Windows
     /// such a pattern is rejected rather than left to fail silently, but only
-    /// where it demands a byte Windows forbids in a name - `C:\repo\**`,
-    /// `src\*.ts`, `\\server\share` - because escaping an ordinary byte is
-    /// legal and `a\b\c` really does select a file named `abc`. Build the
-    /// pattern as a pattern and let [`Walker::new`] hold the path.
+    /// where the plain text of the pattern demands a byte Windows forbids in a
+    /// name - `C:\repo\**`, `src\*.ts`, `\\server\share`. Escaping an
+    /// ordinary byte is legal, so `a\b\c` selects a file named `abc`; and
+    /// inside a group the escape is one member among several, so `[a\*]` and
+    /// `{a,\*}` still select `a`. Build the pattern as a pattern and let
+    /// [`Walker::new`] hold the path.
     ///
     /// ```
     /// use ferralk::Walker;
@@ -4290,6 +4292,27 @@ mod tests {
                 .collect()
                 .expect("walk succeeds");
             assert_eq!(result.entries().len(), 2, "{pattern} selects both files");
+        }
+
+        // An escaped forbidden byte inside a group is one member among
+        // several, so the pattern still selects - and must still be accepted.
+        // The review of #94 found the first version refusing exactly these.
+        for pattern in [
+            r"src/[m\*]ain.ts",
+            r"src/{main,\*}.ts",
+            r"src/@(main|\*).ts",
+        ] {
+            let result = Walker::new(&fixture.root)
+                .include(pattern)
+                .unwrap_or_else(|error| panic!("{pattern} can match, got {error}"))
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("walk succeeds");
+            assert_eq!(
+                relative_paths(result.entries(), &fixture.root),
+                vec![PathBuf::from("src/main.ts")],
+                "{pattern} selects through its group"
+            );
         }
     }
 

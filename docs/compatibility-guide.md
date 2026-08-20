@@ -130,13 +130,24 @@ literal byte Windows forbids in a name, which is what a joined path asks for:
 | `\\server\share\x` | rejected | asks for a literal `\` |
 | `C:/repo/src/**/*.ts` | works | the spelling this dialect uses |
 | `a\b\c` | **accepted** | escaping an ordinary byte is legal; selects `abc` |
+| `[a\*]`, `{a,\*}` | **accepted** | inside a group the escape is one member; both still match `a` |
 
-The last row is the limit of the check, and it is deliberate. Escaping an
-ordinary byte is legal syntax that means the byte itself, so a pattern like
-`a\b\c` really does select a file named `abc`; refusing it would refuse
-patterns that work. What is refused is only what could never have matched, so
-nothing that used to select entries stops doing so. On Linux and macOS nothing
-is refused at all — there a file may genuinely be named `src*.ts`.
+The accepted rows are the limit of the check, and it is deliberate: refusing a
+pattern that works would be worse than the silence this replaces. Escaping an
+ordinary byte is legal syntax meaning the byte itself, so `a\b\c` really does
+select a file named `abc`. And inside a character class or an alternation an
+escaped byte is one member among several — `[a\*]` and `{a,\*}` both still
+select `a` — so the check reads only the plain text before the first `[`, `{`
+or extglob opener.
+
+One consequence is worth naming rather than hiding: a one-alternative group like
+`{a\*b}` could never match on Windows and is still accepted, because noticing it
+would mean parsing the group here and agreeing with the real parser about every
+nesting case. Unnoticed but correct beats noticed but lossy.
+
+What is refused is only what could never have matched, so nothing that used to
+select entries stops doing so. On Linux and macOS nothing is refused at all —
+there a file may genuinely be named `src*.ts`.
 
 **Converting a path you already hold.** Replace the separators, and remember
 that a path is not automatically a valid pattern: if any component contains

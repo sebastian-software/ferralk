@@ -85,15 +85,30 @@ const FORBIDDEN_IN_A_WINDOWS_NAME: [u8; 8] = *b"\\:*?\"<>|";
 /// a literal byte Windows cannot put in a name, so nothing that could ever have
 /// matched is refused:
 ///
-/// - `\` followed by one of [`FORBIDDEN_IN_A_WINDOWS_NAME`], which asks for a
-///   literal `*`, `?`, `:` or `\` in a component - none of which a Windows path
-///   can contain. `C:\repo\src\**\*.ts` and `\\?\C:\x` are caught here.
 /// - a drive prefix spelled with a backslash, `X:\`, which asks for a component
-///   literally named `X:`.
+///   literally named `X:`. That is a property of the first three bytes and needs
+///   no reading of what follows.
+/// - `\` followed by one of [`FORBIDDEN_IN_A_WINDOWS_NAME`] **in plain literal
+///   text**, which asks for a literal `*`, `?`, `:` or `\` in a component - none
+///   of which a Windows path can contain. `C:\repo\src\**\*.ts` and `\\?\C:\x`
+///   are caught here.
 ///
-/// What it deliberately does not catch is `\` before an ordinary byte -
-/// `a\b\c`, which is a legal pattern for a file named `abc`. Guessing there
-/// would refuse patterns that work.
+/// The emphasis is the correction from the review of #94. Inside a character
+/// class or an alternation an escaped forbidden byte is one member among
+/// several: `[a\*]` still matches `a`, and `{a,\*}` still matches `a`. Refusing
+/// those would refuse patterns that work, which is the one thing this check may
+/// never do. The scan therefore stops at the first grouping construct and reads
+/// only the plain text before it.
+///
+/// Two kinds of pattern go unexamined as a result, both deliberately:
+///
+/// - `\` before an ordinary byte, `a\b\c`, a legal pattern for a file named
+///   `abc`.
+/// - anything after a `[`, `{` or extglob opener, including a one-alternative
+///   group like `{a\*b}` that could in fact never match. Unnoticed but correct
+///   beats noticed but lossy, and the alternative is a second parser here that
+///   would have to agree with the real one about every nesting case to stay
+///   sound.
 pub(crate) fn reject_path_shaped(pattern: &[u8], syntax: Syntax) -> Result<(), PatternError> {
     if syntax != Syntax::Windows {
         return Ok(());
@@ -101,20 +116,52 @@ pub(crate) fn reject_path_shaped(pattern: &[u8], syntax: Syntax) -> Result<(), P
     if let Some(offset) = drive_prefix_with_backslash(pattern) {
         return Err(PatternError::new(offset, PATH_SHAPED));
     }
-    let mut index = 0;
-    while let Some(found) = pattern[index..].iter().position(|byte| *byte == b'\\') {
-        let escape = index + found;
-        let Some(escaped) = pattern.get(escape + 1) else {
-            // A trailing backslash is the pattern language's own error and is
-            // reported where that is decided.
-            break;
-        };
-        if FORBIDDEN_IN_A_WINDOWS_NAME.contains(escaped) {
-            return Err(PatternError::new(escape, PATH_SHAPED));
-        }
-        index = escape + 2;
+    if let Some(offset) = escape_before_forbidden_byte(pattern) {
+        return Err(PatternError::new(offset, PATH_SHAPED));
     }
     Ok(())
+}
+
+/// Offset of an escape demanding a byte Windows forbids, read from plain
+/// literal text only.
+///
+/// Stops at the first byte that could open a group rather than skipping the
+/// group, because skipping means deciding where it ends, and disagreeing with
+/// the real parser about that would resume the scan *inside* a group - which is
+/// the lossy rejection being avoided. Stopping early costs only detection.
+fn escape_before_forbidden_byte(pattern: &[u8]) -> Option<usize> {
+    let mut index = 0;
+    while index < pattern.len() {
+        if pattern[index] == b'\\' {
+            // A trailing backslash is the pattern language's own error, and is
+            // reported where that is decided.
+            let escaped = *pattern.get(index + 1)?;
+            if FORBIDDEN_IN_A_WINDOWS_NAME.contains(&escaped) {
+                return Some(index);
+            }
+            index += 2;
+            continue;
+        }
+        if opens_a_group(pattern, index) {
+            return None;
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Whether the unescaped byte at `index` could begin a class, an alternation or
+/// an extglob group.
+///
+/// Asked without looking for the closer: an opener that never closes is a
+/// compilation error anyway, and treating it as a group here only ends the scan
+/// early.
+fn opens_a_group(pattern: &[u8], index: usize) -> bool {
+    match pattern[index] {
+        b'[' | b'{' => true,
+        b'@' | b'+' | b'!' | b'*' | b'?' => pattern.get(index + 1) == Some(&b'('),
+        _ => false,
+    }
 }
 
 /// The one message, so a caller matching on it has one string to match.
@@ -377,6 +424,59 @@ mod tests {
         ] {
             assert_eq!(rejection(pattern, Syntax::Windows), None, "{pattern}");
             assert_eq!(rejection(pattern, Syntax::Posix), None, "{pattern}");
+        }
+    }
+
+    /// An escaped forbidden byte inside a group is one member among several, so
+    /// the pattern can still match and must not be refused.
+    ///
+    /// This is the review finding on #94: the first version scanned raw bytes
+    /// and refused `[a\*]` and `{a,\*}`, both of which match `a`. A rejection
+    /// that removes working patterns is worse than the silence it replaced.
+    #[test]
+    fn an_escape_inside_a_group_is_not_a_path_separator() {
+        for pattern in [
+            // A class: `*` is one member, `a` is another.
+            r"[a\*]",
+            r"src/[a\*].ts",
+            // An alternation: `\*` is one branch, `a` is another.
+            r"{a,\*}",
+            r"src/{a,\*}.ts",
+            // Extglob groups alternate the same way.
+            r"@(a|\*)",
+            r"+(a|\*)",
+            r"!(a|\*)",
+            r"*(a|\*)",
+            r"?(a|\*)",
+            // The residue, stated so it is a decision and not a surprise: a
+            // one-alternative group could never match on Windows, and is still
+            // accepted, because reading it would mean parsing the group.
+            r"{a\*b}",
+        ] {
+            assert_eq!(
+                rejection(pattern, Syntax::Windows),
+                None,
+                "{pattern} can match, so it must not be refused"
+            );
+        }
+    }
+
+    /// The negative half of the same pair: what is refused stays refused.
+    ///
+    /// Restricting the scan to plain text must not cost the shapes the check
+    /// exists for, all of which reach the forbidden escape before any group.
+    #[test]
+    fn narrowing_the_scan_keeps_the_shapes_it_was_built_for() {
+        for pattern in [
+            r"C:\repo\*.ts",
+            r"src\*.ts",
+            r"C:\repo\src\**\*.ts",
+            r"\\server\share\src\*.ts",
+        ] {
+            assert!(
+                rejection(pattern, Syntax::Windows).is_some(),
+                "{pattern} can never match on Windows and must be refused"
+            );
         }
     }
 
