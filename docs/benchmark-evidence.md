@@ -13,7 +13,7 @@ records the same for releases.
 | Lane | What it measures | Where | Gating |
 | --- | --- | --- | --- |
 | Matcher, wall time | Compiled-pattern matching and compilation, against `globset` and `fast-glob` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
-| Walker, wall time | Warm-cache traversal of a synthetic tree, ferralk serial and parallel against `ignore` parallel | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request, medians in the job summary and as an artifact | No |
+| Walker, wall time | Warm-cache traversal of a synthetic tree, ferralk serial and parallel against `ignore` parallel, one job per backend that ships | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request, medians in the job summary and as an artifact | No |
 | Engine comparison | One repository shape, every engine on the same query and the same file set | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), run on demand | No |
 | zlob context | The same matcher and walker shapes against zlob 1.6.3 | [`zlob-benchmark.yml`](../.github/workflows/zlob-benchmark.yml), manual dispatch only | No |
 
@@ -54,6 +54,22 @@ cargo bench -p bench --bench walker -- --warm-up-time 1 --measurement-time 5 --s
 # Engine comparison on a repository-shaped 53k-file tree.
 cargo bench -p bench --bench walker_palamedes
 ```
+
+**Both walker benches measure the portable backend unless a feature says
+otherwise.** The native backends are separate code paths and are only measured
+when they are asked for, on the platform that has them:
+
+```sh
+cargo bench -p bench --bench walker_palamedes --features native-macos
+cargo bench -p bench --bench walker_palamedes --features native-linux
+```
+
+Leaving the feature off is how the macOS bulk reader spent its whole life
+unmeasured: every lane and every reproduction command here read directories
+through `std::fs`, so a native backend that was slower than the portable one
+produced no number that said so. The walker wall-time lane now runs one job per
+backend, macOS included; the engine comparison stays portable-only in CI and is
+compared against a native build locally.
 
 Optional zlob context, which needs **Zig 0.16** and libclang because zlob 1.6.3
 builds through `build.rs` and bindgen:
@@ -140,6 +156,65 @@ arm can be fast by finding less. Unscoped finds 7,400 files, scoped 2,600.
 - The 2,355 ms in the RFC's table was a serial walk doing more per file than
   this reconstruction does; the 75.58 ms here is the same *approach*, not the
   same code.
+
+### Which backend those rows measure
+
+The portable one. `cargo bench -p bench --bench walker_palamedes` compiles
+`ferralk` without a native feature, so both `ferralk` arms above read
+directories through `std::fs`, on macOS as everywhere else.
+
+## The macOS native backend, 2026-08-20
+
+Every lane and every reproduction command in this file left
+`--features native-macos` off, so the macOS backend had never appeared in a
+number here. Turning it on found it losing to the portable backend it exists to
+beat: `getattrlistbulk` assembles a per-entry attribute record, and a listing
+keeps an entry's name, is-dir and is-symlink — the two facts `getdirentries64`
+already returns, in a record a third the size. Routing the reader to
+`getdirentries64` is what the rows below measure.
+
+Four `walker_palamedes` invocations on one host — the same M1 Pro as above,
+macOS 26.5.2, rustc 1.97.1, four threads — each with the zlob 1.6.3 arm timed
+**inside the same invocation** as its anchor. Read down a column against that
+anchor rather than across rows: these ran while the host had other work on it,
+which the unscoped serial spreads show plainly (±13.6 ms on the portable row
+against ±0.5 ms on the second `getdirentries64` round).
+
+Unscoped, `**/*.{ts,tsx}` — the query that has to read the whole tree:
+
+| Reader | Serial | 4 threads | zlob, same run | Parallel ÷ zlob |
+| --- | ---: | ---: | ---: | ---: |
+| portable, `std::fs` | 78.4 ms | 35.2 ms | 30.4 ms | 1.16x |
+| native, `getattrlistbulk` — before | 81.0 ms | 36.6 ms | 30.1 ms | 1.22x |
+| native, `getdirentries64` — after, round 1 | 58.7 ms | 33.9 ms | 29.4 ms | 1.15x |
+| native, `getdirentries64` — after, round 2 | 58.6 ms | 33.1 ms | 30.7 ms | **1.08x** |
+
+Scoped, `{src,packages}/**/*.{ts,tsx}` — the query that prunes:
+
+| Reader | Serial | 4 threads |
+| --- | ---: | ---: |
+| portable, `std::fs` | 12.4 ms | 6.63 ms |
+| native, `getattrlistbulk` — before | 13.9 ms | 7.44 ms |
+| native, `getdirentries64` — after, round 1 | 11.6 ms | 6.18 ms |
+| native, `getdirentries64` — after, round 2 | 11.6 ms | 6.40 ms |
+
+**The serial arm is where the reader shows.** 81.0 ms to 58.7 ms is 28% off a
+walk that is nothing but directory reads and classification, and it is the row
+with the least to hide behind: one thread, one syscall stream. The bulk reader
+was 3% *behind* the portable backend there, which is the finding this section
+exists to record.
+
+**The parallel arm moves less because it is not reader-bound.** 36.6 ms to
+33.1–33.9 ms is 7–10%, and against the anchor 1.22x to 1.08–1.15x. Four threads
+against a warm page cache spend a good share of the walk in the coordination
+and classification the reader change does not touch.
+
+**What this does not establish.** One host, one tree shape, a warm cache, and
+an APFS volume. `getattrlistbulk` returns more than a name and a type, and a
+future walk that wanted those attributes would be reading a different trade;
+today nothing downstream of `Listing::push` can accept one. The spread on the
+noisier rows is real, which is why the anchor is inside each run and why the
+`getdirentries64` measurement was taken twice.
 
 ## Selecting without a caller-side matcher
 
@@ -289,14 +364,39 @@ region, as ferralk's pattern is.
 | `deterministic` non-matching | **11 ns** | 20 ns | — |
 | `long_path` matching | **17 ns** | 194 ns | 551 ns |
 | `long_path` non-matching | **3 ns** | 193 ns | 554 ns |
-| `backtracking` non-matching | 1837 ns | **102 ns** | 258 ns |
+| `backtracking` non-matching † | **3 ns** | 102 ns | 258 ns |
 
-The last row is the one to keep in view: on a pattern built to force
-backtracking, ferralk is 18x slower than `globset`, which compiles to a regex
-engine with no backtracking blow-up. `globset` is also ahead on a literal
-non-match and on one deterministic match. Everywhere else the byte-first matcher
-is ahead, most clearly on long paths, where the baselines pay for path
-normalization ferralk does not do.
+† The ferralk cell of that row was re-measured on 2026-08-20, on the same host
+under rustc 1.97.1, after the prefilter below landed. The two baseline cells are
+the 2026-08-19 numbers for code that did not change.
+
+**The last row used to be the one to keep in view.** On a pattern built to force
+backtracking — `a*a*a*a*b` against a run of `a`s — ferralk ran 1837 ns against
+`globset`'s 102 ns, because nothing in the general engine consulted the
+pattern's trailing literal before exploring: the memoized walk visited the whole
+`tokens × path` state space and only then failed on the final `b`.
+
+Three facts are now read off the token IR when a pattern compiles — the leading
+run of literal and separator tokens, the trailing run, and the bytes the pattern
+consumes with every star empty — and checked before the engine starts. On the
+same host, ferralk arms only:
+
+| Benchmark | before | after |
+| --- | ---: | ---: |
+| `backtracking` non-matching | 1863 ns | **3 ns** |
+| `general_ir` non-matching (`src/*[a-z]?*.rs` vs `src/deep/main.txt`) | 294 ns | **4 ns** |
+| `general_ir` matching (same pattern vs `src/deep/main.rs`) | **79 ns** | 83 ns |
+
+The middle row is the one that matters for a walker: a traversal filter spends
+most of its calls on candidates that do not match. The third row is what the
+check costs when it passes — the engine still runs, and the filter is work on
+top of it. Every other row of the table above reaches a fast path and is
+unchanged to within a nanosecond; the full before/after listing is in the pull
+request that introduced this.
+
+`globset` is still ahead on a literal non-match and on one deterministic match.
+Everywhere else the byte-first matcher is ahead, most clearly on long paths,
+where the baselines pay for path normalization ferralk does not do.
 
 Pattern compilation is measured separately (`compile/*` in the same bench) and
 is not compared against the baselines, whose builders accept different syntax.
