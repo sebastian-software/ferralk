@@ -54,7 +54,6 @@
   "packages": {
     ".": {
       "release-type": "simple",
-      "component": "ferralk",
       "package-name": "ferralk",
       "changelog-path": "CHANGELOG.md",
       "version-file": ".release-please-version",
