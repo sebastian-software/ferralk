@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/sebastian-software/ferralk/compare/v0.4.0...v0.5.0) (2026-08-20)
+
+
+### Features
+
+* **walker:** classify symlink entries by their target on request ([e5027de](https://github.com/sebastian-software/ferralk/commit/e5027de3cafe80954c82d3b6e7742d099e40016e)), closes [#89](https://github.com/sebastian-software/ferralk/issues/89)
+
 ## [0.4.0](https://github.com/sebastian-software/ferralk/compare/v0.3.0...v0.4.0) (2026-08-20)
 
 
