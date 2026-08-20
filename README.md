@@ -66,6 +66,10 @@ on Linux and behind it on macOS. Treat any single row as one shape, and see
 [benchmark evidence](docs/benchmark-evidence.md) for the lanes that carry the
 broader picture.
 
+For the same comparison on real repositories instead of fixtures — including the
+`ignore`-with-hand-pruning arm the RFC's question really turns on — see
+[Palamedes adoption](docs/palamedes-adoption.md).
+
 ## Quick start
 
 Compile a pattern once and match it many times. Syntax that changes meaning is
@@ -124,6 +128,9 @@ unsorted so it can yield entries incrementally.
 - [Corpus format](docs/corpus-format.md) — the JSONL behavioural test corpus.
 - [Architecture RFC](RFC-zig-free-zlob-port.md) and [ADRs](docs/adr/README.md)
   — design rationale and non-goals.
+- [Palamedes adoption](docs/palamedes-adoption.md) — a consumer integration
+  measured over four releases on two real repositories, and what each round
+  changed here.
 - [Deferred follow-up](docs/external-release-gates.md) — open work tracked in
   GitHub after the initial release.
 

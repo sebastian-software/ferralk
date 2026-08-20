@@ -93,6 +93,12 @@ tree of 400 packages, some nesting their own dependencies.
 Absolute numbers are not comparable with the RFC's; the ratios between engines
 on one host are.
 
+The RFC's question — whether existing Rust crates already recover zlob's
+advantage — was also answered on two real repositories rather than a
+reconstruction, by a consumer who built the `ignore` arm the comparison needs
+and then measured against it over four releases. See
+[Palamedes adoption](palamedes-adoption.md).
+
 Every arm is run once before timing and has to return the same file count, so no
 arm can be fast by finding less. Unscoped finds 7,400 files, scoped 2,600.
 
@@ -300,6 +306,8 @@ is not compared against the baselines, whose builders accept different syntax.
 - **Synthetic fixtures.** Every tree here is generated: uniform file sizes, no
   fragmentation, no permission variety, no network filesystems. A real
   repository differs in ways that matter for I/O.
+  [Palamedes adoption](palamedes-adoption.md) is the one record here taken on
+  real repositories, and carries its own limitations.
 - **Warm cache only.** Nothing here measures a cold page cache, which is what a
   first walk after boot pays.
 - **One host per table.** These numbers were taken on one machine. The lanes in
