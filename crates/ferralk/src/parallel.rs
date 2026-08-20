@@ -97,19 +97,39 @@ struct HelperPool<'scope, 'env> {
     shards: &'env Mutex<Vec<Vec<WalkEntry>>>,
 }
 
-/// Directories a walk must have read before it starts its first helper.
+/// Queued directories that make a pool worth starting, once the tree has shown
+/// it is not trivial.
+///
+/// This is the signal #64 measured and it is unchanged: work waiting right now
+/// is what a helper can pick up. What it lacked was any notion of how much
+/// work, which is what [`HELPER_WORK_FLOOR`] adds.
+const HELPER_QUEUE_FLOOR: usize = 8;
+
+/// Directory entries a walk must have seen before a queue counts as worth
+/// paying a thread for.
 ///
 /// Starting a thread costs more than a small tree does: the Palamedes trial
 /// measured every parallel arm losing to its own serial form on a twelve-file
-/// tree, where `ignore` at four threads ran 0.38x its own serial time.
+/// tree, where `ignore` at four threads ran 0.38x its own serial time. Its
+/// sixteen-directory, twelve-file tree cleared the old queue floor at the root -
+/// sixteen directories queued at once - and started a pool with nothing to
+/// give it, running at 0.76x its own serial time.
 ///
-/// Two signals are checked against it, and either one is enough; see
-/// [`Shared::tree_is_worth_helpers`].
+/// Entries, not directories, because entries are what there is to do. The
+/// trial's tree holds 28 of them in total, so a floor above that keeps it
+/// serial, while a tree that fans out for real reaches the floor from its root
+/// listing alone.
+const HELPER_WORK_FLOOR: usize = 32;
+
+/// Entries seen from which a walk is worth helpers whatever its queue looks
+/// like.
 ///
-/// The floor delays the pool, it does not cap it: it is re-checked after every
-/// directory, and a large tree crosses it in its first few before reaching the
-/// configured thread budget as usual.
-const HELPER_TREE_FLOOR: usize = 8;
+/// A handful of directories holding very many files each never queues much: the
+/// old floor left three directories of eighty thousand files running at 1.00x
+/// its own serial time, an entire tree on one thread with three others idle.
+/// One listing that large is worth splitting even though nothing else is
+/// waiting, and by then a thread costs nothing against it.
+const HELPER_LISTING_FLOOR: usize = 1024;
 
 impl<'scope, 'env> HelperPool<'scope, 'env> {
     /// Starts helpers while queued directories outnumber the running workers
@@ -196,8 +216,10 @@ struct Shared<'backend> {
     /// Set by a [`Verdict::Stop`]. Kept apart from `cancellation` so a stop
     /// never reaches into a token the caller owns and may reuse.
     stopped: AtomicBool,
-    /// Directories read so far, the size signal behind [`HELPER_TREE_FLOOR`].
-    directories_read: AtomicUsize,
+    /// Directory entries seen so far, the size signal behind
+    /// [`HELPER_WORK_FLOOR`]. Counted per listing rather than per entry, so a
+    /// directory costs one atomic add however much it holds.
+    entries_seen: AtomicUsize,
     /// Every filesystem call of the walk goes through here, which is what lets
     /// a test mock drive the parallel frontend the same way it drives the
     /// serial one.
@@ -228,7 +250,7 @@ impl<'backend> Shared<'backend> {
             walker,
             visitor,
             stopped: AtomicBool::new(false),
-            directories_read: AtomicUsize::new(0),
+            entries_seen: AtomicUsize::new(0),
             backend,
             scheduler: Scheduler::new(),
             coordinator: Coordinator::new(),
@@ -247,17 +269,17 @@ impl<'backend> Shared<'backend> {
         self.coordinator.wake_waiters();
     }
 
-    /// Whether the tree has shown enough of itself to be worth a helper.
+    /// Whether the tree has shown enough work to be worth a helper.
     ///
-    /// Either signal is enough. Directories already read say how big the tree
-    /// turned out to be, which covers a few directories holding many files; a
-    /// backlog says how much is waiting right now, which covers a root that
-    /// fans out wide before anything deep has been read. Requiring both would
-    /// make a wide, shallow tree walk its first directories serially for no
-    /// reason.
+    /// Queued work says a helper would have something to pick up; entries say
+    /// the tree is large enough for that to be worth a thread. Both together
+    /// is the usual path. A single listing past [`HELPER_LISTING_FLOOR`] is
+    /// enough on its own, because a tree that wide in one directory never
+    /// queues much and would otherwise never spawn at all.
     fn tree_is_worth_helpers(&self) -> bool {
-        self.directories_read.load(Ordering::Acquire) >= HELPER_TREE_FLOOR
-            || self.coordinator.pending() >= HELPER_TREE_FLOOR
+        let entries = self.entries_seen.load(Ordering::Acquire);
+        (entries >= HELPER_WORK_FLOOR && self.coordinator.pending() >= HELPER_QUEUE_FLOOR)
+            || entries >= HELPER_LISTING_FLOOR
     }
 
     fn should_stop(&self) -> bool {
@@ -428,7 +450,9 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
             return;
         }
     };
-    shared.directories_read.fetch_add(1, Ordering::AcqRel);
+    shared
+        .entries_seen
+        .fetch_add(entries.len(), Ordering::AcqRel);
     // The directory's own ignore files join the chain here. Every directory is
     // processed once, so every ignore file is read once, whatever the worker
     // count.
@@ -656,11 +680,11 @@ mod tests {
     /// panics, so the surviving workers have to notice the cancellation.
     /// A tree wide enough to be worth threads.
     ///
-    /// The branch count is above [`super::HELPER_TREE_FLOOR`] on purpose: the walk
-    /// stays serial below it, so a pool test on a smaller tree would be
-    /// asserting against a configuration the walk never uses.
+    /// It holds far more entries than [`super::HELPER_WORK_FLOOR`] on purpose:
+    /// the walk stays serial below the floor, so a pool test on a smaller tree
+    /// would be asserting against a configuration the walk never uses.
     fn create_wide_fixture(root: &Path) {
-        for branch in 0..super::HELPER_TREE_FLOOR + 2 {
+        for branch in 0..10 {
             for nested in 0..4 {
                 let directory = root
                     .join(format!("branch-{branch}"))
@@ -672,6 +696,56 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// What the floor is for, in the two directions it used to get wrong.
+    ///
+    /// A queue on its own says nothing about size: the Palamedes trial's tree
+    /// queues sixteen directories at its root and holds twelve files in total.
+    /// A size on its own says nothing about width: three directories of many
+    /// files each never queue enough to look worth it, and used to walk on one
+    /// thread whatever the budget said.
+    #[test]
+    fn the_floor_weighs_work_rather_than_directories() {
+        let walker = Arc::new(Walker::new("."));
+        let shared = Shared::new(
+            Arc::clone(&walker),
+            &crate::SystemBackend,
+            &crate::keep_every_entry,
+        );
+
+        // The trial's shape: everything it has, queued at once, is still
+        // nothing to do.
+        shared.entries_seen.store(28, Ordering::Release);
+        for _ in 0..16 {
+            shared.coordinator.begin_task();
+        }
+        assert!(
+            !shared.tree_is_worth_helpers(),
+            "a wide but trivial tree must not start a pool"
+        );
+
+        // The same queue, on a tree that turned out to have work in it.
+        shared
+            .entries_seen
+            .store(super::HELPER_WORK_FLOOR, Ordering::Release);
+        assert!(shared.tree_is_worth_helpers());
+
+        // One listing large enough to be worth splitting, with almost nothing
+        // queued behind it.
+        let shared = Shared::new(
+            Arc::clone(&walker),
+            &crate::SystemBackend,
+            &crate::keep_every_entry,
+        );
+        shared
+            .entries_seen
+            .store(super::HELPER_LISTING_FLOOR, Ordering::Release);
+        shared.coordinator.begin_task();
+        assert!(
+            shared.tree_is_worth_helpers(),
+            "a single huge directory is worth helpers even with an empty queue"
+        );
     }
 
     #[test]
