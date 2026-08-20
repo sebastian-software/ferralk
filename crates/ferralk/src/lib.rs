@@ -158,6 +158,7 @@ pub struct WalkOptions {
     metadata: bool,
     directories_only: bool,
     files_only: bool,
+    resolve_symlink_kind: bool,
     skip_hidden: bool,
     keep_git_dir: bool,
     max_depth: Option<usize>,
@@ -186,6 +187,10 @@ impl WalkOptions {
     }
 
     /// Returns only directories while continuing to traverse through them.
+    ///
+    /// A symlink is reported by its own kind, so a link pointing at a directory
+    /// is *not* a directory here unless the walk resolves it - by following
+    /// symlinks, or by [`WalkOptions::resolve_symlink_kind`].
     #[must_use]
     pub const fn directories_only(mut self, enabled: bool) -> Self {
         self.directories_only = enabled;
@@ -193,9 +198,55 @@ impl WalkOptions {
     }
 
     /// Returns only files while continuing to traverse through directories.
+    ///
+    /// A symlink is reported by its own kind, so every symlink counts as a file
+    /// here - including a broken one and one pointing at a directory - unless
+    /// the walk resolves it. [`WalkOptions::resolve_symlink_kind`] is what makes
+    /// this filter agree with `Path::is_file`.
     #[must_use]
     pub const fn files_only(mut self, enabled: bool) -> Self {
         self.files_only = enabled;
+        self
+    }
+
+    /// Classifies symlink entries by what they point at, for the
+    /// [`files_only`](WalkOptions::files_only) and
+    /// [`directories_only`](WalkOptions::directories_only) filters.
+    ///
+    /// A directory listing reports a symlink as a symlink and says nothing
+    /// about its target, so without this the kind filters see every symlink as
+    /// a non-directory: `files_only` keeps broken links and links to
+    /// directories, and `directories_only` drops links to directories. Callers
+    /// who mean `Path::is_file` - which follows the link - get neither.
+    ///
+    /// With this enabled, one `metadata` call per symlink entry decides:
+    ///
+    /// | the link points at | `files_only` | `directories_only` |
+    /// |---|---|---|
+    /// | a file | kept | dropped |
+    /// | a directory | dropped | kept |
+    /// | nothing (broken) | dropped | dropped |
+    ///
+    /// A broken link is an answer rather than a failure - there is no target,
+    /// so the entry is neither a file nor a directory - and is dropped without
+    /// an error. A `metadata` call that fails for any other reason leaves the
+    /// kind unknown, and that *is* reported through the configured
+    /// [`ErrorPolicy`], with the entry dropped either way.
+    ///
+    /// The stat is paid only for symlink entries, only when one of the two kind
+    /// filters is on, and only when the walk is not already following symlinks -
+    /// following resolves the same question on its own. It does not change what
+    /// [`WalkEntry::kind`] reports, which stays what the listing observed, nor
+    /// which entries a pattern matches, nor where the walk descends: this
+    /// switch answers "what is this", while
+    /// [`follow_symlinks`](WalkOptions::follow_symlinks) answers "does the walk
+    /// go through it".
+    ///
+    /// Off by default, because turning it on changes which entries a walk
+    /// returns.
+    #[must_use]
+    pub const fn resolve_symlink_kind(mut self, enabled: bool) -> Self {
+        self.resolve_symlink_kind = enabled;
         self
     }
 
@@ -4742,6 +4793,146 @@ mod tests {
         assert_eq!(state.errors.len(), 1);
         assert_eq!(state.errors[0].operation(), "symlink_metadata");
         assert_eq!(state.errors[0].path(), disappeared);
+    }
+
+    /// Resolving a symlink's kind treats a missing target as an answer, but a
+    /// `metadata` failure for any other reason leaves the kind genuinely
+    /// unknown - and that goes to the error policy rather than being swallowed.
+    ///
+    /// A mock backend, because a stat that fails with anything other than
+    /// `NotFound` is not something a portable fixture can arrange.
+    #[test]
+    fn an_unreadable_symlink_target_is_reported_rather_than_silently_dropped() {
+        struct UnreadableLinkBackend {
+            root: PathBuf,
+            kind: std::io::ErrorKind,
+        }
+
+        impl super::DirectoryBackend for UnreadableLinkBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                listing.clear();
+                if path == self.root {
+                    listing.push("link".as_ref(), false, true);
+                }
+                Ok(())
+            }
+
+            fn metadata(&self, _path: &Path) -> std::io::Result<fs::Metadata> {
+                Err(std::io::Error::from(self.kind))
+            }
+        }
+
+        let fixture = Fixture::new();
+        let walker = Walker::new(&fixture.root).threads(1).options(
+            WalkOptions::default()
+                .files_only(true)
+                .resolve_symlink_kind(true),
+        );
+
+        // A target that is not there answers the question: dropped, no error.
+        let backend = UnreadableLinkBackend {
+            root: fixture.root.clone(),
+            kind: std::io::ErrorKind::NotFound,
+        };
+        let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
+        state
+            .walk_directory(
+                &backend,
+                directory_task(&walker, &backend, fixture.root.clone()),
+            )
+            .expect("a broken link does not end the walk");
+        assert!(state.entries.is_empty(), "a broken link is not a file");
+        assert!(state.errors.is_empty(), "a broken link is not an error");
+
+        // A target we were not allowed to look at does not: dropped and
+        // reported, so the walk cannot silently lose an entry it could not
+        // classify.
+        let backend = UnreadableLinkBackend {
+            root: fixture.root.clone(),
+            kind: std::io::ErrorKind::PermissionDenied,
+        };
+        let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
+        state
+            .walk_directory(
+                &backend,
+                directory_task(&walker, &backend, fixture.root.clone()),
+            )
+            .expect("the collect policy retains the metadata error");
+        assert!(state.entries.is_empty());
+        assert_eq!(state.errors.len(), 1);
+        assert_eq!(state.errors[0].operation(), "metadata");
+        assert_eq!(state.errors[0].path(), fixture.root.join("link"));
+    }
+
+    /// The stat is not paid for entries that cannot need it: an ordinary file,
+    /// and a symlink in a walk that has no kind filter to answer.
+    #[test]
+    fn resolving_stats_only_symlinks_that_a_kind_filter_asks_about() {
+        struct CountingLinkBackend {
+            root: PathBuf,
+            stats: std::cell::Cell<usize>,
+        }
+
+        impl super::DirectoryBackend for CountingLinkBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                listing.clear();
+                if path == self.root {
+                    listing.push("plain.txt".as_ref(), false, false);
+                    listing.push("link".as_ref(), false, true);
+                }
+                Ok(())
+            }
+
+            fn metadata(&self, _path: &Path) -> std::io::Result<fs::Metadata> {
+                self.stats.set(self.stats.get() + 1);
+                fs::metadata(&self.root)
+            }
+        }
+
+        let count = |options: WalkOptions| {
+            let fixture = Fixture::new();
+            let walker = Walker::new(&fixture.root).threads(1).options(options);
+            let backend = CountingLinkBackend {
+                root: fixture.root.clone(),
+                stats: std::cell::Cell::new(0),
+            };
+            let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
+            state
+                .walk_directory(
+                    &backend,
+                    directory_task(&walker, &backend, fixture.root.clone()),
+                )
+                .expect("walk succeeds");
+            backend.stats.get()
+        };
+
+        assert_eq!(
+            count(WalkOptions::default().resolve_symlink_kind(true)),
+            0,
+            "no kind filter is asking, so there is nothing to resolve"
+        );
+        assert_eq!(
+            count(WalkOptions::default().files_only(true)),
+            0,
+            "the option is off"
+        );
+        assert_eq!(
+            count(
+                WalkOptions::default()
+                    .files_only(true)
+                    .resolve_symlink_kind(true)
+            ),
+            1,
+            "one stat, for the symlink only"
+        );
     }
 
     #[cfg(any(

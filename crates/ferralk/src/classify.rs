@@ -102,20 +102,27 @@ pub(crate) struct EntryFailure {
 /// Whether an entry that survived the traversal filters is part of the result
 /// set. Traversal and emission are separate questions: a directory can be
 /// walked into without being emitted, and the other way round.
+///
+/// `kind_is_dir` is what the kind filters count this entry as: a directory, a
+/// file, or - only ever for a symlink whose target is gone - neither. It is
+/// what the listing observed unless
+/// [`WalkOptions::resolve_symlink_kind`](crate::WalkOptions::resolve_symlink_kind)
+/// asked for the target's kind instead.
 fn should_emit(
     walker: &Walker,
     root: usize,
     is_dir: bool,
+    kind_is_dir: Option<bool>,
     bytes: &[u8],
     git_ignored: bool,
 ) -> bool {
     if git_ignored {
         return false;
     }
-    if walker.options.directories_only && !is_dir {
+    if walker.options.directories_only && kind_is_dir != Some(true) {
         return false;
     }
-    if walker.options.files_only && is_dir {
+    if walker.options.files_only && kind_is_dir != Some(false) {
         return false;
     }
     let includes = &walker.roots[root].includes;
@@ -202,7 +209,50 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
             .iter()
             .any(|pattern| pattern.covers_subtree(bytes.as_ref(), walker.wildcard_mode))
         && walker.may_descend_at(root, depth, bytes.as_ref());
-    let emit = should_emit(walker, root, is_dir, bytes.as_ref(), git_ignored);
+    // What the kind filters count this entry as. A listing reports a symlink as
+    // a symlink and nothing about its target, so left alone the filters read
+    // every unfollowed symlink as a non-directory. Resolving costs one stat and
+    // is therefore paid only for a symlink, only when a kind filter is on to
+    // ask the question, and only when following has not already answered it.
+    let mut kind_is_dir = Some(is_dir);
+    if walker.options.resolve_symlink_kind
+        && entry.is_symlink()
+        && !walker.options.follow_symlinks
+        && (walker.options.files_only || walker.options.directories_only)
+    {
+        match backend.metadata(path) {
+            Ok(metadata) => kind_is_dir = Some(metadata.is_dir()),
+            // A link with nothing at the end of it is neither a file nor a
+            // directory. That is an answer, not a failure: dangling links are
+            // ordinary, and reporting one per link would flood the error
+            // channel and end an `Abort` walk over a build artefact.
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => kind_is_dir = None,
+            // Anything else leaves the kind genuinely unknown, which the error
+            // policy gets to decide about. The entry is dropped either way,
+            // because neither filter can be answered for it.
+            Err(source) => {
+                return EntryAction::Failed {
+                    failure: EntryFailure {
+                        operation: "metadata",
+                        path: path.to_path_buf(),
+                        source,
+                    },
+                    // Nothing to traverse: a listing never reports a symlink as
+                    // a directory, and this branch is only reached when the
+                    // walk is not following symlinks, so `descend` is false.
+                    descend: None,
+                };
+            }
+        }
+    }
+    let emit = should_emit(
+        walker,
+        root,
+        is_dir,
+        kind_is_dir,
+        bytes.as_ref(),
+        git_ignored,
+    );
 
     // The rules a subtree inherits travel with it, so the frontends never
     // re-derive them. A queued directory outlives the scratch buffer, so this

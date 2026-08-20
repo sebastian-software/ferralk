@@ -70,7 +70,7 @@ let result = Walker::new(".")
 | `ZLOB_FOLLOW_SYMLINKS` | `WalkOptions::follow_symlinks(true)` |
 | `ZLOB_ERR` | `ErrorPolicy::{Abort, Skip, Collect}` |
 | `ZLOB_ONLYDIR` | `WalkOptions::directories_only(true)` |
-| `ZLOB_WALK_NO_REPORT_DIRS` | `WalkOptions::files_only(true)` |
+| `ZLOB_WALK_NO_REPORT_DIRS` | `WalkOptions::files_only(true)` (same symlink handling as zlob; see below) |
 | walker `max_depth` | `WalkOptions::max_depth(depth)` |
 | walker entry depth | `WalkEntry::depth()` counts relative components below the root |
 | walker entry basename | `WalkEntry::basename()` preserves the native `OsStr` name |
@@ -234,6 +234,23 @@ same way. It is a matching policy, independent of `match_hidden` and of
   unmodified instead of appending display-only separators.
 - `zlob_at` maps naturally to `Walker::new(root)`, but there is no separate
   descriptor-relative entry point yet.
+- `WalkOptions::resolve_symlink_kind(true)` is an extension zlob has no
+  equivalent for, and it is off by default so the default agrees with zlob.
+  Both engines filter on the kind a directory listing reports, and a listing
+  reports a symlink as a symlink without saying what it points at. Measured
+  against zlob 1.6.3 with the oracle in
+  `tools/oracle/tests/zlob_walk_symlinks.rs`, `ZLOB_WALK_NO_REPORT_DIRS`
+  returns all three symlink shapes — link to a file, link to a directory, and
+  broken link — and suppresses only real directories. `files_only(true)` does
+  the same. Callers who mean `Path::is_file`, which follows the link, opt into
+  `resolve_symlink_kind(true)`: it classifies symlink entries by their target,
+  so `files_only` keeps only links to files and `directories_only` starts
+  keeping links to directories, at one `stat` per symlink entry. A broken link
+  is then neither kind and is dropped without an error; a `stat` failing for
+  any other reason is reported through the `ErrorPolicy`. This differs from
+  `follow_symlinks(true)`, where a broken link is a *traversal* failure and is
+  reported: following was asked to walk through the link, while resolving only
+  asked what it is.
 - Backslash escapes inside character classes follow bash and glibc/BSD
   `fnmatch`: an escaped `-` is a literal member and never a range operator
   (`[a\-z]` is exactly `{a, -, z}`). zlob 1.6.3 performs no escape processing

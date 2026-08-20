@@ -39,6 +39,18 @@ impl Fixture {
             .expect("create fixture parent");
         fs::write(path, b"fixture").expect("write fixture file");
     }
+
+    fn directory(&self, path: impl AsRef<Path>) {
+        fs::create_dir_all(self.root.join(path)).expect("create fixture directory");
+    }
+
+    /// A relative symlink, so the fixture stays movable and a broken link stays
+    /// broken for the right reason.
+    #[cfg(unix)]
+    fn link(&self, target: impl AsRef<Path>, name: impl AsRef<Path>) {
+        std::os::unix::fs::symlink(target.as_ref(), self.root.join(name))
+            .expect("create fixture symlink");
+    }
 }
 
 impl Drop for Fixture {
@@ -54,6 +66,18 @@ impl Drop for Fixture {
 /// directories differently but classify entries in one place, so a filter that
 /// reaches one of them has to reach all three.
 fn paths_from_every_frontend(configure: impl Fn(Walker) -> Walker, root: &Path) -> Vec<PathBuf> {
+    paths_from_every_frontend_with(WalkOptions::default(), configure, root)
+}
+
+/// The same agreement check for a configuration that needs [`WalkOptions`],
+/// which every frontend has to receive alike - `stream` included, since it is
+/// the one that does not take the sorted collect path.
+fn paths_from_every_frontend_with(
+    options: WalkOptions,
+    configure: impl Fn(Walker) -> Walker,
+    root: &Path,
+) -> Vec<PathBuf> {
+    let options = options.sort(true);
     let relative = |path: &Path| {
         path.strip_prefix(root)
             .expect("entry is rooted in fixture")
@@ -62,7 +86,7 @@ fn paths_from_every_frontend(configure: impl Fn(Walker) -> Walker, root: &Path) 
     let collected = |threads: usize| {
         configure(Walker::new(root))
             .threads(threads)
-            .options(WalkOptions::default().sort(true))
+            .options(options)
             .collect()
             .expect("collect succeeds")
             .entries()
@@ -73,7 +97,7 @@ fn paths_from_every_frontend(configure: impl Fn(Walker) -> Walker, root: &Path) 
     let visited = |threads: usize| {
         configure(Walker::new(root))
             .threads(threads)
-            .options(WalkOptions::default().sort(true))
+            .options(options)
             .visit(|_| Verdict::Keep)
             .expect("visit succeeds")
             .entries()
@@ -96,6 +120,7 @@ fn paths_from_every_frontend(configure: impl Fn(Walker) -> Walker, root: &Path) 
         "parallel visit differs from serial collect"
     );
     let mut streamed = configure(Walker::new(root))
+        .options(options)
         .stream()
         .map(|entry| relative(entry.expect("stream succeeds").path()))
         .collect::<Vec<_>>();
@@ -635,4 +660,264 @@ fn preserves_non_utf8_path_in_public_integration_api() {
             .strip_prefix(&fixture.root)
             .is_ok_and(|relative| relative == Path::new(&name))
     }));
+}
+
+/// One tree holding an ordinary file, an ordinary directory, and one link of
+/// each of the three shapes.
+#[cfg(unix)]
+fn symlink_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write("plain.txt");
+    fixture.directory("plain-dir");
+    fixture.write("target-file.txt");
+    fixture.directory("target-dir");
+    fixture.link("target-file.txt", "link-to-file");
+    fixture.link("target-dir", "link-to-dir");
+    fixture.link("nowhere", "link-broken");
+    fixture
+}
+
+/// The three symlink shapes against both kind filters, on every frontend.
+///
+/// A listing reports a symlink as a symlink and says nothing about its target,
+/// so `files_only` counts every one of them as a file and `directories_only`
+/// counts none of them as a directory. That is also what zlob 1.6.3 does under
+/// `ZLOB_WALK_NO_REPORT_DIRS` - measured by the oracle in
+/// `tools/oracle/tests/zlob_walk_symlinks.rs` - so it stays the default.
+#[cfg(unix)]
+#[test]
+fn symlink_kinds_reach_both_filters_unresolved_by_default() {
+    let fixture = symlink_fixture();
+
+    let files = paths_from_every_frontend_with(
+        WalkOptions::default().files_only(true),
+        |walker| walker,
+        &fixture.root,
+    );
+    assert_eq!(
+        files,
+        vec![
+            PathBuf::from("link-broken"),
+            PathBuf::from("link-to-dir"),
+            PathBuf::from("link-to-file"),
+            PathBuf::from("plain.txt"),
+            PathBuf::from("target-file.txt"),
+        ],
+        "unresolved, every symlink counts as a file"
+    );
+
+    let directories = paths_from_every_frontend_with(
+        WalkOptions::default().directories_only(true),
+        |walker| walker,
+        &fixture.root,
+    );
+    assert_eq!(
+        directories,
+        vec![PathBuf::from("plain-dir"), PathBuf::from("target-dir")],
+        "unresolved, no symlink counts as a directory"
+    );
+}
+
+/// The same three shapes with `resolve_symlink_kind`, which is what makes the
+/// two filters agree with `Path::is_file` and `Path::is_dir`.
+#[cfg(unix)]
+#[test]
+fn resolving_symlink_kind_sorts_the_three_shapes_by_target() {
+    let fixture = symlink_fixture();
+
+    let files = paths_from_every_frontend_with(
+        WalkOptions::default()
+            .files_only(true)
+            .resolve_symlink_kind(true),
+        |walker| walker,
+        &fixture.root,
+    );
+    assert_eq!(
+        files,
+        vec![
+            PathBuf::from("link-to-file"),
+            PathBuf::from("plain.txt"),
+            PathBuf::from("target-file.txt"),
+        ],
+        "resolved, only the link to a file counts as a file"
+    );
+    // The property the option exists for, checked against the standard library
+    // rather than against itself.
+    for entry in &files {
+        assert!(
+            fixture.root.join(entry).is_file(),
+            "{} is not what Path::is_file calls a file",
+            entry.display()
+        );
+    }
+
+    let directories = paths_from_every_frontend_with(
+        WalkOptions::default()
+            .directories_only(true)
+            .resolve_symlink_kind(true),
+        |walker| walker,
+        &fixture.root,
+    );
+    assert_eq!(
+        directories,
+        vec![
+            PathBuf::from("link-to-dir"),
+            PathBuf::from("plain-dir"),
+            PathBuf::from("target-dir"),
+        ],
+        "resolved, the link to a directory counts as a directory"
+    );
+    for entry in &directories {
+        assert!(
+            fixture.root.join(entry).is_dir(),
+            "{} is not what Path::is_dir calls a directory",
+            entry.display()
+        );
+    }
+}
+
+/// A broken link is dropped rather than reported: dangling links are ordinary,
+/// and an error for each would flood `errors()` and end an `Abort` walk over a
+/// stale build artefact.
+#[cfg(unix)]
+#[test]
+fn a_broken_link_is_dropped_without_an_error_under_every_policy() {
+    let fixture = Fixture::new();
+    fixture.write("plain.txt");
+    fixture.link("nowhere", "link-broken");
+
+    for policy in [ErrorPolicy::Collect, ErrorPolicy::Skip, ErrorPolicy::Abort] {
+        for threads in [1, 4] {
+            let result = Walker::new(&fixture.root)
+                .threads(threads)
+                .error_policy(policy)
+                .options(
+                    WalkOptions::default()
+                        .files_only(true)
+                        .resolve_symlink_kind(true)
+                        .sort(true),
+                )
+                .collect()
+                .unwrap_or_else(|error| {
+                    panic!("{policy:?} on {threads} threads aborted on a broken link: {error}")
+                });
+            assert!(
+                result.errors().is_empty(),
+                "{policy:?} on {threads} threads reported an error for a broken link"
+            );
+            let names = result
+                .entries()
+                .iter()
+                .map(|entry| {
+                    entry
+                        .path()
+                        .strip_prefix(&fixture.root)
+                        .expect("entry is rooted in fixture")
+                        .to_path_buf()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                vec![PathBuf::from("plain.txt")],
+                "{policy:?} on {threads} threads"
+            );
+        }
+    }
+}
+
+/// Resolving does not change what the entry says it is: the link is still a
+/// symlink, and only the kind filters looked past it.
+#[cfg(unix)]
+#[test]
+fn resolving_leaves_the_reported_kind_alone() {
+    let fixture = symlink_fixture();
+
+    let result = Walker::new(&fixture.root)
+        .options(
+            WalkOptions::default()
+                .files_only(true)
+                .resolve_symlink_kind(true)
+                .sort(true),
+        )
+        .collect()
+        .expect("walk succeeds");
+    let link = result
+        .entries()
+        .iter()
+        .find(|entry| entry.path().ends_with("link-to-file"))
+        .expect("the link to a file survives files_only");
+    assert_eq!(link.kind(), ferralk::WalkEntryKind::Symlink);
+    assert!(link.is_symlink());
+    assert!(!link.is_dir());
+}
+
+/// Following symlinks already answers the kind question, so the option adds
+/// nothing there - and must not subtract anything either.
+///
+/// The fixture leaves the broken link out on purpose: under `follow_symlinks`
+/// that is a reported error rather than an entry, which is the asymmetry the
+/// next test pins.
+#[cfg(unix)]
+#[test]
+fn following_symlinks_classifies_the_same_way_with_or_without_resolving() {
+    let fixture = Fixture::new();
+    fixture.write("plain.txt");
+    fixture.directory("plain-dir");
+    fixture.write("target-file.txt");
+    fixture.directory("target-dir");
+    fixture.link("target-file.txt", "link-to-file");
+    fixture.link("target-dir", "link-to-dir");
+
+    for filters in [
+        WalkOptions::default().files_only(true),
+        WalkOptions::default().directories_only(true),
+    ] {
+        let following = filters.follow_symlinks(true);
+        assert_eq!(
+            paths_from_every_frontend_with(following, |walker| walker, &fixture.root),
+            paths_from_every_frontend_with(
+                following.resolve_symlink_kind(true),
+                |walker| walker,
+                &fixture.root
+            ),
+            "resolving changed a walk that already follows symlinks"
+        );
+    }
+}
+
+/// The two switches answer different questions about a broken link, and the
+/// difference is deliberate.
+///
+/// `follow_symlinks` was told to walk *through* the link and cannot, so the
+/// failed `metadata` is reported. `resolve_symlink_kind` only asked *what* the
+/// link is, and "nothing is there" answers that: the entry is neither a file
+/// nor a directory, so both filters drop it and no error is raised.
+#[cfg(unix)]
+#[test]
+fn a_broken_link_errors_when_followed_and_is_merely_dropped_when_resolved() {
+    let fixture = Fixture::new();
+    fixture.write("plain.txt");
+    fixture.link("nowhere", "link-broken");
+
+    let errors_of = |options: WalkOptions| {
+        Walker::new(&fixture.root)
+            .error_policy(ErrorPolicy::Collect)
+            .options(options.files_only(true).sort(true))
+            .collect()
+            .expect("collect retains errors rather than aborting")
+            .errors()
+            .iter()
+            .map(|error| error.operation())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        errors_of(WalkOptions::default().follow_symlinks(true)),
+        vec!["metadata"],
+        "following a broken link is a traversal failure and is reported"
+    );
+    assert!(
+        errors_of(WalkOptions::default().resolve_symlink_kind(true)).is_empty(),
+        "resolving a broken link is an answer, not a failure"
+    );
 }
