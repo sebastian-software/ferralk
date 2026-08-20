@@ -1,7 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
   "include-component-in-tag": false,
-  "last-release-sha": "171bac009c89007a2b3c81524ffea86172615dc9",
   "pull-request-title-pattern": "chore: release ${component} ${version}",
   "separate-pull-requests": false,
   "changelog-sections": [
