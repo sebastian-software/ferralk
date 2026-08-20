@@ -15,10 +15,11 @@ use std::{
 use crossbeam_deque::{Steal, Stealer, Worker};
 
 use super::{
-    BackendEntry, CYCLE_KEY_OPERATION, CycleKey, DirectoryBackend, EntryVisitor, ErrorPolicy,
-    Verdict, WalkEntry, WalkError, WalkResult, Walker,
-    classify::{DirectoryTask, EntryAction, classify_entry},
+    CYCLE_KEY_OPERATION, CycleKey, DirectoryBackend, EntryVisitor, ErrorPolicy, Listing, Verdict,
+    WalkEntry, WalkError, WalkResult, Walker,
+    classify::{DirectoryTask, EmittedEntry, EntryAction, classify_entry},
     gitignore::IgnoreScope,
+    own_path,
     scheduler::{Coordinator, Scheduler, WorkerSlot},
 };
 
@@ -39,6 +40,7 @@ pub(super) fn collect<B: DirectoryBackend + Sync>(
         let _root_task = shared.coordinator.claim_task();
         let root = DirectoryTask {
             path: walker.root.clone(),
+            depth: 0,
             ignores: IgnoreScope::root(&walker, backend),
         };
         process_directory(&shared, &mut caller, root);
@@ -290,11 +292,23 @@ impl<'backend> Shared<'backend> {
     ///
     /// A [`Verdict::Stop`] ends the walk the way cancellation does, waking the
     /// parked workers so none of them sits out the rest of the walk.
-    fn emit(&self, worker: &mut WorkerScratch, entry: WalkEntry) {
+    ///
+    /// The entry's path is copied out of the worker's scratch here, into the
+    /// buffer the last dropped entry gave back — so a worker whose visitor
+    /// keeps nothing runs without allocating.
+    fn emit(&self, worker: &mut WorkerScratch, emitted: EmittedEntry) {
+        let WorkerScratch {
+            entries,
+            path,
+            spare,
+            ..
+        } = worker;
+        let entry = emitted.with_path(own_path(spare, path));
         match (self.visitor)(&entry) {
-            Verdict::Keep => worker.entries.push(entry),
-            Verdict::Skip => {}
+            Verdict::Keep => entries.push(entry),
+            Verdict::Skip => *spare = entry.path,
             Verdict::Stop => {
+                *spare = entry.path;
                 self.stopped.store(true, Ordering::Release);
                 self.coordinator.wake_waiters();
             }
@@ -346,6 +360,14 @@ struct WorkerScratch {
     index: usize,
     queue: Worker<DirectoryTask>,
     entries: Vec<WalkEntry>,
+    /// The directory this worker is reading. It takes tasks off a queue rather
+    /// than descending by recursion, so one directory is open at a time and
+    /// one set of buffers is enough.
+    listing: Listing,
+    /// That directory's path, with the entry being classified pushed onto it.
+    path: PathBuf,
+    /// The path buffer the last dropped entry left behind. See [`own_path`].
+    spare: PathBuf,
 }
 
 impl WorkerScratch {
@@ -354,6 +376,9 @@ impl WorkerScratch {
             index,
             queue: Worker::new_fifo(),
             entries: Vec::new(),
+            listing: Listing::default(),
+            path: PathBuf::new(),
+            spare: PathBuf::new(),
         }
     }
 
@@ -432,7 +457,11 @@ fn try_take(
 }
 
 fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: DirectoryTask) {
-    let DirectoryTask { path, ignores } = task;
+    let DirectoryTask {
+        path,
+        depth,
+        ignores,
+    } = task;
     #[cfg(test)]
     if should_panic_in_directory(&path) {
         panic!("injected directory panic");
@@ -443,25 +472,36 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
     if shared.walker.options.follow_symlinks && !mark_directory(shared, &path) {
         return;
     }
-    let entries = match shared.backend.read_directory(&path) {
-        Ok(entries) => entries,
-        Err(source) => {
-            shared.record_error("read_dir", path, source);
-            return;
-        }
-    };
+    if let Err(source) = shared.backend.read_directory(&path, &mut worker.listing) {
+        shared.record_error("read_dir", path, source);
+        return;
+    }
     shared
         .entries_seen
-        .fetch_add(entries.len(), Ordering::AcqRel);
+        .fetch_add(worker.listing.entries().len(), Ordering::AcqRel);
     // The directory's own ignore files join the chain here. Every directory is
     // processed once, so every ignore file is read once, whatever the worker
     // count.
-    let ignores = ignores.enter(&shared.walker, shared.backend, &path, &entries);
-    for entry in entries {
+    let ignores = ignores.enter(&shared.walker, shared.backend, &path, &worker.listing);
+    worker.path.clear();
+    worker.path.push(&path);
+    for index in 0..worker.listing.entries().len() {
         if shared.should_stop() {
             return;
         }
-        process_entry(shared, worker, entry, &ignores);
+        // The entry's path exists only for as long as it is being decided
+        // about; anything that outlives that copies it out.
+        worker.path.push(worker.listing.entries()[index].name());
+        let action = classify_entry(
+            &shared.walker,
+            shared.backend,
+            &worker.path,
+            &worker.listing.entries()[index],
+            &ignores,
+            depth,
+        );
+        act(shared, worker, action);
+        worker.path.pop();
     }
 }
 
@@ -477,13 +517,10 @@ fn mark_directory(shared: &Shared, directory: &Path) -> bool {
     }
 }
 
-fn process_entry(
-    shared: &Shared,
-    worker: &mut WorkerScratch,
-    entry: BackendEntry,
-    ignores: &IgnoreScope,
-) {
-    match classify_entry(&shared.walker, shared.backend, entry, ignores) {
+/// Carries out what classification decided about one entry. The entry's path
+/// is still on the worker's scratch, which is where `emit` copies it from.
+fn act(shared: &Shared, worker: &mut WorkerScratch, action: EntryAction) {
+    match action {
         EntryAction::Skip => {}
         EntryAction::Descend(task) => shared.schedule(&worker.queue, task),
         EntryAction::DescendAndEmit(entry, task) => {
