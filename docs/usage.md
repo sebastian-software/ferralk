@@ -94,6 +94,44 @@ Important defaults:
 filesystem operation. It is safe to clone the token and keep it outside the
 walker.
 
+### Filtering with a matcher of your own
+
+`collect()` hands back every entry it found, so a caller that applies its own
+predicate afterwards runs it on one thread over the whole list. On a large tree
+that pass is big enough to cancel out the threads the walk just used.
+
+`visit()` asks the predicate on the worker that produced the entry:
+
+```rust
+use ferralk::{Verdict, Walker};
+
+let result = Walker::new("src")
+    .threads(4)
+    .visit(|entry| {
+        if my_matcher.is_match(entry.path()) {
+            Verdict::Keep
+        } else {
+            Verdict::Skip
+        }
+    })?;
+```
+
+Everything else behaves as it does for `collect()`: cancellation, the error
+policy, panic propagation and sorting are unchanged, and only which entries
+survive differs.
+
+- `Verdict::Skip` drops the entry from the result. It does **not** prune: a
+  directory is still descended into, because pruning a subtree is what
+  `exclude()` expresses.
+- `Verdict::Stop` ends the walk the way a cancellation request does, and
+  `WalkResult::was_cancelled` reports it. A caller-owned `CancellationToken` is
+  left alone.
+- The visitor is shared across workers rather than cloned, so it takes `&self`
+  and must be `Sync`. Per-worker state belongs in a thread-local.
+
+Below a small tree size the walk stays on one thread whatever `threads()` says:
+starting workers costs more than a handful of directories does.
+
 ### Hidden paths: two separate switches
 
 An ordinary wildcard does not cover a leading period, so `**/*.ts` skips

@@ -7,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use ferralk::{ErrorPolicy, WalkOptions, Walker};
+use ferralk::{ErrorPolicy, Verdict, WalkOptions, Walker};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -47,8 +47,9 @@ impl Drop for Fixture {
     }
 }
 
-/// Runs one walker configuration through all three frontends - serial
-/// `collect`, parallel `collect`, and `stream` - and returns the sorted
+/// Runs one walker configuration through every frontend - serial `collect`,
+/// parallel `collect`, `visit` on one and four threads, and `stream` - and
+/// returns the sorted
 /// root-relative paths after asserting that they agree. The frontends schedule
 /// directories differently but classify entries in one place, so a filter that
 /// reaches one of them has to reach all three.
@@ -69,8 +70,31 @@ fn paths_from_every_frontend(configure: impl Fn(Walker) -> Walker, root: &Path) 
             .map(|entry| relative(entry.path()))
             .collect::<Vec<_>>()
     };
+    let visited = |threads: usize| {
+        configure(Walker::new(root))
+            .threads(threads)
+            .options(WalkOptions::default().sort(true))
+            .visit(|_| Verdict::Keep)
+            .expect("visit succeeds")
+            .entries()
+            .iter()
+            .map(|entry| relative(entry.path()))
+            .collect::<Vec<_>>()
+    };
     let serial = collected(1);
     assert_eq!(collected(4), serial, "parallel collect differs from serial");
+    // The visitor is a fourth frontend over the same pipeline, so keeping every
+    // entry has to reproduce a plain collect on whatever this fixture holds.
+    assert_eq!(
+        visited(1),
+        serial,
+        "serial visit differs from serial collect"
+    );
+    assert_eq!(
+        visited(4),
+        serial,
+        "parallel visit differs from serial collect"
+    );
     let mut streamed = configure(Walker::new(root))
         .stream()
         .map(|entry| relative(entry.expect("stream succeeds").path()))

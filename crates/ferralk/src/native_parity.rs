@@ -139,7 +139,7 @@ fn describe_errors(errors: &[WalkError], root: &Path) -> Vec<DescribedError> {
 /// Walks the same tree through the portable backend, using the same traversal
 /// code the native walk uses so only the backend differs.
 fn walk_portable(walker: &Walker) -> (Vec<WalkEntry>, Vec<WalkError>) {
-    let mut state = WalkState::new(walker);
+    let mut state = WalkState::new(walker, &crate::keep_every_entry);
     let task = DirectoryTask {
         path: walker.root.clone(),
         ignores: IgnoreScope::root(walker, &StdBackend),
