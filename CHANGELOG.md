@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/sebastian-software/ferralk/compare/v0.5.0...v0.5.1) (2026-08-20)
+
+
+### Performance Improvements
+
+* **walker:** weigh a directory listing in the helper floor ([cfee83d](https://github.com/sebastian-software/ferralk/commit/cfee83d41d99675a04f365a2f4929bdebb2bfac6))
+
 ## [0.5.0](https://github.com/sebastian-software/ferralk/compare/v0.4.0...v0.5.0) (2026-08-20)
 
 
