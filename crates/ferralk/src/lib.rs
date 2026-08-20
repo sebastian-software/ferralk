@@ -10,8 +10,8 @@
 use std::{
     borrow::Cow,
     collections::HashSet,
-    collections::VecDeque,
     error::Error,
+    ffi::{OsStr, OsString},
     fmt, fs,
     path::{Path, PathBuf},
     sync::{
@@ -59,7 +59,7 @@ pub use ignore_rules::fuzz_rule as fuzz_ignore_rule;
 mod parallel;
 mod scheduler;
 
-use classify::{DirectoryTask, EntryAction, classify_entry};
+use classify::{DirectoryTask, EmittedEntry, EntryAction, classify_entry};
 use gitignore::IgnoreScope;
 
 /// Controls what a walk does after a recoverable filesystem error.
@@ -394,6 +394,9 @@ pub(crate) fn keep_every_entry(_: &WalkEntry) -> Verdict {
 #[derive(Debug, Clone)]
 pub struct Walker {
     root: PathBuf,
+    /// Byte index at which the root-relative part of any path this walk builds
+    /// begins. See [`Walker::relative_start`].
+    relative_start: usize,
     includes: Vec<TraversalPattern>,
     excludes: Vec<TraversalPattern>,
     match_hidden: bool,
@@ -406,11 +409,27 @@ pub struct Walker {
 }
 
 impl Walker {
+    /// Where the root-relative part of a walked path starts, in bytes.
+    ///
+    /// Every path the walk produces is the root with names pushed onto it, so
+    /// the offset is the same for all of them and is worth deriving once
+    /// instead of running `strip_prefix` — a component-by-component comparison
+    /// — over every entry. Pushing a name is what settles the question: it is
+    /// what inserts the separator, and it inserts none when the root already
+    /// ends with one or is empty.
+    fn relative_start(root: &Path) -> usize {
+        let mut probe = root.to_path_buf();
+        probe.push("x");
+        probe.as_os_str().as_encoded_bytes().len() - 1
+    }
+
     /// Starts a walk rooted at root.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
         Self {
-            root: root.into(),
+            relative_start: Self::relative_start(&root),
+            root,
             includes: Vec::new(),
             excludes: Vec::new(),
             match_hidden: false,
@@ -610,6 +629,7 @@ impl Walker {
         let scheduler = scheduler::Scheduler::new();
         scheduler.push(DirectoryTask {
             path: self.root.clone(),
+            depth: 0,
             ignores: IgnoreScope::root(&self, backend),
         });
         let worker = scheduler.worker();
@@ -637,12 +657,16 @@ impl Walker {
         WalkStream {
             pending_directories: vec![DirectoryTask {
                 path: self.root.clone(),
+                depth: 0,
                 ignores,
             }],
             walker: self,
-            pending_entries: VecDeque::new(),
+            listing: Listing::default(),
+            next_entry: 0,
+            path: PathBuf::new(),
             visited_directories: HashSet::new(),
             ignores: IgnoreScope::default(),
+            depth: 0,
             cancelled: false,
             stopped: false,
         }
@@ -683,7 +707,11 @@ fn has_hidden_component(path: &[u8]) -> bool {
 /// platform. Native `Path` values retain their platform representation; only
 /// the byte-oriented pattern language is normalized.
 pub(crate) fn glob_path_bytes(path: &Path) -> Cow<'_, [u8]> {
-    let bytes = path.as_os_str().as_encoded_bytes();
+    glob_bytes(path.as_os_str().as_encoded_bytes())
+}
+
+/// The same normalization for a path the caller already has as bytes.
+pub(crate) fn glob_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
     #[cfg(windows)]
     {
         Cow::Owned(
@@ -960,7 +988,12 @@ fn has_closing_parenthesis(pattern: &[u8], open: usize) -> bool {
 /// files is not part of it: those go through the `ignore` crate, which owns
 /// its own IO.
 trait DirectoryBackend {
-    fn read_directory(&self, path: &Path) -> std::io::Result<Vec<BackendEntry>>;
+    /// Reads one directory into `listing`, replacing whatever it held.
+    ///
+    /// The listing is the caller's, and the caller reuses it for every
+    /// directory it reads, so a backend that can name an entry without
+    /// allocating leaves the walk allocating nothing per entry at all.
+    fn read_directory(&self, path: &Path, listing: &mut Listing) -> std::io::Result<()>;
 
     /// Follows symlinks; decides whether a link points at a directory.
     fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
@@ -1026,28 +1059,97 @@ const CYCLE_KEY_OPERATION: &str = "metadata";
 #[cfg(not(unix))]
 const CYCLE_KEY_OPERATION: &str = "canonicalize";
 
-#[derive(Debug, Clone)]
-struct BackendEntry {
-    path: PathBuf,
+/// One directory's entries, held in buffers the walk reuses.
+///
+/// An entry is its name, not its path. The walk builds a whole path only for
+/// the entries it acts on, by pushing the name onto the scratch path it
+/// already holds for the directory — where a `PathBuf` per entry copied the
+/// parent path as well and allocated for it, once for every entry the walk
+/// was about to throw away.
+///
+/// The name buffers are cleared rather than dropped between directories, so a
+/// listing that has been used once names further entries without allocating.
+/// It holds no more than the `Vec<PathBuf>` it replaced: a name is a suffix of
+/// the path that used to be stored whole.
+#[derive(Debug, Default)]
+pub(crate) struct Listing {
+    entries: Vec<ListedEntry>,
+    /// Entries in use. `entries` may be longer: the tail is buffers kept for
+    /// the next directory.
+    len: usize,
+}
+
+/// One entry of a [`Listing`].
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ListedEntry {
+    name: OsString,
     is_dir: bool,
     is_symlink: bool,
+}
+
+impl ListedEntry {
+    pub(crate) fn name(&self) -> &OsStr {
+        &self.name
+    }
+
+    pub(crate) const fn is_dir(&self) -> bool {
+        self.is_dir
+    }
+
+    pub(crate) const fn is_symlink(&self) -> bool {
+        self.is_symlink
+    }
+}
+
+impl Listing {
+    /// Drops the previous directory's entries, keeping their buffers.
+    pub(crate) fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Adds one entry, reusing the buffer left by the directory before.
+    pub(crate) fn push(&mut self, name: &OsStr, is_dir: bool, is_symlink: bool) {
+        if self.len == self.entries.len() {
+            self.entries.push(ListedEntry::default());
+        }
+        let entry = &mut self.entries[self.len];
+        entry.name.clear();
+        entry.name.push(name);
+        entry.is_dir = is_dir;
+        entry.is_symlink = is_symlink;
+        self.len += 1;
+    }
+
+    pub(crate) fn entries(&self) -> &[ListedEntry] {
+        &self.entries[..self.len]
+    }
+
+    /// Whether the directory holds an entry of this name, which is how the
+    /// ignore chain recognizes its own files without probing for them.
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.entries().iter().any(|entry| entry.name == *name)
+    }
 }
 
 struct StdBackend;
 
 impl DirectoryBackend for StdBackend {
-    fn read_directory(&self, path: &Path) -> std::io::Result<Vec<BackendEntry>> {
-        fs::read_dir(path)?
-            .map(|entry| {
-                let entry = entry?;
-                let file_type = entry.file_type()?;
-                Ok(BackendEntry {
-                    path: entry.path(),
-                    is_dir: file_type.is_dir(),
-                    is_symlink: file_type.is_symlink(),
-                })
-            })
-            .collect()
+    fn read_directory(&self, path: &Path, listing: &mut Listing) -> std::io::Result<()> {
+        listing.clear();
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            // `DirEntry` hands its name out by value and nothing else out at
+            // all, so this one allocation is the standard library's and is the
+            // floor for the portable backend. The native backends read names
+            // out of a buffer they own and reach zero.
+            listing.push(
+                &entry.file_name(),
+                file_type.is_dir(),
+                file_type.is_symlink(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1056,13 +1158,13 @@ impl DirectoryBackend for StdBackend {
 struct SystemBackend;
 
 impl DirectoryBackend for SystemBackend {
-    fn read_directory(&self, path: &Path) -> std::io::Result<Vec<BackendEntry>> {
+    fn read_directory(&self, path: &Path, listing: &mut Listing) -> std::io::Result<()> {
         #[cfg(all(feature = "native-macos", target_os = "macos"))]
         {
-            match macos_native::read_directory(path) {
-                Ok(entries) => Ok(entries),
+            match macos_native::read_directory(path, listing) {
+                Ok(()) => Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                    StdBackend.read_directory(path)
+                    StdBackend.read_directory(path, listing)
                 }
                 Err(error) => Err(error),
             }
@@ -1073,10 +1175,10 @@ impl DirectoryBackend for SystemBackend {
             not(all(feature = "native-macos", target_os = "macos"))
         ))]
         {
-            match linux_native::read_directory(path) {
-                Ok(entries) => Ok(entries),
+            match linux_native::read_directory(path, listing) {
+                Ok(()) => Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                    StdBackend.read_directory(path)
+                    StdBackend.read_directory(path, listing)
                 }
                 Err(error) => Err(error),
             }
@@ -1085,7 +1187,7 @@ impl DirectoryBackend for SystemBackend {
             all(feature = "native-macos", target_os = "macos"),
             all(feature = "native-linux", target_os = "linux")
         )))]
-        StdBackend.read_directory(path)
+        StdBackend.read_directory(path, listing)
     }
 }
 
@@ -1094,10 +1196,16 @@ impl DirectoryBackend for SystemBackend {
 pub struct WalkStream {
     walker: Walker,
     pending_directories: Vec<DirectoryTask>,
-    pending_entries: VecDeque<BackendEntry>,
+    /// The directory being delivered and how far through it the stream is.
+    listing: Listing,
+    next_entry: usize,
+    /// That directory's path, with the entry being classified pushed onto it.
+    path: PathBuf,
     visited_directories: HashSet<CycleKey>,
     /// Ignore rules of the directory whose entries are being delivered.
     ignores: IgnoreScope,
+    /// Depth of that same directory, so its entries need not recount it.
+    depth: usize,
     cancelled: bool,
     stopped: bool,
 }
@@ -1136,7 +1244,11 @@ impl WalkStream {
     }
 
     fn prepare_directory(&mut self, task: DirectoryTask) -> Option<Result<WalkEntry, WalkError>> {
-        let DirectoryTask { path, ignores } = task;
+        let DirectoryTask {
+            path,
+            depth,
+            ignores,
+        } = task;
         if self.walker.options.follow_symlinks {
             match SystemBackend.cycle_key(&path) {
                 Ok(key) => {
@@ -1147,27 +1259,46 @@ impl WalkStream {
                 Err(source) => return self.error(CYCLE_KEY_OPERATION, path, source),
             }
         }
-        match SystemBackend.read_directory(&path) {
-            Ok(entries) => {
+        match SystemBackend.read_directory(&path, &mut self.listing) {
+            Ok(()) => {
                 // The directory's own ignore files join the chain here, once,
                 // recognized in the listing that was just read.
-                self.ignores = ignores.enter(&self.walker, &SystemBackend, &path, &entries);
-                self.pending_entries = entries.into();
+                self.ignores = ignores.enter(&self.walker, &SystemBackend, &path, &self.listing);
+                self.depth = depth;
+                self.next_entry = 0;
+                self.path.clear();
+                self.path.push(&path);
                 None
             }
             Err(source) => self.error("read_dir", path, source),
         }
     }
 
-    fn process_entry(&mut self, entry: BackendEntry) -> Option<Result<WalkEntry, WalkError>> {
-        match classify_entry(&self.walker, &SystemBackend, entry, &self.ignores) {
+    /// Classifies the entry at `index` of the directory being delivered.
+    ///
+    /// The entry's path is assembled onto the scratch buffer and taken back off
+    /// it again, so the stream holds one path buffer rather than one per entry.
+    fn process_entry(&mut self, index: usize) -> Option<Result<WalkEntry, WalkError>> {
+        self.path.push(self.listing.entries()[index].name());
+        let action = classify_entry(
+            &self.walker,
+            &SystemBackend,
+            &self.path,
+            &self.listing.entries()[index],
+            &self.ignores,
+            self.depth,
+        );
+        // Only an emitted entry needs a path of its own, and the stream hands
+        // every one of them to the caller.
+        let emitted = match action {
             EntryAction::Skip => None,
             EntryAction::Descend(task) => {
                 self.pending_directories.push(task);
                 None
             }
-            EntryAction::Emit(entry) => Some(Ok(entry)),
+            EntryAction::Emit(entry) => Some(Ok(entry.with_path(self.path.clone()))),
             EntryAction::DescendAndEmit(entry, task) => {
+                let entry = entry.with_path(self.path.clone());
                 self.pending_directories.push(task);
                 Some(Ok(entry))
             }
@@ -1177,7 +1308,9 @@ impl WalkStream {
                 }
                 self.error(failure.operation, failure.path, failure.source)
             }
-        }
+        };
+        self.path.pop();
+        emitted
     }
 }
 
@@ -1190,8 +1323,10 @@ impl Iterator for WalkStream {
                 self.stopped = true;
                 return None;
             }
-            if let Some(entry) = self.pending_entries.pop_front() {
-                if let Some(result) = self.process_entry(entry) {
+            if self.next_entry < self.listing.entries().len() {
+                let index = self.next_entry;
+                self.next_entry += 1;
+                if let Some(result) = self.process_entry(index) {
                     return Some(result);
                 }
                 continue;
@@ -1211,7 +1346,39 @@ struct WalkState<'walker> {
     entries: Vec<WalkEntry>,
     errors: Vec<WalkError>,
     visited_directories: HashSet<CycleKey>,
+    /// Buffers of directories this frontend has finished with. It descends by
+    /// recursion, so several directories are open at once and each needs its
+    /// own; a pool hands the deepest frame the buffers the last one returned.
+    scratch: Vec<DirectoryScratch>,
+    /// The path buffer the last dropped entry left behind. See [`own_path`].
+    spare: PathBuf,
     cancelled: bool,
+}
+
+/// What reading one directory needs: its listing, and the path buffer its
+/// entries are assembled onto.
+#[derive(Default)]
+struct DirectoryScratch {
+    listing: Listing,
+    path: PathBuf,
+}
+
+/// Copies `path` into a buffer of its own, reusing `spare` when an entry the
+/// walk dropped left one behind.
+///
+/// This is what makes a `Verdict::Skip` free: the visitor needs a `WalkEntry`
+/// and a `WalkEntry` owns its path, so one has to be built — but the buffer it
+/// is built in can be the one the previous skipped entry gave back, and then
+/// no allocator call happens at all.
+fn own_path(spare: &mut PathBuf, path: &Path) -> PathBuf {
+    let mut owned = std::mem::take(spare);
+    if owned.capacity() == 0 {
+        // Nothing came back, so this entry buys its own buffer, sized exactly.
+        return path.to_path_buf();
+    }
+    owned.clear();
+    owned.as_mut_os_string().push(path.as_os_str());
+    owned
 }
 
 impl<'walker> WalkState<'walker> {
@@ -1222,16 +1389,25 @@ impl<'walker> WalkState<'walker> {
             entries: Vec::new(),
             errors: Vec::new(),
             visited_directories: HashSet::new(),
+            scratch: Vec::new(),
+            spare: PathBuf::new(),
             cancelled: false,
         }
     }
 
     /// Asks the visitor about one entry and keeps it if it said so.
-    fn emit(&mut self, entry: WalkEntry) {
+    ///
+    /// A verdict that drops the entry hands its path buffer back, so the next
+    /// entry is assembled in it rather than in a fresh allocation.
+    fn emit(&mut self, path: &Path, emitted: EmittedEntry) {
+        let entry = emitted.with_path(own_path(&mut self.spare, path));
         match (self.visitor)(&entry) {
             Verdict::Keep => self.entries.push(entry),
-            Verdict::Skip => {}
-            Verdict::Stop => self.cancelled = true,
+            Verdict::Skip => self.spare = entry.path,
+            Verdict::Stop => {
+                self.spare = entry.path;
+                self.cancelled = true;
+            }
         }
     }
 
@@ -1243,22 +1419,57 @@ impl<'walker> WalkState<'walker> {
         if self.check_cancellation() {
             return Ok(());
         }
-        let DirectoryTask { path, ignores } = task;
+        let DirectoryTask {
+            path,
+            depth,
+            ignores,
+        } = task;
         if self.walker.options.follow_symlinks && !self.mark_directory(backend, &path)? {
             return Ok(());
         }
-        let entries = match backend.read_directory(&path) {
-            Ok(entries) => entries,
-            Err(source) => return self.handle_error("read_dir", path, source),
-        };
+        let mut scratch = self.scratch.pop().unwrap_or_default();
+        let outcome = self.walk_listing(backend, &path, depth, ignores, &mut scratch);
+        scratch.listing.clear();
+        self.scratch.push(scratch);
+        outcome
+    }
+
+    /// The body of [`WalkState::walk_directory`], with the directory's buffers
+    /// held apart so they are returned to the pool however it ends.
+    fn walk_listing(
+        &mut self,
+        backend: &impl DirectoryBackend,
+        path: &Path,
+        depth: usize,
+        ignores: IgnoreScope,
+        scratch: &mut DirectoryScratch,
+    ) -> Result<(), WalkError> {
+        if let Err(source) = backend.read_directory(path, &mut scratch.listing) {
+            return self.handle_error("read_dir", path.to_path_buf(), source);
+        }
         // The directory's own ignore files join the chain here, once,
         // recognized in the listing that was just read.
-        let ignores = ignores.enter(self.walker, backend, &path, &entries);
-        for entry in entries {
+        let ignores = ignores.enter(self.walker, backend, path, &scratch.listing);
+        scratch.path.clear();
+        scratch.path.push(path);
+        for index in 0..scratch.listing.entries().len() {
             if self.check_cancellation() {
                 return Ok(());
             }
-            self.visit_entry(backend, entry, &ignores)?;
+            // The entry's path exists only for as long as it is being decided
+            // about; anything that outlives that copies it out.
+            scratch.path.push(scratch.listing.entries()[index].name());
+            let action = classify_entry(
+                self.walker,
+                backend,
+                &scratch.path,
+                &scratch.listing.entries()[index],
+                &ignores,
+                depth,
+            );
+            let outcome = self.act(backend, action, &scratch.path);
+            scratch.path.pop();
+            outcome?;
         }
         Ok(())
     }
@@ -1277,27 +1488,30 @@ impl<'walker> WalkState<'walker> {
         }
     }
 
-    fn visit_entry(
+    /// Carries out what classification decided about one entry.
+    ///
+    /// `path` is the entry's path, borrowed from the scratch of the directory
+    /// being read. A subtree walked from here takes its buffers from the pool,
+    /// so it never disturbs that scratch and the path stays valid across the
+    /// descent.
+    fn act(
         &mut self,
         backend: &impl DirectoryBackend,
-        entry: BackendEntry,
-        ignores: &IgnoreScope,
+        action: EntryAction,
+        path: &Path,
     ) -> Result<(), WalkError> {
-        if self.check_cancellation() {
-            return Ok(());
-        }
-        match classify_entry(self.walker, backend, entry, ignores) {
+        match action {
             EntryAction::Skip => Ok(()),
             EntryAction::Descend(task) => self.walk_directory(backend, task),
             EntryAction::Emit(entry) => {
-                self.emit(entry);
+                self.emit(path, entry);
                 Ok(())
             }
             // The subtree is walked before the directory itself is recorded,
             // which is the depth-first order this frontend has always had.
             EntryAction::DescendAndEmit(entry, task) => {
                 self.walk_directory(backend, task)?;
-                self.emit(entry);
+                self.emit(path, entry);
                 Ok(())
             }
             EntryAction::Failed { failure, descend } => {
@@ -1337,10 +1551,8 @@ impl<'walker> WalkState<'walker> {
     }
 }
 
-fn should_skip_git_directory(walker: &Walker, path: &Path) -> bool {
-    walker.respect_git_ignore
-        && !walker.options.keep_git_dir
-        && path.file_name().is_some_and(|name| name == ".git")
+fn should_skip_git_directory(walker: &Walker, name: &OsStr) -> bool {
+    walker.respect_git_ignore && !walker.options.keep_git_dir && name == ".git"
 }
 
 /// Crate version exposed for build and integration diagnostics.
@@ -1601,6 +1813,7 @@ mod tests {
     ) -> super::DirectoryTask {
         super::DirectoryTask {
             path,
+            depth: 0,
             ignores: super::IgnoreScope::root(walker, backend),
         }
     }
@@ -1626,8 +1839,8 @@ mod tests {
     }
 
     impl super::DirectoryBackend for CountingBackend {
-        fn read_directory(&self, path: &Path) -> std::io::Result<Vec<super::BackendEntry>> {
-            super::StdBackend.read_directory(path)
+        fn read_directory(&self, path: &Path, listing: &mut super::Listing) -> std::io::Result<()> {
+            super::StdBackend.read_directory(path, listing)
         }
 
         fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
@@ -1965,6 +2178,146 @@ mod tests {
         assert!(!c.is_dir());
         assert_eq!(c.kind(), WalkEntryKind::File);
         assert_eq!(c.depth(), 3);
+    }
+
+    /// Depth is now carried down the tree instead of being recounted from each
+    /// entry's path. The two have to agree, so the definition it replaced is
+    /// the oracle: the components between the walk root and the entry.
+    #[test]
+    fn carried_depth_matches_the_component_count_it_replaced() {
+        let fixture = Fixture::new();
+        fixture.write("a.txt");
+        fixture.write("one/b.txt");
+        fixture.write("one/two/c.txt");
+        fixture.write("one/two/three/d.txt");
+        fixture.write("one/two/three/four/e.txt");
+
+        for threads in [1, 4] {
+            let walked = Walker::new(&fixture.root)
+                .threads(threads)
+                .collect()
+                .expect("walk succeeds");
+            assert!(!walked.entries().is_empty());
+            for entry in walked.entries() {
+                let counted = entry
+                    .path()
+                    .strip_prefix(&fixture.root)
+                    .expect("entry is rooted in the fixture")
+                    .components()
+                    .count();
+                assert_eq!(
+                    entry.depth(),
+                    counted,
+                    "{} on {threads} thread(s)",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+
+    /// The root-relative part of a path is taken as a byte suffix at a fixed
+    /// offset. Deriving that offset by pushing a name is what makes it survive
+    /// a root that already ends in a separator, where adding one would put the
+    /// slice one byte out.
+    #[test]
+    fn a_root_with_a_trailing_separator_walks_like_one_without() {
+        let fixture = Fixture::new();
+        fixture.write("src/main.rs");
+        fixture.write("src/nested/lib.rs");
+        let options = WalkOptions::default().sort(true);
+
+        let plain = Walker::new(&fixture.root)
+            .threads(1)
+            .include("src/**/*.rs")
+            .expect("valid include")
+            .options(options)
+            .collect()
+            .expect("walk succeeds");
+        // The platform's own separator, so the walked paths are comparable
+        // byte for byte. A hardcoded `/` would leave one forward slash in an
+        // otherwise backslash path on Windows, and the test would be measuring
+        // that rather than the offset it is about.
+        let mut trailing_root = fixture.root.clone().into_os_string();
+        trailing_root.push(std::path::MAIN_SEPARATOR_STR);
+        let trailing = Walker::new(PathBuf::from(trailing_root))
+            .threads(1)
+            .include("src/**/*.rs")
+            .expect("valid include")
+            .options(options)
+            .collect()
+            .expect("walk succeeds");
+
+        let paths = |result: &super::WalkResult| {
+            result
+                .entries()
+                .iter()
+                .map(|entry| entry.path().to_path_buf())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths(&trailing), paths(&plain));
+        assert_eq!(plain.entries().len(), 2);
+    }
+
+    /// The serial frontend descends by recursion while the parent directory is
+    /// still being listed. Entries after a subdirectory must therefore still be
+    /// built on the parent's path, not on whatever the descent left behind.
+    #[test]
+    fn entries_after_a_subdirectory_keep_their_own_paths() {
+        let fixture = Fixture::new();
+        // Several of each, interleaved by name, so the listing order the
+        // filesystem happens to return still puts a file after a directory.
+        for index in 0..4 {
+            fixture.write(format!("outer/dir-{index}/inner.txt"));
+            fixture.write(format!("outer/file-{index}.txt"));
+        }
+        let options = WalkOptions::default().sort(true).files_only(true);
+
+        for threads in [1, 4] {
+            let walked = Walker::new(&fixture.root)
+                .threads(threads)
+                .options(options)
+                .collect()
+                .expect("walk succeeds");
+            let mut relative = relative_paths(walked.entries(), &fixture.root);
+            relative.sort();
+            let mut expected = (0..4)
+                .flat_map(|index| {
+                    [
+                        PathBuf::from(format!("outer/dir-{index}/inner.txt")),
+                        PathBuf::from(format!("outer/file-{index}.txt")),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            expected.sort();
+            assert_eq!(relative, expected, "on {threads} thread(s)");
+        }
+    }
+
+    /// One listing buffer serves every directory a worker reads. A directory
+    /// with fewer entries than the one before it must report only its own, and
+    /// not the tail the longer listing left in the buffer.
+    #[test]
+    fn a_short_directory_after_a_long_one_reports_only_its_own_entries() {
+        let fixture = Fixture::new();
+        for index in 0..40 {
+            fixture.write(format!("crowded/file-{index:02}.txt"));
+        }
+        fixture.write("sparse/only.txt");
+
+        // One thread, so both directories go through the same buffer, and the
+        // crowded one is read first.
+        let walked = Walker::new(&fixture.root)
+            .threads(1)
+            .include("sparse/**")
+            .expect("valid include")
+            .options(WalkOptions::default().sort(true).files_only(true))
+            .collect()
+            .expect("walk succeeds");
+
+        assert_eq!(
+            relative_paths(walked.entries(), &fixture.root),
+            vec![PathBuf::from("sparse/only.txt")]
+        );
     }
 
     #[test]
@@ -3342,12 +3695,16 @@ mod tests {
         }
 
         impl super::DirectoryBackend for InjectingBackend {
-            fn read_directory(&self, path: &Path) -> std::io::Result<Vec<super::BackendEntry>> {
+            fn read_directory(
+                &self,
+                path: &Path,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
                 self.reads
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push(path.to_path_buf());
-                super::StdBackend.read_directory(path)
+                super::StdBackend.read_directory(path, listing)
             }
 
             fn symlink_metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
@@ -3425,45 +3782,35 @@ mod tests {
 
     #[test]
     fn literal_include_roots_prune_unrelated_sibling_directories() {
+        /// One directory of the mock tree: entry names and whether each is a
+        /// directory.
+        type MockDirectory = Vec<(&'static str, bool)>;
+
         struct RecordingBackend {
-            entries: HashMap<PathBuf, Vec<super::BackendEntry>>,
+            entries: HashMap<PathBuf, MockDirectory>,
             reads: RefCell<Vec<PathBuf>>,
         }
 
         impl super::DirectoryBackend for RecordingBackend {
-            fn read_directory(&self, path: &Path) -> std::io::Result<Vec<super::BackendEntry>> {
+            fn read_directory(
+                &self,
+                path: &Path,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
                 self.reads.borrow_mut().push(path.to_path_buf());
-                Ok(self.entries.get(path).cloned().unwrap_or_default())
+                listing.clear();
+                for &(name, is_dir) in self.entries.get(path).into_iter().flatten() {
+                    listing.push(name.as_ref(), is_dir, false);
+                }
+                Ok(())
             }
         }
 
         let root = PathBuf::from("/fixture");
         let source = root.join("src");
-        let docs = root.join("docs");
         let mut entries = HashMap::new();
-        entries.insert(
-            root.clone(),
-            vec![
-                super::BackendEntry {
-                    path: source.clone(),
-                    is_dir: true,
-                    is_symlink: false,
-                },
-                super::BackendEntry {
-                    path: docs.clone(),
-                    is_dir: true,
-                    is_symlink: false,
-                },
-            ],
-        );
-        entries.insert(
-            source.clone(),
-            vec![super::BackendEntry {
-                path: source.join("main.rs"),
-                is_dir: false,
-                is_symlink: false,
-            }],
-        );
+        entries.insert(root.clone(), vec![("src", true), ("docs", true)]);
+        entries.insert(source.clone(), vec![("main.rs", false)]);
         let backend = RecordingBackend {
             entries,
             reads: RefCell::new(Vec::new()),
@@ -3490,16 +3837,20 @@ mod tests {
         }
 
         impl super::DirectoryBackend for DisappearingFileBackend {
-            fn read_directory(&self, path: &Path) -> std::io::Result<Vec<super::BackendEntry>> {
+            fn read_directory(
+                &self,
+                path: &Path,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                listing.clear();
                 if path == self.root {
-                    Ok(vec![super::BackendEntry {
-                        path: self.disappeared.clone(),
-                        is_dir: false,
-                        is_symlink: false,
-                    }])
-                } else {
-                    Ok(Vec::new())
+                    let name = self
+                        .disappeared
+                        .file_name()
+                        .expect("the disappearing entry has a name");
+                    listing.push(name, false, false);
                 }
+                Ok(())
             }
         }
 

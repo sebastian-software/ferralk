@@ -17,7 +17,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use super::BackendEntry;
+use super::Listing;
 
 const BUFFER_SIZE: usize = 32 * 1024;
 const RECORD_LENGTH_OFFSET: usize = 16;
@@ -66,13 +66,13 @@ unsafe extern "C" {
     fn syscall(number: c_long, ...) -> c_long;
 }
 
-pub(super) fn read_directory(path: &Path) -> io::Result<Vec<BackendEntry>> {
+pub(super) fn read_directory(path: &Path, listing: &mut Listing) -> io::Result<()> {
     if GETDENTS_UNSUPPORTED.load(Ordering::Relaxed) {
         return Err(unsupported("getdents64 is unavailable on this system"));
     }
     let result = DIRECTORY_BUFFER.with(|buffer| {
         let mut buffer = buffer.borrow_mut();
-        read_directory_with_buffer(path, &mut buffer[..])
+        read_directory_with_buffer(path, &mut buffer[..], listing)
     });
     if result
         .as_ref()
@@ -100,15 +100,19 @@ fn open_directory(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-fn read_directory_with_buffer(path: &Path, buffer: &mut [u8]) -> io::Result<Vec<BackendEntry>> {
+fn read_directory_with_buffer(
+    path: &Path,
+    buffer: &mut [u8],
+    listing: &mut Listing,
+) -> io::Result<()> {
     let directory = open_directory(path)?;
-    let mut entries = Vec::new();
+    listing.clear();
     loop {
         let byte_count = read_batch(&directory, buffer)?;
         if byte_count == 0 {
-            return Ok(entries);
+            return Ok(());
         }
-        parse_records(path, &buffer[..byte_count], &mut entries)?;
+        parse_records(path, &buffer[..byte_count], listing)?;
     }
 }
 
@@ -162,21 +166,13 @@ fn read_batch(directory: &File, buffer: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-fn parse_records(
-    directory: &Path,
-    records: &[u8],
-    entries: &mut Vec<BackendEntry>,
-) -> io::Result<()> {
+fn parse_records(directory: &Path, records: &[u8], listing: &mut Listing) -> io::Result<()> {
     for_each_record(records, |name, directory_type| {
-        let path = directory.join(OsStr::from_bytes(name));
+        let name = OsStr::from_bytes(name);
         // An entry that vanished between the read and its stat costs that one
         // entry; the rest of the listing is still valid and is returned.
-        if let Some((is_dir, is_symlink)) = entry_kind(&path, directory_type)? {
-            entries.push(BackendEntry {
-                path,
-                is_dir,
-                is_symlink,
-            });
+        if let Some((is_dir, is_symlink)) = entry_kind(directory, name, directory_type)? {
+            listing.push(name, is_dir, is_symlink);
         }
         Ok(())
     })
@@ -236,13 +232,19 @@ fn for_each_record(
 /// `Ok(None)` means the entry disappeared or became unreadable between the
 /// directory read and its stat. That costs one entry rather than the whole
 /// listing, which is what a caller racing with a deletion needs.
-fn entry_kind(path: &Path, directory_type: u8) -> io::Result<Option<(bool, bool)>> {
+fn entry_kind(
+    directory: &Path,
+    name: &OsStr,
+    directory_type: u8,
+) -> io::Result<Option<(bool, bool)>> {
     match directory_type {
         DT_DIR => Ok(Some((true, false))),
         DT_REG | DT_FIFO | DT_CHR | DT_BLK | DT_SOCK => Ok(Some((false, false))),
         DT_LNK => Ok(Some((false, true))),
-        // `DT_UNKNOWN`, and any type this build does not name, need one stat.
-        _ => match fs::symlink_metadata(path) {
+        // `DT_UNKNOWN`, and any type this build does not name, need one stat,
+        // and a whole path to stat with. Building one here is what keeps the
+        // common cases above from needing it.
+        _ => match fs::symlink_metadata(directory.join(name)) {
             Ok(metadata) => {
                 let file_type = metadata.file_type();
                 Ok(Some((file_type.is_dir(), file_type.is_symlink())))
@@ -279,7 +281,7 @@ mod tests {
     use crate::{DirectoryBackend, ErrorPolicy, StdBackend, WalkEntry, WalkOptions, Walker};
 
     use super::{
-        BackendEntry, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG, DT_SOCK, NAME_OFFSET, TYPE_OFFSET,
+        DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG, DT_SOCK, Listing, NAME_OFFSET, TYPE_OFFSET,
         entry_kind, open_directory, parse_records, read_directory,
     };
 
@@ -299,23 +301,23 @@ mod tests {
         let mut records = record(b".", DT_DIR);
         records.extend(record(b"..", DT_DIR));
         records.extend(record(b"regular", DT_REG));
-        let mut entries: Vec<BackendEntry> = Vec::new();
-        parse_records(Path::new("/tmp"), &records, &mut entries).expect("dot records parse");
-        assert_eq!(entries.len(), 1);
-        assert!(!entries[0].is_dir);
-        assert!(!entries[0].is_symlink);
+        let mut listing = Listing::default();
+        parse_records(Path::new("/tmp"), &records, &mut listing).expect("dot records parse");
+        assert_eq!(listing.entries().len(), 1);
+        assert!(!listing.entries()[0].is_dir());
+        assert!(!listing.entries()[0].is_symlink());
 
-        assert!(parse_records(Path::new("/tmp"), &[0_u8; NAME_OFFSET], &mut entries).is_err());
+        assert!(parse_records(Path::new("/tmp"), &[0_u8; NAME_OFFSET], &mut listing).is_err());
 
         let mut zero_length = vec![0_u8; NAME_OFFSET + 1];
         zero_length[NAME_OFFSET] = DT_REG;
-        assert!(parse_records(Path::new("/tmp"), &zero_length, &mut entries).is_err());
+        assert!(parse_records(Path::new("/tmp"), &zero_length, &mut listing).is_err());
 
         let mut missing_nul = record(b"name", DT_REG);
         for byte in &mut missing_nul[NAME_OFFSET..] {
             *byte = b'x';
         }
-        assert!(parse_records(Path::new("/tmp"), &missing_nul, &mut entries).is_err());
+        assert!(parse_records(Path::new("/tmp"), &missing_nul, &mut listing).is_err());
     }
 
     #[test]
@@ -328,13 +330,17 @@ mod tests {
         // `DT_UNKNOWN` forces the stat that races with the deletion.
         let mut records = record(missing.as_bytes(), 0);
         records.extend(record(b"survivor", DT_REG));
-        let mut entries: Vec<BackendEntry> = Vec::new();
+        let mut listing = Listing::default();
 
-        parse_records(Path::new("/tmp"), &records, &mut entries)
+        parse_records(Path::new("/tmp"), &records, &mut listing)
             .expect("a vanished entry does not end the listing");
 
-        assert_eq!(entries.len(), 1, "only the vanished entry is dropped");
-        assert!(entries[0].path.ends_with("survivor"));
+        assert_eq!(
+            listing.entries().len(),
+            1,
+            "only the vanished entry is dropped"
+        );
+        assert_eq!(listing.entries()[0].name(), "survivor");
     }
 
     #[test]
@@ -344,7 +350,7 @@ mod tests {
         let absent = Path::new("/ferralk-nonexistent-special");
         for directory_type in [DT_FIFO, DT_CHR, DT_BLK, DT_SOCK] {
             assert_eq!(
-                entry_kind(absent, directory_type).expect("no stat is attempted"),
+                entry_kind(absent, "entry".as_ref(), directory_type).expect("no stat is attempted"),
                 Some((false, false))
             );
         }
@@ -380,29 +386,33 @@ mod tests {
         fs::create_dir_all(root.join("nested")).expect("create native fixture");
         fs::write(root.join("file.txt"), b"fixture").expect("write native fixture");
 
-        let mut native = read_directory(&root).expect("native reader succeeds");
-        let mut portable = StdBackend
-            .read_directory(&root)
-            .expect("portable reader succeeds");
-        native.sort_by(|left, right| left.path.cmp(&right.path));
-        portable.sort_by(|left, right| left.path.cmp(&right.path));
-        let describe = |entries: Vec<BackendEntry>| {
-            entries
-                .into_iter()
+        let describe = |read: &dyn Fn(&mut Listing)| {
+            let mut listing = Listing::default();
+            read(&mut listing);
+            let mut described = listing
+                .entries()
+                .iter()
                 .map(|entry| {
                     (
-                        entry
-                            .path
-                            .strip_prefix(&root)
-                            .expect("entry belongs to fixture")
-                            .to_path_buf(),
-                        entry.is_dir,
-                        entry.is_symlink,
+                        PathBuf::from(entry.name()),
+                        entry.is_dir(),
+                        entry.is_symlink(),
                     )
                 })
-                .collect::<Vec<(PathBuf, bool, bool)>>()
+                .collect::<Vec<(PathBuf, bool, bool)>>();
+            described.sort();
+            described
         };
-        assert_eq!(describe(native), describe(portable));
+        assert_eq!(
+            describe(&|listing| {
+                read_directory(&root, listing).expect("native reader succeeds");
+            }),
+            describe(&|listing| {
+                StdBackend
+                    .read_directory(&root, listing)
+                    .expect("portable reader succeeds");
+            })
+        );
         fs::remove_dir_all(root).expect("remove native fixture");
     }
 
@@ -464,6 +474,7 @@ mod tests {
         let mut state = crate::WalkState::new(walker, &crate::keep_every_entry);
         let task = crate::DirectoryTask {
             path: walker.root.clone(),
+            depth: 0,
             ignores: crate::IgnoreScope::root(walker, &StdBackend),
         };
         state

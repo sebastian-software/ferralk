@@ -142,6 +142,7 @@ fn walk_portable(walker: &Walker) -> (Vec<WalkEntry>, Vec<WalkError>) {
     let mut state = WalkState::new(walker, &crate::keep_every_entry);
     let task = DirectoryTask {
         path: walker.root.clone(),
+        depth: 0,
         ignores: IgnoreScope::root(walker, &StdBackend),
     };
     state

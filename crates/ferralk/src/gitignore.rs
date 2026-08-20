@@ -18,7 +18,7 @@
 use std::{path::Path, sync::Arc};
 
 use super::{
-    BackendEntry, DirectoryBackend, Walker, glob_path_bytes,
+    DirectoryBackend, Listing, Walker, glob_path_bytes,
     ignore_rules::{RuleSet, RuleSetBuilder},
 };
 
@@ -62,18 +62,14 @@ impl IgnoreScope {
         walker: &Walker,
         backend: &B,
         directory: &Path,
-        entries: &[BackendEntry],
+        listing: &Listing,
     ) -> Self {
         if !walker.respect_git_ignore {
             return self;
         }
         let present = IGNORE_FILES
             .into_iter()
-            .filter(|file| {
-                entries
-                    .iter()
-                    .any(|entry| entry.path.file_name().is_some_and(|name| name == *file))
-            })
+            .filter(|file| listing.contains(file))
             .collect::<Vec<_>>();
         if present.is_empty() {
             return self;
