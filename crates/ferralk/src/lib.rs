@@ -4214,6 +4214,50 @@ mod tests {
     /// component `a` - so its contents went missing from the walk without any
     /// pattern saying they should.
     #[test]
+    /// INVESTIGATION for #94, to be replaced by the fix it justifies.
+    ///
+    /// Records what a Windows host does today with the shapes a `PathBuf` join
+    /// produces, so the change that follows is measured against something
+    /// rather than assumed. Every one of these compiles without complaint and
+    /// selects nothing, which is the failure mode the issue is about.
+    #[cfg(windows)]
+    #[test]
+    fn investigation_backslash_patterns_are_accepted_and_select_nothing() {
+        let fixture = Fixture::new();
+        fixture.write("src/main.ts");
+        fixture.write("src/deep/other.ts");
+        let root = fixture.root.display().to_string();
+
+        for pattern in [
+            format!(r"{root}\src\**\*.ts"),
+            format!(r"{root}\src\*.ts"),
+            r"src\*.ts".to_owned(),
+            r"src\**\*.ts".to_owned(),
+        ] {
+            let walker = Walker::new(&fixture.root)
+                .include(&pattern)
+                .unwrap_or_else(|error| panic!("today {pattern:?} compiles, got {error}"));
+            let result = walker
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("walk succeeds");
+            assert!(
+                result.entries().is_empty(),
+                "today {pattern:?} selects nothing, got {:?}",
+                relative_paths(result.entries(), &fixture.root)
+            );
+        }
+
+        // The spelling that works, for contrast: the same pattern with `/`.
+        let works = Walker::new(&fixture.root)
+            .include("src/**/*.ts")
+            .expect("valid include")
+            .options(WalkOptions::default().sort(true).files_only(true))
+            .collect()
+            .expect("walk succeeds");
+        assert_eq!(works.entries().len(), 2);
+    }
+
     fn subtree_pruning_agrees_with_the_exclude_it_came_from() {
         let fixture = Fixture::new();
         fixture.write("a/b.tmp/keep.rs");
