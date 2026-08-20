@@ -70,7 +70,7 @@ fn should_emit(walker: &Walker, entry: &BackendEntry, bytes: &[u8], git_ignored:
         || walker
             .includes
             .iter()
-            .any(|pattern| pattern.matches(bytes, entry.is_dir))
+            .any(|pattern| pattern.matches(bytes, entry.is_dir, walker.wildcard_mode))
 }
 
 /// Decides what one directory entry means for the walk.
@@ -104,7 +104,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     if walker
         .excludes
         .iter()
-        .any(|pattern| pattern.matches(bytes.as_ref(), entry.is_dir))
+        .any(|pattern| pattern.matches(bytes.as_ref(), entry.is_dir, walker.wildcard_mode))
     {
         return EntryAction::Skip;
     }

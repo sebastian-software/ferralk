@@ -135,6 +135,42 @@ arm can be fast by finding less. Unscoped finds 7,400 files, scoped 2,600.
   this reconstruction does; the 75.58 ms here is the same *approach*, not the
   same code.
 
+## Selecting without a caller-side matcher
+
+The `caller_match` arms in [`walker.rs`](../tools/bench/benches/walker.rs) model
+a caller that keeps a `GlobSet` of its own because the walker cannot express
+what it selects. `WildcardMode::SeparatorCrossing` removes that reason for a
+catalog of `*.ext` globs: the same 24 patterns become walker includes, and
+`walker_includes_crossing` measures the walk with nothing running per entry
+outside it. All three arms were checked to select the identical set before
+being timed.
+
+Medians of 41 interleaved rounds on one host, both arms inside each round with
+the order flipped every round, because this host's load drifted enough during a
+sequential criterion run to charge one arm for the other's noise:
+
+| Arm | mini (12 files) | large (5120 files, 2560 selected) |
+| --- | ---: | ---: |
+| `collect_then_filter` — `GlobSet` on one thread after the walk | 110.6 µs | 6.09 ms |
+| `visit_in_worker` — `GlobSet` inside the workers | 111.1 µs | 5.96 ms |
+| `walker_includes_crossing` — includes at the walker, no caller matcher | 130.0 µs | 6.15 ms |
+
+At repository scale the three are level: the includes arm lands 3% behind
+`visit_in_worker` and inside the spread of both `GlobSet` arms. Handing the
+selection to the walker costs nothing measurable, and it removes a matcher the
+caller had to keep in sync.
+
+On the 12-file tree the includes arm is ~19 µs slower, and a control arm that
+compiles the 24 includes and never walks accounts for it: 12–16 µs. That is
+pattern compilation, paid once per walker, which a 12-file tree has no entries
+to amortise it over. A caller that builds one walker and reuses it, or walks
+anything larger than a toy tree, does not see it.
+
+What this does not show: a catalog of extension globs is the case the extension
+prefilter handles well. A pattern set the planner can prove nothing about would
+run every include against every entry, which is the shape where a compiled
+`GlobSet` should still win.
+
 ## Matcher, against Rust baselines
 
 Wall time per match, same host, one line per benchmark

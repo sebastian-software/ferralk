@@ -89,9 +89,50 @@ whether a wildcard may cover a leading period, while `skip_hidden` is a
 traversal filter that removes hidden entries before any pattern is consulted.
 
 Walker include patterns are root-relative. A leading `./` is accepted, and a
-trailing `/` selects matching directories only.
-Ordinary wildcards never cross a path-component boundary there; use recursive
-`**` to select descendants.
+trailing `/` selects matching directories only. Ordinary wildcards stay inside
+one path component by default; use recursive `**` to select descendants, or
+switch the whole walk to crossing wildcards as described next.
+
+### Migrating patterns from globset or fast-glob
+
+`globset` and `fast-glob` read an unconfigured `*` as crossing separators, so
+`*.ts` selects `src/deep/main.ts` there. Ferralk's walker reads patterns as
+filesystem globs by default, where `*.ts` selects only what sits in the walk
+root. Carrying a pattern over unchanged therefore used to select strictly less,
+without saying so.
+
+`Walker::wildcard_mode` makes the choice explicit:
+
+```rust
+use ferralk::{WildcardMode, Walker};
+
+// Patterns written for globset keep their meaning.
+let walker = Walker::new(".")
+    .wildcard_mode(WildcardMode::SeparatorCrossing)
+    .include("*.ts")?;
+# Ok::<(), ferralk::ferralk_glob::PatternError>(())
+```
+
+What the two modes select, for the same pattern:
+
+| Pattern | Candidate | `ComponentScoped` (default) | `SeparatorCrossing` |
+| --- | --- | --- | --- |
+| `*.ts` | `main.ts` | selected | selected |
+| `*.ts` | `src/main.ts` | not selected | selected |
+| `*.ts` | `src/deep/main.ts` | not selected | selected |
+| `src/*.ts` | `src/main.ts` | selected | selected |
+| `src/*.ts` | `src/deep/main.ts` | not selected | selected |
+| `src/*.ts` | `other/main.ts` | not selected | not selected |
+| `**/*.ts` | `src/deep/main.ts` | selected | selected |
+
+Two things carry over unchanged. `**` is recursive under either mode, so a
+pattern already written with `**` means the same thing in both. And a literal
+prefix is still a literal prefix: `src/*.ts` never reaches outside `src/`, which
+is why the walker can still skip sibling directories without opening them.
+
+The mode governs excludes as well as includes, so a walk reads every pattern the
+same way. It is a matching policy, independent of `match_hidden` and of
+`WalkOptions::skip_hidden`.
 
 ## Deliberate differences
 

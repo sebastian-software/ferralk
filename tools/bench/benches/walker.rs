@@ -21,7 +21,7 @@ use std::{
 };
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use ferralk::{Verdict, WalkOptions, Walker};
+use ferralk::{Verdict, WalkOptions, Walker, WildcardMode};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::{WalkBuilder, WalkState, overrides::OverrideBuilder};
 
@@ -174,6 +174,28 @@ fn bench_caller_matching(c: &mut Criterion, group: &str, fixture: &Fixture) {
         },
     );
 
+    // The arm the caller-side matcher exists to avoid: the same catalog handed
+    // to the walker as includes, read the way `globset` reads it. Nothing runs
+    // per entry outside the walk.
+    c.bench_function(
+        &format!("{LANE}/{group}caller_match/walker_includes_crossing"),
+        |benchmark| {
+            benchmark.iter(|| {
+                let mut walker = Walker::new(&fixture.root)
+                    .threads(4)
+                    .wildcard_mode(WildcardMode::SeparatorCrossing)
+                    .options(WalkOptions::default());
+                for extension in CALLER_EXTENSIONS {
+                    walker = walker
+                        .include(format!("*.{extension}"))
+                        .expect("benchmark include is valid");
+                }
+                let result = walker.collect().expect("benchmark walk succeeds");
+                black_box(result.entries().len())
+            })
+        },
+    );
+
     c.bench_function(
         &format!("{LANE}/{group}caller_match/ignore_parallel"),
         |benchmark| {
@@ -184,18 +206,22 @@ fn bench_caller_matching(c: &mut Criterion, group: &str, fixture: &Fixture) {
     );
 }
 
+/// The extensions the caller's catalog covers.
+///
+/// A catalog rather than one pattern. Palamedes carries roughly this many
+/// source globs, and a single-pattern set is cheap enough per entry that a
+/// serial pass over the result hides inside the walk.
+const CALLER_EXTENSIONS: [&str; 24] = [
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "json", "toml", "yaml", "yml", "md", "css",
+    "scss", "html", "py", "go", "java", "kt", "swift", "c", "h", "cpp", "hpp",
+];
+
 /// The caller's own matcher, standing in for the `GlobSet` Palamedes keeps for
-/// parity. Deliberately not a ferralk pattern: the point is a predicate the
-/// walker cannot absorb.
+/// parity. The `walker_includes_crossing` arm above is the same selection
+/// expressed as walker includes instead.
 fn caller_matcher() -> GlobSet {
-    // A catalog rather than one pattern. Palamedes carries roughly this many
-    // source globs, and a single-pattern set is cheap enough per entry that a
-    // serial pass over the result hides inside the walk.
     let mut builder = GlobSetBuilder::new();
-    for extension in [
-        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "json", "toml", "yaml", "yml", "md", "css",
-        "scss", "html", "py", "go", "java", "kt", "swift", "c", "h", "cpp", "hpp",
-    ] {
+    for extension in CALLER_EXTENSIONS {
         builder.add(Glob::new(&format!("**/*.{extension}")).expect("benchmark glob is valid"));
     }
     builder.build().expect("benchmark glob set builds")
