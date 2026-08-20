@@ -267,6 +267,8 @@ fn corpus_candidate(pattern: &[u8], path: &[u8], ours: bool, reference: bool) ->
         matches: Vec::new(),
         oracle_matches: None,
         base_path: String::new(),
+        rewritten: None,
+        windows_paths: false,
         indices: Vec::new(),
         oracle_indices: None,
         pattern: encode_bytes(pattern),

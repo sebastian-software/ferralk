@@ -48,6 +48,32 @@ pub use macos_native::fuzz_validate_bulk_record as fuzz_validate_macos_bulk_reco
 #[cfg(all(feature = "native-macos", target_os = "macos"))]
 #[doc(hidden)]
 pub use macos_native::fuzz_validate_records as fuzz_validate_macos_dirent_records;
+mod absolute;
+
+/// Absolute-pattern rewrite entry point for the corpus harness, exported the
+/// way the fuzz entry points are: for `tools/`, not for consumers.
+///
+/// Returns the pattern the walker would compile, or `None` when the pattern
+/// names paths outside `root` and so can select nothing. `windows_paths`
+/// chooses which spelling makes a path absolute instead of reading the host's,
+/// so one corpus case describes one rule on every platform.
+#[doc(hidden)]
+pub fn corpus_rewrite_absolute_pattern(
+    pattern: &[u8],
+    root: &[u8],
+    windows_paths: bool,
+) -> Result<Option<Vec<u8>>, PatternError> {
+    let syntax = if windows_paths {
+        absolute::Syntax::Windows
+    } else {
+        absolute::Syntax::Posix
+    };
+    Ok(match absolute::rewrite_in(pattern, root, syntax)? {
+        absolute::Rewrite::Relative => Some(pattern.to_vec()),
+        absolute::Rewrite::Rooted(rooted) => Some(rooted),
+        absolute::Rewrite::Outside => None,
+    })
+}
 mod classify;
 mod gitignore;
 mod ignore_rules;
@@ -446,19 +472,100 @@ impl Walker {
 
     /// Adds an OR-ed include pattern. No includes means every non-excluded
     /// entry is returned.
+    ///
+    /// The pattern may be absolute. See [`Walker::exclude`] for what that
+    /// means and when it is rejected.
+    ///
+    /// ```
+    /// use ferralk::Walker;
+    ///
+    /// // On a Unix host these two select the same entries of a walk rooted at
+    /// // `/repo`. The Windows spelling of the second is `C:/repo/src/**/*.ts`
+    /// // for a walk rooted at `C:/repo`.
+    /// let written_relative = Walker::new("/repo").include("src/**/*.ts")?;
+    /// let held_absolute = Walker::new("/repo").include("/repo/src/**/*.ts")?;
+    /// # Ok::<(), ferralk::ferralk_glob::PatternError>(())
+    /// ```
     pub fn include(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
-        let options = traversal_pattern_options(self.match_hidden);
-        self.includes
-            .push(TraversalPattern::compile(pattern.as_ref(), options)?);
+        let compiled = self.traversal_pattern(pattern.as_ref())?;
+        self.includes.push(compiled);
         Ok(self)
     }
 
     /// Adds an OR-ed exclude pattern. Excluded directories are not descended.
+    ///
+    /// # Absolute patterns
+    ///
+    /// A pattern that starts at a filesystem root is understood as naming
+    /// absolute paths, and the walk root is removed from it so that it selects
+    /// the same entries a caller would have written by hand. This is detected
+    /// rather than requested, because a caller holding a mixed list of patterns
+    /// would otherwise have to sort them itself - which is the arithmetic this
+    /// exists to remove. What counts as absolute is the platform's own rule:
+    /// a leading `/` on Unix, a drive letter or a UNC share on Windows, where a
+    /// single leading separator is drive-relative and so stays a walker
+    /// pattern.
+    ///
+    /// A pattern that names paths outside the walk root selects nothing, which
+    /// is what it would have selected had it been matched against absolute
+    /// paths. It is not an error: a caller filtering one list across several
+    /// roots expects the patterns meant for other roots to fall away here.
+    ///
+    /// Three shapes are rejected with a [`PatternError`], because guessing at
+    /// them would silently select the wrong entries:
+    ///
+    /// - a wildcard at or above the walk root (`/*/x.ts`, `/**/*.ts`, or
+    ///   `/repo*/x.ts` for a root of `/repo`), which may or may not cover the
+    ///   root and cannot be decided without matching. Write the part below the
+    ///   root instead: `**/*.ts` selects everything under it.
+    /// - a `..` component, which is not resolved here. Folding it away
+    ///   lexically is wrong across a symlink, and resolving it properly would
+    ///   mean touching the filesystem to compile a pattern.
+    /// - a pattern naming the walk root itself, which selects nothing because
+    ///   the walk emits what is inside the root. Add `/**`.
+    ///
+    /// Separators, repeated or trailing, and `.` components are ignored on
+    /// both sides, so `/repo//src/*.ts` against a root of `/repo/` rewrites the
+    /// same as the tidy spelling. Patterns use `/` on every platform per
+    /// ADR-0005; a `\` is an escape, so a Windows path spelled with backslashes
+    /// is reported rather than mis-split.
+    ///
+    /// ```
+    /// use ferralk::Walker;
+    ///
+    /// // Both of these are about Unix spelling, where a leading `/` is what
+    /// // makes a path absolute.
+    /// if cfg!(unix) {
+    ///     // Selects nothing: the pattern is about a different tree.
+    ///     let elsewhere = Walker::new("/repo").exclude("/other/**").unwrap();
+    ///
+    ///     // Rejected: the wildcard sits above the root.
+    ///     assert!(Walker::new("/repo").exclude("/**/*.tmp").is_err());
+    /// }
+    /// ```
     pub fn exclude(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
-        let options = traversal_pattern_options(self.match_hidden);
-        self.excludes
-            .push(TraversalPattern::compile(pattern.as_ref(), options)?);
+        let compiled = self.traversal_pattern(pattern.as_ref())?;
+        self.excludes.push(compiled);
         Ok(self)
+    }
+
+    /// Compiles one include or exclude, rewriting it if it is absolute.
+    fn traversal_pattern(&self, pattern: &[u8]) -> Result<TraversalPattern, PatternError> {
+        let options = traversal_pattern_options(self.match_hidden);
+        let root = glob_path_bytes(&self.root);
+        match absolute::rewrite(pattern, root.as_ref())? {
+            absolute::Rewrite::Relative => TraversalPattern::compile(pattern, options),
+            absolute::Rewrite::Rooted(rooted) => TraversalPattern::compile(&rooted, options),
+            // Compiled even though it can never match, so that a pattern the
+            // caller wrote badly is still reported, and kept rather than
+            // dropped, because dropping an include would widen the walk to
+            // everything instead of narrowing it to nothing.
+            absolute::Rewrite::Outside => {
+                let mut compiled = TraversalPattern::compile(pattern, options)?;
+                compiled.never_matches = true;
+                Ok(compiled)
+            }
+        }
     }
 
     /// Lets an ordinary wildcard cover a leading period, so `**/*.ts` also
@@ -753,6 +860,10 @@ struct TraversalPattern {
     literal_roots: Option<Vec<Vec<u8>>>,
     /// Literal final extension of every brace alternative, on the same terms.
     extensions: Option<Vec<Vec<u8>>>,
+    /// Set for an absolute pattern that named paths outside this walk root.
+    /// Such a pattern selects nothing and prunes nothing, and saying so once
+    /// here keeps the decision out of every caller of the four predicates.
+    never_matches: bool,
 }
 
 impl TraversalPattern {
@@ -787,6 +898,7 @@ impl TraversalPattern {
             // hidden literal root stays its own root.
             literal_roots: prefilter_of_every_alternative(&alternatives, literal_pattern_root),
             extensions: prefilter_of_every_alternative(&alternatives, literal_extension),
+            never_matches: false,
         })
     }
 
@@ -797,8 +909,12 @@ impl TraversalPattern {
     /// that compiled once compiles again.
     fn recompile(&mut self, options: PatternOptions) {
         let source = std::mem::take(&mut self.source);
+        // Whether the pattern can reach this root is a question about the root,
+        // which `match_hidden` does not change.
+        let never_matches = self.never_matches;
         *self = Self::compile(&source, options)
             .expect("a compiled pattern stays valid when only match_hidden changes");
+        self.never_matches = never_matches;
     }
 
     /// Whether the pattern selects this candidate under `mode`.
@@ -807,7 +923,7 @@ impl TraversalPattern {
     /// they are the same compiled pattern asked a different question rather
     /// than two compilations.
     fn matches(&self, path: &[u8], is_dir: bool, mode: WildcardMode) -> bool {
-        if self.directories_only && !is_dir {
+        if self.never_matches || (self.directories_only && !is_dir) {
             return false;
         }
         match mode {
@@ -825,6 +941,9 @@ impl TraversalPattern {
     /// close `a/b.tmp` even though a component-scoped `*.tmp` cannot match the
     /// component `a`.
     fn covers_subtree(&self, path: &[u8], mode: WildcardMode) -> bool {
+        if self.never_matches {
+            return false;
+        }
         self.subtree_root.as_ref().is_some_and(|root| match mode {
             WildcardMode::ComponentScoped => root.is_match_glob_path(path),
             WildcardMode::SeparatorCrossing => root.is_match(path),
@@ -832,6 +951,9 @@ impl TraversalPattern {
     }
 
     fn could_match_descendant(&self, path: &[u8]) -> bool {
+        if self.never_matches {
+            return false;
+        }
         let Some(roots) = &self.literal_roots else {
             return true;
         };
@@ -841,6 +963,9 @@ impl TraversalPattern {
     }
 
     fn matches_extension(&self, path: &[u8]) -> bool {
+        if self.never_matches {
+            return false;
+        }
         let Some(extensions) = &self.extensions else {
             return true;
         };
@@ -881,15 +1006,24 @@ fn prefilter_of_every_alternative(
     Some(values)
 }
 
-fn literal_pattern_root(pattern: &[u8]) -> Option<Vec<u8>> {
-    let magic = pattern.iter().enumerate().position(|(index, byte)| {
+/// Offset of the first byte that stops the pattern from being a literal path.
+///
+/// A brace or an extglob opener only counts once its closer is present, because
+/// an unpaired one is an ordinary byte. Shared with the absolute-pattern rewrite
+/// so that "how far is this pattern a plain path" has one answer.
+pub(crate) fn first_metacharacter(pattern: &[u8]) -> Option<usize> {
+    pattern.iter().enumerate().position(|(index, byte)| {
         matches!(byte, b'*' | b'?' | b'[')
             || (*byte == b'\\')
             || (*byte == b'{' && has_closing_brace(pattern, index))
             || (matches!(byte, b'@' | b'+' | b'!')
                 && pattern.get(index + 1) == Some(&b'(')
                 && has_closing_parenthesis(pattern, index + 1))
-    });
+    })
+}
+
+fn literal_pattern_root(pattern: &[u8]) -> Option<Vec<u8>> {
+    let magic = first_metacharacter(pattern);
     let prefix = &pattern[..magic.unwrap_or(pattern.len())];
     let root = if magic.is_some() {
         match prefix.strip_suffix(b"/") {
@@ -1574,8 +1708,8 @@ mod tests {
 
     use super::{
         CancellationToken, ErrorPolicy, TraversalPattern, Verdict, WalkEntry, WalkEntryKind,
-        WalkOptions, Walker, WildcardMode, literal_extension, literal_pattern_root,
-        traversal_pattern_options,
+        WalkOptions, Walker, WildcardMode, glob_path_bytes, literal_extension,
+        literal_pattern_root, traversal_pattern_options,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -1612,6 +1746,18 @@ mod tests {
             fs::create_dir_all(path.parent().expect("fixture file has parent"))
                 .expect("create fixture parent");
             fs::write(path, b"fixture").expect("write fixture file");
+        }
+    }
+
+    impl Fixture {
+        /// The fixture root spelled the way an absolute pattern must spell it:
+        /// `/` separators on every platform, drive letter and all. Built at run
+        /// time so the absolute-pattern tests are the same test everywhere
+        /// rather than one test per platform.
+        fn absolute(&self, suffix: &str) -> String {
+            let root = String::from_utf8(glob_path_bytes(&self.root).into_owned())
+                .expect("the temporary directory is UTF-8 on a test host");
+            format!("{root}{suffix}")
         }
     }
 
@@ -3285,6 +3431,199 @@ mod tests {
             relative_paths(skipped.entries(), &fixture.root),
             vec![PathBuf::from("src/visible.ts"), PathBuf::from("visible.ts")],
             "skip_hidden keeps hidden entries away from the matcher under either mode"
+        );
+    }
+
+    /// An absolute pattern selects what the same pattern written relative to
+    /// the root selects, which is the whole point of rewriting it.
+    #[test]
+    fn an_absolute_pattern_means_what_its_relative_spelling_means() {
+        let fixture = Fixture::new();
+        fixture.write("src/a.ts");
+        fixture.write("src/deep/b.ts");
+        fixture.write("other/c.ts");
+
+        let walk = |pattern: &str| -> Vec<PathBuf> {
+            let result = Walker::new(&fixture.root)
+                .include(pattern)
+                .expect("valid include")
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("walk succeeds");
+            relative_paths(result.entries(), &fixture.root)
+        };
+
+        for (absolute, relative) in [
+            ("/src/*.ts", "src/*.ts"),
+            ("/**/*.ts", "**/*.ts"),
+            ("/src/**", "src/**"),
+            // A brace root from #20 survives the rewrite.
+            ("/{src,other}/*.ts", "{src,other}/*.ts"),
+            // The separator that joins the root to the rest is not doubled
+            // into the pattern, which is what a root ending in one produces.
+            ("//src/*.ts", "src/*.ts"),
+            ("/./src/*.ts", "src/*.ts"),
+        ] {
+            assert_eq!(
+                walk(&fixture.absolute(absolute)),
+                walk(relative),
+                "absolute {absolute} must select what {relative} selects"
+            );
+        }
+        // Not vacuously equal.
+        assert_eq!(
+            walk(&fixture.absolute("/src/*.ts")),
+            vec![PathBuf::from("src/a.ts")]
+        );
+    }
+
+    /// The mode from #83 is about how far a wildcard reaches, and rewriting is
+    /// about where the pattern starts, so the two compose without either
+    /// knowing about the other.
+    #[test]
+    fn an_absolute_pattern_is_read_under_the_walk_s_wildcard_mode() {
+        let fixture = Fixture::new();
+        fixture.write("src/a.ts");
+        fixture.write("src/deep/b.ts");
+
+        let walk = |mode: WildcardMode| -> Vec<PathBuf> {
+            let result = Walker::new(&fixture.root)
+                .wildcard_mode(mode)
+                .include(fixture.absolute("/src/*.ts"))
+                .expect("valid include")
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("walk succeeds");
+            relative_paths(result.entries(), &fixture.root)
+        };
+
+        assert_eq!(
+            walk(WildcardMode::ComponentScoped),
+            vec![PathBuf::from("src/a.ts")]
+        );
+        assert_eq!(
+            walk(WildcardMode::SeparatorCrossing),
+            vec![PathBuf::from("src/a.ts"), PathBuf::from("src/deep/b.ts")]
+        );
+    }
+
+    /// A pattern about a different tree selects nothing, and - the part worth
+    /// pinning - prunes nothing either. An exclude that cannot reach this walk
+    /// must not close a directory in it.
+    #[test]
+    fn an_absolute_pattern_outside_the_root_selects_and_prunes_nothing() {
+        let fixture = Fixture::new();
+        fixture.write("src/a.ts");
+        fixture.write("keep/b.ts");
+
+        let elsewhere = format!("{}-elsewhere/**", fixture.absolute(""));
+
+        let included = Walker::new(&fixture.root)
+            .include(&elsewhere)
+            .expect("an unrelated tree is not an error")
+            .options(WalkOptions::default().sort(true).files_only(true))
+            .collect()
+            .expect("walk succeeds");
+        assert!(
+            relative_paths(included.entries(), &fixture.root).is_empty(),
+            "an include about another tree selects nothing here"
+        );
+
+        let excluded = Walker::new(&fixture.root)
+            .exclude(&elsewhere)
+            .expect("an unrelated tree is not an error")
+            .options(WalkOptions::default().sort(true).files_only(true))
+            .collect()
+            .expect("walk succeeds");
+        assert_eq!(
+            relative_paths(excluded.entries(), &fixture.root),
+            vec![PathBuf::from("keep/b.ts"), PathBuf::from("src/a.ts")],
+            "an exclude about another tree removes nothing here"
+        );
+    }
+
+    /// The rewrite happens before compilation, so the traversal prefilters see
+    /// an ordinary relative pattern and keep working. Without this an absolute
+    /// include would open every directory in the tree.
+    #[test]
+    fn the_planner_prefilters_still_apply_to_a_rewritten_pattern() {
+        let fixture = Fixture::new();
+        let walker = Walker::new(&fixture.root)
+            .include(fixture.absolute("/src/**/*.ts"))
+            .expect("valid include");
+        let pattern = &walker.includes[0];
+
+        assert_eq!(
+            pattern.literal_roots,
+            Some(vec![b"src".to_vec()]),
+            "the root prefilter survives the rewrite"
+        );
+        assert_eq!(
+            pattern.extensions,
+            Some(vec![b"ts".to_vec()]),
+            "the extension prefilter survives the rewrite"
+        );
+        assert!(pattern.could_match_descendant(b"src"));
+        assert!(!pattern.could_match_descendant(b"node_modules"));
+        assert!(pattern.matches_extension(b"src/app.ts"));
+        assert!(!pattern.matches_extension(b"src/app.js"));
+
+        // A pattern about another tree proves the strongest prefilter of all:
+        // nothing under this root is worth opening for it.
+        let outside = Walker::new(&fixture.root)
+            .include(format!("{}-elsewhere/**/*.ts", fixture.absolute("")))
+            .expect("an unrelated tree is not an error");
+        assert!(!outside.includes[0].could_match_descendant(b"src"));
+        assert!(!outside.includes[0].covers_subtree(b"src", WildcardMode::ComponentScoped));
+    }
+
+    /// The shapes the rewrite refuses to guess at, reported instead of quietly
+    /// selecting the wrong entries.
+    #[test]
+    fn an_unprovable_absolute_pattern_is_rejected() {
+        let fixture = Fixture::new();
+        let parent = fixture
+            .root
+            .parent()
+            .expect("the fixture root has a parent")
+            .to_path_buf();
+        let parent = String::from_utf8(glob_path_bytes(&parent).into_owned())
+            .expect("the temporary directory is UTF-8 on a test host");
+
+        // A wildcard standing where the root's own components are.
+        let above = Walker::new(&fixture.root)
+            .include(format!("{parent}/*/x.ts"))
+            .expect_err("a wildcard above the root is rejected");
+        assert!(
+            above
+                .message()
+                .starts_with("a wildcard at or above the walk root"),
+        );
+
+        // `..`, which is not resolved here.
+        let dot_dot = Walker::new(&fixture.root)
+            .include(fixture.absolute("/../x.ts"))
+            .expect_err("`..` is rejected");
+        assert!(dot_dot.message().starts_with("`..`"));
+
+        // The root itself, which the walk never emits.
+        let root_itself = Walker::new(&fixture.root)
+            .exclude(fixture.absolute(""))
+            .expect_err("naming the root is rejected");
+        assert!(
+            root_itself
+                .message()
+                .starts_with("an absolute pattern that names the walk root itself")
+        );
+
+        // An absolute pattern cannot be placed against a relative root without
+        // reading the process's working directory.
+        let relative_root = Walker::new("relative/dir")
+            .include(fixture.absolute("/x.ts"))
+            .expect_err("a relative root is rejected");
+        assert_eq!(
+            relative_root.message(),
+            "an absolute pattern needs an absolute walk root"
         );
     }
 

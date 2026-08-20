@@ -84,6 +84,14 @@ Important defaults:
   reading `globset` and `fast-glob` use; see the
   [compatibility guide](compatibility-guide.md).
 
+- Include and exclude patterns may be absolute. `Walker::new("/repo")
+  .include("/repo/src/**/*.ts")` selects what `src/**/*.ts` selects, so a
+  caller holding absolute patterns does not have to strip the root itself. A
+  pattern about a different tree selects nothing rather than erroring; a
+  wildcard at or above the root, a `..`, and a pattern naming the root itself
+  are rejected. See the
+  [compatibility guide](compatibility-guide.md#absolute-patterns-and-the-caller-side-rewrite-they-replace).
+
 - `.gitignore` and `.ignore` files are considered only after
   `respect_git_ignore(true)`, together with the walk root's
   `.git/info/exclude`, which they override. The file closest to an entry
