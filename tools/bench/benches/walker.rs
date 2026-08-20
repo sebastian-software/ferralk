@@ -105,10 +105,109 @@ fn walker(c: &mut Criterion) {
     let mini = Fixture::new(2, 1, 6);
     assert_eq!(mini.files, 12, "the mini fixture models the trial's tree");
 
+    // Three source trees of a size a caller would really hold, walked as one
+    // walk and as three.
+    let roots = [
+        Fixture::new(16, 8, 16),
+        Fixture::new(16, 8, 16),
+        Fixture::new(16, 8, 16),
+    ];
+    assert_eq!(roots[0].files, 2048, "each root is a repository-sized tree");
+
     bench_tree(c, "", &small);
     bench_tree(c, "large/", &large);
     bench_caller_matching(c, "large/", &large);
     bench_caller_matching(c, "mini/", &mini);
+    bench_multi_root(c, &roots);
+}
+
+/// One walker across several roots against one walker per root.
+///
+/// The difference is thread-pool startup: three walkers start three pools over
+/// the same work. Both arms produce the same entries, so what is being measured
+/// is only how many times the walk pays for its threads.
+fn bench_multi_root(c: &mut Criterion, roots: &[Fixture]) {
+    let paths = roots
+        .iter()
+        .map(|root| root.root.clone())
+        .collect::<Vec<_>>();
+    let total = roots.iter().map(|root| root.files).sum::<usize>();
+
+    c.bench_function(&format!("{LANE}/multi_root/one_walker"), |benchmark| {
+        benchmark.iter(|| {
+            let mut walker = Walker::new(&paths[0])
+                .threads(4)
+                .options(WalkOptions::default());
+            for path in &paths[1..] {
+                walker = walker.add_root(path).expect("benchmark root is valid");
+            }
+            let result = walker.collect().expect("benchmark walk succeeds");
+            black_box(result.entries().len())
+        })
+    });
+
+    c.bench_function(
+        &format!("{LANE}/multi_root/one_walker_per_root"),
+        |benchmark| {
+            benchmark.iter(|| {
+                let mut entries = 0;
+                for path in &paths {
+                    let result = Walker::new(path)
+                        .threads(4)
+                        .options(WalkOptions::default())
+                        .collect()
+                        .expect("benchmark walk succeeds");
+                    entries += result.entries().len();
+                }
+                black_box(entries)
+            })
+        },
+    );
+
+    // A trial-sized version of the same question, where the helper floor keeps
+    // both arms serial and the only difference left is the walk itself.
+    let tiny = [
+        Fixture::new(2, 1, 2),
+        Fixture::new(2, 1, 2),
+        Fixture::new(2, 1, 2),
+    ];
+    let tiny_paths = tiny
+        .iter()
+        .map(|root| root.root.clone())
+        .collect::<Vec<_>>();
+
+    c.bench_function(&format!("{LANE}/multi_root/tiny/one_walker"), |benchmark| {
+        benchmark.iter(|| {
+            let mut walker = Walker::new(&tiny_paths[0])
+                .threads(4)
+                .options(WalkOptions::default());
+            for path in &tiny_paths[1..] {
+                walker = walker.add_root(path).expect("benchmark root is valid");
+            }
+            let result = walker.collect().expect("benchmark walk succeeds");
+            black_box(result.entries().len())
+        })
+    });
+
+    c.bench_function(
+        &format!("{LANE}/multi_root/tiny/one_walker_per_root"),
+        |benchmark| {
+            benchmark.iter(|| {
+                let mut entries = 0;
+                for path in &tiny_paths {
+                    let result = Walker::new(path)
+                        .threads(4)
+                        .options(WalkOptions::default())
+                        .collect()
+                        .expect("benchmark walk succeeds");
+                    entries += result.entries().len();
+                }
+                black_box(entries)
+            })
+        },
+    );
+
+    black_box(total);
 }
 
 /// The shape the Palamedes trial measured: the caller keeps a matcher of its

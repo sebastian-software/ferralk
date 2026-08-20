@@ -246,6 +246,9 @@ pub enum WalkEntryKind {
 #[derive(Debug)]
 pub struct WalkEntry {
     path: PathBuf,
+    /// The walk root this entry was found under. Shared per root rather than
+    /// copied per entry.
+    root: Arc<Path>,
     is_dir: bool,
     is_symlink: bool,
     depth: usize,
@@ -257,6 +260,30 @@ impl WalkEntry {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The walk root this entry was found under, exactly as it was given to
+    /// [`Walker::new`] or [`Walker::add_root`].
+    ///
+    /// A single-root walk answers with that one root, so the accessor means the
+    /// same thing however many roots there are. It exists because a path alone
+    /// does not settle the question once roots may contain one another: an
+    /// entry under both `/a` and `/a/b` is produced once per root, and only the
+    /// root it came from distinguishes the two. [`WalkEntry::depth`] is counted
+    /// from this root as well.
+    ///
+    /// ```no_run
+    /// # use ferralk::Walker;
+    /// let result = Walker::new("crates").add_root("tools")?.collect()?;
+    /// for entry in result.entries() {
+    ///     let inside = entry.path().strip_prefix(entry.root()).expect("under its root");
+    ///     println!("{} in {}", inside.display(), entry.root().display());
+    /// }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Whether this entry is a directory according to the selected backend.
@@ -416,15 +443,36 @@ pub(crate) fn keep_every_entry(_: &WalkEntry) -> Verdict {
     Verdict::Keep
 }
 
-/// Builder for a portable serial traversal.
+/// One root of a walk, with the patterns as they read for it.
+///
+/// A relative pattern means the same thing under every root, but an absolute
+/// one does not: `/repo/src/**` selects everything under a root of `/repo` and
+/// nothing at all under a root of `/other`. Compiling per root is what lets one
+/// pattern list serve several roots, and it is why the rewrite in
+/// [`crate::absolute`] takes the root as an argument.
 #[derive(Debug, Clone)]
-pub struct Walker {
-    root: PathBuf,
-    /// Byte index at which the root-relative part of any path this walk builds
-    /// begins. See [`Walker::relative_start`].
+struct RootPlan {
+    path: PathBuf,
+    /// Shared with every entry produced under this root, so an entry can name
+    /// its root without each one owning a copy of the path.
+    shared_path: Arc<Path>,
+    /// Byte index at which the root-relative part of any path built under this
+    /// root begins. See [`RootPlan::relative_start`].
     relative_start: usize,
     includes: Vec<TraversalPattern>,
     excludes: Vec<TraversalPattern>,
+}
+
+/// Builder for a portable serial traversal.
+#[derive(Debug, Clone)]
+pub struct Walker {
+    /// Never empty: [`Walker::new`] establishes the first one.
+    roots: Vec<RootPlan>,
+    /// Include patterns as the caller wrote them, kept so that a root added
+    /// later can be given its own reading of each one.
+    include_sources: Vec<Vec<u8>>,
+    /// Exclude patterns, on the same terms.
+    exclude_sources: Vec<Vec<u8>>,
     match_hidden: bool,
     options: WalkOptions,
     error_policy: ErrorPolicy,
@@ -434,7 +482,7 @@ pub struct Walker {
     threads: usize,
 }
 
-impl Walker {
+impl RootPlan {
     /// Where the root-relative part of a walked path starts, in bytes.
     ///
     /// Every path the walk produces is the root with names pushed onto it, so
@@ -449,15 +497,28 @@ impl Walker {
         probe.as_os_str().as_encoded_bytes().len() - 1
     }
 
-    /// Starts a walk rooted at root.
-    #[must_use]
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        let root = root.into();
+    /// A root with no patterns compiled for it yet.
+    fn new(path: PathBuf) -> Self {
         Self {
-            relative_start: Self::relative_start(&root),
-            root,
+            relative_start: Self::relative_start(&path),
+            shared_path: Arc::from(path.as_path()),
+            path,
             includes: Vec::new(),
             excludes: Vec::new(),
+        }
+    }
+}
+
+impl Walker {
+    /// Starts a walk rooted at root.
+    ///
+    /// Further roots may be added with [`Walker::add_root`].
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            roots: vec![RootPlan::new(root.into())],
+            include_sources: Vec::new(),
+            exclude_sources: Vec::new(),
             match_hidden: false,
             options: WalkOptions::default(),
             error_policy: ErrorPolicy::default(),
@@ -487,8 +548,14 @@ impl Walker {
     /// # Ok::<(), ferralk::ferralk_glob::PatternError>(())
     /// ```
     pub fn include(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
-        let compiled = self.traversal_pattern(pattern.as_ref())?;
-        self.includes.push(compiled);
+        let pattern = pattern.as_ref();
+        // Compiled for every root before any of them is changed, so a pattern
+        // one root rejects leaves the walker as it was rather than half updated.
+        let compiled = self.compile_for_every_root(pattern)?;
+        for (root, pattern) in self.roots.iter_mut().zip(compiled) {
+            root.includes.push(pattern);
+        }
+        self.include_sources.push(pattern.to_vec());
         Ok(self)
     }
 
@@ -544,28 +611,114 @@ impl Walker {
     /// }
     /// ```
     pub fn exclude(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
-        let compiled = self.traversal_pattern(pattern.as_ref())?;
-        self.excludes.push(compiled);
+        let pattern = pattern.as_ref();
+        let compiled = self.compile_for_every_root(pattern)?;
+        for (root, pattern) in self.roots.iter_mut().zip(compiled) {
+            root.excludes.push(pattern);
+        }
+        self.exclude_sources.push(pattern.to_vec());
         Ok(self)
     }
 
-    /// Compiles one include or exclude, rewriting it if it is absolute.
-    fn traversal_pattern(&self, pattern: &[u8]) -> Result<TraversalPattern, PatternError> {
+    /// Adds another root to the same walk.
+    ///
+    /// One walker, one thread pool, several trees: the roots become the walk's
+    /// initial directories and share everything downstream of that - the
+    /// scheduler, the helper-spawn floor, and the visited-directory guard. A
+    /// caller with several source trees no longer pays pool startup per tree.
+    ///
+    /// # Semantics
+    ///
+    /// - **Patterns are per root.** Include and exclude patterns stay
+    ///   root-relative and are applied under every root, so `src/**/*.ts`
+    ///   selects that subtree of each. An absolute pattern is rewritten for
+    ///   each root separately, which means a pattern naming one root's tree
+    ///   selects nothing under the others - the reading
+    ///   [`Walker::exclude`] describes, and the reason it treats an
+    ///   out-of-root pattern as a verdict rather than an error.
+    /// - **`depth` and [`WalkEntry::root`] are relative to the root the entry
+    ///   came from**, so a walk of several trees says the same thing about each
+    ///   entry that a walk of that one tree would.
+    /// - **Overlapping roots deliver their overlap more than once.** Adding
+    ///   `/a` and `/a/b` yields everything under `/a/b` twice, because a
+    ///   multi-root walk is defined as the concatenation of the single-root
+    ///   walks. Suppressing that would need the identity of every directory, a
+    ///   `stat` per directory that only the symlink-following mode pays today,
+    ///   and would make adding a root able to remove entries. A caller who
+    ///   wants each path once passes roots that do not contain one another.
+    /// - **A root that cannot be read is an ordinary walk error** for that
+    ///   root's path, and the other roots are still walked, subject to
+    ///   [`ErrorPolicy`].
+    ///
+    /// The order roots are visited in is not part of the contract, any more
+    /// than the order of entries within one root is: the scheduler hands the
+    /// initial tasks out like any others. `WalkOptions::sort(true)` is what
+    /// orders a result.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error an already-added absolute pattern produces when it is
+    /// rewritten for this root - the same rejections [`Walker::exclude`] lists.
+    /// Builder order does not matter: adding the root first and the pattern
+    /// second reports the same error from [`Walker::include`] instead.
+    ///
+    /// ```
+    /// use ferralk::Walker;
+    ///
+    /// let walker = Walker::new("crates")
+    ///     .add_root("tools")?
+    ///     .include("**/*.rs")?;
+    /// # Ok::<(), ferralk::ferralk_glob::PatternError>(())
+    /// ```
+    pub fn add_root(mut self, root: impl Into<PathBuf>) -> Result<Self, PatternError> {
+        let mut plan = RootPlan::new(root.into());
         let options = traversal_pattern_options(self.match_hidden);
-        let root = glob_path_bytes(&self.root);
-        match absolute::rewrite(pattern, root.as_ref())? {
-            absolute::Rewrite::Relative => TraversalPattern::compile(pattern, options),
-            absolute::Rewrite::Rooted(rooted) => TraversalPattern::compile(&rooted, options),
-            // Compiled even though it can never match, so that a pattern the
-            // caller wrote badly is still reported, and kept rather than
-            // dropped, because dropping an include would widen the walk to
-            // everything instead of narrowing it to nothing.
-            absolute::Rewrite::Outside => {
-                let mut compiled = TraversalPattern::compile(pattern, options)?;
-                compiled.never_matches = true;
-                Ok(compiled)
-            }
+        let root_bytes = glob_path_bytes(&plan.path);
+        for source in &self.include_sources {
+            plan.includes
+                .push(compile_for_root(source, root_bytes.as_ref(), options)?);
         }
+        for source in &self.exclude_sources {
+            plan.excludes
+                .push(compile_for_root(source, root_bytes.as_ref(), options)?);
+        }
+        drop(root_bytes);
+        self.roots.push(plan);
+        Ok(self)
+    }
+
+    /// Adds several roots, in order.
+    ///
+    /// # Errors
+    ///
+    /// The failures [`Walker::add_root`] reports, for the first root that
+    /// produces one.
+    pub fn add_roots<P: Into<PathBuf>>(
+        mut self,
+        roots: impl IntoIterator<Item = P>,
+    ) -> Result<Self, PatternError> {
+        for root in roots {
+            self = self.add_root(root)?;
+        }
+        Ok(self)
+    }
+
+    /// The roots this walk starts from, in the order they were added.
+    #[must_use]
+    pub fn roots(&self) -> impl ExactSizeIterator<Item = &Path> {
+        self.roots.iter().map(|root| root.path.as_path())
+    }
+
+    /// Compiles one pattern once per root, or reports the first rejection.
+    fn compile_for_every_root(
+        &self,
+        pattern: &[u8],
+    ) -> Result<Vec<TraversalPattern>, PatternError> {
+        let options = traversal_pattern_options(self.match_hidden);
+        self.roots
+            .iter()
+            .map(|root| compile_for_root(pattern, glob_path_bytes(&root.path).as_ref(), options))
+            .collect()
     }
 
     /// Lets an ordinary wildcard cover a leading period, so `**/*.ts` also
@@ -587,8 +740,10 @@ impl Walker {
         }
         self.match_hidden = enabled;
         let options = traversal_pattern_options(enabled);
-        for pattern in self.includes.iter_mut().chain(self.excludes.iter_mut()) {
-            pattern.recompile(options);
+        for root in &mut self.roots {
+            for pattern in root.includes.iter_mut().chain(root.excludes.iter_mut()) {
+                pattern.recompile(options);
+            }
         }
         self
     }
@@ -734,11 +889,9 @@ impl Walker {
         // serial baseline owns one local queue and deliberately drains it
         // before returning.
         let scheduler = scheduler::Scheduler::new();
-        scheduler.push(DirectoryTask {
-            path: self.root.clone(),
-            depth: 0,
-            ignores: IgnoreScope::root(&self, backend),
-        });
+        for task in self.root_tasks(backend) {
+            scheduler.push(task);
+        }
         let worker = scheduler.worker();
         while let Some(task) = scheduler.steal_into(&worker).or_else(|| worker.pop()) {
             state.walk_directory(backend, task)?;
@@ -760,13 +913,12 @@ impl Walker {
     /// is intentionally a collect-only global operation.
     #[must_use]
     pub fn stream(self) -> WalkStream {
-        let ignores = IgnoreScope::root(&self, &SystemBackend);
+        // Reversed, because the stream pops from the back and the roots are
+        // walked in the order the caller added them.
+        let mut pending_directories = self.root_tasks(&SystemBackend);
+        pending_directories.reverse();
         WalkStream {
-            pending_directories: vec![DirectoryTask {
-                path: self.root.clone(),
-                depth: 0,
-                ignores,
-            }],
+            pending_directories,
             walker: self,
             listing: Listing::default(),
             next_entry: 0,
@@ -774,34 +926,49 @@ impl Walker {
             visited_directories: HashSet::new(),
             ignores: IgnoreScope::default(),
             depth: 0,
+            root: 0,
             cancelled: false,
             stopped: false,
         }
     }
 
-    fn may_descend_into(&self, relative: &[u8]) -> bool {
-        self.includes.is_empty()
-            || self
-                .includes
+    fn may_descend_into(&self, root: usize, relative: &[u8]) -> bool {
+        let includes = &self.roots[root].includes;
+        includes.is_empty()
+            || includes
                 .iter()
                 .any(|pattern| pattern.could_match_descendant(relative))
     }
 
     /// Whether the walk may traverse into a directory found at `depth`. The
     /// caller counted the components once and passes the result in.
-    fn may_descend_at(&self, depth: usize, bytes: &[u8]) -> bool {
+    fn may_descend_at(&self, root: usize, depth: usize, bytes: &[u8]) -> bool {
         self.options
             .max_depth
             .is_none_or(|max_depth| depth < max_depth)
-            && self.may_descend_into(bytes)
+            && self.may_descend_into(root, bytes)
     }
 
-    fn may_include_file(&self, relative: &[u8]) -> bool {
-        self.includes.is_empty()
-            || self
-                .includes
+    fn may_include_file(&self, root: usize, relative: &[u8]) -> bool {
+        let includes = &self.roots[root].includes;
+        includes.is_empty()
+            || includes
                 .iter()
                 .any(|pattern| pattern.matches_extension(relative))
+    }
+
+    /// The tasks a walk starts from: one per root, in order.
+    fn root_tasks<B: DirectoryBackend + ?Sized>(&self, backend: &B) -> Vec<DirectoryTask> {
+        self.roots
+            .iter()
+            .enumerate()
+            .map(|(index, plan)| DirectoryTask {
+                path: plan.path.clone(),
+                depth: 0,
+                root: index,
+                ignores: IgnoreScope::for_root(self, backend, &plan.path),
+            })
+            .collect()
     }
 }
 
@@ -831,6 +998,31 @@ pub(crate) fn glob_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
     #[cfg(not(windows))]
     {
         Cow::Borrowed(bytes)
+    }
+}
+
+/// Compiles one include or exclude for one root, rewriting it if it is
+/// absolute.
+///
+/// Free rather than a method, because a root is compiled against before it
+/// belongs to the walker, and because it is the unit a multi-root walk repeats.
+fn compile_for_root(
+    pattern: &[u8],
+    root: &[u8],
+    options: PatternOptions,
+) -> Result<TraversalPattern, PatternError> {
+    match absolute::rewrite(pattern, root)? {
+        absolute::Rewrite::Relative => TraversalPattern::compile(pattern, options),
+        absolute::Rewrite::Rooted(rooted) => TraversalPattern::compile(&rooted, options),
+        // Compiled even though it can never match, so that a pattern the caller
+        // wrote badly is still reported, and kept rather than dropped, because
+        // dropping an include would widen the walk to everything instead of
+        // narrowing it to nothing.
+        absolute::Rewrite::Outside => {
+            let mut compiled = TraversalPattern::compile(pattern, options)?;
+            compiled.never_matches = true;
+            Ok(compiled)
+        }
     }
 }
 
@@ -1340,6 +1532,8 @@ pub struct WalkStream {
     ignores: IgnoreScope,
     /// Depth of that same directory, so its entries need not recount it.
     depth: usize,
+    /// Which root that directory sits under, for the same reason.
+    root: usize,
     cancelled: bool,
     stopped: bool,
 }
@@ -1381,6 +1575,7 @@ impl WalkStream {
         let DirectoryTask {
             path,
             depth,
+            root,
             ignores,
         } = task;
         if self.walker.options.follow_symlinks {
@@ -1399,6 +1594,7 @@ impl WalkStream {
                 // recognized in the listing that was just read.
                 self.ignores = ignores.enter(&self.walker, &SystemBackend, &path, &self.listing);
                 self.depth = depth;
+                self.root = root;
                 self.next_entry = 0;
                 self.path.clear();
                 self.path.push(&path);
@@ -1421,6 +1617,7 @@ impl WalkStream {
             &self.listing.entries()[index],
             &self.ignores,
             self.depth,
+            self.root,
         );
         // Only an emitted entry needs a path of its own, and the stream hands
         // every one of them to the caller.
@@ -1556,13 +1753,14 @@ impl<'walker> WalkState<'walker> {
         let DirectoryTask {
             path,
             depth,
+            root,
             ignores,
         } = task;
         if self.walker.options.follow_symlinks && !self.mark_directory(backend, &path)? {
             return Ok(());
         }
         let mut scratch = self.scratch.pop().unwrap_or_default();
-        let outcome = self.walk_listing(backend, &path, depth, ignores, &mut scratch);
+        let outcome = self.walk_listing(backend, &path, depth, root, ignores, &mut scratch);
         scratch.listing.clear();
         self.scratch.push(scratch);
         outcome
@@ -1575,6 +1773,7 @@ impl<'walker> WalkState<'walker> {
         backend: &impl DirectoryBackend,
         path: &Path,
         depth: usize,
+        root: usize,
         ignores: IgnoreScope,
         scratch: &mut DirectoryScratch,
     ) -> Result<(), WalkError> {
@@ -1600,6 +1799,7 @@ impl<'walker> WalkState<'walker> {
                 &scratch.listing.entries()[index],
                 &ignores,
                 depth,
+                root,
             );
             let outcome = self.act(backend, action, &scratch.path);
             scratch.path.pop();
@@ -1942,6 +2142,7 @@ mod tests {
     fn keeps_relative(relative: &Path, root: &Path, keeps: impl Fn(&WalkEntry) -> bool) -> bool {
         let entry = WalkEntry {
             path: root.join(relative),
+            root: std::sync::Arc::from(root),
             is_dir: false,
             is_symlink: false,
             depth: 0,
@@ -1958,9 +2159,10 @@ mod tests {
         path: PathBuf,
     ) -> super::DirectoryTask {
         super::DirectoryTask {
-            path,
+            path: path.clone(),
             depth: 0,
-            ignores: super::IgnoreScope::root(walker, backend),
+            root: 0,
+            ignores: super::IgnoreScope::for_root(walker, backend, &path),
         }
     }
 
@@ -3551,7 +3753,7 @@ mod tests {
         let walker = Walker::new(&fixture.root)
             .include(fixture.absolute("/src/**/*.ts"))
             .expect("valid include");
-        let pattern = &walker.includes[0];
+        let pattern = &walker.roots[0].includes[0];
 
         assert_eq!(
             pattern.literal_roots,
@@ -3573,8 +3775,10 @@ mod tests {
         let outside = Walker::new(&fixture.root)
             .include(format!("{}-elsewhere/**/*.ts", fixture.absolute("")))
             .expect("an unrelated tree is not an error");
-        assert!(!outside.includes[0].could_match_descendant(b"src"));
-        assert!(!outside.includes[0].covers_subtree(b"src", WildcardMode::ComponentScoped));
+        assert!(!outside.roots[0].includes[0].could_match_descendant(b"src"));
+        assert!(
+            !outside.roots[0].includes[0].covers_subtree(b"src", WildcardMode::ComponentScoped)
+        );
     }
 
     /// The shapes the rewrite refuses to guess at, reported instead of quietly
@@ -3630,6 +3834,329 @@ mod tests {
     /// Subtree pruning must decide what the per-entry exclude would have
     /// decided, under either mode.
     ///
+    /// What a multi-root walk observed, in the form the acceptance criterion
+    /// compares: every entry with the root it was found under and its depth
+    /// below that root, plus the recoverable errors. Sorted, so it is a
+    /// multiset and a duplicate stays a duplicate.
+    #[derive(Debug, PartialEq, Eq)]
+    struct RootedOutcome {
+        entries: Vec<(PathBuf, PathBuf, usize)>,
+        errors: Vec<(&'static str, PathBuf)>,
+    }
+
+    impl RootedOutcome {
+        fn of(result: &super::WalkResult) -> Self {
+            let mut entries = result
+                .entries()
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.root().to_path_buf(),
+                        entry.path().to_path_buf(),
+                        entry.depth(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut errors = result
+                .errors()
+                .iter()
+                .map(|error| (error.operation(), error.path().to_path_buf()))
+                .collect::<Vec<_>>();
+            entries.sort_unstable();
+            errors.sort_unstable();
+            Self { entries, errors }
+        }
+
+        /// The concatenation two single-root walks would have produced.
+        fn concatenated(parts: impl IntoIterator<Item = Self>) -> Self {
+            let mut joined = Self {
+                entries: Vec::new(),
+                errors: Vec::new(),
+            };
+            for part in parts {
+                joined.entries.extend(part.entries);
+                joined.errors.extend(part.errors);
+            }
+            joined.entries.sort_unstable();
+            joined.errors.sort_unstable();
+            joined
+        }
+    }
+
+    /// The frontends a multi-root walk has to agree across.
+    #[derive(Debug, Clone, Copy)]
+    enum Frontend {
+        Collect,
+        Visit,
+        Stream,
+    }
+
+    /// Runs one frontend over `roots` and reports what it saw.
+    fn multi_root_outcome(
+        roots: &[PathBuf],
+        include: Option<&str>,
+        threads: usize,
+        frontend: Frontend,
+    ) -> RootedOutcome {
+        let (first, rest) = roots.split_first().expect("at least one root");
+        let mut walker = Walker::new(first)
+            .threads(threads)
+            .options(WalkOptions::default().files_only(true));
+        for root in rest {
+            walker = walker.add_root(root).expect("the root takes the patterns");
+        }
+        if let Some(pattern) = include {
+            walker = walker.include(pattern).expect("valid include");
+        }
+        match frontend {
+            Frontend::Collect => {
+                RootedOutcome::of(&walker.collect().expect("collect walks under Collect"))
+            }
+            Frontend::Visit => RootedOutcome::of(
+                &walker
+                    .visit(|_| Verdict::Keep)
+                    .expect("visit walks under Collect"),
+            ),
+            Frontend::Stream => {
+                // The stream reports errors as items rather than in a result,
+                // so it is reassembled into the same shape.
+                let mut entries = Vec::new();
+                let mut errors = Vec::new();
+                for item in walker.stream() {
+                    match item {
+                        Ok(entry) => entries.push(entry),
+                        Err(error) => errors.push(error),
+                    }
+                }
+                RootedOutcome::of(&super::WalkResult {
+                    entries,
+                    errors,
+                    cancelled: false,
+                })
+            }
+        }
+    }
+
+    /// The acceptance criterion for multi-root walks: walking several roots at
+    /// once observes exactly what walking each of them separately observes,
+    /// counted as a multiset, on every frontend and at every thread count.
+    ///
+    /// Entries carry the root they were found under and their depth below it,
+    /// so this pins more than the path set: an entry from a multi-root walk has
+    /// to say the same things about itself as its single-root counterpart.
+    #[test]
+    fn a_multi_root_walk_is_the_concatenation_of_the_single_root_walks() {
+        let fixture = Fixture::new();
+        fixture.write("alpha/src/one.rs");
+        fixture.write("alpha/src/deep/two.rs");
+        fixture.write("alpha/notes.txt");
+        fixture.write("beta/src/three.rs");
+        fixture.write("beta/four.txt");
+        fixture.write("gamma/src/five.rs");
+
+        let roots = [
+            fixture.root.join("alpha"),
+            fixture.root.join("beta"),
+            fixture.root.join("gamma"),
+            // A root that does not exist, so the invariant covers errors too.
+            fixture.root.join("missing"),
+        ];
+
+        for include in [None, Some("src/**/*.rs"), Some("**/*.rs")] {
+            for threads in [1, 4] {
+                for frontend in [Frontend::Collect, Frontend::Visit, Frontend::Stream] {
+                    let together = multi_root_outcome(&roots, include, threads, frontend);
+                    let separately = RootedOutcome::concatenated(roots.iter().map(|root| {
+                        multi_root_outcome(std::slice::from_ref(root), include, threads, frontend)
+                    }));
+                    assert_eq!(
+                        together, separately,
+                        "{frontend:?} on {threads} threads with include {include:?}"
+                    );
+                }
+            }
+        }
+
+        // Not vacuous: the walk really did see all three trees and the failure.
+        let all = multi_root_outcome(&roots, None, 4, Frontend::Collect);
+        assert_eq!(all.entries.len(), 6);
+        assert_eq!(all.errors.len(), 1);
+        assert_eq!(all.errors[0].0, "read_dir");
+    }
+
+    /// Roots that contain one another deliver their overlap once per root.
+    ///
+    /// This is the concatenation rule taken seriously rather than an oversight:
+    /// suppressing the second copy would need every directory's identity - a
+    /// `stat` per directory that only the symlink-following mode pays today -
+    /// and would make adding a root able to remove entries.
+    #[test]
+    fn overlapping_roots_deliver_their_overlap_once_per_root() {
+        let fixture = Fixture::new();
+        fixture.write("outer/inner/shared.rs");
+        fixture.write("outer/own.rs");
+
+        let outer = fixture.root.join("outer");
+        let inner = outer.join("inner");
+        let result = Walker::new(&outer)
+            .add_root(&inner)
+            .expect("nested roots are allowed")
+            .threads(1)
+            .options(WalkOptions::default().sort(true).files_only(true))
+            .collect()
+            .expect("walk succeeds");
+
+        let shared = inner.join("shared.rs");
+        let copies = result
+            .entries()
+            .iter()
+            .filter(|entry| entry.path() == shared)
+            .collect::<Vec<_>>();
+        assert_eq!(copies.len(), 2, "the overlap is delivered once per root");
+        // The two copies differ in exactly what the root makes different.
+        let mut seen = copies
+            .iter()
+            .map(|entry| (entry.root().to_path_buf(), entry.depth()))
+            .collect::<Vec<_>>();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec![(outer.clone(), 2), (inner.clone(), 1)],
+            "each copy is one level below the root it came from"
+        );
+    }
+
+    /// Patterns are root-relative and apply under every root; an absolute one
+    /// is rewritten per root, so it selects only under the root it names.
+    #[test]
+    fn patterns_are_read_once_per_root() {
+        let fixture = Fixture::new();
+        fixture.write("alpha/src/one.rs");
+        fixture.write("alpha/other/two.rs");
+        fixture.write("beta/src/three.rs");
+        fixture.write("beta/other/four.rs");
+        let alpha = fixture.root.join("alpha");
+        let beta = fixture.root.join("beta");
+
+        let walk = |pattern: String| -> Vec<PathBuf> {
+            let result = Walker::new(&alpha)
+                .add_root(&beta)
+                .expect("the root takes the patterns")
+                .include(pattern)
+                .expect("valid include")
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("walk succeeds");
+            result
+                .entries()
+                .iter()
+                .map(|entry| entry.path().to_path_buf())
+                .collect()
+        };
+
+        // A relative pattern selects that subtree of every root.
+        assert_eq!(
+            walk("src/*.rs".to_owned()),
+            vec![alpha.join("src/one.rs"), beta.join("src/three.rs")],
+        );
+
+        // An absolute pattern names one tree, and #85's out-of-root reading is
+        // what makes it select nothing under the other.
+        let alpha_glob = String::from_utf8(glob_path_bytes(&alpha).into_owned())
+            .expect("the temporary directory is UTF-8 on a test host");
+        assert_eq!(
+            walk(format!("{alpha_glob}/src/*.rs")),
+            vec![alpha.join("src/one.rs")],
+        );
+    }
+
+    /// Builder order does not matter, including for the rejection an absolute
+    /// pattern can produce: the pattern meets every root either way.
+    #[test]
+    fn a_root_and_a_pattern_meet_whichever_order_they_arrive_in() {
+        let fixture = Fixture::new();
+        fixture.write("alpha/src/one.rs");
+        fixture.write("beta/src/two.rs");
+        let alpha = fixture.root.join("alpha");
+        let beta = fixture.root.join("beta");
+
+        let entries = |walker: Walker| -> Vec<PathBuf> {
+            walker
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("walk succeeds")
+                .entries()
+                .iter()
+                .map(|entry| entry.path().to_path_buf())
+                .collect()
+        };
+
+        let root_first = entries(
+            Walker::new(&alpha)
+                .add_root(&beta)
+                .expect("root")
+                .include("src/*.rs")
+                .expect("include"),
+        );
+        let pattern_first = entries(
+            Walker::new(&alpha)
+                .include("src/*.rs")
+                .expect("include")
+                .add_root(&beta)
+                .expect("root"),
+        );
+        assert_eq!(root_first, pattern_first);
+        assert_eq!(root_first.len(), 2);
+
+        // A pattern no root can be given is refused from whichever side it is
+        // added, rather than only when the root happens to come first.
+        let unprovable = fixture.absolute("/../x.rs");
+        assert!(
+            Walker::new(&alpha)
+                .add_root(&beta)
+                .expect("root")
+                .include(&unprovable)
+                .is_err()
+        );
+        assert!(
+            Walker::new(&alpha)
+                .include(&unprovable)
+                .expect_err("`..` is refused for the first root already")
+                .message()
+                .starts_with("`..`")
+        );
+    }
+
+    /// A root that cannot be read is that root's error, and the walk goes on to
+    /// the others under `Collect`.
+    #[test]
+    fn an_unreadable_root_does_not_stop_the_other_roots() {
+        let fixture = Fixture::new();
+        fixture.write("alpha/one.rs");
+        fixture.write("gamma/two.rs");
+        let missing = fixture.root.join("beta");
+
+        for threads in [1, 4] {
+            let result = Walker::new(fixture.root.join("alpha"))
+                .add_root(&missing)
+                .expect("root")
+                .add_root(fixture.root.join("gamma"))
+                .expect("root")
+                .threads(threads)
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("Collect keeps walking");
+            assert_eq!(
+                relative_paths(result.entries(), &fixture.root),
+                vec![PathBuf::from("alpha/one.rs"), PathBuf::from("gamma/two.rs")],
+                "the readable roots are walked on {threads} threads"
+            );
+            assert_eq!(result.errors().len(), 1);
+            assert_eq!(result.errors()[0].operation(), "read_dir");
+            assert_eq!(result.errors()[0].path(), missing);
+        }
+    }
+
     /// `*.tmp/**` used to close `a/b.tmp` in both modes, because the subtree
     /// root was always read as separator-crossing. In the default mode the
     /// exclude does not reach that directory at all - `*.tmp` cannot match the
@@ -4360,7 +4887,15 @@ mod tests {
         state
             .walk_directory(
                 &super::StdBackend,
-                directory_task(walker, &super::StdBackend, walker.root.clone()),
+                directory_task(
+                    walker,
+                    &super::StdBackend,
+                    walker
+                        .roots()
+                        .next()
+                        .expect("a walk has a root")
+                        .to_path_buf(),
+                ),
             )
             .expect("portable walk succeeds");
         if walker.options.sort {

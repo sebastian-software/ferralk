@@ -95,6 +95,37 @@ switch the whole walk to crossing wildcards as described below. A pattern that
 starts at a filesystem root is understood as absolute and rewritten, as
 described next.
 
+### Several roots in one walk
+
+`Walker::add_root` and `Walker::add_roots` extend a walk to more than one tree.
+A caller with several source directories used to build one walker per directory,
+and with it one thread pool per directory; the roots are now the walk's initial
+directories and everything downstream of that is shared — the scheduler, the
+helper-spawn floor, and the visited-directory guard.
+
+| Question | Answer |
+| --- | --- |
+| Which patterns apply? | Every pattern applies under every root, root-relative as always. An absolute pattern is rewritten per root, so a pattern naming one root's tree selects nothing under the others. |
+| What is `depth`? | Components between the entry and **its own** root, exactly as in a single-root walk. |
+| Which root did an entry come from? | `WalkEntry::root`. A single-root walk answers with that one root, so the accessor reads the same either way. |
+| What if roots overlap? | Their overlap is delivered once per root. |
+| What if a root cannot be read? | An ordinary walk error for that root's path; the other roots are still walked, subject to the error policy. |
+| In what order? | Unspecified, exactly as within a single root: the roots become scheduler tasks like any other. `WalkOptions::sort(true)` is what orders a result. |
+
+The overlap rule is the one worth stating twice, because it is a choice rather
+than an accident. A multi-root walk is defined as the concatenation of the
+single-root walks — that is what makes it substitutable for the loop it
+replaces, and what the invariant tests check on every frontend. Suppressing the
+second copy of a shared subtree would need the identity of every directory,
+which costs a `stat` per directory that only `follow_symlinks(true)` pays today,
+and it would make adding a root able to *remove* entries. A caller who wants
+each path once passes roots that do not contain one another.
+
+Because patterns are read per root, an absolute pattern list can be handed to a
+multi-root walk unsorted: each pattern selects under the root it names and
+falls away under the rest, which is why an out-of-root pattern is a verdict
+rather than an error.
+
 ### Absolute patterns, and the caller-side rewrite they replace
 
 A caller that knows where a project lives holds `/repo/src/**/*.ts` rather than
