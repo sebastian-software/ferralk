@@ -17,6 +17,10 @@ use std::{cell::RefCell, error::Error, fmt, ops::RangeInclusive};
 
 use memchr::{memchr, memchr2, memchr3, memmem};
 
+mod sweep;
+
+use sweep::SweepEngine;
+
 /// A compiled glob pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern {
@@ -267,12 +271,16 @@ impl Pattern {
         flush_literals(&mut tokens, &mut literals);
         budget.charge(tokens.len() - charged, 0)?;
 
+        let extglob = compile_extglob(pattern, options, budget)?;
+        let fast_path = FastPath::compile(&tokens, options);
+        let sweep = compile_sweep(&tokens, &fast_path, extglob.as_ref(), options, budget)?;
         Self::from_alternatives(
             vec![CompiledAlternative {
-                extglob: compile_extglob(pattern, options, budget)?,
+                extglob,
                 raw: pattern.to_vec(),
-                fast_path: FastPath::compile(&tokens, options),
+                fast_path,
                 prefilter: Prefilter::compile(&tokens),
+                sweep,
                 tokens,
             }],
             options,
@@ -301,6 +309,47 @@ impl Pattern {
         Self::match_alternatives(&self.alternatives, self.options, path)
     }
 
+    /// Reports whether every match engine agrees on `path`.
+    ///
+    /// Hidden from documentation: it exists for the differential fuzz
+    /// harness, which cannot strip the per-alternative engines from outside
+    /// the crate. Each entry point is asked as compiled, with the fast paths
+    /// stripped so the sweep engine answers, and with the sweep stripped too
+    /// so the memoized matcher answers.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn engines_agree(&self, path: impl AsRef<[u8]>) -> bool {
+        let path = path.as_ref();
+        let answers = |pattern: &Self| {
+            (
+                pattern.is_match(path),
+                pattern.is_match_path(path),
+                pattern.is_match_glob_path(path),
+            )
+        };
+        let mut sweep_only = self.clone();
+        sweep_only.strip_engines(true, false, false);
+        let mut memoized = self.clone();
+        memoized.strip_engines(true, true, true);
+        let compiled = answers(self);
+        compiled == answers(&sweep_only) && compiled == answers(&memoized)
+    }
+
+    /// Removes accelerated engines so a differential run can pin one engine.
+    ///
+    /// `prefilters` neutralises the fixed-ends prefilter as well, which turns
+    /// the stripped pattern into the bare memoized engine — the oracle the
+    /// prefilter and the sweep are both held against.
+    fn strip_engines(&mut self, fast_paths: bool, sweeps: bool, prefilters: bool) {
+        for alternative in self
+            .alternatives
+            .iter_mut()
+            .chain(self.path_filter_alternatives.iter_mut().flatten())
+        {
+            alternative.strip_engines(fast_paths, sweeps, prefilters);
+        }
+    }
+
     /// Matches `path` against any of `alternatives` under `options`.
     ///
     /// Free of `self` so a compiled extglob alternative can be run through the
@@ -324,13 +373,18 @@ impl Pattern {
             {
                 fast_path.is_match(path, options)
             } else {
-                // The engine explores before it consults the pattern's fixed
-                // ends, so a candidate that cannot possibly match is rejected
-                // here rather than after the whole state space has been walked.
+                // Neither engine consults the pattern's fixed ends before it
+                // walks the candidate, so a candidate that cannot possibly
+                // match is rejected here rather than after the walk: the sweep
+                // pays per byte and the memoized engine per visited state.
                 !alternative
                     .prefilter
                     .rejects(path, options.case_insensitive)
-                    && Self::matches_general(&alternative.tokens, path, options)
+                    && if let Some(sweep) = &alternative.sweep {
+                        sweep.is_match(path, options)
+                    } else {
+                        Self::matches_general(&alternative.tokens, path, options)
+                    }
             }
         })
     }
@@ -570,11 +624,13 @@ impl Pattern {
         );
         budget.charge(tokens.len(), 0)?;
         let extglob = compile_extglob(&raw, options, budget)?;
+        let sweep = compile_sweep(&tokens, &fast_path, extglob.as_ref(), options, budget)?;
         Ok(CompiledAlternative {
             extglob,
             raw,
             fast_path,
             prefilter: Prefilter::compile(&tokens),
+            sweep,
             tokens,
         })
     }
@@ -1271,6 +1327,62 @@ struct CompiledAlternative {
     /// Necessary conditions on a candidate, read off `tokens` at compile time
     /// and checked before the general engine runs. See [`Prefilter`].
     prefilter: Prefilter,
+    /// The bit-parallel engine for the general path, present when
+    /// [`compile_sweep`] found the tokens suitable. It answers exactly like
+    /// the memoized matcher and replaces it in the dispatch, never a fast
+    /// path and never an extglob program.
+    sweep: Option<Box<SweepEngine>>,
+}
+
+impl CompiledAlternative {
+    /// Removes accelerated engines, descending into extglob alternatives so a
+    /// differential run pins one engine for the sub-matches too.
+    fn strip_engines(&mut self, fast_paths: bool, sweeps: bool, prefilters: bool) {
+        if fast_paths {
+            self.fast_path = None;
+        }
+        if sweeps {
+            self.sweep = None;
+        }
+        if prefilters {
+            self.prefilter = Prefilter::default();
+        }
+        if let Some(program) = &mut self.extglob {
+            for group in &mut program.groups {
+                for alternative in &mut group.alternatives {
+                    for nested in alternative.compiled.iter_mut().flatten() {
+                        nested.strip_engines(fast_paths, sweeps, prefilters);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Compiles the Shift-And engine where the alternative would use it.
+///
+/// An extglob program keeps its own interpreter, and the literal and
+/// deterministic fast paths win the dispatch under every option profile, so
+/// building an engine behind either would spend budget on dead tables. Every
+/// other shape may reach the general path — the starred fast paths lose the
+/// dispatch once wildcards are component-local — and gets an engine when its
+/// positions fit one word.
+fn compile_sweep(
+    tokens: &[Token],
+    fast_path: &Option<FastPath>,
+    extglob: Option<&CompiledExtglob>,
+    options: PatternOptions,
+    budget: &mut IrBudget,
+) -> Result<Option<Box<SweepEngine>>, PatternError> {
+    if extglob.is_some()
+        || matches!(
+            fast_path,
+            Some(FastPath::LiteralTokens(_) | FastPath::DeterministicTokens(_))
+        )
+    {
+        return Ok(None);
+    }
+    SweepEngine::compile(tokens, options, budget)
 }
 
 /// Conditions every candidate the general engine accepts must already satisfy.
@@ -2998,11 +3110,15 @@ mod tests {
     fn repeated_general_matches_reuse_the_thread_local_scratch() {
         // libtest gives each test its own thread, so the scratch observed here
         // is private to this test.
-        let pattern = Pattern::compile(
+        let mut pattern = Pattern::compile(
             "**/*.ts",
             PatternOptions::default().recursive_double_star(true),
         )
         .unwrap();
+        // The scratch belongs to the memoized matcher; pin it, since the
+        // sweep engine would otherwise answer for this shape without any
+        // buffers at all.
+        pattern.strip_engines(false, true, false);
         let matching = "src/deep/nested/module/component/widget/main.ts";
         let other = "src/deep/nested/module/component/widget/main.tsx";
 
@@ -3028,11 +3144,9 @@ mod tests {
 
         // One oversized candidate grows the matrix, but must not keep it.
         let long = "x".repeat(300_000);
-        assert!(
-            !Pattern::compile("*a*y", PatternOptions::default())
-                .unwrap()
-                .is_match(&long)
-        );
+        let mut oversized = Pattern::compile("*a*y", PatternOptions::default()).unwrap();
+        oversized.strip_engines(false, true, true);
+        assert!(!oversized.is_match(&long));
         assert!(
             scratch_capacities().0 <= super::RETAINED_SCRATCH_WORDS,
             "an oversized candidate must release the matrix it needed"
@@ -4344,6 +4458,203 @@ mod tests {
         assert_eq!(prefilter.prefix, b"a");
         assert_eq!(prefilter.suffix, b"d");
         assert_eq!(prefilter.min_length, 4);
+    }
+
+    /// Asserts that the sweep engine and the memoized matcher agree on every
+    /// candidate, under every entry point, and that the compiled dispatch
+    /// answers the same.
+    fn assert_sweep_agrees(pattern: &[u8], options: PatternOptions, candidates: &[Vec<u8>]) {
+        let compiled = Pattern::compile(pattern, options).expect("differential pattern compiles");
+        let mut sweep_only = compiled.clone();
+        sweep_only.strip_engines(true, false, false);
+        let mut memoized = sweep_only.clone();
+        memoized.strip_engines(false, true, true);
+        for candidate in candidates {
+            let name = String::from_utf8_lossy(pattern);
+            let shown = String::from_utf8_lossy(candidate);
+            assert_eq!(
+                sweep_only.is_match(candidate),
+                memoized.is_match(candidate),
+                "is_match diverges for {name:?} against {shown:?} under {options:?}"
+            );
+            assert_eq!(
+                sweep_only.is_match_path(candidate),
+                memoized.is_match_path(candidate),
+                "is_match_path diverges for {name:?} against {shown:?} under {options:?}"
+            );
+            assert_eq!(
+                sweep_only.is_match_glob_path(candidate),
+                memoized.is_match_glob_path(candidate),
+                "is_match_glob_path diverges for {name:?} against {shown:?} under {options:?}"
+            );
+            assert!(
+                compiled.engines_agree(candidate),
+                "an engine diverges for {name:?} against {shown:?} under {options:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_engine_agrees_with_the_memoized_matcher_over_exhaustive_byte_words() {
+        // Both letter cases, the hidden-file dot, and the separator: the four
+        // byte roles the sweep tables distinguish.
+        let words = byte_words(b"aB./", 4);
+        let patterns: &[&[u8]] = &[
+            b"*",
+            b"?",
+            b"a",
+            b"*a",
+            b"a*",
+            b"*a*",
+            b"a*B",
+            b"*.*",
+            b"a*a*a*B",
+            b"?a?",
+            b"[aB]",
+            b"[!a]*",
+            b"[.]a",
+            b"[a-b]*",
+            b"[[:alpha:]]?",
+            b"*/",
+            b"/*",
+            b"a/*",
+            b"*/a",
+            b"a/?",
+            b"a/??",
+            b"**",
+            b"**/",
+            b"a/**",
+            b"**/a",
+            b"a/**/B",
+            b"**/*.a",
+            b"a/?*B",
+            b"./a/*",
+            b"\\*a",
+            b"a\\/B",
+            b"\\.a",
+        ];
+        for &pattern in patterns {
+            for recursive in [false, true] {
+                for match_hidden in [false, true] {
+                    for case_insensitive in [false, true] {
+                        let options = PatternOptions::default()
+                            .recursive_double_star(recursive)
+                            .match_hidden(match_hidden)
+                            .case_insensitive(case_insensitive);
+                        assert_sweep_agrees(pattern, options, &words);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sweep_engine_agrees_for_brace_alternatives_over_exhaustive_byte_words() {
+        let words = byte_words(b"aB./", 4);
+        for &pattern in [b"{a,B}*".as_slice(), b"{a/**,B?}", b"*.{a,B}"].iter() {
+            for match_hidden in [false, true] {
+                let options = PatternOptions::default()
+                    .braces(true)
+                    .recursive_double_star(true)
+                    .match_hidden(match_hidden);
+                assert_sweep_agrees(pattern, options, &words);
+            }
+        }
+    }
+
+    #[test]
+    fn sweep_engine_agrees_over_randomized_patterns_and_paths() {
+        // A multiplicative generator keeps the search reproducible without a
+        // random-number crate. The fragments cover every token kind the sweep
+        // encodes, and the paths lean on the bytes with special roles.
+        let fragments: &[&[u8]] = &[
+            b"a", b"B", b".", b"/", b"*", b"?", b"**", b"[aB]", b"[!a]", b"[.-b]", b"{a,B}", b"\\*",
+        ];
+        let path_bytes = b"aB./";
+        let mut seed = 0x0123_4567_89AB_CDEF_u64;
+        let mut next = move |bound: usize| {
+            seed = seed.wrapping_mul(0x2545_F491_4F6C_DD1D).wrapping_add(1);
+            (usize::try_from(seed >> 33).expect("31 bits fit a usize")) % bound
+        };
+        for _ in 0..2_000 {
+            let mut pattern = Vec::new();
+            for _ in 0..next(8) {
+                pattern.extend_from_slice(fragments[next(fragments.len())]);
+            }
+            let options = PatternOptions::default()
+                .braces(next(2) == 0)
+                .recursive_double_star(next(2) == 0)
+                .match_hidden(next(2) == 0)
+                .case_insensitive(next(2) == 0)
+                .escape(next(2) == 0);
+            let Ok(compiled) = Pattern::compile(&pattern, options) else {
+                continue;
+            };
+            for _ in 0..24 {
+                let mut path = Vec::new();
+                for _ in 0..next(12) {
+                    path.push(path_bytes[next(path_bytes.len())]);
+                }
+                assert!(
+                    compiled.engines_agree(&path),
+                    "engines diverge for {:?} against {:?} under {options:?}",
+                    String::from_utf8_lossy(&pattern),
+                    String::from_utf8_lossy(&path)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sweep_engine_is_present_exactly_where_the_general_path_needs_it() {
+        let starred = Pattern::compile("a*a*B", PatternOptions::default()).unwrap();
+        assert!(starred.alternatives[0].sweep.is_some());
+
+        // Literal and deterministic shapes never reach the general path.
+        let literal = Pattern::compile("src/main.rs", PatternOptions::default()).unwrap();
+        assert!(literal.alternatives[0].sweep.is_none());
+        let deterministic = Pattern::compile("src/[ab]?.rs", PatternOptions::default()).unwrap();
+        assert!(deterministic.alternatives[0].sweep.is_none());
+
+        // An extglob program keeps its own interpreter.
+        let extglob = Pattern::compile("@(a|b)*", PatternOptions::default().extglob(true)).unwrap();
+        assert!(extglob.alternatives[0].sweep.is_none());
+
+        // Past the position cap the memoized matcher stays responsible, and
+        // both engines still answer alike.
+        let oversized_source = [b"a".repeat(70), b"*B".to_vec()].concat();
+        let oversized = Pattern::compile(&oversized_source, PatternOptions::default()).unwrap();
+        assert!(oversized.alternatives[0].sweep.is_none());
+        let candidate = [b"a".repeat(70), b"xB".to_vec()].concat();
+        assert!(oversized.is_match(&candidate));
+        assert!(oversized.engines_agree(&candidate));
+    }
+
+    #[test]
+    fn sweep_engine_keeps_the_terminal_recursive_star_end_of_path_case() {
+        let options = PatternOptions::default().recursive_double_star(true);
+        // `src/**` accepts `src` itself; `src/**/` does not, because the
+        // recursive-prefix form still demands the separator.
+        assert_sweep_agrees(
+            b"src/**",
+            options,
+            &[
+                b"src".to_vec(),
+                b"src/".to_vec(),
+                b"sr".to_vec(),
+                b"src/a".to_vec(),
+                b"src/.a".to_vec(),
+            ],
+        );
+        assert_sweep_agrees(
+            b"src/**/",
+            options,
+            &[b"src".to_vec(), b"src/".to_vec(), b"src/a/".to_vec()],
+        );
+        let terminal = Pattern::compile("src/**", options).unwrap();
+        assert!(terminal.is_match("src"));
+        let prefixed = Pattern::compile("src/**/", options).unwrap();
+        assert!(!prefixed.is_match("src"));
     }
 
     fn byte_words(alphabet: &[u8], max_length: usize) -> Vec<Vec<u8>> {
