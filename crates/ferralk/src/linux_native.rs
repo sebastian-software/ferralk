@@ -209,7 +209,9 @@ fn for_each_record(
         // the end of the record, so a valid terminating NUL may be its final
         // byte. Search the entire name-and-padding region.
         let name_and_padding = &record[NAME_OFFSET..record_length];
-        let Some(name_length) = name_and_padding.iter().position(|&byte| byte == 0) else {
+        // Both scans run for every entry of every directory the walk reads, so
+        // they use the vectorised search rather than a byte-at-a-time loop.
+        let Some(name_length) = memchr::memchr(0, name_and_padding) else {
             return Err(malformed_record());
         };
         let name = &name_and_padding[..name_length];
@@ -219,7 +221,7 @@ fn for_each_record(
         if name.is_empty() || name == b"." || name == b".." {
             continue;
         }
-        if name.contains(&b'/') {
+        if memchr::memchr(b'/', name).is_some() {
             return Err(malformed_record());
         }
         visit(name, record[TYPE_OFFSET])?;

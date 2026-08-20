@@ -301,7 +301,14 @@ pub struct WalkEntry {
     is_dir: bool,
     is_symlink: bool,
     depth: usize,
-    metadata: Option<fs::Metadata>,
+    /// Boxed rather than inline: `fs::Metadata` is the platform `stat` struct,
+    /// around 144 bytes on Unix, and carrying it in the entry made every
+    /// `WalkEntry` that size whether or not
+    /// [`WalkOptions::metadata`](WalkOptions::metadata) was ever asked for. A
+    /// walk collects millions of these into one `Vec`, and the default walk
+    /// leaves the option off. The box costs one allocation per entry on the
+    /// walks that do ask, which already paid a `stat` syscall for it.
+    metadata: Option<Box<fs::Metadata>>,
 }
 
 impl WalkEntry {
@@ -374,7 +381,7 @@ impl WalkEntry {
     /// Metadata collected when WalkOptions metadata is enabled.
     #[must_use]
     pub fn metadata(&self) -> Option<&fs::Metadata> {
-        self.metadata.as_ref()
+        self.metadata.as_deref()
     }
 }
 
@@ -983,6 +990,7 @@ impl Walker {
             listing: Listing::default(),
             next_entry: 0,
             path: PathBuf::new(),
+            directory: PathBuf::new(),
             visited_directories: HashSet::new(),
             ignores: IgnoreScope::default(),
             depth: 0,
@@ -1611,6 +1619,9 @@ pub struct WalkStream {
     next_entry: usize,
     /// That directory's path, with the entry being classified pushed onto it.
     path: PathBuf,
+    /// The same directory without an entry on it, kept so `path` can be reset
+    /// by [`reset_to_directory`] rather than by `PathBuf::pop`.
+    directory: PathBuf,
     visited_directories: HashSet<CycleKey>,
     /// Ignore rules of the directory whose entries are being delivered.
     ignores: IgnoreScope,
@@ -1680,8 +1691,8 @@ impl WalkStream {
                 self.depth = depth;
                 self.root = root;
                 self.next_entry = 0;
-                self.path.clear();
-                self.path.push(&path);
+                self.directory = path;
+                reset_to_directory(&mut self.path, &self.directory);
                 None
             }
             Err(source) => self.error("read_dir", path, source),
@@ -1724,7 +1735,7 @@ impl WalkStream {
                 self.error(failure.operation, failure.path, failure.source)
             }
         };
-        self.path.pop();
+        reset_to_directory(&mut self.path, &self.directory);
         emitted
     }
 }
@@ -1776,6 +1787,32 @@ struct WalkState<'walker> {
 struct DirectoryScratch {
     listing: Listing,
     path: PathBuf,
+}
+
+/// Entries between two cancellation checks inside one directory.
+///
+/// Both frontends check when they take a directory and then once every this
+/// many entries. Checking per entry bought a granularity nothing observes: a
+/// walk is already free to finish the directory it has started, and the check
+/// reads shared state — an atomic the parallel frontend's workers all load, and
+/// a token behind an `Arc` in the serial one.
+///
+/// A power of two, so the test is a mask, and small enough that a cancelled
+/// walk keeps classifying for the width of a stride rather than the width of a
+/// listing.
+const CANCELLATION_STRIDE: usize = 64;
+
+/// Puts `path` back to the directory its entries are assembled onto.
+///
+/// `PathBuf::pop` finds the parent by walking the path's components backwards,
+/// which is a question the caller already knows the answer to: it pushed one
+/// name onto a directory whose length it recorded. `OsString::truncate` would
+/// say exactly that, but it is unstable (rust#133262) and this crate denies
+/// unsafe, so the directory is re-copied instead — a `memcpy` of a short path,
+/// with no component parsing and no separator scan.
+fn reset_to_directory(path: &mut PathBuf, directory: &Path) {
+    path.clear();
+    path.as_mut_os_string().push(directory.as_os_str());
 }
 
 /// Copies `path` into a buffer of its own, reusing `spare` when an entry the
@@ -1870,7 +1907,13 @@ impl<'walker> WalkState<'walker> {
         scratch.path.clear();
         scratch.path.push(path);
         for index in 0..scratch.listing.entries().len() {
-            if self.check_cancellation() {
+            // A `Verdict::Stop` is this walk's own decision, already on a local
+            // field, and is honoured on the very next entry. The caller's token
+            // is polled every [`CANCELLATION_STRIDE`] entries instead of every
+            // one, which is what costs a load through the shared `Arc`.
+            if self.cancelled
+                || (index.is_multiple_of(CANCELLATION_STRIDE) && self.check_cancellation())
+            {
                 return Ok(());
             }
             // The entry's path exists only for as long as it is being decided
@@ -1886,7 +1929,7 @@ impl<'walker> WalkState<'walker> {
                 root,
             );
             let outcome = self.act(backend, action, &scratch.path);
-            scratch.path.pop();
+            reset_to_directory(&mut scratch.path, path);
             outcome?;
         }
         Ok(())

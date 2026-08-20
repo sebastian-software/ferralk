@@ -143,9 +143,22 @@ Important defaults:
 - `stream()` yields entries and recoverable errors incrementally. It is
   single-threaded and cannot provide global sorting.
 
-`CancellationToken::cancel` requests a cooperative stop before the next
-filesystem operation. It is safe to clone the token and keep it outside the
-walker.
+`CancellationToken::cancel` requests a cooperative stop. It is safe to clone the
+token and keep it outside the walker.
+
+The request is observed at a bounded granularity rather than between every two
+filesystem operations. `collect()`, serial and parallel alike, reads the token
+when a worker takes a directory and then once every 64 entries while it works
+through the listing, so a cancelled walk classifies at most that many more
+entries per worker before stopping and never opens another directory.
+`stream()` reads it before every entry it yields. `Verdict::Stop` reaches a
+parallel walk's workers, the one that returned it included, at that same
+granularity; a serial walk stops at the very next entry, because there the
+verdict is a local flag rather than shared state.
+
+Reading shared cancellation state per entry bought a promptness nothing can
+observe — a walk is free to finish the listing it has already read either way —
+and cost a load of a shared atomic on the walk's hottest loop.
 
 ### Filtering with a matcher of your own
 
