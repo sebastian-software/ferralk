@@ -77,6 +77,13 @@ if result.was_cancelled() {
 
 Important defaults:
 
+- Ordinary wildcards (`*`, `?`, classes) stay inside one path component, so
+  `*.ts` selects a file in the walk root and not `src/main.ts`. `**` is
+  recursive under either setting, and
+  `Walker::wildcard_mode(WildcardMode::SeparatorCrossing)` switches to the
+  reading `globset` and `fast-glob` use; see the
+  [compatibility guide](compatibility-guide.md).
+
 - `.gitignore` and `.ignore` files are considered only after
   `respect_git_ignore(true)`, together with the walk root's
   `.git/info/exclude`, which they override. The file closest to an entry

@@ -93,6 +93,37 @@ impl CancellationToken {
     }
 }
 
+/// How far an ordinary wildcard reaches in a walker pattern.
+///
+/// `*`, `?` and character classes are the ordinary wildcards; `**` crosses
+/// separators under either mode.
+///
+/// ```
+/// use ferralk::{WildcardMode, Walker};
+///
+/// // The default. `*.ts` selects a TypeScript file in the walk root, the way
+/// // a shell glob does, and `src/*.ts` selects one directly inside `src`.
+/// let scoped = Walker::new(".").include("*.ts")?;
+///
+/// // A wildcard spans separators, the way `globset` and `fast-glob` read a
+/// // pattern by default: `*.ts` now also selects `a/b.ts`.
+/// let crossing = Walker::new(".")
+///     .wildcard_mode(WildcardMode::SeparatorCrossing)
+///     .include("*.ts")?;
+/// # Ok::<(), ferralk::ferralk_glob::PatternError>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WildcardMode {
+    /// A wildcard stays inside one path component: `*.ts` matches `main.ts`
+    /// and not `src/main.ts`. Filesystem-glob semantics, and the default.
+    #[default]
+    ComponentScoped,
+    /// A wildcard spans separators: `*.ts` matches `main.ts` and `src/main.ts`
+    /// alike. This is how `globset` and `fast-glob` read an unconfigured
+    /// pattern, so it is the mode to pick when porting patterns from them.
+    SeparatorCrossing,
+}
+
 /// Behaviour switches for a Walker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WalkOptions {
@@ -370,6 +401,7 @@ pub struct Walker {
     error_policy: ErrorPolicy,
     cancellation: Option<CancellationToken>,
     respect_git_ignore: bool,
+    wildcard_mode: WildcardMode,
     threads: usize,
 }
 
@@ -386,6 +418,7 @@ impl Walker {
             error_policy: ErrorPolicy::default(),
             cancellation: None,
             respect_git_ignore: false,
+            wildcard_mode: WildcardMode::default(),
             threads: std::thread::available_parallelism()
                 .map(std::num::NonZeroUsize::get)
                 .unwrap_or(1),
@@ -431,6 +464,36 @@ impl Walker {
         for pattern in self.includes.iter_mut().chain(self.excludes.iter_mut()) {
             pattern.recompile(options);
         }
+        self
+    }
+
+    /// Chooses how far an ordinary wildcard reaches.
+    ///
+    /// The default, [`WildcardMode::ComponentScoped`], keeps `*`, `?` and
+    /// character classes inside one path component, so `*.ts` selects a file in
+    /// the walk root and `src/*.ts` one directly inside `src`.
+    ///
+    /// [`WildcardMode::SeparatorCrossing`] lets them span separators, which is
+    /// how `globset` and `fast-glob` read a pattern that was not configured
+    /// otherwise. Under it `*.ts` also selects `src/deep/main.ts`. Patterns
+    /// carried over from those crates keep their meaning here instead of
+    /// quietly selecting less; see the migration note in the compatibility
+    /// guide.
+    ///
+    /// The mode applies to includes and excludes alike, and builder order does
+    /// not matter.
+    ///
+    /// ```
+    /// use ferralk::{WildcardMode, Walker};
+    ///
+    /// let walker = Walker::new(".")
+    ///     .wildcard_mode(WildcardMode::SeparatorCrossing)
+    ///     .include("*.ts")?;
+    /// # Ok::<(), ferralk::ferralk_glob::PatternError>(())
+    /// ```
+    #[must_use]
+    pub const fn wildcard_mode(mut self, mode: WildcardMode) -> Self {
+        self.wildcard_mode = mode;
         self
     }
 
@@ -710,14 +773,34 @@ impl TraversalPattern {
             .expect("a compiled pattern stays valid when only match_hidden changes");
     }
 
-    fn matches(&self, path: &[u8], is_dir: bool) -> bool {
-        (!self.directories_only || is_dir) && self.matcher.is_match_glob_path(path)
+    /// Whether the pattern selects this candidate under `mode`.
+    ///
+    /// The two readings differ only in how far an ordinary wildcard reaches, so
+    /// they are the same compiled pattern asked a different question rather
+    /// than two compilations.
+    fn matches(&self, path: &[u8], is_dir: bool, mode: WildcardMode) -> bool {
+        if self.directories_only && !is_dir {
+            return false;
+        }
+        match mode {
+            WildcardMode::ComponentScoped => self.matcher.is_match_glob_path(path),
+            WildcardMode::SeparatorCrossing => self.matcher.is_match(path),
+        }
     }
 
-    fn covers_subtree(&self, path: &[u8]) -> bool {
-        self.subtree_root
-            .as_ref()
-            .is_some_and(|root| root.is_match(path))
+    /// Whether the exclude covers everything below `path`, so the walk may skip
+    /// opening it.
+    ///
+    /// The subtree root is asked under the same mode as the pattern itself.
+    /// Reading it as separator-crossing while the walk scopes wildcards to a
+    /// component prunes subtrees the exclude does not cover: `*.tmp/**` would
+    /// close `a/b.tmp` even though a component-scoped `*.tmp` cannot match the
+    /// component `a`.
+    fn covers_subtree(&self, path: &[u8], mode: WildcardMode) -> bool {
+        self.subtree_root.as_ref().is_some_and(|root| match mode {
+            WildcardMode::ComponentScoped => root.is_match_glob_path(path),
+            WildcardMode::SeparatorCrossing => root.is_match(path),
+        })
     }
 
     fn could_match_descendant(&self, path: &[u8]) -> bool {
@@ -781,13 +864,19 @@ fn literal_pattern_root(pattern: &[u8]) -> Option<Vec<u8>> {
     });
     let prefix = &pattern[..magic.unwrap_or(pattern.len())];
     let root = if magic.is_some() {
-        if let Some(prefix) = prefix.strip_suffix(b"/") {
-            prefix
-        } else {
-            prefix
-                .iter()
-                .rposition(|byte| *byte == b'/')
-                .map_or(prefix, |separator| &prefix[..separator])
+        match prefix.strip_suffix(b"/") {
+            // The wildcard starts its own component, so everything before it is
+            // a proven prefix.
+            Some(complete) => complete,
+            // Otherwise the wildcard shares a component with the literal before
+            // it, and that literal proves nothing about a directory: `src*`
+            // selects inside `srcfoo` as readily as inside `src`. Only what
+            // precedes the last separator is proven, and a prefix without one
+            // proves nothing at all.
+            None => {
+                let separator = prefix.iter().rposition(|byte| *byte == b'/')?;
+                &prefix[..separator]
+            }
         }
     } else {
         prefix
@@ -1273,7 +1362,8 @@ mod tests {
 
     use super::{
         CancellationToken, ErrorPolicy, TraversalPattern, Verdict, WalkEntry, WalkEntryKind,
-        WalkOptions, Walker, literal_extension, literal_pattern_root, traversal_pattern_options,
+        WalkOptions, Walker, WildcardMode, literal_extension, literal_pattern_root,
+        traversal_pattern_options,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -2551,14 +2641,22 @@ mod tests {
         let hidden = traversal_pattern_options(true);
         let scoped = TraversalPattern::compile(b"site/**/*.ts", hidden).expect("valid include");
         assert!(scoped.could_match_descendant(b"site/.react-router"));
-        assert!(scoped.matches(b"site/.react-router/routes.ts", false));
+        assert!(scoped.matches(
+            b"site/.react-router/routes.ts",
+            false,
+            WildcardMode::ComponentScoped
+        ));
         assert!(scoped.matches_extension(b"site/.react-router/routes.ts"));
         assert!(!scoped.could_match_descendant(b".react-router"));
 
         // Same pattern, same prefilters, and only the matcher verdict differs.
         let default = traversal_pattern(b"site/**/*.ts");
         assert!(default.could_match_descendant(b"site/.react-router"));
-        assert!(!default.matches(b"site/.react-router/routes.ts", false));
+        assert!(!default.matches(
+            b"site/.react-router/routes.ts",
+            false,
+            WildcardMode::ComponentScoped
+        ));
         assert_eq!(default.literal_roots, scoped.literal_roots);
         assert_eq!(default.extensions, scoped.extensions);
 
@@ -2566,7 +2664,11 @@ mod tests {
         // literal period is not a wildcard.
         let literal = TraversalPattern::compile(b".claude/**/*.ts", hidden).expect("valid include");
         assert!(literal.could_match_descendant(b".claude"));
-        assert!(traversal_pattern(b".claude/**/*.ts").matches(b".claude/agents/run.ts", false));
+        assert!(traversal_pattern(b".claude/**/*.ts").matches(
+            b".claude/agents/run.ts",
+            false,
+            WildcardMode::ComponentScoped
+        ));
     }
 
     /// The option and the patterns are set in either order, so a builder that
@@ -2685,18 +2787,268 @@ mod tests {
         }
     }
 
+    /// The two readings, through the walker rather than the matcher.
+    ///
+    /// This is the whole point of the option: a pattern carried over from
+    /// `globset` selects what it selected there.
+    #[test]
+    fn the_wildcard_mode_decides_how_far_a_wildcard_reaches() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts");
+        fixture.write("src/app.ts");
+        fixture.write("src/deep/nested.ts");
+        fixture.write("other/stray.ts");
+
+        let walk = |mode: WildcardMode, pattern: &str| -> Vec<PathBuf> {
+            let result = Walker::new(&fixture.root)
+                .wildcard_mode(mode)
+                .include(pattern)
+                .expect("valid include")
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("walk succeeds");
+            relative_paths(result.entries(), &fixture.root)
+        };
+
+        assert_eq!(
+            walk(WildcardMode::ComponentScoped, "*.ts"),
+            vec![PathBuf::from("main.ts")],
+            "the default keeps a wildcard inside its component"
+        );
+        assert_eq!(
+            walk(WildcardMode::SeparatorCrossing, "*.ts"),
+            vec![
+                PathBuf::from("main.ts"),
+                PathBuf::from("other/stray.ts"),
+                PathBuf::from("src/app.ts"),
+                PathBuf::from("src/deep/nested.ts"),
+            ],
+            "crossing reads the pattern the way globset does"
+        );
+
+        // A literal prefix still holds under crossing, which is what keeps the
+        // planner allowed to prune on it.
+        assert_eq!(
+            walk(WildcardMode::SeparatorCrossing, "src/*.ts"),
+            vec![
+                PathBuf::from("src/app.ts"),
+                PathBuf::from("src/deep/nested.ts")
+            ],
+            "crossing reaches below the prefix, never outside it"
+        );
+        assert_eq!(
+            walk(WildcardMode::ComponentScoped, "src/*.ts"),
+            vec![PathBuf::from("src/app.ts")]
+        );
+    }
+
+    /// Excludes are read the same way as includes, so one mode governs the
+    /// whole walk rather than half of it.
+    #[test]
+    fn the_wildcard_mode_governs_excludes_too() {
+        let fixture = Fixture::new();
+        fixture.write("keep.rs");
+        fixture.write("drop.tmp");
+        fixture.write("src/drop.tmp");
+
+        let walk = |mode: WildcardMode| -> Vec<PathBuf> {
+            let result = Walker::new(&fixture.root)
+                .wildcard_mode(mode)
+                .exclude("*.tmp")
+                .expect("valid exclude")
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("walk succeeds");
+            relative_paths(result.entries(), &fixture.root)
+        };
+
+        assert_eq!(
+            walk(WildcardMode::ComponentScoped),
+            vec![PathBuf::from("keep.rs"), PathBuf::from("src/drop.tmp")],
+            "a component-scoped exclude only reaches the root component"
+        );
+        assert_eq!(
+            walk(WildcardMode::SeparatorCrossing),
+            vec![PathBuf::from("keep.rs")],
+            "a crossing exclude reaches every level"
+        );
+    }
+
+    /// How far a wildcard reaches and whether it may reach a dot-leading name
+    /// are separate questions, and the mode answers only the first.
+    #[test]
+    fn the_wildcard_mode_leaves_the_hidden_policy_alone() {
+        let fixture = Fixture::new();
+        fixture.write("visible.ts");
+        fixture.write(".hidden.ts");
+        fixture.write("src/visible.ts");
+        fixture.write("src/.hidden.ts");
+        fixture.write(".config/inside.ts");
+
+        let walk = |match_hidden: bool| -> Vec<PathBuf> {
+            let result = Walker::new(&fixture.root)
+                .wildcard_mode(WildcardMode::SeparatorCrossing)
+                .match_hidden(match_hidden)
+                .include("*.ts")
+                .expect("valid include")
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("walk succeeds");
+            relative_paths(result.entries(), &fixture.root)
+        };
+
+        assert_eq!(
+            walk(false),
+            vec![PathBuf::from("src/visible.ts"), PathBuf::from("visible.ts")],
+            "crossing reaches deeper, not into hidden names"
+        );
+        assert_eq!(
+            walk(true),
+            vec![
+                PathBuf::from(".config/inside.ts"),
+                PathBuf::from(".hidden.ts"),
+                PathBuf::from("src/.hidden.ts"),
+                PathBuf::from("src/visible.ts"),
+                PathBuf::from("visible.ts"),
+            ],
+            "match_hidden opens hidden names at every level a crossing wildcard reaches"
+        );
+
+        // Traversal still decides what the matcher ever sees.
+        let skipped = Walker::new(&fixture.root)
+            .wildcard_mode(WildcardMode::SeparatorCrossing)
+            .match_hidden(true)
+            .include("*.ts")
+            .expect("valid include")
+            .options(
+                WalkOptions::default()
+                    .sort(true)
+                    .files_only(true)
+                    .skip_hidden(true),
+            )
+            .collect()
+            .expect("walk succeeds");
+        assert_eq!(
+            relative_paths(skipped.entries(), &fixture.root),
+            vec![PathBuf::from("src/visible.ts"), PathBuf::from("visible.ts")],
+            "skip_hidden keeps hidden entries away from the matcher under either mode"
+        );
+    }
+
+    /// Subtree pruning must decide what the per-entry exclude would have
+    /// decided, under either mode.
+    ///
+    /// `*.tmp/**` used to close `a/b.tmp` in both modes, because the subtree
+    /// root was always read as separator-crossing. In the default mode the
+    /// exclude does not reach that directory at all - `*.tmp` cannot match the
+    /// component `a` - so its contents went missing from the walk without any
+    /// pattern saying they should.
+    #[test]
+    fn subtree_pruning_agrees_with_the_exclude_it_came_from() {
+        let fixture = Fixture::new();
+        fixture.write("a/b.tmp/keep.rs");
+        fixture.write("b.tmp/gone.rs");
+        fixture.write("a/plain/keep.rs");
+
+        let walk = |mode: WildcardMode| -> Vec<PathBuf> {
+            let result = Walker::new(&fixture.root)
+                .wildcard_mode(mode)
+                .exclude("*.tmp/**")
+                .expect("valid exclude")
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("walk succeeds");
+            relative_paths(result.entries(), &fixture.root)
+        };
+
+        assert_eq!(
+            walk(WildcardMode::ComponentScoped),
+            vec![
+                PathBuf::from("a/b.tmp/keep.rs"),
+                PathBuf::from("a/plain/keep.rs"),
+            ],
+            "a nested `.tmp` directory is out of a component-scoped exclude's reach"
+        );
+        assert_eq!(
+            walk(WildcardMode::SeparatorCrossing),
+            vec![PathBuf::from("a/plain/keep.rs")],
+            "a crossing exclude reaches the nested one, and pruning may follow it"
+        );
+    }
+
+    /// A literal that shares a component with a wildcard proves nothing about a
+    /// directory, so the planner may not prune on it.
+    ///
+    /// `src*` selects inside `srcfoo` as readily as inside `src`; the root
+    /// prefilter used to cut at the last separator even when there was none,
+    /// keeping the walk out of `srcfoo` entirely. The matcher was always right
+    /// about this - corpus case `wildcard-mode-046-scoped` - only the traversal
+    /// never asked it.
+    #[test]
+    fn a_partial_component_literal_does_not_prune_its_siblings() {
+        let fixture = Fixture::new();
+        fixture.write("src/x.ts");
+        fixture.write("srcfoo/x.ts");
+        fixture.write("other/x.ts");
+
+        for mode in [
+            WildcardMode::ComponentScoped,
+            WildcardMode::SeparatorCrossing,
+        ] {
+            let result = Walker::new(&fixture.root)
+                .wildcard_mode(mode)
+                .include("src*/x.ts")
+                .expect("valid include")
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("walk succeeds");
+            assert_eq!(
+                relative_paths(result.entries(), &fixture.root),
+                vec![PathBuf::from("src/x.ts"), PathBuf::from("srcfoo/x.ts")],
+                "{mode:?}: a partial-component literal must not prune a sibling it matches"
+            );
+        }
+
+        // What is still proven, and still pruned: a literal that ends at a
+        // separator.
+        assert_eq!(
+            literal_pattern_root(b"src/*.ts"),
+            Some(b"src".to_vec()),
+            "a complete component is still a root"
+        );
+        assert_eq!(
+            literal_pattern_root(b"src*/x.ts"),
+            None,
+            "a partial component is not"
+        );
+        assert_eq!(
+            literal_pattern_root(b"docs/api*/x.ts"),
+            Some(b"docs".to_vec()),
+            "what precedes the last separator is still proven"
+        );
+    }
+
     #[test]
     fn prune_planner_only_accepts_explicit_whole_subtree_excludes() {
+        let scoped = WildcardMode::ComponentScoped;
         let subtree = traversal_pattern(b"src/**");
-        assert!(subtree.covers_subtree(b"src"));
-        assert!(!subtree.covers_subtree(b"src/nested"));
+        assert!(subtree.covers_subtree(b"src", scoped));
+        assert!(!subtree.covers_subtree(b"src/nested", scoped));
 
         let suffix = traversal_pattern(b"*.tmp");
-        assert!(!suffix.covers_subtree(b"cache"));
+        assert!(!suffix.covers_subtree(b"cache", scoped));
 
         let nested = traversal_pattern(b"**/target/**");
-        assert!(nested.covers_subtree(b"target"));
-        assert!(nested.covers_subtree(b"crates/ferralk/target"));
+        assert!(nested.covers_subtree(b"target", scoped));
+        assert!(nested.covers_subtree(b"crates/ferralk/target", scoped));
+
+        // The subtree root is read under the walk's own mode. A component-scoped
+        // `*.tmp` cannot match the component `a`, so `a/b.tmp` must stay open;
+        // a crossing one matches the whole path, so it may be closed.
+        let wildcard_subtree = traversal_pattern(b"*.tmp/**");
+        assert!(!wildcard_subtree.covers_subtree(b"a/b.tmp", scoped));
+        assert!(wildcard_subtree.covers_subtree(b"b.tmp", scoped));
+        assert!(wildcard_subtree.covers_subtree(b"a/b.tmp", WildcardMode::SeparatorCrossing));
 
         assert_eq!(
             literal_pattern_root(b"src/foo/*.rs"),
