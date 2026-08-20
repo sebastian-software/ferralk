@@ -171,6 +171,38 @@ prefilter handles well. A pattern set the planner can prove nothing about would
 run every include against every entry, which is the shape where a compiled
 `GlobSet` should still win.
 
+## Several roots, one walker or several
+
+The `multi_root` arms in [`walker.rs`](../tools/bench/benches/walker.rs) walk
+three trees as one walk and as three, producing the same entries either way.
+What differs is how many times the walk pays for its setup: one thread pool
+instead of three, one `available_parallelism` query instead of three.
+
+Medians of 41 interleaved rounds, order flipped every round:
+
+| Shape | One walker, three roots | One walker per root |
+| --- | ---: | ---: |
+| 3 × 8 entries, below the helper floor | **234 µs** | 241 µs |
+| 3 × 54 entries, just above the floor | 434 µs | **426 µs** |
+| 3 × 2192 entries | 6.73 ms | **6.69 ms** |
+
+**This is not a throughput feature, and the numbers say so.** The saving is a
+fixed per-root cost of a few microseconds, which is visible on a walk small
+enough for setup to matter — about 3% on the smallest shape, reproduced across
+runs — and is lost in the noise of anything repository-sized. Helper threads are
+spawned lazily and only once the work floor is crossed, so even the shape built
+to isolate pool startup shows no reliable difference: spawning a scoped thread
+is cheap next to reading a few hundred directory entries.
+
+What one walker actually buys is structural rather than measurable here: one
+helper-spawn decision taken over the whole walk instead of per tree, so three
+small roots stay serial where three separate walkers would each weigh
+themselves; one visited-directory set; and one place for the caller's patterns
+instead of a loop that rebuilds them per root. Criterion's sequential arms
+disagreed with the paired measurement on the smallest shape — it reported the
+one-walker arm slower — which is drift between arms measured minutes apart, and
+the reason the table above is paired.
+
 ## Matcher, against Rust baselines
 
 Wall time per match, same host, one line per benchmark

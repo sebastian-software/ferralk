@@ -42,15 +42,15 @@ impl IgnoreScope {
     /// What the walk root inherits: the repository-wide excludes. The root's
     /// own ignore files join like every other directory's, when the walk
     /// enters it, and being deeper they override these.
-    pub(crate) fn root<B: DirectoryBackend + ?Sized>(walker: &Walker, backend: &B) -> Self {
+    pub(crate) fn for_root<B: DirectoryBackend + ?Sized>(
+        walker: &Walker,
+        backend: &B,
+        root: &Path,
+    ) -> Self {
         if !walker.respect_git_ignore {
             return Self::default();
         }
-        Self::default().link(read_rules(
-            backend,
-            &walker.root,
-            &[REPOSITORY_EXCLUDE_FILE],
-        ))
+        Self::default().link(read_rules(backend, root, &[REPOSITORY_EXCLUDE_FILE]))
     }
 
     /// Adds `directory`'s own ignore files to the chain. Called once, when the

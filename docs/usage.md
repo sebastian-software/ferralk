@@ -84,6 +84,13 @@ Important defaults:
   reading `globset` and `fast-glob` use; see the
   [compatibility guide](compatibility-guide.md).
 
+- A walk may have several roots. `Walker::new(first).add_root(second)?` walks
+  both trees with one thread pool, and `WalkEntry::root` says which root an
+  entry came from. Patterns apply under every root, `depth` is counted from the
+  entry's own root, and roots that contain one another deliver their overlap
+  once per root. See the
+  [compatibility guide](compatibility-guide.md#several-roots-in-one-walk).
+
 - Include and exclude patterns may be absolute. `Walker::new("/repo")
   .include("/repo/src/**/*.ts")` selects what `src/**/*.ts` selects, so a
   caller holding absolute patterns does not have to strip the root itself. A

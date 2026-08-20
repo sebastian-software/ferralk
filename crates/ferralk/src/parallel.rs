@@ -18,7 +18,6 @@ use super::{
     CYCLE_KEY_OPERATION, CycleKey, DirectoryBackend, EntryVisitor, ErrorPolicy, Listing, Verdict,
     WalkEntry, WalkError, WalkResult, Walker,
     classify::{DirectoryTask, EmittedEntry, EntryAction, classify_entry},
-    gitignore::IgnoreScope,
     own_path,
     scheduler::{Coordinator, Scheduler, WorkerSlot},
 };
@@ -33,16 +32,14 @@ pub(super) fn collect<B: DirectoryBackend + Sync>(
     let mut caller = WorkerScratch::new(0);
     let caller_slot = shared.coordinator.claim_caller_slot();
 
-    // The caller starts alone. Helpers are created only after the root made
-    // parallel directory work available, as required by ADR-0009.
-    shared.coordinator.begin_task();
-    {
+    // The caller starts alone. Helpers are created only after the roots made
+    // parallel directory work available, as required by ADR-0009. Several roots
+    // are several initial tasks and nothing more: the caller reads them in
+    // order, and whatever they uncover is ordinary work for the same pool.
+    let roots = walker.root_tasks(backend);
+    for root in roots {
+        shared.coordinator.begin_task();
         let _root_task = shared.coordinator.claim_task();
-        let root = DirectoryTask {
-            path: walker.root.clone(),
-            depth: 0,
-            ignores: IgnoreScope::root(&walker, backend),
-        };
         process_directory(&shared, &mut caller, root);
     }
     caller.flush_into(&shared.scheduler);
@@ -336,7 +333,11 @@ impl<'backend> Shared<'backend> {
         if startup_error.is_none() {
             *startup_error = Some(WalkError::new(
                 "spawn_worker",
-                self.walker.root.clone(),
+                self.walker
+                    .roots()
+                    .next()
+                    .expect("a walk has a root")
+                    .into(),
                 source,
             ));
             self.cancellation.cancel();
@@ -460,6 +461,7 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
     let DirectoryTask {
         path,
         depth,
+        root,
         ignores,
     } = task;
     #[cfg(test)]
@@ -499,6 +501,7 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
             &worker.listing.entries()[index],
             &ignores,
             depth,
+            root,
         );
         act(shared, worker, action);
         worker.path.pop();
@@ -643,7 +646,10 @@ fn join_worker_rendezvous(shared: &Shared) {
     }
     let mut state = lock(&WORKER_RENDEZVOUS);
     match state.as_mut() {
-        Some(rendezvous) if rendezvous.root == shared.walker.root && !rendezvous.released => {
+        Some(rendezvous)
+            if shared.walker.roots().next() == Some(rendezvous.root.as_path())
+                && !rendezvous.released =>
+        {
             rendezvous.threads.insert(std::thread::current().id());
         }
         _ => return,
@@ -837,6 +843,89 @@ mod tests {
         );
         assert_eq!(walked_paths(&parallel), walked_paths(&serial));
         assert!(parallel.errors().is_empty());
+    }
+
+    /// Several roots share one pool, which is the point of the feature.
+    ///
+    /// The rendezvous makes that observable: it releases only once `expected`
+    /// distinct threads have joined it, so reaching four across a three-root
+    /// walk means the roots were worked by one set of helpers rather than by
+    /// three pools taking turns.
+    #[test]
+    fn several_roots_are_walked_by_one_pool() {
+        let _rendezvous = lock(&WORKER_RENDEZVOUS_GUARD);
+        let root = unique_root("multi-root-pool");
+        for name in ["alpha", "beta", "gamma"] {
+            create_wide_fixture(&root.join(name));
+        }
+        let roots = ["alpha", "beta", "gamma"].map(|name| root.join(name));
+
+        let serial = Walker::new(&roots[0])
+            .add_root(&roots[1])
+            .expect("root")
+            .add_root(&roots[2])
+            .expect("root")
+            .threads(1)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("serial walk succeeds");
+
+        expect_worker_threads(roots[0].clone(), 4);
+        let parallel = Walker::new(&roots[0])
+            .add_root(&roots[1])
+            .expect("root")
+            .add_root(&roots[2])
+            .expect("root")
+            .threads(4)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("parallel walk succeeds");
+        let observed = observed_worker_threads();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            observed, 4,
+            "three roots must share the walk's one thread budget"
+        );
+        assert_eq!(walked_paths(&parallel), walked_paths(&serial));
+        assert!(parallel.errors().is_empty());
+    }
+
+    /// The helper floor counts the whole walk, not one root of it.
+    ///
+    /// Three tiny roots are still a tiny walk, and starting a pool for them
+    /// would cost more than it saves - the same judgement #76 made for one
+    /// root, applied to the sum rather than to whichever root came first.
+    #[test]
+    fn the_floor_counts_across_roots() {
+        let walker = Arc::new(Walker::new("."));
+        let shared = Shared::new(
+            Arc::clone(&walker),
+            &crate::SystemBackend,
+            &crate::keep_every_entry,
+        );
+
+        // Three roots' worth of a trial-sized tree, queued together.
+        shared.entries_seen.store(12, Ordering::Release);
+        for _ in 0..3 {
+            shared.coordinator.begin_task();
+        }
+        assert!(
+            !shared.tree_is_worth_helpers(),
+            "three tiny roots are still a tiny walk"
+        );
+
+        // The same three roots once they turn out to hold work between them.
+        shared
+            .entries_seen
+            .store(super::HELPER_WORK_FLOOR, Ordering::Release);
+        for _ in 0..super::HELPER_QUEUE_FLOOR {
+            shared.coordinator.begin_task();
+        }
+        assert!(
+            shared.tree_is_worth_helpers(),
+            "work summed across roots reaches the floor like work under one"
+        );
     }
 
     #[test]

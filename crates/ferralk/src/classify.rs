@@ -18,6 +18,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use super::{
@@ -55,6 +56,9 @@ pub(crate) struct EmittedEntry {
     pub(crate) is_symlink: bool,
     pub(crate) depth: usize,
     pub(crate) metadata: Option<fs::Metadata>,
+    /// The root this entry was found under, shared with every other entry from
+    /// the same root rather than copied per entry.
+    pub(crate) root: Arc<Path>,
 }
 
 impl EmittedEntry {
@@ -62,6 +66,7 @@ impl EmittedEntry {
     pub(crate) fn with_path(self, path: PathBuf) -> WalkEntry {
         WalkEntry {
             path,
+            root: self.root,
             is_dir: self.is_dir,
             is_symlink: self.is_symlink,
             depth: self.depth,
@@ -76,6 +81,10 @@ impl EmittedEntry {
 #[derive(Debug)]
 pub(crate) struct DirectoryTask {
     pub(crate) path: PathBuf,
+    /// Which of the walk's roots this directory sits under. Carried down the
+    /// tree rather than rediscovered, because it selects the patterns and the
+    /// root-relative offset that apply here.
+    pub(crate) root: usize,
     /// Components between the walk root and this directory. The walk counts
     /// them once, on the way down, instead of recounting the components of
     /// every entry's path.
@@ -93,7 +102,13 @@ pub(crate) struct EntryFailure {
 /// Whether an entry that survived the traversal filters is part of the result
 /// set. Traversal and emission are separate questions: a directory can be
 /// walked into without being emitted, and the other way round.
-fn should_emit(walker: &Walker, is_dir: bool, bytes: &[u8], git_ignored: bool) -> bool {
+fn should_emit(
+    walker: &Walker,
+    root: usize,
+    is_dir: bool,
+    bytes: &[u8],
+    git_ignored: bool,
+) -> bool {
     if git_ignored {
         return false;
     }
@@ -103,9 +118,9 @@ fn should_emit(walker: &Walker, is_dir: bool, bytes: &[u8], git_ignored: bool) -
     if walker.options.files_only && is_dir {
         return false;
     }
-    walker.includes.is_empty()
-        || walker
-            .includes
+    let includes = &walker.roots[root].includes;
+    includes.is_empty()
+        || includes
             .iter()
             .any(|pattern| pattern.matches(bytes, is_dir, walker.wildcard_mode))
 }
@@ -122,13 +137,15 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     entry: &ListedEntry,
     ignores: &IgnoreScope,
     directory_depth: usize,
+    root: usize,
 ) -> EntryAction {
+    let plan = &walker.roots[root];
     let mut is_dir = entry.is_dir();
     let path_bytes = path.as_os_str().as_encoded_bytes();
-    // Every walked path is the root with names pushed onto it, so the
+    // Every walked path is its root with names pushed onto it, so the
     // root-relative part is a suffix at a fixed offset rather than something
     // `strip_prefix` has to rediscover component by component.
-    let relative = &path_bytes[walker.relative_start.min(path_bytes.len())..];
+    let relative = &path_bytes[plan.relative_start.min(path_bytes.len())..];
     let depth = directory_depth + 1;
     if walker
         .options
@@ -144,7 +161,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     if should_skip_git_directory(walker, entry.name()) {
         return EntryAction::Skip;
     }
-    if walker
+    if plan
         .excludes
         .iter()
         .any(|pattern| pattern.matches(bytes.as_ref(), is_dir, walker.wildcard_mode))
@@ -172,7 +189,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
             }
         }
     }
-    if !is_dir && !walker.may_include_file(bytes.as_ref()) {
+    if !is_dir && !walker.may_include_file(root, bytes.as_ref()) {
         return EntryAction::Skip;
     }
 
@@ -180,12 +197,12 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     // its contents are ignored whatever the ignore files inside it say.
     let descend = is_dir
         && !git_ignored
-        && !walker
+        && !plan
             .excludes
             .iter()
             .any(|pattern| pattern.covers_subtree(bytes.as_ref(), walker.wildcard_mode))
-        && walker.may_descend_at(depth, bytes.as_ref());
-    let emit = should_emit(walker, is_dir, bytes.as_ref(), git_ignored);
+        && walker.may_descend_at(root, depth, bytes.as_ref());
+    let emit = should_emit(walker, root, is_dir, bytes.as_ref(), git_ignored);
 
     // The rules a subtree inherits travel with it, so the frontends never
     // re-derive them. A queued directory outlives the scratch buffer, so this
@@ -193,6 +210,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     let task = || DirectoryTask {
         path: path.to_path_buf(),
         depth,
+        root,
         ignores: ignores.clone(),
     };
     if !emit {
@@ -224,6 +242,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         is_symlink: entry.is_symlink(),
         depth,
         metadata,
+        root: Arc::clone(&plan.shared_path),
     };
     if descend {
         EntryAction::DescendAndEmit(emitted, task())
