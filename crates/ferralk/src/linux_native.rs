@@ -472,10 +472,16 @@ mod tests {
 
     fn collect_with_portable_backend(walker: &Walker) -> (Vec<WalkEntry>, Vec<crate::WalkError>) {
         let mut state = crate::WalkState::new(walker, &crate::keep_every_entry);
+        let root = walker
+            .roots()
+            .next()
+            .expect("a walk has a root")
+            .to_path_buf();
         let task = crate::DirectoryTask {
-            path: walker.root.clone(),
+            path: root.clone(),
             depth: 0,
-            ignores: crate::IgnoreScope::root(walker, &StdBackend),
+            root: 0,
+            ignores: crate::IgnoreScope::for_root(walker, &StdBackend, &root),
         };
         state
             .walk_directory(&StdBackend, task)
