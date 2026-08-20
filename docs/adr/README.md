@@ -18,6 +18,7 @@ Decisions from the end-to-end design review of 2026-08-18 (see
 | [0011](0011-posix-conservative-walker-defaults.md) | POSIX-conservative walker defaults |
 | [0012](0012-ferroni-repository-blueprint.md) | Ferroni repository blueprint for tooling |
 | [0013](0013-no-glob-to-regex-translation.md) | Dedicated glob matcher — no glob-to-regex translation |
+| [0014](0014-own-gitignore-rule-matching.md) | Own gitignore rule matching over ferralk-glob (engine half of 0006) |
 
 Convention: [Nygard-style ADRs](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions),
 numbered sequentially, never rewritten once accepted — superseding decisions
