@@ -283,6 +283,7 @@ dependencies = [
  "ferralk-glob",
  "ignore",
  "loom",
+ "memchr",
  "serde_json",
 ]
 

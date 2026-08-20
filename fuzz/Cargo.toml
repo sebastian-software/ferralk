@@ -22,6 +22,13 @@ ferralk = { path = "../crates/ferralk", features = ["native-macos"] }
 ferralk = { path = "../crates/ferralk", features = ["native-linux"] }
 
 [[bin]]
+name = "ignore_rule_parser"
+path = "fuzz_targets/ignore_rule_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "pattern_parser"
 path = "fuzz_targets/pattern_parser.rs"
 test = false
