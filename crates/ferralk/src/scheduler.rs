@@ -69,17 +69,51 @@ impl<T> Scheduler<T> {
 /// observable. Every notification is sent while `wake_lock` is held, so a
 /// worker that has decided to park cannot miss one.
 pub(crate) struct Coordinator {
-    pending: AtomicUsize,
-    active_workers: AtomicUsize,
+    pending: CacheLine<AtomicUsize>,
+    active_workers: CacheLine<AtomicUsize>,
     wake_lock: Mutex<()>,
     wake: Condvar,
+}
+
+/// One value with a cache line to itself.
+///
+/// The counters this wraps are written once per directory by whichever worker
+/// read it and loaded by every other worker deciding whether to park or to grow
+/// the pool. Packed next to each other they share a line, so one worker's
+/// increment invalidates the line the others are reading — false sharing
+/// between counters that have nothing to say to each other.
+///
+/// 128 bytes rather than 64 on the two architectures that have a native
+/// backend: Apple silicon and x86-64 both move cache lines in adjacent pairs,
+/// so 64-byte separation leaves two values in the same coherence granule.
+/// Elsewhere a line is 64 bytes and the padding follows.
+#[cfg_attr(any(target_arch = "aarch64", target_arch = "x86_64"), repr(align(128)))]
+#[cfg_attr(
+    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    repr(align(64))
+)]
+pub(crate) struct CacheLine<T>(pub(crate) T);
+
+/// How many parked workers one notification is meant for.
+#[derive(Clone, Copy)]
+enum Wake {
+    One,
+    All,
+}
+
+impl<T> std::ops::Deref for CacheLine<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
 }
 
 impl Coordinator {
     pub(crate) fn new() -> Self {
         Self {
-            pending: AtomicUsize::new(0),
-            active_workers: AtomicUsize::new(0),
+            pending: CacheLine(AtomicUsize::new(0)),
+            active_workers: CacheLine(AtomicUsize::new(0)),
             wake_lock: Mutex::new(()),
             wake: Condvar::new(),
         }
@@ -100,13 +134,41 @@ impl Coordinator {
         self.pending.load(Ordering::Acquire)
     }
 
-    /// Wakes every parked worker. Taking `wake_lock` around the notification
-    /// is what makes the hand-off free of lost wakeups: a worker that observed
-    /// an empty queue holds the lock until it parks, so it either sees the new
-    /// state before parking or is notified afterwards.
+    /// Wakes every parked worker. Used for the states every worker has to see:
+    /// the walk draining, being cancelled, aborting, or unwinding.
     pub(crate) fn wake_waiters(&self) {
+        self.wake_some(Wake::All);
+    }
+
+    /// Wakes at most one parked worker, for a producer that made exactly one
+    /// task available. A worker that wakes and finds the task already taken by
+    /// somebody who never parked simply parks again; the task is not lost,
+    /// because whoever took it holds it.
+    pub(crate) fn wake_one_waiter(&self) {
+        self.wake_some(Wake::One);
+    }
+
+    /// The notification itself. Taking `wake_lock` around it is what makes the
+    /// hand-off free of lost wakeups: a worker that observed an empty queue
+    /// holds the lock until it parks, so it either sees the new state before
+    /// parking or is notified afterwards.
+    ///
+    /// A parked-worker count that let a producer skip the lock as well was
+    /// tried in #98 and dropped there. It was sound — producer and worker each
+    /// ran a store-then-load with a `SeqCst` fence between the halves, and the
+    /// loom models passed — but it multiplied the hand-off model's state space
+    /// by fifteen, from 69,363 explored executions to 1,072,953, because three
+    /// more atomic accesses inside `wait_for_task` are three more scheduling
+    /// points per interleaving. That is a nineteen-fold loom job on every pull
+    /// request, and no walk measurement could tell the two versions apart: this
+    /// fires once per queued directory, a few thousand times across a 33 ms
+    /// walk.
+    fn wake_some(&self, wake: Wake) {
         drop(lock(&self.wake_lock));
-        self.wake.notify_all();
+        match wake {
+            Wake::One => self.wake.notify_one(),
+            Wake::All => self.wake.notify_all(),
+        }
     }
 
     /// Parks until `try_take` yields a task, the walk is cancelled, or no task
@@ -283,6 +345,12 @@ mod loom_models {
 
     /// A task announced while a worker is on its way into `wait_for_task` must
     /// still reach that worker, and the walk must end once it is done.
+    ///
+    /// The producer notifies through the single-worker path the walk uses when
+    /// it queues one directory, so this covers `notify_one` as well as the
+    /// hand-off. Loom's `wait_timeout` never times out, so a notification that
+    /// failed to reach the consumer shows up here as a deadlock rather than as
+    /// a slow test.
     #[test]
     fn a_queued_task_reaches_a_parking_worker() {
         static EXECUTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -299,7 +367,8 @@ mod loom_models {
                 let _root = producer_coordinator.claim_task();
                 producer_coordinator.begin_task();
                 push(&producer_queue, 7);
-                producer_coordinator.wake_waiters();
+                // One task pushed, so this is the walk's own hand-off path.
+                producer_coordinator.wake_one_waiter();
             });
 
             let consumer_coordinator = Arc::clone(&coordinator);

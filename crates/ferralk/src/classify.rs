@@ -55,7 +55,11 @@ pub(crate) struct EmittedEntry {
     pub(crate) is_dir: bool,
     pub(crate) is_symlink: bool,
     pub(crate) depth: usize,
-    pub(crate) metadata: Option<fs::Metadata>,
+    /// Boxed for the same reason [`WalkEntry`] boxes it: the inline `stat`
+    /// struct dominated both this type and [`EntryAction`], which is returned
+    /// by value from `classify_entry` for every entry the walk classifies -
+    /// including the ones it drops.
+    pub(crate) metadata: Option<Box<fs::Metadata>>,
     /// The root this entry was found under, shared with every other entry from
     /// the same root rather than copied per entry.
     pub(crate) root: Arc<Path>,
@@ -272,7 +276,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     // Last, and only for an entry that is actually emitted.
     let metadata = if walker.options.metadata {
         match backend.symlink_metadata(path) {
-            Ok(metadata) => Some(metadata),
+            Ok(metadata) => Some(Box::new(metadata)),
             Err(source) => {
                 return EntryAction::Failed {
                     descend: descend.then(task),

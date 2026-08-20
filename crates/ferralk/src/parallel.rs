@@ -15,11 +15,11 @@ use std::{
 use crossbeam_deque::{Steal, Stealer, Worker};
 
 use super::{
-    CYCLE_KEY_OPERATION, CycleKey, DirectoryBackend, EntryVisitor, ErrorPolicy, Listing, Verdict,
-    WalkEntry, WalkError, WalkResult, Walker,
+    CANCELLATION_STRIDE, CYCLE_KEY_OPERATION, CycleKey, DirectoryBackend, EntryVisitor,
+    ErrorPolicy, Listing, Verdict, WalkEntry, WalkError, WalkResult, Walker,
     classify::{DirectoryTask, EmittedEntry, EntryAction, classify_entry},
-    own_path,
-    scheduler::{Coordinator, Scheduler, WorkerSlot},
+    own_path, reset_to_directory,
+    scheduler::{CacheLine, Coordinator, Scheduler, WorkerSlot},
 };
 
 pub(super) fn collect<B: DirectoryBackend + Sync>(
@@ -281,7 +281,11 @@ struct Shared<'backend> {
     /// plus [`DIRECTORY_WEIGHT`] for each listing they came from. Accumulated
     /// per listing rather than per entry, so a directory costs one atomic add
     /// however much it holds - and the weight rides along in that same add.
-    work_seen: AtomicUsize,
+    ///
+    /// On its own cache line: every worker adds to it once per directory and
+    /// every `grow` reads it, so packing it beside `stopped` and `lone` -
+    /// which the same loops read - made three unrelated values share one line.
+    work_seen: CacheLine<AtomicUsize>,
     /// Every filesystem call of the walk goes through here, which is what lets
     /// a test mock drive the parallel frontend the same way it drives the
     /// serial one.
@@ -313,7 +317,7 @@ impl<'backend> Shared<'backend> {
             visitor,
             stopped: AtomicBool::new(false),
             lone: AtomicBool::new(true),
-            work_seen: AtomicUsize::new(0),
+            work_seen: CacheLine(AtomicUsize::new(0)),
             backend,
             scheduler: Scheduler::new(),
             coordinator: Coordinator::new(),
@@ -334,8 +338,13 @@ impl<'backend> Shared<'backend> {
         // [`Shared::widen`] clears this before the first helper can exist, and
         // starting a thread synchronizes with it, so no helper can park without
         // having seen the flag already cleared.
+        //
+        // Past that, exactly one task became available, so one parked worker is
+        // woken rather than all of them. A worker that wakes to find the task
+        // already taken by somebody who never parked parks again; nothing is
+        // stranded, because whoever took it holds it.
         if !self.lone.load(Ordering::Relaxed) {
-            self.coordinator.wake_waiters();
+            self.coordinator.wake_one_waiter();
         }
     }
 
@@ -566,7 +575,12 @@ fn try_take(
                 .chain(head.iter().take(worker.index))
                 .find_map(|stealer| {
                     loop {
-                        match stealer.steal() {
+                        // A batch, not one task: an idle worker that takes a
+                        // single directory is back contending for a victim as
+                        // soon as it has read it, and the victim pays for the
+                        // steal either way. This is what the injector path
+                        // already does through `Scheduler::steal_into`.
+                        match stealer.steal_batch_and_pop(&worker.queue) {
                             Steal::Success(task) => break Some(task),
                             Steal::Empty => break None,
                             Steal::Retry => continue,
@@ -610,7 +624,12 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
     worker.path.clear();
     worker.path.push(&path);
     for index in 0..worker.listing.entries().len() {
-        if shared.should_stop() {
+        // Once per directory above, and then every [`CANCELLATION_STRIDE`]
+        // entries so a listing of a hundred thousand names still stops
+        // promptly. Both loads are shared state read by every worker, and the
+        // per-entry read of them bought a granularity nothing observes: the
+        // walk is already free to finish any directory it has started.
+        if index.is_multiple_of(CANCELLATION_STRIDE) && shared.should_stop() {
             return;
         }
         // The entry's path exists only for as long as it is being decided
@@ -626,7 +645,7 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
             root,
         );
         act(shared, worker, action);
-        worker.path.pop();
+        reset_to_directory(&mut worker.path, &path);
     }
 }
 

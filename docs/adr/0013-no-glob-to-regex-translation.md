@@ -18,9 +18,10 @@ not a dependency.
 
 Reasons:
 
-- **Wrong machine.** Glob matching runs in linear time with tiny constants via
-  the classic two-pointer/last-star algorithm; a general regex engine carries
-  program dispatch, captures, and lookaround machinery a glob never needs.
+- **Wrong machine.** Glob matching needs a machine sized to the token IR — a
+  memoized walk over (token, position) pairs, bounded by their product; a
+  general regex engine carries program dispatch, captures, and lookaround
+  machinery a glob never needs.
 - **Wrong workload shape.** A walker compiles once and then matches millions
   of short (20–80 byte) paths anchored end-to-end; regex engines are tuned for
   finding matches in long texts, so per-call overhead dominates here.
@@ -43,3 +44,24 @@ Reasons:
 - `globset` may be added to the matcher benchmarks as the representative of
   the translation approach, keeping this trade-off documented as a measured
   series rather than an argument.
+
+## Correction, 2026-08-20
+
+The first reason above described the matcher as "the classic two-pointer /
+last-star algorithm". It never was one. The general path is a memoized
+depth-first walk of the (token, path position) state graph: one star's
+repetition branch is deferred to an explicit work list while its other
+successor continues in place, and `FailedStates` memoizes visited pairs, which
+is what bounds the exploration to `tokens × path` rather than to the single
+backtrack point a two-pointer scan keeps.
+
+The distinction matters for the third reason, not just for accuracy. A
+two-pointer scan is linear by construction; a memoized walk is linear in
+`tokens × path`, which is a weaker guarantee — the `backtracking` row of
+[benchmark evidence](../benchmark-evidence.md) is what that costs on a pattern
+built to exercise it. Nothing about the decision changes: the state graph is
+still the machine a glob needs, still smaller than a regex program, and still
+free of the dialect translation the fourth reason is about. What changes is
+that the linearity claim is the memoized walk's, and is stated as such.
+
+Amendment only; the decision above is unchanged.
