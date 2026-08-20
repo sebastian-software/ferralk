@@ -50,13 +50,15 @@ pub use macos_native::fuzz_validate_bulk_record as fuzz_validate_macos_bulk_reco
 pub use macos_native::fuzz_validate_records as fuzz_validate_macos_dirent_records;
 mod absolute;
 
-/// Absolute-pattern rewrite entry point for the corpus harness, exported the
-/// way the fuzz entry points are: for `tools/`, not for consumers.
+/// Walker-pattern entry point for the corpus harness, exported the way the
+/// fuzz entry points are: for `tools/`, not for consumers.
 ///
 /// Returns the pattern the walker would compile, or `None` when the pattern
 /// names paths outside `root` and so can select nothing. `windows_paths`
-/// chooses which spelling makes a path absolute instead of reading the host's,
-/// so one corpus case describes one rule on every platform.
+/// chooses which spelling of a path the rules read instead of the host's, so
+/// one corpus case describes one rule on every platform - including the rules
+/// that only apply to Windows, which would otherwise be recorded where nothing
+/// replays them.
 #[doc(hidden)]
 pub fn corpus_rewrite_absolute_pattern(
     pattern: &[u8],
@@ -68,11 +70,7 @@ pub fn corpus_rewrite_absolute_pattern(
     } else {
         absolute::Syntax::Posix
     };
-    Ok(match absolute::rewrite_in(pattern, root, syntax)? {
-        absolute::Rewrite::Relative => Some(pattern.to_vec()),
-        absolute::Rewrite::Rooted(rooted) => Some(rooted),
-        absolute::Rewrite::Outside => None,
-    })
+    walker_pattern_for_root(pattern, root, syntax)
 }
 mod classify;
 mod gitignore;
@@ -644,9 +642,18 @@ impl Walker {
     ///
     /// Separators, repeated or trailing, and `.` components are ignored on
     /// both sides, so `/repo//src/*.ts` against a root of `/repo/` rewrites the
-    /// same as the tidy spelling. Patterns use `/` on every platform per
-    /// ADR-0005; a `\` is an escape, so a Windows path spelled with backslashes
-    /// is reported rather than mis-split.
+    /// same as the tidy spelling.
+    ///
+    /// # Patterns are written with `/`
+    ///
+    /// On every platform, per ADR-0005: `\` is the escape character, not a
+    /// separator, so a pattern built by joining `PathBuf`s on Windows asks for
+    /// each separator's next byte literally and matches nothing. On Windows
+    /// such a pattern is rejected rather than left to fail silently, but only
+    /// where it demands a byte Windows forbids in a name - `C:\repo\**`,
+    /// `src\*.ts`, `\\server\share` - because escaping an ordinary byte is
+    /// legal and `a\b\c` really does select a file named `abc`. Build the
+    /// pattern as a pattern and let [`Walker::new`] hold the path.
     ///
     /// ```
     /// use ferralk::Walker;
@@ -1062,18 +1069,42 @@ fn compile_for_root(
     root: &[u8],
     options: PatternOptions,
 ) -> Result<TraversalPattern, PatternError> {
-    match absolute::rewrite(pattern, root)? {
-        absolute::Rewrite::Relative => TraversalPattern::compile(pattern, options),
-        absolute::Rewrite::Rooted(rooted) => TraversalPattern::compile(&rooted, options),
+    match walker_pattern_for_root(pattern, root, absolute::Syntax::NATIVE)? {
+        Some(usable) => TraversalPattern::compile(&usable, options),
         // Compiled even though it can never match, so that a pattern the caller
         // wrote badly is still reported, and kept rather than dropped, because
         // dropping an include would widen the walk to everything instead of
         // narrowing it to nothing.
-        absolute::Rewrite::Outside => {
+        None => {
             let mut compiled = TraversalPattern::compile(pattern, options)?;
             compiled.never_matches = true;
             Ok(compiled)
         }
+    }
+}
+
+/// The bytes the walker will compile for `root`, or the reason it will not.
+///
+/// `None` is the verdict that the pattern names paths outside this root and can
+/// select nothing here. The path-shaped check runs after the rewrite and only
+/// on the outcomes that still have to match something: a pattern already known
+/// to select nothing needs no second reason, and refusing it would turn the
+/// verdict a multi-root walk depends on into an error.
+fn walker_pattern_for_root(
+    pattern: &[u8],
+    root: &[u8],
+    syntax: absolute::Syntax,
+) -> Result<Option<Vec<u8>>, PatternError> {
+    match absolute::rewrite_in(pattern, root, syntax)? {
+        absolute::Rewrite::Relative => {
+            absolute::reject_path_shaped(pattern, syntax)?;
+            Ok(Some(pattern.to_vec()))
+        }
+        absolute::Rewrite::Rooted(rooted) => {
+            absolute::reject_path_shaped(&rooted, syntax)?;
+            Ok(Some(rooted))
+        }
+        absolute::Rewrite::Outside => Ok(None),
     }
 }
 
@@ -4213,16 +4244,15 @@ mod tests {
     /// exclude does not reach that directory at all - `*.tmp` cannot match the
     /// component `a` - so its contents went missing from the walk without any
     /// pattern saying they should.
-    #[test]
-    /// INVESTIGATION for #94, to be replaced by the fix it justifies.
+    /// The trap from #94, on the one host that can observe it.
     ///
-    /// Records what a Windows host does today with the shapes a `PathBuf` join
-    /// produces, so the change that follows is measured against something
-    /// rather than assumed. Every one of these compiles without complaint and
-    /// selects nothing, which is the failure mode the issue is about.
+    /// A pattern built by joining `PathBuf`s carries `\` separators, which this
+    /// dialect reads as escapes. Every one of these used to compile without
+    /// complaint and select nothing; each is now refused with a message that
+    /// names the cause.
     #[cfg(windows)]
     #[test]
-    fn investigation_backslash_patterns_are_accepted_and_select_nothing() {
+    fn a_windows_path_handed_over_as_a_pattern_is_refused() {
         let fixture = Fixture::new();
         fixture.write("src/main.ts");
         fixture.write("src/deep/other.ts");
@@ -4234,30 +4264,41 @@ mod tests {
             r"src\*.ts".to_owned(),
             r"src\**\*.ts".to_owned(),
         ] {
-            let walker = Walker::new(&fixture.root)
+            let refused = Walker::new(&fixture.root)
                 .include(&pattern)
-                .unwrap_or_else(|error| panic!("today {pattern:?} compiles, got {error}"));
-            let result = walker
+                .expect_err("a path spelled as a pattern is refused");
+            assert!(
+                refused
+                    .message()
+                    .starts_with("this looks like a Windows path"),
+                "{pattern:?} reported {refused}"
+            );
+            // Excludes are read by the same rules, so they are refused too -
+            // an exclude that silently matches nothing is just as invisible.
+            assert!(Walker::new(&fixture.root).exclude(&pattern).is_err());
+        }
+
+        // The spelling the dialect wants keeps working, absolute or relative.
+        for pattern in [
+            "src/**/*.ts",
+            &format!("{}/src/**/*.ts", root.replace('\\', "/")),
+        ] {
+            let result = Walker::new(&fixture.root)
+                .include(pattern)
+                .expect("valid include")
                 .options(WalkOptions::default().sort(true).files_only(true))
                 .collect()
                 .expect("walk succeeds");
-            assert!(
-                result.entries().is_empty(),
-                "today {pattern:?} selects nothing, got {:?}",
-                relative_paths(result.entries(), &fixture.root)
-            );
+            assert_eq!(result.entries().len(), 2, "{pattern} selects both files");
         }
-
-        // The spelling that works, for contrast: the same pattern with `/`.
-        let works = Walker::new(&fixture.root)
-            .include("src/**/*.ts")
-            .expect("valid include")
-            .options(WalkOptions::default().sort(true).files_only(true))
-            .collect()
-            .expect("walk succeeds");
-        assert_eq!(works.entries().len(), 2);
     }
 
+    /// `*.tmp/**` used to close `a/b.tmp` in both modes, because the subtree
+    /// root was always read as separator-crossing. In the default mode the
+    /// exclude does not reach that directory at all - `*.tmp` cannot match the
+    /// component `a` - so its contents went missing from the walk without any
+    /// pattern saying they should.
+    #[test]
     fn subtree_pruning_agrees_with_the_exclude_it_came_from() {
         let fixture = Fixture::new();
         fixture.write("a/b.tmp/keep.rs");
