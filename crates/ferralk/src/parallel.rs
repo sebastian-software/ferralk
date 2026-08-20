@@ -5,15 +5,18 @@ use std::{
     collections::HashSet,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
 };
 
 use crossbeam_deque::{Steal, Stealer, Worker};
 
 use super::{
-    BackendEntry, CYCLE_KEY_OPERATION, CycleKey, DirectoryBackend, ErrorPolicy, WalkEntry,
-    WalkError, WalkResult, Walker,
+    BackendEntry, CYCLE_KEY_OPERATION, CycleKey, DirectoryBackend, EntryVisitor, ErrorPolicy,
+    Verdict, WalkEntry, WalkError, WalkResult, Walker,
     classify::{DirectoryTask, EntryAction, classify_entry},
     gitignore::IgnoreScope,
     scheduler::{Coordinator, Scheduler, WorkerSlot},
@@ -22,9 +25,10 @@ use super::{
 pub(super) fn collect<B: DirectoryBackend + Sync>(
     walker: Walker,
     backend: &B,
+    visitor: EntryVisitor<'_>,
 ) -> Result<WalkResult, WalkError> {
     let walker = Arc::new(walker);
-    let shared = Arc::new(Shared::new(Arc::clone(&walker), backend));
+    let shared = Arc::new(Shared::new(Arc::clone(&walker), backend, visitor));
     let mut caller = WorkerScratch::new(0);
     let caller_slot = shared.coordinator.claim_caller_slot();
 
@@ -93,12 +97,29 @@ struct HelperPool<'scope, 'env> {
     shards: &'env Mutex<Vec<Vec<WalkEntry>>>,
 }
 
+/// Directories a walk must have read before it starts its first helper.
+///
+/// Starting a thread costs more than a small tree does: the Palamedes trial
+/// measured every parallel arm losing to its own serial form on a twelve-file
+/// tree, where `ignore` at four threads ran 0.38x its own serial time.
+///
+/// Two signals are checked against it, and either one is enough; see
+/// [`Shared::tree_is_worth_helpers`].
+///
+/// The floor delays the pool, it does not cap it: it is re-checked after every
+/// directory, and a large tree crosses it in its first few before reaching the
+/// configured thread budget as usual.
+const HELPER_TREE_FLOOR: usize = 8;
+
 impl<'scope, 'env> HelperPool<'scope, 'env> {
     /// Starts helpers while queued directories outnumber the running workers
     /// and the thread budget has room. Cheap enough to call after every
     /// directory: a full pool costs the two atomic loads that reject the claim.
     fn grow(self) {
         while !self.shared.should_stop() {
+            if !self.shared.tree_is_worth_helpers() {
+                return;
+            }
             let Some(slot) = self
                 .shared
                 .coordinator
@@ -163,12 +184,20 @@ fn finish(shared: Arc<Shared>, mut entries: Vec<WalkEntry>) -> Result<WalkResult
     Ok(WalkResult {
         entries,
         errors: std::mem::take(&mut *lock(&shared.errors)),
-        cancelled: shared.cancellation.is_cancelled(),
+        cancelled: shared.should_stop(),
     })
 }
 
 struct Shared<'backend> {
     walker: Arc<Walker>,
+    /// The caller's per-entry filter, run on whichever worker produced the
+    /// entry. Shared rather than cloned, which is why it is `Sync`.
+    visitor: EntryVisitor<'backend>,
+    /// Set by a [`Verdict::Stop`]. Kept apart from `cancellation` so a stop
+    /// never reaches into a token the caller owns and may reuse.
+    stopped: AtomicBool,
+    /// Directories read so far, the size signal behind [`HELPER_TREE_FLOOR`].
+    directories_read: AtomicUsize,
     /// Every filesystem call of the walk goes through here, which is what lets
     /// a test mock drive the parallel frontend the same way it drives the
     /// serial one.
@@ -189,10 +218,17 @@ struct Shared<'backend> {
 }
 
 impl<'backend> Shared<'backend> {
-    fn new(walker: Arc<Walker>, backend: &'backend (dyn DirectoryBackend + Sync)) -> Self {
+    fn new(
+        walker: Arc<Walker>,
+        backend: &'backend (dyn DirectoryBackend + Sync),
+        visitor: EntryVisitor<'backend>,
+    ) -> Self {
         let cancellation = walker.cancellation.clone().unwrap_or_default();
         Self {
             walker,
+            visitor,
+            stopped: AtomicBool::new(false),
+            directories_read: AtomicUsize::new(0),
             backend,
             scheduler: Scheduler::new(),
             coordinator: Coordinator::new(),
@@ -211,8 +247,36 @@ impl<'backend> Shared<'backend> {
         self.coordinator.wake_waiters();
     }
 
+    /// Whether the tree has shown enough of itself to be worth a helper.
+    ///
+    /// Either signal is enough. Directories already read say how big the tree
+    /// turned out to be, which covers a few directories holding many files; a
+    /// backlog says how much is waiting right now, which covers a root that
+    /// fans out wide before anything deep has been read. Requiring both would
+    /// make a wide, shallow tree walk its first directories serially for no
+    /// reason.
+    fn tree_is_worth_helpers(&self) -> bool {
+        self.directories_read.load(Ordering::Acquire) >= HELPER_TREE_FLOOR
+            || self.coordinator.pending() >= HELPER_TREE_FLOOR
+    }
+
     fn should_stop(&self) -> bool {
-        self.cancellation.is_cancelled()
+        self.cancellation.is_cancelled() || self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Runs the visitor and keeps the entry if it survived.
+    ///
+    /// A [`Verdict::Stop`] ends the walk the way cancellation does, waking the
+    /// parked workers so none of them sits out the rest of the walk.
+    fn emit(&self, worker: &mut WorkerScratch, entry: WalkEntry) {
+        match (self.visitor)(&entry) {
+            Verdict::Keep => worker.entries.push(entry),
+            Verdict::Skip => {}
+            Verdict::Stop => {
+                self.stopped.store(true, Ordering::Release);
+                self.coordinator.wake_waiters();
+            }
+        }
     }
 
     fn record_error(&self, operation: &'static str, path: PathBuf, source: std::io::Error) {
@@ -364,6 +428,7 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
             return;
         }
     };
+    shared.directories_read.fetch_add(1, Ordering::AcqRel);
     // The directory's own ignore files join the chain here. Every directory is
     // processed once, so every ignore file is read once, whatever the worker
     // count.
@@ -399,9 +464,9 @@ fn process_entry(
         EntryAction::Descend(task) => shared.schedule(&worker.queue, task),
         EntryAction::DescendAndEmit(entry, task) => {
             shared.schedule(&worker.queue, task);
-            worker.entries.push(entry);
+            shared.emit(worker, entry);
         }
-        EntryAction::Emit(entry) => worker.entries.push(entry),
+        EntryAction::Emit(entry) => shared.emit(worker, entry),
         EntryAction::Failed { failure, descend } => {
             if let Some(task) = descend {
                 shared.schedule(&worker.queue, task);
@@ -468,6 +533,15 @@ struct WorkerRendezvous {
 #[cfg(test)]
 static WORKER_RENDEZVOUS: Mutex<Option<WorkerRendezvous>> = Mutex::new(None);
 
+/// Held for the whole of any test that uses the rendezvous.
+///
+/// The rendezvous is one process-global slot and `observed_worker_threads`
+/// takes it, so two tests arming it at once would read each other's walk — or
+/// an empty slot. libtest runs tests on parallel threads, so that is the
+/// default rather than the exception once more than one test uses it.
+#[cfg(test)]
+static WORKER_RENDEZVOUS_GUARD: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 static WORKER_RENDEZVOUS_WAKE: std::sync::Condvar = std::sync::Condvar::new();
 
@@ -499,6 +573,13 @@ fn observed_worker_threads() -> usize {
 
 #[cfg(test)]
 fn join_worker_rendezvous(shared: &Shared) {
+    // Below the size floor the walk is deliberately serial, so a rendezvous
+    // there would block the one worker that still has to read its way past the
+    // floor. Standing aside on exactly the production condition keeps the
+    // harness measuring the pool rather than the floor.
+    if !shared.tree_is_worth_helpers() {
+        return;
+    }
     let mut state = lock(&WORKER_RENDEZVOUS);
     match state.as_mut() {
         Some(rendezvous) if rendezvous.root == shared.walker.root && !rendezvous.released => {
@@ -534,11 +615,12 @@ fn join_worker_rendezvous(shared: &Shared) {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashSet,
         fs,
         panic::{AssertUnwindSafe, catch_unwind},
         path::{Path, PathBuf},
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
             mpsc,
         },
@@ -547,8 +629,8 @@ mod tests {
     };
 
     use super::{
-        Shared, Walker, catch_worker_panic, expect_worker_threads, fail_next_worker_spawn, finish,
-        observed_worker_threads, panic_in_directory,
+        Shared, WORKER_RENDEZVOUS_GUARD, Walker, catch_worker_panic, expect_worker_threads,
+        fail_next_worker_spawn, finish, lock, observed_worker_threads, panic_in_directory,
     };
     use crate::{CancellationToken, WalkOptions, WalkResult};
 
@@ -572,8 +654,13 @@ mod tests {
 
     /// Builds a tree wide enough to keep several helpers busy while one of them
     /// panics, so the surviving workers have to notice the cancellation.
+    /// A tree wide enough to be worth threads.
+    ///
+    /// The branch count is above [`super::HELPER_TREE_FLOOR`] on purpose: the walk
+    /// stays serial below it, so a pool test on a smaller tree would be
+    /// asserting against a configuration the walk never uses.
     fn create_wide_fixture(root: &Path) {
-        for branch in 0..6 {
+        for branch in 0..super::HELPER_TREE_FLOOR + 2 {
             for nested in 0..4 {
                 let directory = root
                     .join(format!("branch-{branch}"))
@@ -591,7 +678,11 @@ mod tests {
     fn worker_panic_cancels_siblings_and_resumes_on_the_caller() {
         let cancellation = CancellationToken::default();
         let walker = Arc::new(Walker::new(".").cancellation(cancellation.clone()));
-        let shared = Arc::new(Shared::new(walker, &crate::SystemBackend));
+        let shared = Arc::new(Shared::new(
+            walker,
+            &crate::SystemBackend,
+            &crate::keep_every_entry,
+        ));
 
         catch_worker_panic(&shared, || panic!("injected worker panic"));
         assert!(cancellation.is_cancelled());
@@ -608,6 +699,7 @@ mod tests {
 
     #[test]
     fn a_single_root_subdirectory_still_uses_the_configured_threads() {
+        let _rendezvous = lock(&WORKER_RENDEZVOUS_GUARD);
         let root = unique_root("single-subtree");
         // The root has exactly one traversable child, so the root fan-out that
         // used to size the helper pool is one and the walk stayed serial.
@@ -634,6 +726,37 @@ mod tests {
         );
         assert_eq!(walked_paths(&parallel), walked_paths(&serial));
         assert!(parallel.errors().is_empty());
+    }
+
+    #[test]
+    fn a_visitor_runs_on_every_worker_of_the_walk() {
+        // The point of the API: a caller's predicate must not be funnelled back
+        // onto one thread. The rendezvous is what makes that observable without
+        // racing the pool — a plain thread-id count would pass or fail on how
+        // quickly the caller drains a small tree.
+        let _rendezvous = lock(&WORKER_RENDEZVOUS_GUARD);
+        let root = unique_root("visitor-threads");
+        create_wide_fixture(&root);
+
+        expect_worker_threads(root.clone(), 4);
+        let seen = Mutex::new(HashSet::new());
+        let result = Walker::new(&root)
+            .threads(4)
+            .visit(|_| {
+                lock(&seen).insert(thread::current().id());
+                crate::Verdict::Keep
+            })
+            .expect("visited walk succeeds");
+        let workers = observed_worker_threads();
+        let visitor_threads = lock(&seen).len();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(workers, 4, "the walk did not reach its thread budget");
+        assert!(
+            visitor_threads > 1,
+            "the visitor ran on {visitor_threads} thread(s) across {workers} workers"
+        );
+        assert!(!result.entries().is_empty());
     }
 
     #[test]
@@ -680,8 +803,9 @@ mod tests {
     #[test]
     fn worker_start_failure_returns_a_structured_error_and_cancels() {
         let root = unique_root("worker-start");
-        fs::create_dir_all(root.join("left")).expect("create left fixture");
-        fs::create_dir_all(root.join("right")).expect("create right fixture");
+        // Wide enough to reach the size floor, or no helper is ever attempted
+        // and there is nothing for the injected failure to land on.
+        create_wide_fixture(&root);
         let cancellation = CancellationToken::default();
         fail_next_worker_spawn();
 

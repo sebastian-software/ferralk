@@ -818,7 +818,7 @@ mod tests {
     }
 
     fn collect_with_portable_backend(walker: &Walker) -> (Vec<WalkEntry>, Vec<crate::WalkError>) {
-        let mut state = crate::WalkState::new(walker);
+        let mut state = crate::WalkState::new(walker, &crate::keep_every_entry);
         let task = crate::DirectoryTask {
             path: walker.root.clone(),
             ignores: crate::IgnoreScope::root(walker, &StdBackend),

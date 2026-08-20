@@ -21,7 +21,8 @@ use std::{
 };
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use ferralk::{WalkOptions, Walker};
+use ferralk::{Verdict, WalkOptions, Walker};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::{WalkBuilder, WalkState, overrides::OverrideBuilder};
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -99,8 +100,123 @@ fn walker(c: &mut Criterion) {
         "the large fixture must exceed 5k files"
     );
 
+    // A tree the size of the Palamedes trial's synthetic case, where every
+    // parallel arm lost to its own serial form.
+    let mini = Fixture::new(2, 1, 6);
+    assert_eq!(mini.files, 12, "the mini fixture models the trial's tree");
+
     bench_tree(c, "", &small);
     bench_tree(c, "large/", &large);
+    bench_caller_matching(c, "large/", &large);
+    bench_caller_matching(c, "mini/", &mini);
+}
+
+/// The shape the Palamedes trial measured: the caller keeps a matcher of its
+/// own and the walker only has to find the candidates.
+///
+/// `collect_then_filter` is the arm the trial ran, and the one that lost to a
+/// hand-pruned parallel `ignore` at four threads — the walk parallelises and
+/// the caller's `GlobSet` then runs over every entry on one thread.
+/// `visit_in_worker` is the same matcher moved into the workers.
+fn bench_caller_matching(c: &mut Criterion, group: &str, fixture: &Fixture) {
+    let matcher = caller_matcher();
+
+    c.bench_function(
+        &format!("{LANE}/{group}caller_match/collect_then_filter"),
+        |benchmark| {
+            benchmark.iter(|| {
+                let result = Walker::new(&fixture.root)
+                    .threads(4)
+                    .options(WalkOptions::default())
+                    .collect()
+                    .expect("benchmark walk succeeds");
+                let kept = result
+                    .entries()
+                    .iter()
+                    .filter(|entry| matcher.is_match(entry.path()))
+                    .count();
+                black_box(kept)
+            })
+        },
+    );
+
+    c.bench_function(
+        &format!("{LANE}/{group}caller_match/visit_in_worker"),
+        |benchmark| {
+            benchmark.iter(|| {
+                let result = Walker::new(&fixture.root)
+                    .threads(4)
+                    .options(WalkOptions::default())
+                    .visit(|entry| {
+                        if matcher.is_match(entry.path()) {
+                            Verdict::Keep
+                        } else {
+                            Verdict::Skip
+                        }
+                    })
+                    .expect("benchmark walk succeeds");
+                black_box(result.entries().len())
+            })
+        },
+    );
+
+    c.bench_function(
+        &format!("{LANE}/{group}caller_match/collect_only"),
+        |benchmark| {
+            benchmark.iter(|| {
+                let result = Walker::new(&fixture.root)
+                    .threads(4)
+                    .options(WalkOptions::default())
+                    .collect()
+                    .expect("benchmark walk succeeds");
+                black_box(result.entries().len())
+            })
+        },
+    );
+
+    c.bench_function(
+        &format!("{LANE}/{group}caller_match/ignore_parallel"),
+        |benchmark| {
+            benchmark.iter(|| {
+                black_box(ignore_parallel_caller_matched(&fixture.root, &matcher));
+            })
+        },
+    );
+}
+
+/// The caller's own matcher, standing in for the `GlobSet` Palamedes keeps for
+/// parity. Deliberately not a ferralk pattern: the point is a predicate the
+/// walker cannot absorb.
+fn caller_matcher() -> GlobSet {
+    // A catalog rather than one pattern. Palamedes carries roughly this many
+    // source globs, and a single-pattern set is cheap enough per entry that a
+    // serial pass over the result hides inside the walk.
+    let mut builder = GlobSetBuilder::new();
+    for extension in [
+        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "json", "toml", "yaml", "yml", "md", "css",
+        "scss", "html", "py", "go", "java", "kt", "swift", "c", "h", "cpp", "hpp",
+    ] {
+        builder.add(Glob::new(&format!("**/*.{extension}")).expect("benchmark glob is valid"));
+    }
+    builder.build().expect("benchmark glob set builds")
+}
+
+/// The baseline: `ignore` in parallel with the same matcher applied in-worker,
+/// which is what ferralk had no answer to before `visit`.
+fn ignore_parallel_caller_matched(root: &Path, matcher: &GlobSet) -> usize {
+    let kept = AtomicUsize::new(0);
+    let mut builder = WalkBuilder::new(root);
+    builder.threads(4).standard_filters(false);
+    builder.build_parallel().run(|| {
+        Box::new(|entry| {
+            let entry = entry.expect("benchmark walk succeeds");
+            if matcher.is_match(entry.path()) {
+                kept.fetch_add(1, Ordering::Relaxed);
+            }
+            WalkState::Continue
+        })
+    });
+    kept.load(Ordering::Relaxed)
 }
 
 fn bench_tree(c: &mut Criterion, group: &str, fixture: &Fixture) {

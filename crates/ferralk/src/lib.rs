@@ -293,6 +293,25 @@ impl Error for WalkError {
     }
 }
 
+/// What a [`Walker::visit`] visitor decides about one entry.
+///
+/// The visitor runs on the thread that produced the entry, so a caller with a
+/// matcher of its own filters in parallel instead of over the returned list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Keep the entry in the result.
+    Keep,
+    /// Leave the entry out of the result. Traversal is unaffected: a directory
+    /// is still descended into, because pruning a subtree is what
+    /// [`Walker::exclude`] expresses, and one verdict meaning different things
+    /// for files and directories would be a trap.
+    Skip,
+    /// Leave the entry out and end the walk, the way a cancellation request
+    /// does. A caller that wants the entry which stopped the walk records it in
+    /// the visitor, where the decision was made anyway.
+    Stop,
+}
+
 /// Completed entries and recoverable errors.
 #[derive(Debug)]
 pub struct WalkResult {
@@ -320,11 +339,24 @@ impl WalkResult {
         (self.entries, self.errors)
     }
 
-    /// Whether a cancellation request stopped traversal before completion.
+    /// Whether a cancellation request or a [`Verdict::Stop`] stopped traversal
+    /// before completion.
     #[must_use]
     pub const fn was_cancelled(&self) -> bool {
         self.cancelled
     }
+}
+
+/// A borrowed per-entry visitor, shared by every worker of one walk.
+///
+/// Behind a reference rather than a generic parameter: the walk already reaches
+/// its filesystem through `&dyn DirectoryBackend`, and one indirect call per
+/// entry is not measurable against a traversal made of syscalls.
+pub(crate) type EntryVisitor<'a> = &'a (dyn Fn(&WalkEntry) -> Verdict + Sync + 'a);
+
+/// The visitor [`Walker::collect`] runs: every entry survives.
+pub(crate) fn keep_every_entry(_: &WalkEntry) -> Verdict {
+    Verdict::Keep
 }
 
 /// Builder for a portable serial traversal.
@@ -446,16 +478,69 @@ impl Walker {
         self.collect_with(&SystemBackend)
     }
 
+    /// Runs the walk and asks `visitor` about every entry, on the worker that
+    /// produced it.
+    ///
+    /// This is [`Walker::collect`] with a filter that runs in parallel. A
+    /// caller whose predicate is not expressible as a ferralk glob — another
+    /// glob engine, a content check, a lookup — otherwise pays a
+    /// single-threaded pass over every entry after the walk, which is enough to
+    /// cancel out the threads the walk just used.
+    ///
+    /// The visitor is shared rather than cloned per worker, so it takes `&self`
+    /// and must be `Sync`. Per-worker state belongs in a thread-local, which is
+    /// how ferralk's own matcher keeps its scratch buffers.
+    ///
+    /// Cancellation, the error policy, panic propagation and sorting behave
+    /// exactly as they do for [`Walker::collect`]; only which entries survive
+    /// differs. A [`Verdict::Stop`] ends the walk and is reported by
+    /// [`WalkResult::was_cancelled`].
+    ///
+    /// ```no_run
+    /// use ferralk::{Verdict, Walker};
+    ///
+    /// let result = Walker::new(".")
+    ///     .threads(4)
+    ///     .visit(|entry| {
+    ///         if entry.path().extension().is_some_and(|kind| kind == "rs") {
+    ///             Verdict::Keep
+    ///         } else {
+    ///             Verdict::Skip
+    ///         }
+    ///     })?;
+    /// # Ok::<(), ferralk::WalkError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The same failures [`Walker::collect`] reports.
+    pub fn visit<V>(self, visitor: V) -> Result<WalkResult, WalkError>
+    where
+        V: Fn(&WalkEntry) -> Verdict + Sync,
+    {
+        self.walk(&SystemBackend, &visitor)
+    }
+
     /// The collect implementation both frontends share, with the filesystem
     /// behind a backend so tests can drive either of them with a mock.
     fn collect_with<B: DirectoryBackend + Sync>(
         self,
         backend: &B,
     ) -> Result<WalkResult, WalkError> {
+        self.walk(backend, &keep_every_entry)
+    }
+
+    /// The one traversal `collect` and `visit` share, so a visitor cannot
+    /// observe a different tree than a plain collect would.
+    fn walk<B: DirectoryBackend + Sync>(
+        self,
+        backend: &B,
+        visitor: EntryVisitor<'_>,
+    ) -> Result<WalkResult, WalkError> {
         if self.threads > 1 {
-            return parallel::collect(self, backend);
+            return parallel::collect(self, backend, visitor);
         }
-        let mut state = WalkState::new(&self);
+        let mut state = WalkState::new(&self, visitor);
         // Use the same injector-to-worker transfer as the parallel backend. The
         // serial baseline owns one local queue and deliberately drains it
         // before returning.
@@ -1033,6 +1118,7 @@ impl Iterator for WalkStream {
 
 struct WalkState<'walker> {
     walker: &'walker Walker,
+    visitor: EntryVisitor<'walker>,
     entries: Vec<WalkEntry>,
     errors: Vec<WalkError>,
     visited_directories: HashSet<CycleKey>,
@@ -1040,13 +1126,23 @@ struct WalkState<'walker> {
 }
 
 impl<'walker> WalkState<'walker> {
-    fn new(walker: &'walker Walker) -> Self {
+    fn new(walker: &'walker Walker, visitor: EntryVisitor<'walker>) -> Self {
         Self {
             walker,
+            visitor,
             entries: Vec::new(),
             errors: Vec::new(),
             visited_directories: HashSet::new(),
             cancelled: false,
+        }
+    }
+
+    /// Asks the visitor about one entry and keeps it if it said so.
+    fn emit(&mut self, entry: WalkEntry) {
+        match (self.visitor)(&entry) {
+            Verdict::Keep => self.entries.push(entry),
+            Verdict::Skip => {}
+            Verdict::Stop => self.cancelled = true,
         }
     }
 
@@ -1105,14 +1201,14 @@ impl<'walker> WalkState<'walker> {
             EntryAction::Skip => Ok(()),
             EntryAction::Descend(task) => self.walk_directory(backend, task),
             EntryAction::Emit(entry) => {
-                self.entries.push(entry);
+                self.emit(entry);
                 Ok(())
             }
             // The subtree is walked before the directory itself is recorded,
             // which is the depth-first order this frontend has always had.
             EntryAction::DescendAndEmit(entry, task) => {
                 self.walk_directory(backend, task)?;
-                self.entries.push(entry);
+                self.emit(entry);
                 Ok(())
             }
             EntryAction::Failed { failure, descend } => {
@@ -1165,16 +1261,19 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 mod tests {
     use std::{
         cell::RefCell,
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::{
-        CancellationToken, ErrorPolicy, TraversalPattern, WalkEntry, WalkEntryKind, WalkOptions,
-        Walker, literal_extension, literal_pattern_root, traversal_pattern_options,
+        CancellationToken, ErrorPolicy, TraversalPattern, Verdict, WalkEntry, WalkEntryKind,
+        WalkOptions, Walker, literal_extension, literal_pattern_root, traversal_pattern_options,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -1298,9 +1397,15 @@ mod tests {
         }
     }
 
-    /// Serial `collect`, parallel `collect` and `stream` share one
+    /// Serial `collect`, parallel `collect`, `stream` and `visit` share one
     /// classification pipeline, so they have to report the same entries and the
     /// same errors for the same tree under every policy.
+    ///
+    /// `visit` is checked twice: keeping everything has to reproduce `collect`
+    /// exactly, and filtering in the visitor has to reproduce the same filter
+    /// applied to `collect`'s result. The second is the property the API
+    /// exists for — a caller moves its predicate into the workers and must get
+    /// the same set back.
     fn assert_frontends_agree(label: &str, root: &Path, build: impl Fn() -> Walker) {
         for policy in [ErrorPolicy::Collect, ErrorPolicy::Skip, ErrorPolicy::Abort] {
             let serial = collect_outcome(build().threads(1).error_policy(policy).collect(), root);
@@ -1314,7 +1419,87 @@ mod tests {
                 streamed, serial,
                 "{label}: stream and serial disagree under {policy:?}"
             );
+
+            for threads in [1, 4] {
+                let visited = collect_outcome(
+                    build()
+                        .threads(threads)
+                        .error_policy(policy)
+                        .visit(|_| Verdict::Keep),
+                    root,
+                );
+                assert_eq!(
+                    visited, serial,
+                    "{label}: keep-everything visit on {threads} threads disagrees under {policy:?}"
+                );
+
+                // An arbitrary predicate that splits the tree, applied in the
+                // workers here and to the collected list below.
+                let keeps = |entry: &WalkEntry| {
+                    entry
+                        .path()
+                        .to_string_lossy()
+                        .bytes()
+                        .filter(|byte| *byte == b'a')
+                        .count()
+                        % 2
+                        == 0
+                };
+                let filtered = collect_outcome(
+                    build()
+                        .threads(threads)
+                        .error_policy(policy)
+                        .visit(|entry| {
+                            if keeps(entry) {
+                                Verdict::Keep
+                            } else {
+                                Verdict::Skip
+                            }
+                        }),
+                    root,
+                );
+                let expected = match &serial {
+                    FrontendOutcome::Aborted(operation) => FrontendOutcome::Aborted(operation),
+                    FrontendOutcome::Completed { errors, .. } => {
+                        let mut entries = collect_outcome(
+                            build().threads(threads).error_policy(policy).collect(),
+                            root,
+                        );
+                        if let FrontendOutcome::Completed {
+                            entries: collected, ..
+                        } = &mut entries
+                        {
+                            collected.retain(|path| keeps_relative(path, root, keeps));
+                        }
+                        match entries {
+                            FrontendOutcome::Completed { entries, .. } => {
+                                FrontendOutcome::Completed {
+                                    entries,
+                                    errors: errors.clone(),
+                                }
+                            }
+                            aborted => aborted,
+                        }
+                    }
+                };
+                assert_eq!(
+                    filtered, expected,
+                    "{label}: filtering visit on {threads} threads disagrees under {policy:?}"
+                );
+            }
         }
+    }
+
+    /// Re-applies a visitor predicate to a path `collect_outcome` made relative.
+    fn keeps_relative(relative: &Path, root: &Path, keeps: impl Fn(&WalkEntry) -> bool) -> bool {
+        let entry = WalkEntry {
+            path: root.join(relative),
+            is_dir: false,
+            is_symlink: false,
+            depth: 0,
+            metadata: None,
+        };
+        keeps(&entry)
     }
 
     /// Builds the root task the way the walk frontends do, for tests that
@@ -2536,6 +2721,138 @@ mod tests {
     }
 
     #[test]
+    fn a_visitor_skip_drops_the_entry_without_pruning_the_subtree() {
+        // Skip is a result filter, not a traversal filter: excluding a
+        // directory from the result must leave its children reachable.
+        let fixture = Fixture::new();
+        fixture.write("keep/inside.txt");
+
+        for threads in [1, 4] {
+            let result = Walker::new(&fixture.root)
+                .threads(threads)
+                .visit(|entry| {
+                    if entry.path().file_name().is_some_and(|name| name == "keep") {
+                        Verdict::Skip
+                    } else {
+                        Verdict::Keep
+                    }
+                })
+                .expect("visited walk succeeds");
+            let paths = relative_paths(result.entries(), &fixture.root);
+            assert_eq!(
+                paths,
+                vec![PathBuf::from("keep/inside.txt")],
+                "the skipped directory must still have been descended into"
+            );
+            assert!(!result.was_cancelled());
+        }
+    }
+
+    #[test]
+    fn a_visitor_stop_ends_the_walk_and_is_reported() {
+        let fixture = Fixture::new();
+        for index in 0..64 {
+            fixture.write(format!("file-{index}.txt"));
+        }
+
+        for threads in [1, 4] {
+            let seen = AtomicUsize::new(0);
+            let result = Walker::new(&fixture.root)
+                .threads(threads)
+                .visit(|_| {
+                    if seen.fetch_add(1, Ordering::AcqRel) >= 8 {
+                        Verdict::Stop
+                    } else {
+                        Verdict::Keep
+                    }
+                })
+                .expect("visited walk succeeds");
+            assert!(
+                result.was_cancelled(),
+                "a stop must be reported the way a cancellation is"
+            );
+            assert!(result.entries().len() <= 64);
+        }
+    }
+
+    #[test]
+    fn a_visitor_stop_leaves_a_caller_owned_cancellation_token_alone() {
+        // The token belongs to the caller and may drive other work, so ending
+        // one walk must not cancel it.
+        let fixture = Fixture::new();
+        fixture.write("only.txt");
+        let cancellation = CancellationToken::default();
+
+        for threads in [1, 4] {
+            let result = Walker::new(&fixture.root)
+                .threads(threads)
+                .cancellation(cancellation.clone())
+                .visit(|_| Verdict::Stop)
+                .expect("visited walk succeeds");
+            assert!(result.was_cancelled());
+            assert!(
+                !cancellation.is_cancelled(),
+                "a stop must not cancel the caller's token"
+            );
+        }
+    }
+
+    #[test]
+    fn a_visitor_panic_is_resumed_on_the_caller() {
+        let fixture = Fixture::new();
+        for branch in 0..12 {
+            fixture.write(format!("branch-{branch}/file.txt"));
+        }
+
+        for threads in [1, 4] {
+            let root = fixture.root.clone();
+            let panicked = std::panic::catch_unwind(move || {
+                let _ = Walker::new(&root)
+                    .threads(threads)
+                    .visit(|_| panic!("visitor panic"));
+            });
+            assert!(
+                panicked.is_err(),
+                "a panic inside the visitor must reach the caller on {threads} threads"
+            );
+        }
+    }
+
+    #[test]
+    fn a_small_tree_stays_on_one_thread() {
+        // The size floor: every parallel arm of the Palamedes trial lost to its
+        // own serial form on a twelve-file tree.
+        let fixture = Fixture::new();
+        for index in 0..12 {
+            fixture.write(format!("one/file-{index}.txt"));
+        }
+        fixture.write("two/only.txt");
+
+        let threads = Mutex::new(HashSet::new());
+        let result = Walker::new(&fixture.root)
+            .threads(4)
+            .visit(|_| {
+                threads
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(std::thread::current().id());
+                Verdict::Keep
+            })
+            .expect("visited walk succeeds");
+
+        let observed = threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert_eq!(
+            observed, 1,
+            "a tree below the size floor must not pay for helper threads"
+        );
+        // Two directories and the thirteen files under them.
+        assert_eq!(result.entries().len(), 2 + 13);
+    }
+
+    #[test]
     fn the_three_frontends_agree_on_entries_and_errors() {
         let fixture = Fixture::new();
         fixture.write("src/lib.rs");
@@ -2802,7 +3119,7 @@ mod tests {
         let walker = Walker::new(&root)
             .include("src/**/*.rs")
             .expect("valid include");
-        let mut state = super::WalkState::new(&walker);
+        let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
 
         state
             .walk_directory(&backend, directory_task(&walker, &backend, root.clone()))
@@ -2843,7 +3160,7 @@ mod tests {
             root: fixture.root.clone(),
             disappeared: disappeared.clone(),
         };
-        let mut state = super::WalkState::new(&walker);
+        let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
 
         state
             .walk_directory(
@@ -2997,7 +3314,7 @@ mod tests {
         all(feature = "native-linux", target_os = "linux")
     ))]
     fn collect_with_portable_backend(walker: &Walker) -> (Vec<WalkEntry>, Vec<super::WalkError>) {
-        let mut state = super::WalkState::new(walker);
+        let mut state = super::WalkState::new(walker, &super::keep_every_entry);
         state
             .walk_directory(
                 &super::StdBackend,
