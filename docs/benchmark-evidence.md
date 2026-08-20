@@ -171,6 +171,68 @@ prefilter handles well. A pattern set the planner can prove nothing about would
 run every include against every entry, which is the shape where a compiled
 `GlobSet` should still win.
 
+## When a pool is worth starting
+
+The helper floor decides whether a walk starts threads at all, so what it
+weighs is a measurement question. This sweep is the evidence behind
+`DIRECTORY_WEIGHT` and `HELPER_WORK_FLOOR` in
+[`parallel.rs`](../crates/ferralk/src/parallel.rs).
+
+Thirty-six shapes, directory count against files per directory. Each is walked
+process-fresh — one walk per process, because thread startup is the cost under
+test and repeated iterations in one process amortise it away — with helpers
+forced off and forced on, the two arms alternating every round, medians of 51
+rounds. The cell is pooled ÷ serial: **below 1.00 pooling wins**.
+
+| Directories | 0 files each | 1 | 4 | 16 |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | | 1.48 | 1.50 | 1.38 |
+| 8 | | 1.24 | 1.17 | 1.10 |
+| 10 | | 1.08 | 1.15 | 1.02 |
+| 12 | | 1.08 | 1.03 | 1.03 |
+| 14 | | 1.03 | 1.04 | **0.85** |
+| 16 | 1.01 | 0.98 | 1.01 | **0.83** |
+| 20 | 0.99 | 0.99 | **0.89** | **0.81** |
+| 24 | **0.91** | **0.85** | **0.83** | **0.80** |
+| 28 | **0.74** | | | |
+| 31 | **0.95** | | | |
+| 32 | | **0.86** | **0.85** | **0.71** |
+| 40 | **0.70** | | | |
+| 48 | | **0.85** | **0.77** | **0.68** |
+| 64 | **0.83** | | | |
+| 96 | **0.79** | | | |
+
+**Directories cost about twenty times what an entry costs.** Holding the entry
+count at 150 and spreading it across more directories takes the walk from 200 µs
+at 2 directories to 1374 µs at 75 — 16 µs per directory, with the entries
+unchanged — while adding 135 entries to a fixed 9 directories costs 110 µs, or
+0.8 µs each. That ratio is why the floor counts a listing as twenty entries.
+
+**The break-even is one number, not one per shape.** The first pooling win
+arrives at 24 directories of 1 file, 20 of 4, and 14 of 16 — shapes with little
+in common except that the serial walk takes 480 µs (509, 478, 476). Pooling wins
+once there is about half a millisecond of walk to divide, which is what it costs
+to start and join the threads.
+
+**What the sweep changed.** The floor counted entries alone, which reads a tree
+of empty directories as trivial: 24 to 31 empty directories stayed serial
+although pooling wins there by up to 26%, and 32 pooled only because 32 names in
+the root listing are 32 entries. Weighting the listing removes that cliff and
+also stops one shape the old floor pooled by mistake, 14 directories of 4 files.
+Decisions were read from a spawn trace rather than inferred from time — a helper
+walking empty directories never reaches the visitor, so counting visitor threads
+would call a running pool serial.
+
+**What it did not change.** The pair that prompted the issue, 9 directories of
+16 files against 17, was already decided correctly. The entry floor never stood
+alone: requiring `HELPER_QUEUE_FLOOR` directories still queued when it is met
+already weighed directories, just implicitly.
+
+Against this host, the floor now picks the better arm on all 36 shapes; the
+previous one missed 4. Every ratio here is one machine's, and the constants are
+a judgement about where a thread stops paying for itself, not a threshold any
+lane enforces.
+
 ## Several roots, one walker or several
 
 The `multi_root` arms in [`walker.rs`](../tools/bench/benches/walker.rs) walk

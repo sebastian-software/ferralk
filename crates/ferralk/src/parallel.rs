@@ -121,8 +121,24 @@ struct HelperPool<'scope, 'env> {
 /// work, which is what [`HELPER_WORK_FLOOR`] adds.
 const HELPER_QUEUE_FLOOR: usize = 8;
 
-/// Directory entries a walk must have seen before a queue counts as worth
-/// paying a thread for.
+/// What one directory listing is worth in the units [`HELPER_WORK_FLOOR`]
+/// counts, beside the entries it returned.
+///
+/// A directory costs a syscall; an entry costs a few pointer moves. Fitting a
+/// cost model to the #88 sweep on this host put a listing at roughly 16us and
+/// an entry at 0.8us, so a directory is worth about twenty entries. The same
+/// ratio falls out of the sweep directly: hold the entry count at 150 and move
+/// it between 2 and 75 directories, and the walk goes from 200us to 1374us -
+/// 16us per directory added, with the entries unchanged.
+///
+/// This is what makes the floor a mixed signal rather than an entry count. The
+/// two are the same thing on an ordinary tree, where entries arrive with the
+/// directories that hold them, and come apart exactly where #88 found them
+/// apart: a tree of empty directories has no entries but plenty to do.
+const DIRECTORY_WEIGHT: usize = 20;
+
+/// Work a walk must have seen before a queue counts as worth paying a thread
+/// for, counted in entries with each listing worth [`DIRECTORY_WEIGHT`].
 ///
 /// Starting a thread costs more than a small tree does: the Palamedes trial
 /// measured every parallel arm losing to its own serial form on a twelve-file
@@ -131,29 +147,47 @@ const HELPER_QUEUE_FLOOR: usize = 8;
 /// sixteen directories queued at once - and started a pool with nothing to
 /// give it, running at 0.76x its own serial time.
 ///
-/// Entries, not directories, because entries are what there is to do. The
-/// trial's tree holds 28 of them in total, so a floor above that keeps it
-/// serial, while a tree that fans out for real reaches the floor from its root
-/// listing alone.
+/// **The #88 sweep.** Thirty-six shapes, directory count against entries per
+/// directory, each walked process-fresh with helpers forced off and forced on,
+/// arms alternating every round. Pooling turns from loss to win at a strikingly
+/// constant point: whatever the shape, once the serial walk would take about
+/// 480us. In work units that lands between 370, the largest shape where serial
+/// still wins, and 520, the smallest where pooling wins; 224 is the largest
+/// value that trips on every shape the sweep says should pool while trapping
+/// none that should not, because the queue has to still hold
+/// [`HELPER_QUEUE_FLOOR`] directories at the moment the floor is met.
+///
+/// **What the sweep corrected.** The floor counted entries alone, which reads a
+/// tree of empty directories as trivial: twenty-four to thirty-one empty
+/// directories stayed serial although pooling won there by up to 26%, and
+/// thirty-two pooled only because thirty-two names in the root listing are
+/// thirty-two entries. Weighting the listing removes that cliff. It also stops
+/// one shape the old floor pooled by mistake - fourteen directories of four
+/// files, where serial wins by 4%.
+///
+/// **What it did not correct.** The pair in the issue, nine directories of
+/// sixteen files against seventeen, was already decided correctly, and still is.
+/// The old floor got that right for a reason worth writing down: the entry
+/// floor never stood alone, and requiring [`HELPER_QUEUE_FLOOR`] directories
+/// still queued when it is met already weighed directories, just implicitly.
 ///
 /// Re-swept after #84 made a walked entry cheaper, on the theory that a
 /// cheaper entry leaves less work to amortise a thread and should raise this.
-/// It does not. Measured on both code bases, with the floor forced off and
-/// forced on, the break-even sits between the same two shapes either way:
-/// thirteen directories, where a pool still loses, and seventeen, where it
-/// wins. The walks this floor arbitrates are dominated by the syscall each
-/// directory costs, and #84 changed per-entry work rather than that. The
-/// constant stands.
-const HELPER_WORK_FLOOR: usize = 32;
+/// It does not: these walks are dominated by the syscall each directory costs,
+/// and #84 changed per-entry work rather than that.
+const HELPER_WORK_FLOOR: usize = 224;
 
-/// Entries seen from which a walk is worth helpers whatever its queue looks
-/// like.
+/// Work seen from which a walk is worth helpers whatever its queue looks like.
 ///
 /// A handful of directories holding very many files each never queues much: the
 /// old floor left three directories of eighty thousand files running at 1.00x
 /// its own serial time, an entire tree on one thread with three others idle.
 /// One listing that large is worth splitting even though nothing else is
 /// waiting, and by then a thread costs nothing against it.
+///
+/// In work units since #88, so the listing itself counts towards it. At this
+/// size that is a 2% difference and the constant keeps its meaning: one
+/// directory holding about a thousand files.
 const HELPER_LISTING_FLOOR: usize = 1024;
 
 impl<'scope, 'env> HelperPool<'scope, 'env> {
@@ -243,10 +277,11 @@ struct Shared<'backend> {
     stopped: AtomicBool,
     /// Whether the caller is still the only worker. See [`Shared::schedule`].
     lone: AtomicBool,
-    /// Directory entries seen so far, the size signal behind
-    /// [`HELPER_WORK_FLOOR`]. Counted per listing rather than per entry, so a
-    /// directory costs one atomic add however much it holds.
-    entries_seen: AtomicUsize,
+    /// Work seen so far, the size signal behind [`HELPER_WORK_FLOOR`]: entries
+    /// plus [`DIRECTORY_WEIGHT`] for each listing they came from. Accumulated
+    /// per listing rather than per entry, so a directory costs one atomic add
+    /// however much it holds - and the weight rides along in that same add.
+    work_seen: AtomicUsize,
     /// Every filesystem call of the walk goes through here, which is what lets
     /// a test mock drive the parallel frontend the same way it drives the
     /// serial one.
@@ -278,7 +313,7 @@ impl<'backend> Shared<'backend> {
             visitor,
             stopped: AtomicBool::new(false),
             lone: AtomicBool::new(true),
-            entries_seen: AtomicUsize::new(0),
+            work_seen: AtomicUsize::new(0),
             backend,
             scheduler: Scheduler::new(),
             coordinator: Coordinator::new(),
@@ -314,15 +349,15 @@ impl<'backend> Shared<'backend> {
 
     /// Whether the tree has shown enough work to be worth a helper.
     ///
-    /// Queued work says a helper would have something to pick up; entries say
-    /// the tree is large enough for that to be worth a thread. Both together
-    /// is the usual path. A single listing past [`HELPER_LISTING_FLOOR`] is
-    /// enough on its own, because a tree that wide in one directory never
-    /// queues much and would otherwise never spawn at all.
+    /// Queued work says a helper would have something to pick up; work seen says
+    /// the tree is large enough for that to be worth a thread. Both together is
+    /// the usual path. A single listing past [`HELPER_LISTING_FLOOR`] is enough
+    /// on its own, because a tree that wide in one directory never queues much
+    /// and would otherwise never spawn at all.
     fn tree_is_worth_helpers(&self) -> bool {
-        let entries = self.entries_seen.load(Ordering::Acquire);
-        (entries >= HELPER_WORK_FLOOR && self.coordinator.pending() >= HELPER_QUEUE_FLOOR)
-            || entries >= HELPER_LISTING_FLOOR
+        let work = self.work_seen.load(Ordering::Acquire);
+        (work >= HELPER_WORK_FLOOR && self.coordinator.pending() >= HELPER_QUEUE_FLOOR)
+            || work >= HELPER_LISTING_FLOOR
     }
 
     fn should_stop(&self) -> bool {
@@ -562,9 +597,12 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
         shared.record_error("read_dir", path, source);
         return;
     }
-    shared
-        .entries_seen
-        .fetch_add(worker.listing.entries().len(), Ordering::AcqRel);
+    // One add for the whole listing: the entries it returned, and the listing
+    // itself, which cost a syscall to get them.
+    shared.work_seen.fetch_add(
+        worker.listing.entries().len() + DIRECTORY_WEIGHT,
+        Ordering::AcqRel,
+    );
     // The directory's own ignore files join the chain here. Every directory is
     // processed once, so every ignore file is read once, whatever the worker
     // count.
@@ -825,6 +863,91 @@ mod tests {
         }
     }
 
+    /// Replays what a two-level tree shows the floor, and reports whether it
+    /// ever trips.
+    ///
+    /// The root listing queues `dirs` directories and is worth that many
+    /// entries; each directory the caller then reads adds its own files and
+    /// takes one off the queue. That draining is the point: the floor has to be
+    /// met while directories are still waiting, which is what stops a tree from
+    /// pooling once there is nothing left to steal.
+    fn floor_trips_for(dirs: usize, per_dir: usize) -> bool {
+        let walker = Arc::new(Walker::new("."));
+        let shared = Shared::new(
+            Arc::clone(&walker),
+            &crate::SystemBackend,
+            &crate::keep_every_entry,
+        );
+        let mut queued = Vec::new();
+        for _ in 0..dirs {
+            shared.coordinator.begin_task();
+            queued.push(shared.coordinator.claim_task());
+        }
+        shared
+            .work_seen
+            .store(dirs + super::DIRECTORY_WEIGHT, Ordering::Release);
+        if shared.tree_is_worth_helpers() {
+            return true;
+        }
+        while queued.pop().is_some() {
+            shared
+                .work_seen
+                .fetch_add(per_dir + super::DIRECTORY_WEIGHT, Ordering::AcqRel);
+            if shared.tree_is_worth_helpers() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The dividing line the #88 sweep measured, pinned shape by shape.
+    ///
+    /// Each row was walked process-fresh with helpers forced off and forced on,
+    /// arms alternating every round; the comment is what that measured. The
+    /// rows without one sat inside the noise either way and are here to fix the
+    /// boundary, not because a wrong answer would cost anything.
+    #[test]
+    fn the_floor_divides_where_the_sweep_says_it_should() {
+        // Directories of files. Pooling loses on the small ones and wins once
+        // there is enough of the tree to amortise a thread.
+        for (dirs, per_dir, expected, note) in [
+            (9, 16, false, "pooling loses 10%"),
+            (17, 16, true, "pooling wins 8.5%"),
+            (4, 16, false, "pooling loses 38%"),
+            (8, 16, false, "pooling loses 10%"),
+            (14, 16, true, "pooling wins 15%"),
+            (10, 4, false, "pooling loses 15%"),
+            (14, 4, false, "pooling loses 4%"),
+            (20, 4, true, "pooling wins 11%"),
+            (12, 1, false, "pooling loses 8%"),
+            (24, 1, true, "pooling wins 15%"),
+            (48, 1, true, "pooling wins 15%"),
+        ] {
+            assert_eq!(
+                floor_trips_for(dirs, per_dir),
+                expected,
+                "{dirs} directories of {per_dir} files: {note}"
+            );
+        }
+
+        // Empty directories, where the old entry-only floor read a tree with
+        // real work in it as trivial and left it on one thread.
+        for (dirs, expected, note) in [
+            (16, false, "inside the noise"),
+            (24, true, "pooling wins 9%, and used to be refused"),
+            (28, true, "pooling wins 26%, and used to be refused"),
+            (31, true, "pooling wins 5%, and used to be refused"),
+            (40, true, "pooling wins 30%"),
+            (96, true, "pooling wins 21%"),
+        ] {
+            assert_eq!(
+                floor_trips_for(dirs, 0),
+                expected,
+                "{dirs} empty directories: {note}"
+            );
+        }
+    }
+
     /// What the floor is for, in the two directions it used to get wrong.
     ///
     /// A queue on its own says nothing about size: the Palamedes trial's tree
@@ -833,7 +956,7 @@ mod tests {
     /// files each never queue enough to look worth it, and used to walk on one
     /// thread whatever the budget said.
     #[test]
-    fn the_floor_weighs_work_rather_than_directories() {
+    fn the_floor_weighs_the_tree_and_the_queue_together() {
         let walker = Arc::new(Walker::new("."));
         let shared = Shared::new(
             Arc::clone(&walker),
@@ -842,8 +965,13 @@ mod tests {
         );
 
         // The trial's shape: everything it has, queued at once, is still
-        // nothing to do.
-        shared.entries_seen.store(28, Ordering::Release);
+        // nothing to do. Sixteen listings and twelve files is 332 work units,
+        // which would clear the floor - except that reading them empties the
+        // queue, so the two conditions are never true together. The store here
+        // is the generous reading, one listing's worth.
+        shared
+            .work_seen
+            .store(28 + super::DIRECTORY_WEIGHT, Ordering::Release);
         for _ in 0..16 {
             shared.coordinator.begin_task();
         }
@@ -854,7 +982,7 @@ mod tests {
 
         // The same queue, on a tree that turned out to have work in it.
         shared
-            .entries_seen
+            .work_seen
             .store(super::HELPER_WORK_FLOOR, Ordering::Release);
         assert!(shared.tree_is_worth_helpers());
 
@@ -866,7 +994,7 @@ mod tests {
             &crate::keep_every_entry,
         );
         shared
-            .entries_seen
+            .work_seen
             .store(super::HELPER_LISTING_FLOOR, Ordering::Release);
         shared.coordinator.begin_task();
         assert!(
@@ -990,7 +1118,9 @@ mod tests {
         );
 
         // Three roots' worth of a trial-sized tree, queued together.
-        shared.entries_seen.store(12, Ordering::Release);
+        shared
+            .work_seen
+            .store(12 + super::DIRECTORY_WEIGHT, Ordering::Release);
         for _ in 0..3 {
             shared.coordinator.begin_task();
         }
@@ -1001,7 +1131,7 @@ mod tests {
 
         // The same three roots once they turn out to hold work between them.
         shared
-            .entries_seen
+            .work_seen
             .store(super::HELPER_WORK_FLOOR, Ordering::Release);
         for _ in 0..super::HELPER_QUEUE_FLOOR {
             shared.coordinator.begin_task();
