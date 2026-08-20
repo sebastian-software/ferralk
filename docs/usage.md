@@ -94,6 +94,37 @@ Important defaults:
 filesystem operation. It is safe to clone the token and keep it outside the
 walker.
 
+### Hidden paths: two separate switches
+
+An ordinary wildcard does not cover a leading period, so `**/*.ts` skips
+`.react-router/routes.ts` — the period belongs to a directory component, and
+the whole subtree stays out of the result. `Walker::match_hidden(true)` opts in
+for include and exclude patterns alike:
+
+```rust
+use ferralk::{WalkOptions, Walker};
+
+let result = Walker::new("workspace")
+    .match_hidden(true)
+    .include("site/**/*.ts")?
+    .exclude("**/node_modules/**")?
+    .options(WalkOptions::default().sort(true))
+    .collect()?;
+# let _ = result;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Builder order does not matter; patterns added before the call are recompiled.
+A literal period is not a wildcard, so `.claude/**` selects a hidden directory
+with either setting.
+
+`WalkOptions::skip_hidden(true)` is a different mechanism, not the inverse of
+this one. It is a traversal filter: it drops every entry with a leading-period
+component and never descends into a hidden directory, before any pattern is
+consulted. `match_hidden` only decides what a wildcard is allowed to cover.
+With `skip_hidden` enabled no hidden path survives long enough for
+`match_hidden` to matter.
+
 ## Platform support
 
 The portable backend uses `std::fs` on Linux, macOS, and Windows. Experimental
