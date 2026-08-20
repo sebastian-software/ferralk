@@ -42,12 +42,29 @@ pub(super) fn collect<B: DirectoryBackend + Sync>(
         let _root_task = shared.coordinator.claim_task();
         process_directory(&shared, &mut caller, root);
     }
+
+    // A walk that never crosses the floor never builds any of what follows.
+    // The caller keeps walking on its own queue instead, which is what a tree
+    // too small for a thread should cost: the spare deques, the stealer list,
+    // the two mutexes and `thread::scope` are all paid once per walk, and a
+    // twelve-file tree paid them to spawn nothing.
+    //
     caller.flush_into(&shared.scheduler);
 
-    if shared.coordinator.pending() == 0 {
+    // Every root has been read by the time this starts, so the queue it drains
+    // holds whatever all of them uncovered — a walk that never widens still
+    // finishes every root, in the order the eager route read them.
+    //
+    // Panics are caught here the way `run_worker` catches them, because this
+    // stands in for `run_worker` on the route that never widens. Reading the
+    // roots above is outside it on both routes alike.
+    let widened =
+        catch_worker_panic(&shared, || drain_alone(&shared, &mut caller)).unwrap_or(false);
+    if !widened {
         drop(caller_slot);
-        return finish(shared, caller.entries);
+        return finish(shared, std::mem::take(&mut caller.entries));
     }
+    shared.widen();
 
     // Every helper slot is built here so the stealer list is complete and stays
     // lock-free once the walk runs. Only the threads are lazy: a slot stays
@@ -118,6 +135,15 @@ const HELPER_QUEUE_FLOOR: usize = 8;
 /// trial's tree holds 28 of them in total, so a floor above that keeps it
 /// serial, while a tree that fans out for real reaches the floor from its root
 /// listing alone.
+///
+/// Re-swept after #84 made a walked entry cheaper, on the theory that a
+/// cheaper entry leaves less work to amortise a thread and should raise this.
+/// It does not. Measured on both code bases, with the floor forced off and
+/// forced on, the break-even sits between the same two shapes either way:
+/// thirteen directories, where a pool still loses, and seventeen, where it
+/// wins. The walks this floor arbitrates are dominated by the syscall each
+/// directory costs, and #84 changed per-entry work rather than that. The
+/// constant stands.
 const HELPER_WORK_FLOOR: usize = 32;
 
 /// Entries seen from which a walk is worth helpers whatever its queue looks
@@ -215,6 +241,8 @@ struct Shared<'backend> {
     /// Set by a [`Verdict::Stop`]. Kept apart from `cancellation` so a stop
     /// never reaches into a token the caller owns and may reuse.
     stopped: AtomicBool,
+    /// Whether the caller is still the only worker. See [`Shared::schedule`].
+    lone: AtomicBool,
     /// Directory entries seen so far, the size signal behind
     /// [`HELPER_WORK_FLOOR`]. Counted per listing rather than per entry, so a
     /// directory costs one atomic add however much it holds.
@@ -249,6 +277,7 @@ impl<'backend> Shared<'backend> {
             walker,
             visitor,
             stopped: AtomicBool::new(false),
+            lone: AtomicBool::new(true),
             entries_seen: AtomicUsize::new(0),
             backend,
             scheduler: Scheduler::new(),
@@ -265,7 +294,22 @@ impl<'backend> Shared<'backend> {
     fn schedule(&self, worker: &Worker<DirectoryTask>, task: DirectoryTask) {
         self.coordinator.begin_task();
         worker.push(task);
-        self.coordinator.wake_waiters();
+        // A walk that has not widened yet has nobody to wake, and the
+        // notification is a lock and a broadcast for every directory it finds.
+        // [`Shared::widen`] clears this before the first helper can exist, and
+        // starting a thread synchronizes with it, so no helper can park without
+        // having seen the flag already cleared.
+        if !self.lone.load(Ordering::Relaxed) {
+            self.coordinator.wake_waiters();
+        }
+    }
+
+    /// Announces that this walk is about to have more than one worker.
+    ///
+    /// Called once, before the pool is built, so every notification a helper
+    /// could need is sent from then on.
+    fn widen(&self) {
+        self.lone.store(false, Ordering::Relaxed);
     }
 
     /// Whether the tree has shown enough work to be worth a helper.
@@ -394,9 +438,49 @@ fn run_worker_catching_panics(pool: HelperPool<'_, '_>, worker: &mut WorkerScrat
     catch_worker_panic(pool.shared, || run_worker(pool, worker));
 }
 
-fn catch_worker_panic(shared: &Shared, work: impl FnOnce()) {
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(work)) {
-        shared.record_panic(payload);
+/// Runs `work`, recording a panic as this walk's rather than letting it escape.
+/// `None` says the work panicked; [`finish`] resumes it on the caller.
+fn catch_worker_panic<T>(shared: &Shared, work: impl FnOnce() -> T) -> Option<T> {
+    match catch_unwind(AssertUnwindSafe(work)) {
+        Ok(value) => Some(value),
+        Err(payload) => {
+            shared.record_panic(payload);
+            None
+        }
+    }
+}
+
+/// Walks on the caller thread alone, for as long as the tree is too small to
+/// be worth a helper.
+///
+/// Reports whether the walk should widen: `true` once the floor unlocks a
+/// helper and there is work queued for one to take, `false` when the tree ran
+/// out first and no thread was ever needed.
+///
+/// The floor is checked at the same two moments [`HelperPool::grow`] is called
+/// on the parallel route — before the first directory and after every one —
+/// so the two routes decide to widen on exactly the same evidence. Queued work
+/// is required as well, which is the condition the eager route applied once
+/// after the root: a helper with nothing to steal is a thread spent on joining
+/// itself.
+fn drain_alone(shared: &Shared, caller: &mut WorkerScratch) -> bool {
+    loop {
+        let has_work = !caller.queue.is_empty() || !shared.scheduler.is_empty();
+        if has_work && shared.tree_is_worth_helpers() {
+            return true;
+        }
+        let Some(directory) = caller
+            .queue
+            .pop()
+            .or_else(|| shared.scheduler.steal_into(&caller.queue))
+        else {
+            return false;
+        };
+        let _task = shared.coordinator.claim_task();
+        if shared.should_stop() {
+            return false;
+        }
+        process_directory(shared, caller, directory);
     }
 }
 
@@ -957,6 +1041,43 @@ mod tests {
             "the visitor ran on {visitor_threads} thread(s) across {workers} workers"
         );
         assert!(!result.entries().is_empty());
+    }
+
+    /// A tree below the floor never builds the scoped machinery, so a panic
+    /// there unwinds through a different frame than a widened walk's does. It
+    /// still has to reach the caller, and still has to cancel the walk on its
+    /// way out — the two routes may not differ on what a panic means.
+    #[test]
+    fn a_panic_below_the_floor_resumes_on_the_caller_and_cancels() {
+        let root = unique_root("lean-panic");
+        // One subdirectory holding four files: below every floor, so the walk
+        // never widens and the panic is raised on the caller thread itself.
+        let only = root.join("only");
+        fs::create_dir_all(&only).expect("create fixture directory");
+        for index in 0..4 {
+            fs::write(only.join(format!("file-{index}.txt")), b"fixture")
+                .expect("write fixture file");
+        }
+        panic_in_directory(only);
+
+        let cancellation = CancellationToken::default();
+        let walk_cancellation = cancellation.clone();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            Walker::new(&root)
+                .threads(4)
+                .cancellation(walk_cancellation)
+                .collect()
+        }));
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            outcome.is_err(),
+            "the injected panic must resume on the caller"
+        );
+        assert!(
+            cancellation.is_cancelled(),
+            "and must cancel the walk on its way out"
+        );
     }
 
     #[test]

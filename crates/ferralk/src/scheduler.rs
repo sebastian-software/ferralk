@@ -45,6 +45,11 @@ impl<T> Scheduler<T> {
         Worker::new_fifo()
     }
 
+    /// Whether the shared queue holds nothing a worker could take.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.injector.is_empty()
+    }
+
     pub(crate) fn steal_into(&self, worker: &Worker<T>) -> Option<T> {
         loop {
             match self.injector.steal_batch_and_pop(worker) {
