@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.2.0](https://github.com/sebastian-software/ferralk/compare/v0.1.2...v0.2.0) (2026-08-20)
+
+
+### Features
+
+* **glob:** expose brace expansion ([898ca7d](https://github.com/sebastian-software/ferralk/commit/898ca7df5289c2068dd9c9bf3717777ddc06bfae))
+
+
+### Bug Fixes
+
+* **fuzz:** construct corpus cases with the new ignore files field ([88472ff](https://github.com/sebastian-software/ferralk/commit/88472ff8f94e3e5458f8717b5ec9beabe1be78cd))
+* **glob:** bound brace expansion and drop its recursion ([f8d8311](https://github.com/sebastian-software/ferralk/commit/f8d8311c7c5520c343c81e63e993d6b9a5a9d0f4)), closes [#42](https://github.com/sebastian-software/ferralk/issues/42)
+* **glob:** bound the work brace expansion may do ([e7ef63e](https://github.com/sebastian-software/ferralk/commit/e7ef63e7e6f17734eae139d1b08ed10e44ae23e2)), closes [#54](https://github.com/sebastian-software/ferralk/issues/54)
+* **glob:** drive star repetition without native recursion ([7008f01](https://github.com/sebastian-software/ferralk/commit/7008f012ab89b07a81dbf2e5abaa7b2c38c4060e)), closes [#17](https://github.com/sebastian-software/ferralk/issues/17)
+* **glob:** keep an escaped dash literal inside a character class ([44b364c](https://github.com/sebastian-software/ferralk/commit/44b364cf7c0efde6b3f93f42d28e9355061a7497)), closes [#16](https://github.com/sebastian-software/ferralk/issues/16)
+* **oracle:** skip cases zlob cannot represent instead of panicking ([9dcd883](https://github.com/sebastian-software/ferralk/commit/9dcd883f7e0ef7d1c71497eccddcde82a162a31c))
+* **walker:** build the native backend tests again ([c6363fb](https://github.com/sebastian-software/ferralk/commit/c6363fb9f968ec7c88b24dafabc1df7c4c4665f5))
+* **walker:** classify entries in one place ([48ad846](https://github.com/sebastian-software/ferralk/commit/48ad846b16e4230030c6320a10fc87a45c539125)), closes [#21](https://github.com/sebastian-software/ferralk/issues/21)
+* **walker:** close the scheduler wakeup races ([3fe39a8](https://github.com/sebastian-software/ferralk/commit/3fe39a81a6d82392dd6cbc07c530844cfa489050)), closes [#24](https://github.com/sebastian-software/ferralk/issues/24)
+* **walker:** degrade native directory reads per entry, not per directory ([081d64e](https://github.com/sebastian-software/ferralk/commit/081d64ecb9e7f090cfa27c96d7eb09ec9622c916))
+* **walker:** native backend fallback robustness ([a10a563](https://github.com/sebastian-software/ferralk/commit/a10a563e64ed01d605c980bde93dc8c72bc93bba))
+* **walker:** release panicked worker tasks ([21a0f7a](https://github.com/sebastian-software/ferralk/commit/21a0f7ae54a7ad316d8eea6d21a5e7309a6c9c74)), closes [#22](https://github.com/sebastian-software/ferralk/issues/22)
+
+
+### Performance Improvements
+
+* **glob:** compile extglob groups instead of interpreting pattern bytes ([a7b9538](https://github.com/sebastian-software/ferralk/commit/a7b9538df8f6163f2318e5b0e2a659d8639cd1b2)), closes [#15](https://github.com/sebastian-software/ferralk/issues/15)
+* **glob:** reuse the matcher scratch and skip to the next literal ([0ccd4bd](https://github.com/sebastian-software/ferralk/commit/0ccd4bd06f41471ebd0593a4b460578cce44371f)), closes [#18](https://github.com/sebastian-software/ferralk/issues/18)
+* **glob:** scan short candidates without memchr entry cost ([5ea450d](https://github.com/sebastian-software/ferralk/commit/5ea450ddba1d1d99c5e562c40260d2b7868f9487))
+* **glob:** stop skipping when the literal is dense ([8e5195f](https://github.com/sebastian-software/ferralk/commit/8e5195f4abb7705c10547ad1ffad94dddc065c4a))
+* **walker:** evaluate ignore rules per directory ([df16af5](https://github.com/sebastian-software/ferralk/commit/df16af57175e2ebfe72097785f79e5d95f6c1aac)), closes [#19](https://github.com/sebastian-software/ferralk/issues/19)
+* **walker:** keep the prefilters on brace patterns ([06a4288](https://github.com/sebastian-software/ferralk/commit/06a428887eb78289d5b806de10052dabf89d8f92)), closes [#20](https://github.com/sebastian-software/ferralk/issues/20)
+* **walker:** key the follow-symlinks guard on dev and inode ([c365c87](https://github.com/sebastian-software/ferralk/commit/c365c87d47ff9c5a191b90580aa7bff1f5107865))
+* **walker:** widen the walk below the root ([e19a4fe](https://github.com/sebastian-software/ferralk/commit/e19a4fe8f386ed67e4b4f09ca54ef36f238394ce)), closes [#23](https://github.com/sebastian-software/ferralk/issues/23)
+
 ## [0.1.2](https://github.com/sebastian-software/ferralk/compare/v0.1.1...v0.1.2) (2026-08-19)
 
 
