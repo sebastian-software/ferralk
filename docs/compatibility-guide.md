@@ -66,6 +66,7 @@ let result = Walker::new(".")
 | `ZLOB_GITIGNORE` | `Walker::respect_git_ignore(true)` (`.git/info/exclude`, then `.gitignore`, then zlob-compatible `.ignore`) |
 | `ZLOB_WALK_KEEP_GIT_DIR` | `WalkOptions::keep_git_dir(true)` |
 | `ZLOB_SKIP_HIDDEN` | `WalkOptions::skip_hidden(true)` |
+| `ZLOB_PERIOD` on a walk | `Walker::match_hidden(true)` (include and exclude patterns alike) |
 | `ZLOB_FOLLOW_SYMLINKS` | `WalkOptions::follow_symlinks(true)` |
 | `ZLOB_ERR` | `ErrorPolicy::{Abort, Skip, Collect}` |
 | `ZLOB_ONLYDIR` | `WalkOptions::directories_only(true)` |
@@ -82,6 +83,11 @@ let result = Walker::new(".")
 selected. `stream()` is intentionally single-threaded and unsorted so it can
 deliver entries incrementally.
 
+`Walker::match_hidden` and `WalkOptions::skip_hidden` are separate mechanisms
+and not each other's inverse: `match_hidden` is matcher semantics, deciding
+whether a wildcard may cover a leading period, while `skip_hidden` is a
+traversal filter that removes hidden entries before any pattern is consulted.
+
 Walker include patterns are root-relative. A leading `./` is accepted, and a
 trailing `/` selects matching directories only.
 Ordinary wildcards never cross a path-component boundary there; use recursive
@@ -92,8 +98,9 @@ Ordinary wildcards never cross a path-component boundary there; use recursive
 - Ferralk has no C ABI and no zlob-Rust migration facade. It exposes the two
   Rust crates `ferralk-glob` and `ferralk` instead (ADR-0003).
 - Direct matching excludes leading-period path components by default. Enable
-  `match_hidden` to opt in; this is the POSIX-conservative default selected by
-  ADR-0011.
+  `PatternOptions::match_hidden` for a compiled pattern, or
+  `Walker::match_hidden` for a whole walk, to opt in; this is the
+  POSIX-conservative default selected by ADR-0011.
 - `ZLOB_TILDE` and `ZLOB_TILDE_CHECK` are out of scope. Callers resolve home
   directories before constructing a `Walker` when that behaviour is wanted.
 - `ZLOB_APPEND` and `ZLOB_DOOFFS` have no equivalent because Rust results are

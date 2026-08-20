@@ -138,6 +138,14 @@ impl WalkOptions {
 
     /// Excludes entries with a leading-period path component and does not
     /// descend into hidden directories.
+    ///
+    /// This is a traversal filter, not matcher semantics, and therefore not the
+    /// same switch as [`Walker::match_hidden`]: it removes hidden entries from
+    /// the walk before any include or exclude pattern is consulted, while
+    /// `match_hidden` decides whether a wildcard is allowed to cover a leading
+    /// period at all. They compose in one direction only - with `skip_hidden`
+    /// enabled no hidden path survives long enough for `match_hidden` to have
+    /// anything to say about it.
     #[must_use]
     pub const fn skip_hidden(mut self, enabled: bool) -> Self {
         self.skip_hidden = enabled;
@@ -319,6 +327,7 @@ pub struct Walker {
     root: PathBuf,
     includes: Vec<TraversalPattern>,
     excludes: Vec<TraversalPattern>,
+    match_hidden: bool,
     options: WalkOptions,
     error_policy: ErrorPolicy,
     cancellation: Option<CancellationToken>,
@@ -334,6 +343,7 @@ impl Walker {
             root: root.into(),
             includes: Vec::new(),
             excludes: Vec::new(),
+            match_hidden: false,
             options: WalkOptions::default(),
             error_policy: ErrorPolicy::default(),
             cancellation: None,
@@ -347,16 +357,43 @@ impl Walker {
     /// Adds an OR-ed include pattern. No includes means every non-excluded
     /// entry is returned.
     pub fn include(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
+        let options = traversal_pattern_options(self.match_hidden);
         self.includes
-            .push(TraversalPattern::compile(pattern.as_ref())?);
+            .push(TraversalPattern::compile(pattern.as_ref(), options)?);
         Ok(self)
     }
 
     /// Adds an OR-ed exclude pattern. Excluded directories are not descended.
     pub fn exclude(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
+        let options = traversal_pattern_options(self.match_hidden);
         self.excludes
-            .push(TraversalPattern::compile(pattern.as_ref())?);
+            .push(TraversalPattern::compile(pattern.as_ref(), options)?);
         Ok(self)
+    }
+
+    /// Lets an ordinary wildcard cover a leading period, so `**/*.ts` also
+    /// reaches `.react-router/routes.ts`. Off by default, per ADR-0011.
+    ///
+    /// The switch is matcher semantics and applies to include and exclude
+    /// patterns alike: what a wildcard may reach, a wildcard may also prune.
+    /// It is not [`WalkOptions::skip_hidden`], which drops hidden entries from
+    /// the traversal before any pattern sees them; a literal `.cache/**`
+    /// selects a hidden path with either setting, because a literal period is
+    /// not a wildcard.
+    ///
+    /// Builder order does not matter: patterns added before this call are
+    /// recompiled under the new setting.
+    #[must_use]
+    pub fn match_hidden(mut self, enabled: bool) -> Self {
+        if self.match_hidden == enabled {
+            return self;
+        }
+        self.match_hidden = enabled;
+        let options = traversal_pattern_options(enabled);
+        for pattern in self.includes.iter_mut().chain(self.excludes.iter_mut()) {
+            pattern.recompile(options);
+        }
+        self
     }
 
     /// Replaces all traversal options.
@@ -508,15 +545,23 @@ pub(crate) fn glob_path_bytes(path: &Path) -> Cow<'_, [u8]> {
     }
 }
 
-fn traversal_pattern_options() -> PatternOptions {
+/// The pattern dialect every walker pattern is compiled in. Only
+/// `match_hidden` is caller-selectable; the other three are what a filesystem
+/// glob means here and are not negotiable per walk.
+fn traversal_pattern_options(match_hidden: bool) -> PatternOptions {
     PatternOptions::default()
         .braces(true)
         .recursive_double_star(true)
         .extglob(true)
+        .match_hidden(match_hidden)
 }
 
 #[derive(Debug, Clone)]
 struct TraversalPattern {
+    /// The pattern as the caller wrote it, so a later
+    /// [`Walker::match_hidden`] can recompile it instead of forcing the caller
+    /// to order the builder calls.
+    source: Vec<u8>,
     matcher: Pattern,
     directories_only: bool,
     subtree_root: Option<Pattern>,
@@ -529,18 +574,17 @@ struct TraversalPattern {
 }
 
 impl TraversalPattern {
-    fn compile(pattern: &[u8]) -> Result<Self, PatternError> {
+    fn compile(source: &[u8], options: PatternOptions) -> Result<Self, PatternError> {
         // Walker candidates are always root-relative, so retain zlob glob's
         // conventional leading `./` spelling without making it part of the
         // candidate path representation.
-        let pattern = pattern.strip_prefix(b"./").unwrap_or(pattern);
+        let pattern = source.strip_prefix(b"./").unwrap_or(source);
         let directories_only = pattern.len() > 1 && pattern.ends_with(b"/");
         let pattern = if directories_only {
             &pattern[..pattern.len() - 1]
         } else {
             pattern
         };
-        let options = traversal_pattern_options();
         let subtree_root = pattern
             .strip_suffix(b"/**")
             .map(|root| Pattern::compile(root, options))
@@ -551,12 +595,28 @@ impl TraversalPattern {
         // without braces expands to itself, which is the previous behaviour.
         let alternatives = ferralk_glob::expand_braces(pattern, options)?;
         Ok(Self {
+            source: source.to_vec(),
             matcher: Pattern::compile(pattern, options)?,
             directories_only,
             subtree_root,
+            // The prefilters are literal prefixes and literal extensions, so
+            // they are the same under either `match_hidden`: a hidden
+            // component below a visible literal root stays reachable, and a
+            // hidden literal root stays its own root.
             literal_roots: prefilter_of_every_alternative(&alternatives, literal_pattern_root),
             extensions: prefilter_of_every_alternative(&alternatives, literal_extension),
         })
+    }
+
+    /// Recompiles the pattern under changed matcher options.
+    ///
+    /// `match_hidden` is a matching-time policy - it decides whether a wildcard
+    /// may cover a leading period - and never a question of syntax, so a source
+    /// that compiled once compiles again.
+    fn recompile(&mut self, options: PatternOptions) {
+        let source = std::mem::take(&mut self.source);
+        *self = Self::compile(&source, options)
+            .expect("a compiled pattern stays valid when only match_hidden changes");
     }
 
     fn matches(&self, path: &[u8], is_dir: bool) -> bool {
@@ -1108,10 +1168,17 @@ mod tests {
 
     use super::{
         CancellationToken, ErrorPolicy, TraversalPattern, WalkEntry, WalkEntryKind, WalkOptions,
-        Walker, literal_extension, literal_pattern_root,
+        Walker, literal_extension, literal_pattern_root, traversal_pattern_options,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Compiles one walker pattern the way `include` and `exclude` do, in the
+    /// default dialect where a wildcard does not cover a leading period.
+    fn traversal_pattern(pattern: &[u8]) -> TraversalPattern {
+        TraversalPattern::compile(pattern, traversal_pattern_options(false))
+            .expect("valid walker pattern")
+    }
 
     struct Fixture {
         root: PathBuf,
@@ -2261,20 +2328,20 @@ mod tests {
     /// quiet as soon as one alternative cannot contribute a value.
     #[test]
     fn brace_alternatives_carry_the_planner_prefilters() {
-        let sources = TraversalPattern::compile(b"**/*.{ts,tsx}").expect("valid brace pattern");
+        let sources = traversal_pattern(b"**/*.{ts,tsx}");
         assert!(sources.matches_extension(b"src/app.ts"));
         assert!(sources.matches_extension(b"src/app.tsx"));
         assert!(!sources.matches_extension(b"src/app.js"));
         assert!(!sources.matches_extension(b"src/app"));
 
-        let scoped = TraversalPattern::compile(b"{src,lib}/**/*.ts").expect("valid brace pattern");
+        let scoped = traversal_pattern(b"{src,lib}/**/*.ts");
         assert!(scoped.could_match_descendant(b"src"));
         assert!(scoped.could_match_descendant(b"lib"));
         assert!(scoped.could_match_descendant(b"src/nested"));
         assert!(!scoped.could_match_descendant(b"docs"));
         assert!(!scoped.could_match_descendant(b"node_modules"));
 
-        let nested = TraversalPattern::compile(b"{src/{a,b},lib}/**").expect("valid brace pattern");
+        let nested = traversal_pattern(b"{src/{a,b},lib}/**");
         assert!(nested.could_match_descendant(b"src"));
         assert!(nested.could_match_descendant(b"src/a"));
         assert!(!nested.could_match_descendant(b"src/c"));
@@ -2282,10 +2349,88 @@ mod tests {
         // One alternative without a literal root, or without a literal
         // extension, switches the whole prefilter off rather than pruning what
         // that alternative could still match.
-        let partial_root = TraversalPattern::compile(b"{src,*}/**/*.ts").expect("valid pattern");
+        let partial_root = traversal_pattern(b"{src,*}/**/*.ts");
         assert!(partial_root.could_match_descendant(b"docs"));
-        let partial_extension = TraversalPattern::compile(b"**/*.{ts,*}").expect("valid pattern");
+        let partial_extension = traversal_pattern(b"**/*.{ts,*}");
         assert!(partial_extension.matches_extension(b"src/app.js"));
+    }
+
+    /// The planner prefilters are literal prefixes and literal extensions, so
+    /// `match_hidden` changes what the matcher accepts without changing what
+    /// the planner is allowed to prune.
+    #[test]
+    fn match_hidden_widens_the_matcher_without_moving_the_planner_prefilters() {
+        let hidden = traversal_pattern_options(true);
+        let scoped = TraversalPattern::compile(b"site/**/*.ts", hidden).expect("valid include");
+        assert!(scoped.could_match_descendant(b"site/.react-router"));
+        assert!(scoped.matches(b"site/.react-router/routes.ts", false));
+        assert!(scoped.matches_extension(b"site/.react-router/routes.ts"));
+        assert!(!scoped.could_match_descendant(b".react-router"));
+
+        // Same pattern, same prefilters, and only the matcher verdict differs.
+        let default = traversal_pattern(b"site/**/*.ts");
+        assert!(default.could_match_descendant(b"site/.react-router"));
+        assert!(!default.matches(b"site/.react-router/routes.ts", false));
+        assert_eq!(default.literal_roots, scoped.literal_roots);
+        assert_eq!(default.extensions, scoped.extensions);
+
+        // A hidden literal root is its own prefilter under either setting: a
+        // literal period is not a wildcard.
+        let literal = TraversalPattern::compile(b".claude/**/*.ts", hidden).expect("valid include");
+        assert!(literal.could_match_descendant(b".claude"));
+        assert!(traversal_pattern(b".claude/**/*.ts").matches(b".claude/agents/run.ts", false));
+    }
+
+    /// The option and the patterns are set in either order, so a builder that
+    /// enables it last still compiles every pattern under it.
+    #[test]
+    fn match_hidden_applies_to_patterns_added_before_and_after_it() {
+        let fixture = Fixture::new();
+        fixture.write(".react-router/types.ts");
+        fixture.write("src/app.ts");
+
+        let walk = |walker: Walker| {
+            relative_paths(
+                walker
+                    .options(WalkOptions::default().sort(true))
+                    .collect()
+                    .expect("walk succeeds")
+                    .entries(),
+                &fixture.root,
+            )
+        };
+        let before = walk(
+            Walker::new(&fixture.root)
+                .match_hidden(true)
+                .include("**/*.ts")
+                .expect("valid include"),
+        );
+        let after = walk(
+            Walker::new(&fixture.root)
+                .include("**/*.ts")
+                .expect("valid include")
+                .match_hidden(true),
+        );
+        assert_eq!(
+            before,
+            vec![
+                PathBuf::from(".react-router/types.ts"),
+                PathBuf::from("src/app.ts"),
+            ]
+        );
+        assert_eq!(after, before);
+
+        // And switching it back off returns the default verdict.
+        assert_eq!(
+            walk(
+                Walker::new(&fixture.root)
+                    .match_hidden(true)
+                    .include("**/*.ts")
+                    .expect("valid include")
+                    .match_hidden(false),
+            ),
+            vec![PathBuf::from("src/app.ts")]
+        );
     }
 
     /// The planner expands before it compiles, so a pattern the expansion
@@ -2299,7 +2444,7 @@ mod tests {
         assert_eq!(error.message(), "too many brace alternatives");
         assert_eq!(
             error.offset(),
-            ferralk_glob::Pattern::compile(&beyond, super::traversal_pattern_options())
+            ferralk_glob::Pattern::compile(&beyond, traversal_pattern_options(false))
                 .expect_err("the matcher rejects it the same way")
                 .offset()
         );
@@ -2338,7 +2483,7 @@ mod tests {
             "{src,lib}/**/*.{ts,rs}",
         ] {
             let alternatives =
-                ferralk_glob::expand_braces(pattern, super::traversal_pattern_options())
+                ferralk_glob::expand_braces(pattern, traversal_pattern_options(false))
                     .expect("expandable pattern");
             let mut union = alternatives
                 .iter()
@@ -2354,15 +2499,14 @@ mod tests {
 
     #[test]
     fn prune_planner_only_accepts_explicit_whole_subtree_excludes() {
-        let subtree = TraversalPattern::compile(b"src/**").expect("valid subtree pattern");
+        let subtree = traversal_pattern(b"src/**");
         assert!(subtree.covers_subtree(b"src"));
         assert!(!subtree.covers_subtree(b"src/nested"));
 
-        let suffix = TraversalPattern::compile(b"*.tmp").expect("valid suffix pattern");
+        let suffix = traversal_pattern(b"*.tmp");
         assert!(!suffix.covers_subtree(b"cache"));
 
-        let nested =
-            TraversalPattern::compile(b"**/target/**").expect("valid recursive subtree pattern");
+        let nested = traversal_pattern(b"**/target/**");
         assert!(nested.covers_subtree(b"target"));
         assert!(nested.covers_subtree(b"crates/ferralk/target"));
 
@@ -2381,7 +2525,7 @@ mod tests {
             Some(b"foo@(bar".to_vec())
         );
 
-        let rust_sources = TraversalPattern::compile(b"src/**/*.rs").expect("valid suffix");
+        let rust_sources = traversal_pattern(b"src/**/*.rs");
         assert!(rust_sources.matches_extension(b"src/lib.rs"));
         assert!(!rust_sources.matches_extension(b"src/lib.txt"));
         assert_eq!(literal_extension(b"src/**/*.{rs,ts}"), None);

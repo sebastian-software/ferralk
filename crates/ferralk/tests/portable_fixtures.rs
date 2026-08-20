@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -10,8 +10,6 @@ use std::{
 use ferralk::{ErrorPolicy, WalkOptions, Walker};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-#[cfg(target_os = "linux")]
-use std::path::Path;
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
@@ -35,7 +33,6 @@ impl Fixture {
         Self { root }
     }
 
-    #[cfg(target_os = "linux")]
     fn write(&self, path: impl AsRef<Path>) {
         let path = self.root.join(path);
         fs::create_dir_all(path.parent().expect("fixture file has parent"))
@@ -48,6 +45,155 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+/// Runs one walker configuration through all three frontends - serial
+/// `collect`, parallel `collect`, and `stream` - and returns the sorted
+/// root-relative paths after asserting that they agree. The frontends schedule
+/// directories differently but classify entries in one place, so a filter that
+/// reaches one of them has to reach all three.
+fn paths_from_every_frontend(configure: impl Fn(Walker) -> Walker, root: &Path) -> Vec<PathBuf> {
+    let relative = |path: &Path| {
+        path.strip_prefix(root)
+            .expect("entry is rooted in fixture")
+            .to_path_buf()
+    };
+    let collected = |threads: usize| {
+        configure(Walker::new(root))
+            .threads(threads)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("collect succeeds")
+            .entries()
+            .iter()
+            .map(|entry| relative(entry.path()))
+            .collect::<Vec<_>>()
+    };
+    let serial = collected(1);
+    assert_eq!(collected(4), serial, "parallel collect differs from serial");
+    let mut streamed = configure(Walker::new(root))
+        .stream()
+        .map(|entry| relative(entry.expect("stream succeeds").path()))
+        .collect::<Vec<_>>();
+    streamed.sort();
+    assert_eq!(streamed, serial, "stream differs from serial collect");
+    serial
+}
+
+/// The shape that cost the Palamedes trial (sebastian-software/palamedes#878)
+/// its parity: visible sources below a hidden directory. Their leading period
+/// belongs to a directory component, so an ordinary wildcard refuses the whole
+/// subtree until `match_hidden` says otherwise.
+#[test]
+fn match_hidden_admits_visible_files_below_hidden_directories() {
+    let fixture = Fixture::new();
+    fixture.write("src/app.ts");
+    fixture.write("src/app.js");
+    fixture.write("site/app.ts");
+    fixture.write(".react-router/types.ts");
+    fixture.write("site/.react-router/routes.ts");
+    fixture.write(".hidden.ts");
+
+    let default = paths_from_every_frontend(
+        |walker| walker.include("**/*.ts").expect("valid include"),
+        &fixture.root,
+    );
+    assert_eq!(
+        default,
+        vec![PathBuf::from("site/app.ts"), PathBuf::from("src/app.ts")]
+    );
+
+    let hidden = paths_from_every_frontend(
+        |walker| {
+            walker
+                .match_hidden(true)
+                .include("**/*.ts")
+                .expect("valid include")
+        },
+        &fixture.root,
+    );
+    assert_eq!(
+        hidden,
+        vec![
+            PathBuf::from(".hidden.ts"),
+            PathBuf::from(".react-router/types.ts"),
+            PathBuf::from("site/.react-router/routes.ts"),
+            PathBuf::from("site/app.ts"),
+            PathBuf::from("src/app.ts"),
+        ]
+    );
+
+    // The option is matcher semantics, so a traversal filter still overrules
+    // it: `skip_hidden` removes the same entries before any pattern runs.
+    let skipped = Walker::new(&fixture.root)
+        .match_hidden(true)
+        .include("**/*.ts")
+        .expect("valid include")
+        .options(WalkOptions::default().sort(true).skip_hidden(true))
+        .collect()
+        .expect("collect succeeds")
+        .entries()
+        .iter()
+        .map(|entry| {
+            entry
+                .path()
+                .strip_prefix(&fixture.root)
+                .expect("entry is rooted in fixture")
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(skipped, default);
+}
+
+/// Two things the option must not break: the prune planner still descends
+/// below a visible literal root when the next component is hidden, and an
+/// exclude wildcard covers a leading period exactly like an include one.
+#[test]
+fn match_hidden_reaches_excludes_and_the_prune_planner_alike() {
+    let fixture = Fixture::new();
+    fixture.write("src/app.ts");
+    fixture.write("site/app.ts");
+    fixture.write("site/.react-router/routes.ts");
+    fixture.write(".react-router/types.ts");
+    fixture.write(".hidden.ts");
+
+    let scoped = paths_from_every_frontend(
+        |walker| {
+            walker
+                .match_hidden(true)
+                .include("site/**/*.ts")
+                .expect("valid include")
+        },
+        &fixture.root,
+    );
+    assert_eq!(
+        scoped,
+        vec![
+            PathBuf::from("site/.react-router/routes.ts"),
+            PathBuf::from("site/app.ts"),
+        ]
+    );
+
+    // `*/*.ts` reaches `.react-router/types.ts` only when the exclude side of
+    // the walker was compiled with the option too.
+    let excluded = paths_from_every_frontend(
+        |walker| {
+            walker
+                .match_hidden(true)
+                .include("**/*.ts")
+                .expect("valid include")
+                .exclude("*/*.ts")
+                .expect("valid exclude")
+        },
+        &fixture.root,
+    );
+    assert_eq!(
+        excluded,
+        vec![
+            PathBuf::from(".hidden.ts"),
+            PathBuf::from("site/.react-router/routes.ts"),
+        ]
+    );
 }
 
 #[test]
