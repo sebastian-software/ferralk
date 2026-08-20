@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.2](https://github.com/sebastian-software/ferralk/compare/v0.5.1...v0.5.2) (2026-08-20)
+
+
+### Bug Fixes
+
+* **walker:** read the path-shaped check outside groups only ([2781961](https://github.com/sebastian-software/ferralk/commit/2781961226db021aa86d40c6b8936a3f1af38556))
+* **walker:** refuse Windows paths handed over as patterns ([c70745e](https://github.com/sebastian-software/ferralk/commit/c70745e9ec5fddee08789d3d206baddc67ff1a1b))
+* **walker:** refuse Windows paths handed over as patterns ([dd64074](https://github.com/sebastian-software/ferralk/commit/dd64074ad6b2af2fa3863d3a0b8fc2430699a1e1)), closes [#94](https://github.com/sebastian-software/ferralk/issues/94)
+
 ## [0.5.1](https://github.com/sebastian-software/ferralk/compare/v0.5.0...v0.5.1) (2026-08-20)
 
 
