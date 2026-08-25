@@ -15,16 +15,16 @@ native-linux = []
 native-macos = []
 
 [dependencies]
-crossbeam-deque = "0.8"
+crossbeam-deque = "=0.8.7"
 ferralk-glob = { path = "../ferralk-glob", version = "0.6.0" }
-memchr = "2.7"
+memchr = "=2.8.3"
 
 [dev-dependencies]
 corpus = { path = "../../tools/corpus" }
 # The engine ADR-0014 replaced, kept for the test that compares the two rule
 # matchers over generated rules and paths.
-ignore = "0.4"
-loom = "0.7"
+ignore = "=0.4.33"
+loom = "=0.7.2"
 serde_json.workspace = true
 
 [lints]
