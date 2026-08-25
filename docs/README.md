@@ -1,7 +1,7 @@
 # Ferralk documentation
 
-Start with the repository [README](../README.md) for installation status and
-small working examples. This directory contains the durable technical record.
+Start with the repository [README](../README.md) for installation and small
+working examples. This directory contains the durable technical record.
 
 | Document | Use it for |
 | --- | --- |

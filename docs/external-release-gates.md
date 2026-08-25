@@ -1,12 +1,7 @@
 # Deferred follow-up
 
-Ferralk `0.1.2` is published. There are no external release gates and no
-numeric performance gates. The source of truth for remaining follow-up work
-is GitHub:
-
-| Topic | Tracking issue |
-| --- | --- |
-| Feedback from the Palamedes integration trial | [#13](https://github.com/sebastian-software/ferralk/issues/13) |
+Ferralk 0.6.0 is published. There are no external release gates and no numeric
+performance gates; GitHub tracks the remaining follow-up work.
 
 The native filesystem parity corpus that used to sit in this table closed with
 [#12](https://github.com/sebastian-software/ferralk/issues/12): eleven parity
@@ -17,7 +12,7 @@ platforms and under the sanitizers.
 
 | Platform | Backend | Exercised by |
 | --- | --- | --- |
-| macOS | `getattrlistbulk`, behind `native-macos` | macOS native and AddressSanitizer jobs, every pull request |
+| macOS | `getdirentries64`, behind `native-macos` | macOS native and AddressSanitizer jobs, every pull request |
 | Linux | `getdents64`, behind `native-linux` | Linux native, AddressSanitizer and Miri jobs, every pull request |
 | Windows | Portable reader only | Windows test job, every pull request |
 

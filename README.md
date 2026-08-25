@@ -16,18 +16,16 @@ compatible with zlob and deliberately has no C ABI.
 ## Status
 
 Ferralk is pre-1.0. The public API and release cadence are still being refined;
-do not rely on a 1.0 stability guarantee yet. The workspace is not currently
-published on crates.io. Until the first public release is deliberately made,
-use a pinned Git revision in applications that want to trial it.
+do not rely on a 1.0 stability guarantee yet. Both crates are published on
+crates.io; use the current 0.6 release line for applications.
 
 ```toml
 [dependencies]
-ferralk = { git = "https://github.com/sebastian-software/ferralk", rev = "0063ffbd0c7d7cd25d31135d2295bdf08f7cc4c2" }
-ferralk-glob = { git = "https://github.com/sebastian-software/ferralk", rev = "0063ffbd0c7d7cd25d31135d2295bdf08f7cc4c2" }
+ferralk = "0.6"
+ferralk-glob = "0.6"
 ```
 
-Pin a revision for repeatable builds. The release PR and crates.io publishing
-are intentionally separate from development builds.
+For an unreleased Git dependency, pin a revision for repeatable builds.
 
 ## Local benchmark snapshot
 
