@@ -2044,6 +2044,9 @@ fn parse_class(
     // the flag has to survive until `class_members` groups the entries.
     let mut values: Vec<ClassValue> = Vec::new();
     let mut members = Vec::new();
+    // Once an invalid POSIX opener has established where this class closes,
+    // later `[:` pairs cannot start a valid POSIX class before that end.
+    let mut invalid_posix_class_end = None;
     if pattern.get(index) == Some(&b']') {
         values.push(ClassValue::literal(b']'));
         index += 1;
@@ -2067,7 +2070,10 @@ fn parse_class(
                 index + 1,
             ));
         }
-        if byte == b'[' && pattern.get(index + 1) == Some(&b':') {
+        if byte == b'['
+            && pattern.get(index + 1) == Some(&b':')
+            && invalid_posix_class_end.is_none_or(|end| index >= end)
+        {
             if let Some(posix_end) = memmem::find(&pattern[index + 2..], b":]")
                 && let Some(class) = parse_posix_class(&pattern[index + 2..index + 2 + posix_end])
             {
@@ -2080,12 +2086,13 @@ fn parse_class(
             // Without a closing bracket, a later `[:` opener cannot make this
             // class valid. Reporting it now avoids re-scanning the remaining
             // bytes for every nested opener.
-            if memchr(b']', &pattern[index + 2..]).is_none() {
+            let Some(end) = memchr(b']', &pattern[index + 2..]) else {
                 return Err(PatternError {
                     offset: start,
                     message: "unclosed character class",
                 });
-            }
+            };
+            invalid_posix_class_end = Some(index + 2 + end);
         }
         if byte == b'\\' && escapes {
             let Some(&escaped) = pattern.get(index + 1) else {
@@ -4360,6 +4367,14 @@ mod tests {
         let error = Pattern::compile(&pattern, PatternOptions::default()).unwrap_err();
         assert_eq!(error.offset(), 0);
         assert_eq!(error.message(), "unclosed character class");
+    }
+
+    #[test]
+    fn deeply_nested_posix_openers_with_a_final_bracket_compile_linearly() {
+        let mut pattern = String::from("[");
+        pattern.push_str("[:".repeat(32_768).as_str());
+        pattern.push(']');
+        assert!(Pattern::compile(&pattern, PatternOptions::default()).is_ok());
     }
 
     #[test]
