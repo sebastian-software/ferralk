@@ -1695,7 +1695,14 @@ impl WalkStream {
                 reset_to_directory(&mut self.path, &self.directory);
                 None
             }
-            Err(source) => self.error("read_dir", path, source),
+            Err(source) => {
+                // A backend can fail after appending entries. They belong to
+                // the failed directory and must never be classified against
+                // the directory the stream delivered previously.
+                self.listing.clear();
+                self.next_entry = 0;
+                self.error("read_dir", path, source)
+            }
         }
     }
 
@@ -2291,6 +2298,32 @@ mod tests {
             root: 0,
             ignores: super::IgnoreScope::for_root(walker, backend, &path),
         }
+    }
+
+    #[test]
+    fn stream_discards_partial_listing_after_a_directory_read_error() {
+        let fixture = Fixture::new();
+        let missing = fixture.root.join("missing");
+        let mut stream = Walker::new(&missing)
+            .error_policy(ErrorPolicy::Collect)
+            .stream();
+
+        // Model a backend that appended an entry before it reported its error.
+        stream
+            .listing
+            .push(std::ffi::OsStr::new("must-not-leak"), false, false);
+
+        let task = stream
+            .pending_directories
+            .pop()
+            .expect("the root is queued for reading");
+        let error = stream
+            .prepare_directory(task)
+            .expect("the failed root produces an error")
+            .expect_err("a missing root cannot yield an entry");
+        assert_eq!(error.operation(), "read_dir");
+        assert!(stream.listing.entries().is_empty());
+        assert!(stream.next().is_none(), "partial entries must not leak");
     }
 
     /// Counts what a walk reads, so tests can pin how often it happens.
