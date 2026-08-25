@@ -69,16 +69,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let options = options_from_flags(&case.flags)
                     .map_err(|error| format!("{}:{}: {error}", file.display(), line_number + 1))?;
                 let actual = match case.kind {
-                    CaseKind::Matcher => Pattern::compile(pattern, options)
-                        .map_err(|error| {
+                    CaseKind::Matcher => {
+                        let matcher = Pattern::compile(pattern, options).map_err(|error| {
                             format!("{}:{}: {error}", file.display(), line_number + 1)
-                        })?
-                        .is_match(path),
-                    CaseKind::MatchGlobPath => Pattern::compile(pattern, options)
-                        .map_err(|error| {
+                        })?;
+                        check_engines(&matcher, &path, &file, line_number)?;
+                        matcher.is_match(path)
+                    }
+                    CaseKind::MatchGlobPath => {
+                        let matcher = Pattern::compile(pattern, options).map_err(|error| {
                             format!("{}:{}: {error}", file.display(), line_number + 1)
-                        })?
-                        .is_match_glob_path(path),
+                        })?;
+                        check_engines(&matcher, &path, &file, line_number)?;
+                        matcher.is_match_glob_path(path)
+                    }
                     CaseKind::HasWildcards => Pattern::has_wildcards(pattern, options),
                     CaseKind::AbsolutePattern => {
                         replay_absolute_pattern(&case).map_err(|error| {
@@ -335,6 +339,26 @@ fn options_from_flags(flags: &[String]) -> Result<PatternOptions, String> {
         };
     }
     Ok(options)
+}
+
+/// Replays one match case through every engine, so a corpus verdict also
+/// certifies that the fast paths, the sweep engine, and the memoized matcher
+/// agree on it.
+fn check_engines(
+    matcher: &Pattern,
+    path: &[u8],
+    file: &Path,
+    line_number: usize,
+) -> Result<(), String> {
+    if matcher.engines_agree(path) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}:{}: match engines disagree",
+            file.display(),
+            line_number + 1
+        ))
+    }
 }
 
 fn collect_jsonl(root: &Path, files: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {

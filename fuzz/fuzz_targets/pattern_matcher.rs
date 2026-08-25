@@ -10,7 +10,12 @@ fuzz_target!(|data: &[u8]| {
     let (pattern, path) = split_input(data);
     let bits = data.last().copied().unwrap_or_default();
     if let Ok(pattern) = Pattern::compile(pattern, options_from(bits)) {
-        let _ = pattern.is_match(path);
+        // Differential oracle: the fast paths, the bit-parallel sweep engine,
+        // and the memoized matcher must answer alike on every entry point.
+        assert!(
+            pattern.engines_agree(path),
+            "match engines disagree on this input"
+        );
     }
 });
 
