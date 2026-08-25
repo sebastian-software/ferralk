@@ -10,7 +10,7 @@ read the [compatibility guide](compatibility-guide.md).
 
 | zlob capability / flag | ferralk API | Status | Notes |
 |---|---|---|---|
-| `*`, `?`, separators | `Pattern::compile` / `Pattern::is_match` | In progress (M1) | In-memory `*`/`?` are separator-agnostic; leading periods remain opt-in. |
+| `*`, `?`, separators | `Pattern::compile` / `Pattern::is_match` | Implemented | In-memory `*`/`?` are separator-agnostic; leading periods remain opt-in. |
 | `**` | `PatternOptions::recursive_double_star` | Implemented (M1) | Explicit option; corpus import continues. |
 | bracket classes, ranges, `[!...]`, `[^...]` | `Pattern::compile` | Implemented (M1) | Byte-first, including ASCII POSIX classes. |
 | `ZLOB_BRACE` | `PatternOptions::braces` | Implemented (M1) | Nested and empty alternatives; source-backed corpus import continues. |
@@ -27,8 +27,8 @@ read the [compatibility guide](compatibility-guide.md).
 
 | zlob capability / flag | ferralk API | Status | Notes |
 |---|---|---|---|
-| path traversal | `Walker::new` / `Walker::threads` | In progress (M3/M5) | Portable `std::fs` backend by default. macOS `native-macos` optionally uses audited `getattrlistbulk` batch name/type records, with a portable fallback for unsupported filesystems and a separately tested `getdirentries64` decoder. Linux `native-linux` optionally uses a bounds-checked `getdents64` reader on reviewed architectures, otherwise falling back portably. `collect()` uses a lazy work-stealing parallel scheduler and `stream()` remains incremental and single-threaded. |
-| `ZLOB_GITIGNORE` | `Walker::respect_git_ignore` | Implemented (M3) | Nested `.gitignore` chains plus zlob-compatible `.ignore` supplements (loaded after `.gitignore`), negation-aware descent, and shared-parent caching use `ignore`'s matcher. |
+| path traversal | `Walker::new` / `Walker::threads` | Implemented | Portable `std::fs` backend by default. macOS `native-macos` optionally uses the audited `getdirentries64` reader, with a portable fallback for unsupported filesystems; `getattrlistbulk` remains a separately tested decoder. Linux `native-linux` optionally uses a bounds-checked `getdents64` reader on reviewed architectures, otherwise falling back portably. `collect()` uses a lazy work-stealing parallel scheduler and `stream()` remains incremental and single-threaded. |
+| `ZLOB_GITIGNORE` | `Walker::respect_git_ignore` | Implemented | Nested `.gitignore` chains plus zlob-compatible `.ignore` supplements (loaded after `.gitignore`), negation-aware descent, and shared-parent caching use Ferralk's in-tree matcher. |
 | `ZLOB_WALK_KEEP_GIT_DIR` | `WalkOptions::keep_git_dir` | Implemented (M3) | `.git` is skipped with Gitignore by default; this explicit opt-in keeps it. |
 | `ZLOB_SKIP_HIDDEN` | `WalkOptions::skip_hidden` | Implemented (M2) | Explicit opt-in; suppresses hidden files and whole hidden subtrees. |
 | `ZLOB_FOLLOW_SYMLINKS` | `WalkOptions::follow_symlinks` | Implemented (M2) | Default off; canonical-path cycle guard when enabled. |
