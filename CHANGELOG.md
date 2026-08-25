@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.3](https://github.com/sebastian-software/ferralk/compare/v0.5.2...v0.5.3) (2026-08-20)
+
+
+### Performance Improvements
+
+* getdirentries64 on macOS, a matcher prefilter, and a lighter walk hot path ([27400f0](https://github.com/sebastian-software/ferralk/commit/27400f09a82d6454af3b5fc3dc11767c2c4cc3c6))
+* **glob:** reject on a pattern's fixed ends before the general engine ([34be594](https://github.com/sebastian-software/ferralk/commit/34be5949d70e908b9a1d388cd341be22a4c61fcd))
+* **walker:** read macOS directories with getdirentries64 ([286c7c5](https://github.com/sebastian-software/ferralk/commit/286c7c5db35ae38477032da117fe32a169517b90))
+* **walker:** trim the per-entry and per-directory hot path ([d0bc87e](https://github.com/sebastian-software/ferralk/commit/d0bc87ea783ca1fc11b23334b883092913679f27))
+
 ## [0.5.2](https://github.com/sebastian-software/ferralk/compare/v0.5.1...v0.5.2) (2026-08-20)
 
 
