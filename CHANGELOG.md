@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/sebastian-software/ferralk/compare/v0.5.3...v0.6.0) (2026-08-25)
+
+
+### Features
+
+* **glob:** bit-parallel Shift-And engine for the general match path ([1b00ca8](https://github.com/sebastian-software/ferralk/commit/1b00ca8534ee5d7a04d302caff6fd74f9182d781))
+
 ## [0.5.3](https://github.com/sebastian-software/ferralk/compare/v0.5.2...v0.5.3) (2026-08-20)
 
 
