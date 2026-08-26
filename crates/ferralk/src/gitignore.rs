@@ -150,26 +150,51 @@ fn read_rules<B: DirectoryBackend + ?Sized>(
 
 /// Feeds one ignore file's lines to the builder.
 ///
-/// A leading byte-order mark is dropped the way Git drops it, and a line that
-/// is not UTF-8 ends the file, keeping the lines before it.
+/// Ignore files are byte streams. Git strips one BOM at the file start, treats
+/// NUL as the end of a rule line, and otherwise keeps parsing after invalid
+/// UTF-8 bytes.
 fn add_rules(builder: &mut RuleSetBuilder, contents: &[u8]) {
-    let text = match std::str::from_utf8(contents) {
-        Ok(text) => text,
-        Err(error) => {
-            let valid = &contents[..error.valid_up_to()];
-            let complete = valid
-                .iter()
-                .rposition(|&byte| byte == b'\n')
-                .map_or(0, |index| index + 1);
-            std::str::from_utf8(&valid[..complete]).unwrap_or_default()
-        }
-    };
-    for (index, line) in text.lines().enumerate() {
-        let line = if index == 0 {
-            line.trim_start_matches('\u{feff}')
-        } else {
-            line
-        };
+    let contents = contents.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(contents);
+    for line in contents.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line = line.split(|byte| *byte == b'\0').next().unwrap_or(line);
         builder.add_line(line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{RuleSetBuilder, add_rules};
+
+    #[test]
+    fn byte_lines_continue_after_invalid_utf8_and_match_byte_patterns() {
+        let root = Path::new("/fixture");
+        let mut builder = RuleSetBuilder::new(root);
+        add_rules(&mut builder, b"first.txt\n\xE9latin1.txt\nsecond.txt\n");
+        let rules = builder.build();
+
+        assert_eq!(rules.matched(b"/fixture/second.txt", false), Some(true));
+        assert_eq!(rules.matched(b"/fixture/\xE9latin1.txt", false), Some(true));
+    }
+
+    #[test]
+    fn nul_ends_a_rule_and_one_initial_bom_is_stripped() {
+        let root = Path::new("/fixture");
+        let mut builder = RuleSetBuilder::new(root);
+        add_rules(
+            &mut builder,
+            b"\xEF\xBB\xBF\xEF\xBB\xBFdouble.txt\r\nsec\0ret.txt\r\n",
+        );
+        let rules = builder.build();
+
+        assert_eq!(
+            rules.matched(b"/fixture/\xEF\xBB\xBFdouble.txt", false),
+            Some(true)
+        );
+        assert_eq!(rules.matched(b"/fixture/double.txt", false), None);
+        assert_eq!(rules.matched(b"/fixture/sec", false), Some(true));
+        assert_eq!(rules.matched(b"/fixture/secret.txt", false), None);
     }
 }

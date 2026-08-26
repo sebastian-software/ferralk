@@ -55,3 +55,9 @@
 {"id":"ignore-055","pattern":"abc/**","path":"abc","flags":[],"ignore_rules":["abc/**"],"expected":false,"source":"git_check_ignore","note":"A trailing double star covers what is inside, not the directory itself."}
 {"id":"ignore-056","pattern":"trailing\\x5C ","path":"trailing ","flags":[],"ignore_rules":["trailing\\ "],"expected":true,"source":"git_check_ignore","note":"An escaped trailing space is part of the name."}
 {"id":"ignore-057","pattern":"foo\\x5C","path":"foo","flags":[],"ignore_rules":["foo\\"],"expected":false,"source":"git_check_ignore","note":"A rule ending in an unpaired backslash matches nothing."}
+{"id":"ignore-058","pattern":"a//b","path":"a/b","flags":[],"ignore_rules":["a//b"],"expected":false,"source":"git_check_ignore","note":"A doubled separator creates an empty component, which Git treats as unmatchable."}
+{"id":"ignore-059","pattern":"//foo","path":"foo","flags":[],"ignore_rules":["//foo"],"expected":false,"source":"git_check_ignore","note":"Only one leading slash is an anchor; the second creates an unmatchable empty component."}
+{"id":"ignore-060","pattern":"x///y","path":"x/y","flags":[],"ignore_rules":["x///y"],"expected":false,"source":"git_check_ignore","note":"Repeated interior separators create empty components and cannot hide a real path."}
+{"id":"ignore-061","pattern":"sec","path":"sec","flags":[],"ignore_rules":["sec\u0000ret.txt"],"expected":true,"source":"git_check_ignore","note":"Git truncates an ignore rule at its first NUL byte."}
+{"id":"ignore-062","pattern":"sec","path":"secret.txt","flags":[],"ignore_rules":["sec\u0000ret.txt"],"expected":false,"source":"git_check_ignore","note":"The text after a NUL is not part of the ignore rule."}
+{"id":"ignore-063","pattern":"\uFEFFdouble.txt","path":"\uFEFFdouble.txt","flags":[],"ignore_rules":["\uFEFF\uFEFFdouble.txt"],"expected":true,"source":"git_check_ignore","note":"Git strips exactly one initial UTF-8 BOM, leaving a second BOM as part of the rule."}

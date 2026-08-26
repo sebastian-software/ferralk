@@ -80,6 +80,8 @@ mod ignore_rules;
 /// the native dirent parsers are: for the harness in `fuzz/`, not for consumers.
 #[doc(hidden)]
 pub use ignore_rules::fuzz_rule as fuzz_ignore_rule;
+#[doc(hidden)]
+pub use ignore_rules::fuzz_rule_bytes as fuzz_ignore_rule_bytes;
 mod parallel;
 mod scheduler;
 
@@ -3054,6 +3056,31 @@ mod tests {
         assert!(streamed_paths.contains(&PathBuf::from("src/keep.tmp")));
         assert!(!streamed_paths.contains(&PathBuf::from("build/keep.txt")));
         assert!(!streamed_paths.contains(&PathBuf::from("build")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_walk_gitignore_matches_non_utf8_file_names_on_linux() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let fixture = Fixture::new();
+        let name = std::ffi::OsString::from_vec(b"\xE9latin1.txt".to_vec());
+        fs::write(fixture.root.join(".gitignore"), b"\xE9latin1.txt\n")
+            .expect("write byte-pattern gitignore");
+        fixture.write(Path::new(&name));
+
+        let ignored = fixture.root.join(&name);
+        let result = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk succeeds");
+        assert!(
+            !result
+                .entries()
+                .iter()
+                .any(|entry| entry.path() == ignored.as_path()),
+            "the byte-pattern rule has to hide its byte-named file"
+        );
     }
 
     #[test]

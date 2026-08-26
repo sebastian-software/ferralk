@@ -199,8 +199,14 @@ impl RuleSetBuilder {
     pub(crate) fn new(root: &Path) -> Self {
         let root = glob_path_bytes(root);
         // The separator between the directory and what follows it belongs to
-        // the prefix, unless the directory already ends in one.
-        let root_len = root.len() + usize::from(!root.ends_with(b"/"));
+        // the prefix, unless the directory already ends in one. The empty
+        // root is used by the fuzz helper, where candidates are already
+        // relative and so have no prefix to remove.
+        let root_len = if root.is_empty() {
+            0
+        } else {
+            root.len() + usize::from(!root.ends_with(b"/"))
+        };
         Self {
             root_len,
             rules: Vec::new(),
@@ -209,7 +215,7 @@ impl RuleSetBuilder {
 
     /// Adds one line. A line that is blank, a comment, or malformed adds
     /// nothing, which is what Git does with it.
-    pub(crate) fn add_line(&mut self, line: &str) {
+    pub(crate) fn add_line(&mut self, line: impl AsRef<[u8]>) {
         if let Some(rule) = parse_rule(line) {
             self.rules.push(rule);
         }
@@ -229,14 +235,24 @@ impl RuleSetBuilder {
 /// surface the harness needs: parsing and matching are the two halves that must
 /// stay total, whatever bytes arrive.
 pub fn fuzz_rule(line: &str, candidate: &[u8], is_dir: bool) -> Option<bool> {
+    fuzz_rule_bytes(line.as_bytes(), candidate, is_dir)
+}
+
+/// Byte-oriented fuzz entry point for the rule layer.
+///
+/// Ignore files are bytes, so this also reaches patterns that are not valid
+/// UTF-8. It shares the same empty-root setup as [`fuzz_rule`].
+#[doc(hidden)]
+pub fn fuzz_rule_bytes(line: &[u8], candidate: &[u8], is_dir: bool) -> Option<bool> {
     let mut builder = RuleSetBuilder::new(Path::new(""));
     builder.add_line(line);
     builder.build().matched(candidate, is_dir)
 }
 
 /// Reads one `gitignore(5)` line into a rule, or nothing.
-fn parse_rule(line: &str) -> Option<Rule> {
-    if line.is_empty() || line.starts_with('#') {
+fn parse_rule(line: impl AsRef<[u8]>) -> Option<Rule> {
+    let line = line.as_ref();
+    if line.is_empty() || line.starts_with(b"#") {
         return None;
     }
     let body = strip_trailing_spaces(line);
@@ -244,7 +260,7 @@ fn parse_rule(line: &str) -> Option<Rule> {
         return None;
     }
 
-    let (negated, body) = match body.strip_prefix('!') {
+    let (negated, body) = match body.strip_prefix(b"!") {
         Some(rest) => (true, rest),
         None => (false, body),
     };
@@ -254,15 +270,20 @@ fn parse_rule(line: &str) -> Option<Rule> {
         return None;
     }
 
-    let (directory_only, body) = match body.strip_suffix('/') {
+    let (directory_only, body) = match body.strip_suffix(b"/") {
         Some(rest) => (true, rest),
         None => (false, body),
     };
     // A separator anywhere but at the end binds the rule to its own directory;
     // without one it matches at any level.
-    let anchored = body.contains('/');
-    let body = body.strip_prefix('/').unwrap_or(body);
+    let anchored = body.contains(&b'/');
+    let body = body.strip_prefix(b"/").unwrap_or(body);
     if body.is_empty() {
+        return None;
+    }
+    // A single leading separator is the anchor. Any other empty component is
+    // unmatchable in Git, rather than an alternate spelling of a valid rule.
+    if body.split(|byte| *byte == b'/').any(<[u8]>::is_empty) {
         return None;
     }
 
@@ -271,8 +292,8 @@ fn parse_rule(line: &str) -> Option<Rule> {
     if !anchored {
         components.push(Component::AnyDirs);
     }
-    for part in body.split('/').filter(|part| !part.is_empty()) {
-        if let Some(literal) = longest_literal_run(part.as_bytes())
+    for part in body.split(|byte| *byte == b'/') {
+        if let Some(literal) = longest_literal_run(part)
             && gate.as_ref().is_none_or(|best| best.len() < literal.len())
         {
             gate = Some(literal);
@@ -289,7 +310,7 @@ fn parse_rule(line: &str) -> Option<Rule> {
     }
     if matches!(components.last(), Some(Component::AnyDirs)) {
         // `abc/**` is what is inside `abc`, so one component has to follow.
-        components.push(compile_component("*")?);
+        components.push(compile_component(b"*")?);
     }
     // A body of nothing but separators is not a rule.
     if components.len() == usize::from(!anchored) {
@@ -304,19 +325,19 @@ fn parse_rule(line: &str) -> Option<Rule> {
     })
 }
 
-fn compile_component(part: &str) -> Option<Component> {
-    if part == "**" {
+fn compile_component(part: &[u8]) -> Option<Component> {
+    if part == b"**" {
         return Some(Component::AnyDirs);
     }
-    Pattern::compile(collapse_partial_stars(part.as_bytes()), component_options())
+    Pattern::compile(collapse_partial_stars(part), component_options())
         .ok()
         .map(Component::Pattern)
 }
 
 /// Drops the trailing spaces Git drops: those that are not escaped.
-fn strip_trailing_spaces(line: &str) -> &str {
+fn strip_trailing_spaces(line: &[u8]) -> &[u8] {
     let mut end = line.len();
-    while end > 0 && line.as_bytes()[end - 1] == b' ' {
+    while end > 0 && line[end - 1] == b' ' {
         if trailing_backslashes(&line[..end - 1]) % 2 == 1 {
             break;
         }
@@ -325,8 +346,8 @@ fn strip_trailing_spaces(line: &str) -> &str {
     &line[..end]
 }
 
-fn trailing_backslashes(text: &str) -> usize {
-    text.bytes().rev().take_while(|byte| *byte == b'\\').count()
+fn trailing_backslashes(text: &[u8]) -> usize {
+    text.iter().rev().take_while(|byte| **byte == b'\\').count()
 }
 
 /// The longest run of bytes one component matches literally.
@@ -434,7 +455,7 @@ fn collapse_partial_stars(part: &[u8]) -> Vec<u8> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{RuleSetBuilder, parse_rule};
+    use super::{RuleSetBuilder, fuzz_rule, fuzz_rule_bytes, parse_rule};
 
     /// Rule shapes to compare, one per line of a synthetic ignore file.
     const RULES: &[&str] = &[
@@ -599,6 +620,12 @@ mod tests {
         assert!(parse_rule("# comment").is_none());
         assert!(parse_rule("   ").is_none(), "spaces alone are not a rule");
         assert!(parse_rule("/").is_none(), "a lone separator is not a rule");
+        for rule in ["a//b", "//foo", "x///y"] {
+            assert!(
+                parse_rule(rule).is_none(),
+                "repeated separators are unmatchable: {rule}"
+            );
+        }
         assert!(
             parse_rule("foo\\").is_none(),
             "a dangling escape matches nothing"
@@ -615,6 +642,18 @@ mod tests {
         let directory = parse_rule("build/").expect("directory rule parses");
         assert!(directory.directory_only);
         assert!(!directory.negated);
+    }
+
+    #[test]
+    fn fuzz_rule_uses_empty_root_candidates_without_dropping_a_byte() {
+        assert_eq!(fuzz_rule("abc", b"abc", false), Some(true));
+        assert_eq!(fuzz_rule("abc", b"Xabc", false), None);
+        assert_eq!(fuzz_rule("/a", b"a", false), Some(true));
+        assert_eq!(fuzz_rule("/a", b"Xa", false), None);
+        assert_eq!(
+            fuzz_rule_bytes(b"\xE9latin1.txt", b"\xE9latin1.txt", false),
+            Some(true)
+        );
     }
 
     #[test]

@@ -16,10 +16,6 @@ fuzz_target!(|data: &[u8]| {
         Some(separator) => (&data[..separator], &data[separator + 1..]),
         None => (data, &[][..]),
     };
-    // Ignore files are read as text, so a rule line that is not UTF-8 never
-    // reaches the parser. Such an input still drives the matcher, with a rule
-    // shaped like the ones a repository carries, rather than being thrown away.
-    let line = std::str::from_utf8(line).unwrap_or("**/node_modules/**");
-    let _ = ferralk::fuzz_ignore_rule(line, candidate, false);
-    let _ = ferralk::fuzz_ignore_rule(line, candidate, true);
+    let _ = ferralk::fuzz_ignore_rule_bytes(line, candidate, false);
+    let _ = ferralk::fuzz_ignore_rule_bytes(line, candidate, true);
 });
