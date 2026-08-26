@@ -100,7 +100,11 @@ pub enum ErrorPolicy {
     Collect,
 }
 
-/// Cloneable cooperative cancellation handle for a walk.
+/// Cloneable, caller-controlled cooperative cancellation handle for a walk.
+///
+/// A walker only observes this handle; internal aborts, worker startup
+/// failures, visitor stops, and panics never cancel it. This lets callers
+/// share one token across walks or reuse it after an individual walk fails.
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
@@ -5826,7 +5830,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn parallel_abort_returns_an_error_and_cancels_the_shared_token() {
+    fn parallel_abort_returns_an_error_without_cancelling_the_caller_token() {
         use std::os::unix::fs::symlink;
 
         let fixture = Fixture::new();
@@ -5837,6 +5841,15 @@ mod tests {
         symlink("missing-right", fixture.root.join("right/dangling"))
             .expect("create right dangling symlink");
         let cancellation = CancellationToken::default();
+        let serial_cancellation = CancellationToken::default();
+
+        let serial_error = Walker::new(&fixture.root)
+            .threads(1)
+            .options(WalkOptions::default().follow_symlinks(true))
+            .error_policy(ErrorPolicy::Abort)
+            .cancellation(serial_cancellation.clone())
+            .collect()
+            .expect_err("serial abort returns the first metadata error");
 
         let error = Walker::new(&fixture.root)
             .threads(4)
@@ -5847,7 +5860,22 @@ mod tests {
             .expect_err("abort policy returns the first metadata error");
 
         assert_eq!(error.operation(), "metadata");
-        assert!(cancellation.is_cancelled());
+        assert_eq!(serial_error.operation(), error.operation());
+        assert!(
+            !serial_cancellation.is_cancelled(),
+            "serial abort leaves the caller-owned token alone"
+        );
+        assert!(
+            !cancellation.is_cancelled(),
+            "parallel abort must match serial token ownership"
+        );
+
+        let reused = Walker::new(&fixture.root)
+            .threads(4)
+            .cancellation(cancellation.clone())
+            .collect()
+            .expect("the same token can drive a later walk");
+        assert!(!reused.was_cancelled());
     }
 
     #[cfg(target_os = "linux")]

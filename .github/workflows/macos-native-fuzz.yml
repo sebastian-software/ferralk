@@ -50,9 +50,5 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS: -Zsanitizer=address
           ASAN_OPTIONS: detect_leaks=1
-        # Loom's generator runtime intentionally retains model state until
-        # process exit, which LeakSanitizer reports outside the native code.
         run: >-
-          cargo test --target aarch64-apple-darwin -p ferralk --features native-macos --lib --
-          --skip scheduler::loom_models::last_completion_notifies_exactly_once
-          --skip scheduler::loom_models::queued_child_keeps_waiting_workers_alive_until_it_is_observed
+          cargo test --target aarch64-apple-darwin -p ferralk --features native-macos --lib

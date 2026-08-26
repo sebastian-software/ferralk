@@ -49,12 +49,8 @@ jobs:
       - name: Run AddressSanitizer tests
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zsanitizer=address
-        # Loom's generator runtime intentionally retains model state until
-        # process exit, which LeakSanitizer reports outside the native code.
         run: >-
-          cargo test --target x86_64-unknown-linux-gnu -p ferralk --features native-linux --lib --
-          --skip scheduler::loom_models::last_completion_notifies_exactly_once
-          --skip scheduler::loom_models::queued_child_keeps_waiting_workers_alive_until_it_is_observed
+          cargo test --target x86_64-unknown-linux-gnu -p ferralk --features native-linux --lib
 
   miri-parser:
     name: Linux Miri parser

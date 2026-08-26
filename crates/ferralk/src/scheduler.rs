@@ -9,12 +9,12 @@ use std::time::Duration;
 #[cfg(loom)]
 use loom::sync::{
     Condvar, Mutex, MutexGuard,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 #[cfg(not(loom))]
 use std::sync::{
     Condvar, Mutex, MutexGuard,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use crossbeam_deque::{Injector, Steal, Worker};
@@ -71,6 +71,10 @@ impl<T> Scheduler<T> {
 pub(crate) struct Coordinator {
     pending: CacheLine<AtomicUsize>,
     active_workers: CacheLine<AtomicUsize>,
+    /// Whether the caller is still the only worker. This state belongs beside
+    /// the parking protocol because it decides whether producing work must
+    /// notify a waiter.
+    lone: AtomicBool,
     wake_lock: Mutex<()>,
     wake: Condvar,
 }
@@ -94,13 +98,6 @@ pub(crate) struct Coordinator {
 )]
 pub(crate) struct CacheLine<T>(pub(crate) T);
 
-/// How many parked workers one notification is meant for.
-#[derive(Clone, Copy)]
-enum Wake {
-    One,
-    All,
-}
-
 impl<T> std::ops::Deref for CacheLine<T> {
     type Target = T;
 
@@ -114,6 +111,7 @@ impl Coordinator {
         Self {
             pending: CacheLine(AtomicUsize::new(0)),
             active_workers: CacheLine(AtomicUsize::new(0)),
+            lone: AtomicBool::new(true),
             wake_lock: Mutex::new(()),
             wake: Condvar::new(),
         }
@@ -122,6 +120,33 @@ impl Coordinator {
     /// Announces one task that some worker will claim later.
     pub(crate) fn begin_task(&self) {
         self.pending.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Makes one task available to a worker.
+    ///
+    /// The producer publishes the task before checking `lone`. In lone mode
+    /// this stays on the old lock-free fast path: no helper can exist yet. If
+    /// widening wins the check, one helper is notified while holding the same
+    /// lock a waiter uses to enter the condvar. If production wins it, widening
+    /// starts helpers only after the task has been published, so their first
+    /// queue probe observes it. Keeping both operations here lets loom drive
+    /// the real fast path rather than a stand-in.
+    pub(crate) fn schedule(&self, publish: impl FnOnce()) {
+        self.begin_task();
+        publish();
+        if self.lone.load(Ordering::Acquire) {
+            return;
+        }
+        let guard = lock(&self.wake_lock);
+        self.wake.notify_one();
+        drop(guard);
+    }
+
+    /// Announces that helpers may exist. The caller invokes this before
+    /// spawning the first helper, so a producer that still sees `lone` cannot
+    /// strand work behind a parked worker.
+    pub(crate) fn widen(&self) {
+        self.lone.store(false, Ordering::Release);
     }
 
     /// Takes ownership of one announced task. The guard releases it on drop,
@@ -137,38 +162,9 @@ impl Coordinator {
     /// Wakes every parked worker. Used for the states every worker has to see:
     /// the walk draining, being cancelled, aborting, or unwinding.
     pub(crate) fn wake_waiters(&self) {
-        self.wake_some(Wake::All);
-    }
-
-    /// Wakes at most one parked worker, for a producer that made exactly one
-    /// task available. A worker that wakes and finds the task already taken by
-    /// somebody who never parked simply parks again; the task is not lost,
-    /// because whoever took it holds it.
-    pub(crate) fn wake_one_waiter(&self) {
-        self.wake_some(Wake::One);
-    }
-
-    /// The notification itself. Taking `wake_lock` around it is what makes the
-    /// hand-off free of lost wakeups: a worker that observed an empty queue
-    /// holds the lock until it parks, so it either sees the new state before
-    /// parking or is notified afterwards.
-    ///
-    /// A parked-worker count that let a producer skip the lock as well was
-    /// tried in #98 and dropped there. It was sound — producer and worker each
-    /// ran a store-then-load with a `SeqCst` fence between the halves, and the
-    /// loom models passed — but it multiplied the hand-off model's state space
-    /// by fifteen, from 69,363 explored executions to 1,072,953, because three
-    /// more atomic accesses inside `wait_for_task` are three more scheduling
-    /// points per interleaving. That is a nineteen-fold loom job on every pull
-    /// request, and no walk measurement could tell the two versions apart: this
-    /// fires once per queued directory, a few thousand times across a 33 ms
-    /// walk.
-    fn wake_some(&self, wake: Wake) {
-        drop(lock(&self.wake_lock));
-        match wake {
-            Wake::One => self.wake.notify_one(),
-            Wake::All => self.wake.notify_all(),
-        }
+        let guard = lock(&self.wake_lock);
+        self.wake.notify_all();
+        drop(guard);
     }
 
     /// Parks until `try_take` yields a task, the walk is cancelled, or no task
@@ -358,17 +354,16 @@ mod loom_models {
             EXECUTIONS.fetch_add(1, Ordering::Relaxed);
             let coordinator = Arc::new(Coordinator::new());
             let queue = Arc::new(Mutex::new(VecDeque::new()));
-            // The root task is outstanding before the helper starts.
+            // Helpers exist for this hand-off, so producing work must notify
+            // one of them through the production scheduling path.
+            coordinator.widen();
             coordinator.begin_task();
 
             let producer_coordinator = Arc::clone(&coordinator);
             let producer_queue = Arc::clone(&queue);
             let producer = thread::spawn(move || {
                 let _root = producer_coordinator.claim_task();
-                producer_coordinator.begin_task();
-                push(&producer_queue, 7);
-                // One task pushed, so this is the walk's own hand-off path.
-                producer_coordinator.wake_one_waiter();
+                producer_coordinator.schedule(|| push(&producer_queue, 7));
             });
 
             let consumer_coordinator = Arc::clone(&coordinator);
@@ -390,6 +385,47 @@ mod loom_models {
             assert_eq!(coordinator.pending(), 0);
         });
         report("a_queued_task_reaches_a_parking_worker", &EXECUTIONS);
+    }
+
+    /// A producer may publish work just as the caller turns its lone walk into
+    /// a helper walk. The real `Coordinator` owns that decision: if the
+    /// producer still sees lone mode, the helper starts only after the task is
+    /// already published; otherwise it receives the normal one-worker wakeup.
+    #[test]
+    fn widening_does_not_lose_a_concurrent_scheduled_task() {
+        static EXECUTIONS: AtomicUsize = AtomicUsize::new(0);
+        loom::model(|| {
+            EXECUTIONS.fetch_add(1, Ordering::Relaxed);
+            let coordinator = Arc::new(Coordinator::new());
+            let queue = Arc::new(Mutex::new(VecDeque::new()));
+            // The caller is still processing its root while the first helper
+            // becomes eligible to wait for a child task.
+            coordinator.begin_task();
+
+            let producer_coordinator = Arc::clone(&coordinator);
+            let producer_queue = Arc::clone(&queue);
+            let producer = thread::spawn(move || {
+                let _root = producer_coordinator.claim_task();
+                producer_coordinator.schedule(|| push(&producer_queue, 7));
+            });
+
+            let helper_coordinator = Arc::clone(&coordinator);
+            let helper_queue = Arc::clone(&queue);
+            let helper = thread::spawn(move || {
+                helper_coordinator.widen();
+                let task = helper_coordinator.wait_for_task(|| false, || pop(&helper_queue));
+                assert_eq!(task, Some(7), "widening must not strand published work");
+                drop(helper_coordinator.claim_task());
+            });
+
+            producer.join().expect("producer joins");
+            helper.join().expect("helper joins");
+            assert_eq!(coordinator.pending(), 0);
+        });
+        report(
+            "widening_does_not_lose_a_concurrent_scheduled_task",
+            &EXECUTIONS,
+        );
     }
 
     /// The task guard has to release its task while the panic unwinds, or the
