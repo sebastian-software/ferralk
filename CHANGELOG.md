@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.1](https://github.com/sebastian-software/ferralk/compare/v0.6.0...v0.6.1) (2026-08-26)
+
+
+### Bug Fixes
+
+* **deps:** pin dependencies ([#102](https://github.com/sebastian-software/ferralk/issues/102)) ([b9f73f0](https://github.com/sebastian-software/ferralk/commit/b9f73f0ad206c65347d443884bc0c9c5e35422bb))
+* discard partial stream listings after read errors ([#138](https://github.com/sebastian-software/ferralk/issues/138)) ([b23872f](https://github.com/sebastian-software/ferralk/commit/b23872fba53a017aa915f6d81ecce5c28f231d96))
+* handle literal-dot extglobs and malformed POSIX classes ([#137](https://github.com/sebastian-software/ferralk/issues/137)) ([8e78680](https://github.com/sebastian-software/ferralk/commit/8e78680ad92204797837dfa358bcedfeaa55bafc))
+
 ## [0.6.0](https://github.com/sebastian-software/ferralk/compare/v0.5.3...v0.6.0) (2026-08-25)
 
 
