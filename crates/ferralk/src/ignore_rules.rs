@@ -265,13 +265,18 @@ fn parse_rule(line: &str) -> Option<Rule> {
     if body.is_empty() {
         return None;
     }
+    // A single leading separator is the anchor. Any other empty component is
+    // unmatchable in Git, rather than an alternate spelling of a valid rule.
+    if body.split('/').any(str::is_empty) {
+        return None;
+    }
 
     let mut components = Vec::new();
     let mut gate: Option<Vec<u8>> = None;
     if !anchored {
         components.push(Component::AnyDirs);
     }
-    for part in body.split('/').filter(|part| !part.is_empty()) {
+    for part in body.split('/') {
         if let Some(literal) = longest_literal_run(part.as_bytes())
             && gate.as_ref().is_none_or(|best| best.len() < literal.len())
         {
@@ -599,6 +604,12 @@ mod tests {
         assert!(parse_rule("# comment").is_none());
         assert!(parse_rule("   ").is_none(), "spaces alone are not a rule");
         assert!(parse_rule("/").is_none(), "a lone separator is not a rule");
+        for rule in ["a//b", "//foo", "x///y"] {
+            assert!(
+                parse_rule(rule).is_none(),
+                "repeated separators are unmatchable: {rule}"
+            );
+        }
         assert!(
             parse_rule("foo\\").is_none(),
             "a dangling escape matches nothing"
