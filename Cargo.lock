@@ -282,6 +282,7 @@ dependencies = [
  "crossbeam-deque",
  "ferralk-glob",
  "ignore",
+ "libc",
  "loom",
  "memchr",
  "serde_json",
