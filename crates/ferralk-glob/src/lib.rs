@@ -2497,6 +2497,8 @@ struct ExtglobAlternative {
 struct ExtglobGroup {
     kind: ExtglobKind,
     alternatives: Vec<ExtglobAlternative>,
+    /// Offset of this group's operator in the program.
+    start: usize,
     /// Offset just past the closing parenthesis.
     rest: usize,
 }
@@ -2566,6 +2568,7 @@ fn compile_extglob_step(
         groups.push(ExtglobGroup {
             kind,
             alternatives,
+            start: index,
             rest: close + 1,
         });
         return Ok(ExtglobStep::Group(groups.len() - 1));
@@ -2725,9 +2728,13 @@ fn split_extglob_alternatives(content: &[u8], escapes: bool) -> Vec<&[u8]> {
 }
 
 thread_local! {
-    /// Stack of visited-position bitsets, one frame per repetition in flight.
+    /// A program-wide state memo followed by one visited-position frame per
+    /// repetition in flight.
     static EXTGLOB_VISITED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
+
+/// The program-wide memo is the first frame in [`EXTGLOB_VISITED`].
+const EXTGLOB_PROGRAM_MEMO_BASE: usize = 0;
 
 /// Runs a compiled extglob program on the thread's reusable visited buffer.
 ///
@@ -2739,13 +2746,19 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
     EXTGLOB_VISITED.with(|cell| match cell.try_borrow_mut() {
         Ok(mut visited) => {
             visited.clear();
+            push_visited(&mut visited, (program.steps.len() + 1) * (path.len() + 1));
             let matched = match_extglob_from(program, path, 0, 0, options, &mut visited);
+            visited.clear();
             if visited.capacity() > RETAINED_SCRATCH_WORDS {
                 visited.shrink_to(RETAINED_SCRATCH_WORDS);
             }
             matched
         }
-        Err(_) => match_extglob_from(program, path, 0, 0, options, &mut Vec::new()),
+        Err(_) => {
+            let mut visited = Vec::new();
+            push_visited(&mut visited, (program.steps.len() + 1) * (path.len() + 1));
+            match_extglob_from(program, path, 0, 0, options, &mut visited)
+        }
     })
 }
 
@@ -2789,6 +2802,15 @@ fn match_extglob_from(
     let mut star_pattern_index = 0_usize;
     let mut star_path_index = 0_usize;
     let mut has_star = false;
+
+    // Every recursive branch reaches a program step with no inherited star
+    // backtrack point. It can therefore be shared across sequential groups and
+    // within one repetition: once a suffix has been explored, another
+    // partition cannot make it succeed.
+    let state = pattern_index * (path.len() + 1) + path_index;
+    if !visit(visited, EXTGLOB_PROGRAM_MEMO_BASE, state) {
+        return false;
+    }
 
     while path_index < path.len() || pattern_index < steps.len() {
         if pattern_index < steps.len() {
@@ -3027,9 +3049,7 @@ fn match_extglob_repeated(
             if match_extglob_alternative_exact(alternative, &path[path_index..end], options)
                 && (match_extglob_from(program, path, group.rest, end, options, visited)
                     || (end > path_index
-                        && match_extglob_repeated(
-                            program, group, path, end, options, visited, base,
-                        )))
+                        && match_extglob_from(program, path, group.start, end, options, visited)))
             {
                 return true;
             }
@@ -3645,6 +3665,23 @@ mod tests {
                 .unwrap()
                 .is_match("foo")
         );
+    }
+
+    #[test]
+    fn sequential_extglob_repetitions_share_failed_suffixes() {
+        let pattern = Pattern::compile("+(a)+(a)+(a)+(a)", PatternOptions::default().extglob(true))
+            .expect("repeating extglobs compile");
+
+        // Every partition of this run reaches one of the same group/path
+        // suffixes. The trailing byte makes all of them fail, exercising the
+        // global extglob state memo without a wall-clock assertion.
+        let mut non_matching = "a".repeat(400);
+        non_matching.push('x');
+        assert!(!pattern.is_match(&non_matching));
+
+        // Adjacent `+()` groups remain independently non-empty.
+        assert!(pattern.is_match("aaaa"));
+        assert!(!pattern.is_match("aaa"));
     }
 
     #[test]

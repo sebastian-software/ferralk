@@ -236,6 +236,20 @@ fn matcher(c: &mut Criterion) {
             .iter(|| black_box(extglob_free.is_match(black_box("src/deep/nested/dir1/file1.ts"))))
     });
 
+    // Sequential repetitions used to re-explore every suffix for every way
+    // earlier groups split this run. Keep the failure shape here: a match
+    // returns at the first successful partition, while the trailing byte
+    // exercises the memo across all of them.
+    let chained_repetition =
+        Pattern::compile("+(a)+(a)+(a)+(a)", PatternOptions::default().extglob(true))
+            .expect("chained extglob repetition pattern is valid");
+    let mut chained_repetition_path = "a".repeat(400);
+    chained_repetition_path.push('x');
+    c.bench_function("extglob/chained_repetition/non_matching", |benchmark| {
+        benchmark
+            .iter(|| black_box(chained_repetition.is_match(black_box(&chained_repetition_path))))
+    });
+
     let suffix_star = Pattern::compile("*.rs", PatternOptions::default())
         .expect("suffix-star benchmark pattern is valid");
     c.bench_function("single_star/ferralk_compiled/matching", |benchmark| {
