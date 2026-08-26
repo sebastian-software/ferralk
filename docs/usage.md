@@ -249,7 +249,22 @@ ferralk = { version = "0.6", features = ["native-linux"] }
 `native-linux` applies only on Linux and `native-macos` only on macOS; other
 platforms retain the portable backend. These backends are not a stability or
 performance promise while Ferralk remains pre-1.0. See ADR-0010 for the
-rollout policy.
+rollout policy. `native-macos` links Darwin's private `__getdirentries64`
+stub: it is what libc's `readdir` uses today, but it is not an Apple public API
+and can be rejected by App Store private-symbol checks. App-Store-distributed
+applications should keep the default portable backend. If a filesystem or a
+future OS refuses the native call at runtime, Ferralk maps that refusal to the
+portable fallback; this preserves correctness but not native performance.
+
+On Unix, a native no-follow walk opens scheduled non-root directories with
+`O_NOFOLLOW`, closing the directory-to-symlink replacement window at the final
+component while retaining the portable reader's support for a user-supplied
+directory-symlink root. A changed scheduled path is rejected (`ELOOP` on
+Linux; Darwin may report `ENOTDIR` with `O_DIRECTORY`). If a native syscall is
+unsupported, Ferralk reports that scheduled directory rather than reopening it
+through a symlink-following `std::fs::read_dir(path)` call. This is the native
+reader's deliberate safety advantage; a portable-only walk cannot offer the
+same atomic final-component guarantee.
 
 ## Development and validation
 

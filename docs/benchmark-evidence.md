@@ -216,6 +216,19 @@ today nothing downstream of `Listing::push` can accept one. The spread on the
 noisier rows is real, which is why the anchor is inside each run and why the
 `getdirentries64` measurement was taken twice.
 
+### Final-batch EOF flag, 2026-08-27
+
+Darwin's extended `__getdirentries64` buffer reserves its final four bytes for
+`GETDIRENTRIES64_EOF` when the buffer is at least 1024 bytes. A small-directory
+C probe on the same APFS setup returned data and this flag on its first call;
+the old reader then issued one empty terminal syscall. The native reader now
+checks that tail only after parsing `buffer[..byte_count]`, so the flag cannot
+expand parser input or weaken record bounds. A final flagged batch now follows
+`open + read + close`, rather than `open + read + empty read + close`: one
+directory-read syscall is removed for directories that fit their final batch.
+This is a syscall-count observation, not a new wall-time benchmark; cache,
+tree shape, filesystem and concurrent work determine the realised speedup.
+
 ## Selecting without a caller-side matcher
 
 The `caller_match` arms in [`walker.rs`](../tools/bench/benches/walker.rs) model
