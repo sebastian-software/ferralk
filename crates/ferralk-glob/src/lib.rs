@@ -2002,6 +2002,8 @@ enum PosixClass {
     Xdigit,
 }
 
+const MAX_POSIX_CLASS_NAME_LEN: usize = 6;
+
 impl PosixClass {
     fn matches(self, byte: u8, case_insensitive: bool) -> bool {
         let folded = fold_ascii(byte, case_insensitive);
@@ -2067,16 +2069,21 @@ fn parse_class(
                 index + 1,
             ));
         }
-        if byte == b'['
-            && pattern.get(index + 1) == Some(&b':')
-            && let Some(end) = memmem::find(&pattern[index + 2..], b":]")
-            && let Some(class) = parse_posix_class(&pattern[index + 2..index + 2 + end])
-        {
-            let name_end = index + 2 + end;
-            members.extend(class_members(std::mem::take(&mut values)));
-            members.push(ClassMember::Posix(class));
-            index = name_end + 2;
-            continue;
+        if byte == b'[' && pattern.get(index + 1) == Some(&b':') {
+            let name_start = index + 2;
+            // POSIX class names are a closed, short set. Bounding the search
+            // keeps every malformed opener constant-time while preserving the
+            // old rule that only the first `:]` can close this opener.
+            let search_end = pattern.len().min(name_start + MAX_POSIX_CLASS_NAME_LEN + 2);
+            if let Some(posix_end) = memmem::find(&pattern[name_start..search_end], b":]")
+                && let Some(class) = parse_posix_class(&pattern[name_start..name_start + posix_end])
+            {
+                let name_end = name_start + posix_end;
+                members.extend(class_members(std::mem::take(&mut values)));
+                members.push(ClassMember::Posix(class));
+                index = name_end + 2;
+                continue;
+            }
         }
         if byte == b'\\' && escapes {
             let Some(&escaped) = pattern.get(index + 1) else {
@@ -2785,13 +2792,15 @@ fn match_extglob_from(
 
     while path_index < path.len() || pattern_index < steps.len() {
         if pattern_index < steps.len() {
-            // A group refuses a leading period before it looks at its
-            // alternatives, and does so even when its parenthesis never closes
-            // and the bytes end up read as ordinary text.
-            if matches!(
-                steps[pattern_index],
-                ExtglobStep::Group(_) | ExtglobStep::UnclosedGroup { .. }
-            ) && !options.match_hidden
+            let leading_period_is_forbidden = match &steps[pattern_index] {
+                ExtglobStep::Group(group) => {
+                    !extglob_group_allows_literal_leading_period(&program.groups[*group])
+                }
+                ExtglobStep::UnclosedGroup { .. } => true,
+                _ => false,
+            };
+            if leading_period_is_forbidden
+                && !options.match_hidden
                 && path.get(path_index) == Some(&b'.')
                 && at_component_start(path, path_index)
             {
@@ -2918,6 +2927,28 @@ fn match_extglob_from(
         return false;
     }
     true
+}
+
+/// Whether a group can explicitly consume the leading period of a component.
+///
+/// Wildcard-led alternatives still observe `match_hidden`; only a literal dot
+/// is an opt-in to matching a hidden path.
+fn extglob_group_allows_literal_leading_period(group: &ExtglobGroup) -> bool {
+    // Negation consumes whatever its alternatives reject, not a literal from
+    // one of them, so it remains wildcard-like at a component boundary.
+    if group.kind == ExtglobKind::Negated {
+        return false;
+    }
+    group.alternatives.iter().any(|alternative| {
+        alternative.compiled.as_ref().is_some_and(|alternatives| {
+            alternatives.iter().any(|alternative| {
+                matches!(
+                    alternative.tokens.first(),
+                    Some(Token::Literal(literal)) if literal.first() == Some(&b'.')
+                )
+            })
+        })
+    })
 }
 
 fn match_extglob_group(
@@ -3637,6 +3668,34 @@ mod tests {
     }
 
     #[test]
+    fn extglob_literal_dot_alternatives_honor_leading_period_policy() {
+        let options = PatternOptions::default().extglob(true);
+        let matcher =
+            Pattern::compile("@(.gitignore|.npmignore)", options).expect("extglob compiles");
+        assert!(matcher.is_match(".gitignore"));
+        assert!(matcher.is_match(".npmignore"));
+        assert!(!matcher.is_match(".env"));
+
+        // The exemption is for explicit dots only: a wildcard alternative
+        // still cannot select a hidden path with the default options.
+        let wildcard = Pattern::compile("@(*|visible)", options).expect("extglob compiles");
+        assert!(!wildcard.is_match(".hidden"));
+
+        let mixed = Pattern::compile("@(.gitignore|*)", options).expect("extglob compiles");
+        assert!(mixed.is_match(".gitignore"));
+        assert!(!mixed.is_match(".hidden"));
+
+        // A negated group is itself wildcard-like: naming one hidden path as
+        // the exception must not opt every other hidden path into matching.
+        let negated = Pattern::compile("!(.gitignore)", options).expect("extglob compiles");
+        assert!(!negated.is_match(".hidden"));
+        let hidden = Pattern::compile("!(.gitignore)", options.match_hidden(true))
+            .expect("period-enabled extglob compiles");
+        assert!(hidden.is_match(".hidden"));
+        assert!(!hidden.is_match(".gitignore"));
+    }
+
+    #[test]
     fn extglob_programs_are_compiled_only_where_the_syntax_is_present() {
         let options = PatternOptions::default().extglob(true);
         let with_group = Pattern::compile("@(a|b)c", options).expect("group compiles");
@@ -4308,6 +4367,31 @@ mod tests {
         assert_eq!(error.offset(), 0);
         assert_eq!(error.message(), "unclosed character class");
         assert!(compile("foo\\").is_match("foo\\"));
+    }
+
+    #[test]
+    fn deeply_nested_unclosed_posix_openers_are_rejected() {
+        let mut pattern = String::from("[");
+        pattern.push_str("[:".repeat(32_768).as_str());
+        let error = Pattern::compile(&pattern, PatternOptions::default()).unwrap_err();
+        assert_eq!(error.offset(), 0);
+        assert_eq!(error.message(), "unclosed character class");
+    }
+
+    #[test]
+    fn deeply_nested_posix_openers_with_a_final_bracket_compile_linearly() {
+        let mut pattern = String::from("[");
+        pattern.push_str("[:".repeat(32_768).as_str());
+        pattern.push(']');
+        assert!(Pattern::compile(&pattern, PatternOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn invalid_posix_opener_does_not_hide_a_later_valid_class() {
+        let pattern = Pattern::compile("[[:[:alpha:]]", PatternOptions::default())
+            .expect("character class compiles");
+        assert!(pattern.is_match("x"));
+        assert!(!pattern.is_match("1"));
     }
 
     #[test]

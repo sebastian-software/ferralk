@@ -366,7 +366,11 @@ fn longest_literal_run(part: &[u8]) -> Option<Vec<u8>> {
                     if part[scan] == b'[' && part.get(scan + 1) == Some(&b':') {
                         match part[scan + 2..].windows(2).position(|pair| pair == b":]") {
                             Some(end) => scan += 2 + end + 2,
-                            None => scan += 1,
+                            // The rest of an unclosed POSIX class cannot be a
+                            // literal run. Skipping it also keeps malformed
+                            // input linear instead of re-scanning the suffix
+                            // at every nested `[:` opener.
+                            None => scan = part.len(),
                         }
                     } else {
                         scan += 1;
@@ -611,6 +615,13 @@ mod tests {
         let directory = parse_rule("build/").expect("directory rule parses");
         assert!(directory.directory_only);
         assert!(!directory.negated);
+    }
+
+    #[test]
+    fn deeply_nested_unclosed_posix_openers_are_rejected() {
+        let mut rule = String::from("[");
+        rule.push_str("[:".repeat(32_768).as_str());
+        assert!(parse_rule(&rule).is_none());
     }
 
     #[test]
