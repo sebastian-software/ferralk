@@ -3412,6 +3412,48 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_gitdir_pointer_is_skipped_like_unreadable_repository_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        let checkout = fixture.root.join("unreadable-pointer");
+        fs::create_dir_all(&checkout).expect("create checkout");
+        let pointer = checkout.join(".git");
+        fs::write(&pointer, b"gitdir: ../missing-git-directory\n").expect("write pointer file");
+        fs::write(checkout.join("not-excluded.txt"), b"fixture").expect("write candidate");
+
+        let original_permissions = fs::metadata(&pointer)
+            .expect("read pointer metadata")
+            .permissions();
+        fs::set_permissions(&pointer, fs::Permissions::from_mode(0o000))
+            .expect("make pointer unreadable");
+        if fs::read(&pointer).is_ok() {
+            // A privileged test process can bypass mode bits. There is no
+            // portable way to arrange an unreadable regular file for it.
+            fs::set_permissions(&pointer, original_permissions)
+                .expect("restore pointer permissions");
+            return;
+        }
+
+        let result = Walker::new(&checkout)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("unreadable metadata is skipped rather than reported");
+        fs::set_permissions(&pointer, original_permissions).expect("restore pointer permissions");
+
+        assert!(
+            result.errors().is_empty(),
+            "unreadable repository metadata follows the existing silent policy"
+        );
+        assert!(
+            relative_paths(result.entries(), &checkout)
+                .contains(&PathBuf::from("not-excluded.txt")),
+            "an unreadable pointer must add no repository rules"
+        );
+    }
+
     #[test]
     fn nested_repositories_remain_traversed_with_the_outer_ignore_chain() {
         let fixture = Fixture::new();
