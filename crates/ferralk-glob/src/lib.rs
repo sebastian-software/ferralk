@@ -2002,6 +2002,8 @@ enum PosixClass {
     Xdigit,
 }
 
+const MAX_POSIX_CLASS_NAME_LEN: usize = 6;
+
 impl PosixClass {
     fn matches(self, byte: u8, case_insensitive: bool) -> bool {
         let folded = fold_ascii(byte, case_insensitive);
@@ -2044,9 +2046,6 @@ fn parse_class(
     // the flag has to survive until `class_members` groups the entries.
     let mut values: Vec<ClassValue> = Vec::new();
     let mut members = Vec::new();
-    // Once an invalid POSIX opener has established where this class closes,
-    // later `[:` pairs cannot start a valid POSIX class before that end.
-    let mut invalid_posix_class_end = None;
     if pattern.get(index) == Some(&b']') {
         values.push(ClassValue::literal(b']'));
         index += 1;
@@ -2070,29 +2069,21 @@ fn parse_class(
                 index + 1,
             ));
         }
-        if byte == b'['
-            && pattern.get(index + 1) == Some(&b':')
-            && invalid_posix_class_end.is_none_or(|end| index >= end)
-        {
-            if let Some(posix_end) = memmem::find(&pattern[index + 2..], b":]")
-                && let Some(class) = parse_posix_class(&pattern[index + 2..index + 2 + posix_end])
+        if byte == b'[' && pattern.get(index + 1) == Some(&b':') {
+            let name_start = index + 2;
+            // POSIX class names are a closed, short set. Bounding the search
+            // keeps every malformed opener constant-time while preserving the
+            // old rule that only the first `:]` can close this opener.
+            let search_end = pattern.len().min(name_start + MAX_POSIX_CLASS_NAME_LEN + 2);
+            if let Some(posix_end) = memmem::find(&pattern[name_start..search_end], b":]")
+                && let Some(class) = parse_posix_class(&pattern[name_start..name_start + posix_end])
             {
-                let name_end = index + 2 + posix_end;
+                let name_end = name_start + posix_end;
                 members.extend(class_members(std::mem::take(&mut values)));
                 members.push(ClassMember::Posix(class));
                 index = name_end + 2;
                 continue;
             }
-            // Without a closing bracket, a later `[:` opener cannot make this
-            // class valid. Reporting it now avoids re-scanning the remaining
-            // bytes for every nested opener.
-            let Some(end) = memchr(b']', &pattern[index + 2..]) else {
-                return Err(PatternError {
-                    offset: start,
-                    message: "unclosed character class",
-                });
-            };
-            invalid_posix_class_end = Some(index + 2 + end);
         }
         if byte == b'\\' && escapes {
             let Some(&escaped) = pattern.get(index + 1) else {
@@ -2943,6 +2934,11 @@ fn match_extglob_from(
 /// Wildcard-led alternatives still observe `match_hidden`; only a literal dot
 /// is an opt-in to matching a hidden path.
 fn extglob_group_allows_literal_leading_period(group: &ExtglobGroup) -> bool {
+    // Negation consumes whatever its alternatives reject, not a literal from
+    // one of them, so it remains wildcard-like at a component boundary.
+    if group.kind == ExtglobKind::Negated {
+        return false;
+    }
     group.alternatives.iter().any(|alternative| {
         alternative.compiled.as_ref().is_some_and(|alternatives| {
             alternatives.iter().any(|alternative| {
@@ -3684,6 +3680,19 @@ mod tests {
         // still cannot select a hidden path with the default options.
         let wildcard = Pattern::compile("@(*|visible)", options).expect("extglob compiles");
         assert!(!wildcard.is_match(".hidden"));
+
+        let mixed = Pattern::compile("@(.gitignore|*)", options).expect("extglob compiles");
+        assert!(mixed.is_match(".gitignore"));
+        assert!(!mixed.is_match(".hidden"));
+
+        // A negated group is itself wildcard-like: naming one hidden path as
+        // the exception must not opt every other hidden path into matching.
+        let negated = Pattern::compile("!(.gitignore)", options).expect("extglob compiles");
+        assert!(!negated.is_match(".hidden"));
+        let hidden = Pattern::compile("!(.gitignore)", options.match_hidden(true))
+            .expect("period-enabled extglob compiles");
+        assert!(hidden.is_match(".hidden"));
+        assert!(!hidden.is_match(".gitignore"));
     }
 
     #[test]
@@ -4375,6 +4384,14 @@ mod tests {
         pattern.push_str("[:".repeat(32_768).as_str());
         pattern.push(']');
         assert!(Pattern::compile(&pattern, PatternOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn invalid_posix_opener_does_not_hide_a_later_valid_class() {
+        let pattern = Pattern::compile("[[:[:alpha:]]", PatternOptions::default())
+            .expect("character class compiles");
+        assert!(pattern.is_match("x"));
+        assert!(!pattern.is_match("1"));
     }
 
     #[test]
