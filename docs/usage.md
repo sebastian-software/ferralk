@@ -235,7 +235,7 @@ The portable backend uses `std::fs` on Linux, macOS, and Windows. Experimental
 native backends are feature-gated:
 
 ```toml
-ferralk = { git = "https://github.com/sebastian-software/ferralk", features = ["native-linux"] }
+ferralk = { version = "0.6", features = ["native-linux"] }
 ```
 
 `native-linux` applies only on Linux and `native-macos` only on macOS; other
