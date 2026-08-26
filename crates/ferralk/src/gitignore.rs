@@ -15,7 +15,11 @@
 //! exactly once, whatever the worker count. A shared cache would add
 //! synchronization to a problem the task graph has already solved.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use super::{
     DirectoryBackend, Listing, Walker, glob_path_bytes,
@@ -25,10 +29,8 @@ use super::{
 /// Ignore files of a directory, in increasing precedence: a later file wins.
 const IGNORE_FILES: [&str; 2] = [".gitignore", ".ignore"];
 
-/// Repository-wide excludes, which the root's own ignore files override. Git
-/// reads this file for the repository the walk root belongs to; ferralk applies
-/// ignore rules from the walk root downwards, so it reads the one there.
-const REPOSITORY_EXCLUDE_FILE: &str = ".git/info/exclude";
+/// Repository-wide excludes, which the root's own ignore files override.
+const REPOSITORY_EXCLUDE_FILE: &str = "info/exclude";
 
 /// The ignore rules in force inside one directory.
 #[derive(Debug, Clone, Default)]
@@ -50,7 +52,7 @@ impl IgnoreScope {
         if !walker.respect_git_ignore {
             return Self::default();
         }
-        Self::default().link(read_rules(backend, root, &[REPOSITORY_EXCLUDE_FILE]))
+        Self::default().link(read_repository_rules(backend, root))
     }
 
     /// Adds `directory`'s own ignore files to the chain. Called once, when the
@@ -146,6 +148,95 @@ fn read_rules<B: DirectoryBackend + ?Sized>(
         }
     }
     builder.build()
+}
+
+/// Reads the repository-wide exclude file for `root`.
+///
+/// A normal checkout has a `.git` directory. Linked worktrees and submodules
+/// instead put a `gitdir: ...` pointer in `.git`; a linked worktree's private
+/// git directory can in turn point at the common repository directory through
+/// `commondir`. Git reads `info/exclude` from that common directory. Every
+/// malformed or unreadable metadata file behaves like an unreadable exclude:
+/// it contributes no rules.
+fn read_repository_rules<B: DirectoryBackend + ?Sized>(backend: &B, root: &Path) -> RuleSet {
+    let mut builder = RuleSetBuilder::new(root);
+    let Some(git_directory) = repository_git_directory(root) else {
+        return builder.build();
+    };
+    let path = git_directory.join(REPOSITORY_EXCLUDE_FILE);
+    if let Ok(contents) = backend.read_repository_file(&path) {
+        add_rules(&mut builder, &contents);
+    }
+    builder.build()
+}
+
+/// Resolves the directory that owns the repository-wide exclude file.
+///
+/// Only the exact `gitdir: ` pointer format Git writes is accepted. The path
+/// has one line, may be absolute or relative to the pointer file, and may use
+/// a single `commondir` indirection relative to the resulting git directory.
+fn repository_git_directory(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    let metadata = fs::metadata(&dot_git).ok()?;
+    if metadata.is_dir() {
+        return Some(dot_git);
+    }
+    if !metadata.is_file() {
+        return None;
+    }
+
+    let git_directory =
+        resolve_metadata_path(root, parse_gitdir_pointer(&fs::read(&dot_git).ok()?)?)?;
+    let common_dir = git_directory.join("commondir");
+    match fs::read(common_dir) {
+        Ok(contents) => resolve_metadata_path(&git_directory, parse_metadata_path(&contents)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(git_directory),
+        Err(_) => None,
+    }
+}
+
+fn parse_gitdir_pointer(contents: &[u8]) -> Option<PathBuf> {
+    parse_metadata_path(contents.strip_prefix(b"gitdir: ")?)
+}
+
+/// Parses the one native path Git writes into a `gitdir` or `commondir` file.
+/// Rejecting additional lines and NUL keeps a malformed metadata file from
+/// being interpreted as a path by accident.
+fn parse_metadata_path(contents: &[u8]) -> Option<PathBuf> {
+    let contents = contents.strip_suffix(b"\n").unwrap_or(contents);
+    let contents = contents.strip_suffix(b"\r").unwrap_or(contents);
+    if contents.is_empty()
+        || contents
+            .iter()
+            .any(|byte| matches!(*byte, b'\0' | b'\n' | b'\r'))
+    {
+        return None;
+    }
+    path_from_git_bytes(contents)
+}
+
+#[cfg(unix)]
+fn path_from_git_bytes(contents: &[u8]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    Some(PathBuf::from(std::ffi::OsString::from_vec(
+        contents.to_vec(),
+    )))
+}
+
+#[cfg(not(unix))]
+fn path_from_git_bytes(contents: &[u8]) -> Option<PathBuf> {
+    std::str::from_utf8(contents).ok().map(PathBuf::from)
+}
+
+fn resolve_metadata_path(base: &Path, path: PathBuf) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path)
+    } else if path.as_os_str().is_empty() {
+        None
+    } else {
+        Some(base.join(path))
+    }
 }
 
 /// Feeds one ignore file's lines to the builder.

@@ -19,6 +19,9 @@ crossbeam-deque = "=0.8.7"
 ferralk-glob = { path = "../ferralk-glob", version = "0.6.1" }
 memchr = "=2.8.3"
 
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.189"
+
 [dev-dependencies]
 corpus = { path = "../../tools/corpus" }
 # The engine ADR-0014 replaced, kept for the test that compares the two rule

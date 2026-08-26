@@ -108,9 +108,15 @@ Important defaults:
   [compatibility guide](compatibility-guide.md#absolute-patterns-and-the-caller-side-rewrite-they-replace).
 
 - `.gitignore` and `.ignore` files are considered only after
-  `respect_git_ignore(true)`, together with the walk root's
-  `.git/info/exclude`, which they override. The file closest to an entry
-  decides, as in Git.
+  `respect_git_ignore(true)`, together with the walk root's `.git/info/exclude`,
+  which they override. Linked-worktree and submodule `.git` pointer files are
+  resolved (including one `commondir`), and the file closest to an entry
+  decides, as in Git. In-tree `.gitignore` and `.ignore` symlinks are ignored
+  rather than followed; `.git/info/exclude` keeps Git's link-following behavior.
+
+  Ferralk deliberately continues into nested repositories, as ripgrep does:
+  outer ignore rules remain active inside them and their own ignore files are
+  loaded too. This differs from Git's repository-boundary behavior.
 - Symlinks are not followed unless `WalkOptions::follow_symlinks(true)` is
   selected; a canonical-path guard prevents directory cycles.
 - `files_only(true)` and `directories_only(true)` filter on the kind a

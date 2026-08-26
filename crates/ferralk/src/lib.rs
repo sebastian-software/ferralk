@@ -1404,9 +1404,7 @@ fn has_closing_parenthesis(pattern: &[u8], open: usize) -> bool {
 }
 
 /// The filesystem calls that traversal and classification make, so one mock
-/// can drive the serial and the parallel frontend alike. Reading `.gitignore`
-/// files is not part of it: those go through the `ignore` crate, which owns
-/// its own IO.
+/// can drive the serial and the parallel frontend alike.
 trait DirectoryBackend {
     /// Reads one directory into `listing`, replacing whatever it held.
     ///
@@ -1431,9 +1429,22 @@ trait DirectoryBackend {
         fs::canonicalize(path)
     }
 
-    /// Reads one ignore file. Missing files are the common case and are
-    /// reported as an error rather than probed for beforehand.
+    /// Reads an in-tree ignore file. Missing files are the common case and
+    /// are reported as an error rather than probed for beforehand.
+    ///
+    /// On Unix this refuses symlinks atomically. Git likewise refuses an
+    /// in-tree `.gitignore` that resolves through a link, so its rules cannot
+    /// redirect a walk to an arbitrary file outside the tree.
     fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        read_in_tree_ignore_file(path)
+    }
+
+    /// Reads repository metadata such as `.git/info/exclude`.
+    ///
+    /// Unlike in-tree rule files, Git permits this file to be a link. Keeping
+    /// this separate prevents a repository-wide exclude from weakening the
+    /// in-tree no-follow rule above.
+    fn read_repository_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         fs::read(path)
     }
 
@@ -1454,6 +1465,35 @@ trait DirectoryBackend {
             self.canonicalize(path)
         }
     }
+}
+
+/// Reads a rule file found in the tree being walked.
+///
+/// Unix opens the final path component with `O_NOFOLLOW`, so exchanging a
+/// regular rule file for a symlink between a metadata check and an open cannot
+/// make a walk read a target outside the tree. Other supported platforms do
+/// not expose an equivalent through `std`, so they reject a symlink before the
+/// regular `fs::read`; Windows will receive an atomic implementation once its
+/// stable standard-library API exposes one.
+#[cfg(unix)]
+fn read_in_tree_ignore_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt};
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    Ok(contents)
+}
+
+#[cfg(not(unix))]
+fn read_in_tree_ignore_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    fs::read(path)
 }
 
 /// What identifies a directory that the follow-symlinks guard has seen.
@@ -3220,6 +3260,227 @@ mod tests {
         assert_eq!(relative_paths(serial.entries(), &fixture.root), expected);
         assert_eq!(relative_paths(parallel.entries(), &fixture.root), expected);
         assert_eq!(relative_paths(&streamed, &fixture.root), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_in_tree_ignore_files_do_not_apply_but_repository_excludes_can_follow_links() {
+        use std::os::unix::fs::symlink;
+
+        for ignore_file in [".gitignore", ".ignore"] {
+            let fixture = Fixture::new();
+            fixture.write("linked.tmp");
+            fs::write(fixture.root.join("rules-source"), b"linked.tmp\n")
+                .expect("write linked ignore source");
+            symlink("rules-source", fixture.root.join(ignore_file))
+                .expect("create linked in-tree ignore file");
+
+            let result = Walker::new(&fixture.root)
+                .respect_git_ignore(true)
+                .options(WalkOptions::default().sort(true))
+                .collect()
+                .expect("walk succeeds when a linked ignore file is refused");
+            assert!(
+                relative_paths(result.entries(), &fixture.root)
+                    .contains(&PathBuf::from("linked.tmp")),
+                "{ignore_file} must not redirect in-tree rules through its target"
+            );
+        }
+
+        let fixture = Fixture::new();
+        fixture.write("repository-only.tmp");
+        fs::write(fixture.root.join("rules-source"), b"repository-only.tmp\n")
+            .expect("write repository exclude source");
+        fs::create_dir_all(fixture.root.join(".git/info")).expect("create git info directory");
+        symlink("../../rules-source", fixture.root.join(".git/info/exclude"))
+            .expect("link repository exclude");
+
+        let result = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk succeeds when repository exclude is linked");
+        assert!(
+            !relative_paths(result.entries(), &fixture.root)
+                .contains(&PathBuf::from("repository-only.tmp")),
+            ".git/info/exclude remains allowed to follow links"
+        );
+    }
+
+    #[test]
+    fn linked_worktree_and_submodule_gitdir_pointers_read_the_right_info_exclude() {
+        let fixture = Fixture::new();
+
+        // This is the shape `git worktree add` writes: the checkout's `.git`
+        // points at a private worktree directory, whose `commondir` points
+        // back at the main repository's `.git` directory.
+        let worktree = fixture.root.join("linked-worktree");
+        let common_git = fixture.root.join("main/.git");
+        let private_git = common_git.join("worktrees/linked-worktree");
+        fs::create_dir_all(private_git.join("refs")).expect("create private git directory");
+        fs::create_dir_all(common_git.join("info")).expect("create common git info");
+        fs::write(common_git.join("info/exclude"), b"worktree-secret.txt\n")
+            .expect("write common exclude");
+        fs::write(private_git.join("commondir"), b"../..\n").expect("write commondir");
+        fs::create_dir_all(&worktree).expect("create linked worktree");
+        fs::write(
+            worktree.join(".git"),
+            b"gitdir: ../main/.git/worktrees/linked-worktree\n",
+        )
+        .expect("write linked-worktree pointer");
+        fs::write(worktree.join("worktree-secret.txt"), b"fixture")
+            .expect("write linked-worktree secret");
+
+        let worktree_result = Walker::new(&worktree)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk linked worktree");
+        assert!(
+            !relative_paths(worktree_result.entries(), &worktree)
+                .contains(&PathBuf::from("worktree-secret.txt")),
+            "the linked worktree must use its common info/exclude"
+        );
+
+        // A submodule has the same pointer-file form but normally points
+        // directly at `.git/modules/<name>` with no `commondir` file.
+        let submodule = fixture.root.join("super/dependency");
+        let submodule_git = fixture.root.join("super/.git/modules/dependency");
+        fs::create_dir_all(submodule_git.join("info")).expect("create submodule git info");
+        fs::write(
+            submodule_git.join("info/exclude"),
+            b"submodule-secret.txt\n",
+        )
+        .expect("write submodule exclude");
+        fs::create_dir_all(&submodule).expect("create submodule checkout");
+        fs::write(
+            submodule.join(".git"),
+            b"gitdir: ../.git/modules/dependency\n",
+        )
+        .expect("write submodule pointer");
+        fs::write(submodule.join("submodule-secret.txt"), b"fixture")
+            .expect("write submodule secret");
+
+        let submodule_result = Walker::new(&submodule)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk submodule checkout");
+        assert!(
+            !relative_paths(submodule_result.entries(), &submodule)
+                .contains(&PathBuf::from("submodule-secret.txt")),
+            "the submodule pointer must use its own info/exclude"
+        );
+    }
+
+    #[test]
+    fn absolute_and_malformed_gitdir_pointers_are_handled_without_rules() {
+        let fixture = Fixture::new();
+        let checkout = fixture.root.join("absolute-worktree");
+        let git_directory = fixture.root.join("separate-git-directory");
+        fs::create_dir_all(git_directory.join("info")).expect("create separate git info");
+        fs::write(git_directory.join("info/exclude"), b"absolute-secret.txt\n")
+            .expect("write absolute exclude");
+        fs::create_dir_all(&checkout).expect("create absolute checkout");
+        fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", git_directory.display()),
+        )
+        .expect("write absolute pointer");
+        fs::write(checkout.join("absolute-secret.txt"), b"fixture").expect("write absolute secret");
+
+        let absolute_result = Walker::new(&checkout)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk absolute pointer checkout");
+        assert!(
+            !relative_paths(absolute_result.entries(), &checkout)
+                .contains(&PathBuf::from("absolute-secret.txt"))
+        );
+
+        let malformed = fixture.root.join("malformed-pointer");
+        fs::create_dir_all(&malformed).expect("create malformed checkout");
+        fs::write(malformed.join(".git"), b"gitdir: \nextra data\n")
+            .expect("write malformed pointer");
+        fs::write(malformed.join("not-excluded.txt"), b"fixture")
+            .expect("write malformed candidate");
+        let malformed_result = Walker::new(&malformed)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("malformed metadata is skipped");
+        assert!(
+            relative_paths(malformed_result.entries(), &malformed)
+                .contains(&PathBuf::from("not-excluded.txt")),
+            "a malformed pointer must add no repository rules"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_gitdir_pointer_is_skipped_like_unreadable_repository_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        let checkout = fixture.root.join("unreadable-pointer");
+        fs::create_dir_all(&checkout).expect("create checkout");
+        let pointer = checkout.join(".git");
+        fs::write(&pointer, b"gitdir: ../missing-git-directory\n").expect("write pointer file");
+        fs::write(checkout.join("not-excluded.txt"), b"fixture").expect("write candidate");
+
+        let original_permissions = fs::metadata(&pointer)
+            .expect("read pointer metadata")
+            .permissions();
+        fs::set_permissions(&pointer, fs::Permissions::from_mode(0o000))
+            .expect("make pointer unreadable");
+        if fs::read(&pointer).is_ok() {
+            // A privileged test process can bypass mode bits. There is no
+            // portable way to arrange an unreadable regular file for it.
+            fs::set_permissions(&pointer, original_permissions)
+                .expect("restore pointer permissions");
+            return;
+        }
+
+        let result = Walker::new(&checkout)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("unreadable metadata is skipped rather than reported");
+        fs::set_permissions(&pointer, original_permissions).expect("restore pointer permissions");
+
+        assert!(
+            result.errors().is_empty(),
+            "unreadable repository metadata follows the existing silent policy"
+        );
+        assert!(
+            relative_paths(result.entries(), &checkout)
+                .contains(&PathBuf::from("not-excluded.txt")),
+            "an unreadable pointer must add no repository rules"
+        );
+    }
+
+    #[test]
+    fn nested_repositories_remain_traversed_with_the_outer_ignore_chain() {
+        let fixture = Fixture::new();
+        fixture.write("nested/.git/config");
+        fixture.write("nested/outer.tmp");
+        fixture.write("nested/keep.tmp");
+        fixture.write("nested/inner-only.tmp");
+        fs::write(fixture.root.join(".gitignore"), b"*.tmp\n").expect("write outer ignore rules");
+        fs::write(
+            fixture.root.join("nested/.gitignore"),
+            b"!keep.tmp\ninner-only.tmp\n",
+        )
+        .expect("write nested repository rules");
+
+        let result = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("walk nested repository");
+        let paths = relative_paths(result.entries(), &fixture.root);
+        assert!(paths.contains(&PathBuf::from("nested/keep.tmp")));
+        assert!(!paths.contains(&PathBuf::from("nested/outer.tmp")));
+        assert!(!paths.contains(&PathBuf::from("nested/inner-only.tmp")));
+        assert!(
+            !paths.contains(&PathBuf::from("nested/.git/config")),
+            "the nested repository's control directory remains skipped"
+        );
     }
 
     #[test]
