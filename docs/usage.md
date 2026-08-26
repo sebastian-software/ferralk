@@ -150,7 +150,9 @@ Important defaults:
   single-threaded and cannot provide global sorting.
 
 `CancellationToken::cancel` requests a cooperative stop. It is safe to clone the
-token and keep it outside the walker.
+token and keep it outside the walker; walkers only observe it, so their own
+abort errors, worker-start failures, visitor stops, and panics do not cancel a
+token the caller may share or reuse.
 
 The request is observed at a bounded granularity rather than between every two
 filesystem operations. `collect()`, serial and parallel alike, reads the token
