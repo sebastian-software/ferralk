@@ -1,0 +1,23 @@
+{
+  "name": "@ferralk/node-bench",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Unpublished Node.js ecosystem benchmark harness for ferralk development.",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "bench": "node bench.mjs",
+    "check": "node --check bench.mjs && node bench.mjs --validate-only"
+  },
+  "dependencies": {
+    "fast-glob": "3.3.3",
+    "fdir": "6.5.0",
+    "glob": "13.0.6",
+    "micromatch": "4.0.8",
+    "minimatch": "10.2.6",
+    "picomatch": "4.0.7",
+    "tinyglobby": "0.2.17"
+  }
+}
