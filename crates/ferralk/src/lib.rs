@@ -579,6 +579,10 @@ pub struct Walker {
     error_policy: ErrorPolicy,
     cancellation: Option<CancellationToken>,
     respect_git_ignore: bool,
+    /// Explicit effective Git settings. `None` reads supported
+    /// repository-local config; `Some` wins over it.
+    git_ignore_case: Option<bool>,
+    git_precompose_unicode: Option<bool>,
     wildcard_mode: WildcardMode,
     threads: usize,
 }
@@ -629,6 +633,8 @@ impl Walker {
             error_policy: ErrorPolicy::default(),
             cancellation: None,
             respect_git_ignore: false,
+            git_ignore_case: None,
+            git_precompose_unicode: None,
             wildcard_mode: WildcardMode::default(),
             threads: std::thread::available_parallelism()
                 .map(std::num::NonZeroUsize::get)
@@ -926,6 +932,36 @@ impl Walker {
     #[must_use]
     pub const fn respect_git_ignore(mut self, enabled: bool) -> Self {
         self.respect_git_ignore = enabled;
+        self
+    }
+
+    /// Overrides the repository-local `core.ignoreCase` value used by
+    /// [`Walker::respect_git_ignore`].
+    ///
+    /// Git sets this value when `git init` or `git clone` probes a
+    /// case-insensitive filesystem. When enabled, Ferralk mirrors Git's
+    /// ASCII-only ignore-rule case folding. The override takes precedence over
+    /// the repository's local config and is useful when Git's effective value
+    /// comes from a global config, include, or environment that Ferralk does
+    /// not read.
+    #[must_use]
+    pub const fn git_ignore_case(mut self, enabled: bool) -> Self {
+        self.git_ignore_case = Some(enabled);
+        self
+    }
+
+    /// Overrides the repository-local `core.precomposeUnicode` value used by
+    /// [`Walker::respect_git_ignore`].
+    ///
+    /// Git implements this filesystem adaptation only on macOS. There, an
+    /// enabled value converts valid UTF-8 candidate path components to NFC
+    /// before ignore matching; invalid bytes remain byte-exact. On other
+    /// platforms this method is retained for portable builder code but has no
+    /// effect, matching Git's platform applicability. The override takes
+    /// precedence over repository-local config.
+    #[must_use]
+    pub const fn git_precompose_unicode(mut self, enabled: bool) -> Self {
+        self.git_precompose_unicode = Some(enabled);
         self
     }
 
@@ -1782,6 +1818,20 @@ impl Listing {
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.entries().iter().any(|entry| entry.name == *name)
     }
+
+    /// Whether a directory contains a possible spelling of a Git ignore file.
+    /// The caller still opens the canonical name: on a case-sensitive
+    /// filesystem that open fails for `.GITIGNORE`, while on APFS/NTFS it
+    /// resolves exactly as Git's `open(".gitignore")` does.
+    pub(crate) fn contains_git_ignore_name(&self, name: &str) -> bool {
+        self.contains(name)
+            || self.entries().iter().any(|entry| {
+                entry
+                    .name
+                    .as_encoded_bytes()
+                    .eq_ignore_ascii_case(name.as_bytes())
+            })
+    }
 }
 
 #[cfg_attr(all(feature = "native-macos", target_os = "macos"), allow(dead_code))]
@@ -2403,6 +2453,7 @@ mod tests {
         collections::{HashMap, HashSet},
         fs,
         path::{Path, PathBuf},
+        process::Command,
         sync::{
             Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -3777,6 +3828,371 @@ mod tests {
         assert!(!streamed_paths.contains(&PathBuf::from("build")));
     }
 
+    fn git_check_ignore(root: &Path, candidate: &str) -> bool {
+        let status = Command::new("git")
+            .args(["check-ignore", "--no-index", "--quiet", "--", candidate])
+            .current_dir(root)
+            .status()
+            .expect("run Git ignore oracle");
+        match status.code() {
+            Some(0) => true,
+            Some(1) => false,
+            other => panic!("git check-ignore failed with {other:?}"),
+        }
+    }
+
+    fn git_config_bool(root: &Path, key: &str) -> bool {
+        let output = Command::new("git")
+            .args(["config", "--type=bool", "--get", key])
+            .current_dir(root)
+            .output()
+            .expect("run Git config boolean oracle");
+        assert!(
+            output.status.success(),
+            "Git config boolean oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        match String::from_utf8(output.stdout)
+            .expect("Git config boolean output is UTF-8")
+            .trim()
+        {
+            "true" => true,
+            "false" => false,
+            value => panic!("unexpected Git config boolean output: {value:?}"),
+        }
+    }
+
+    fn git_config_file_bool(config: &Path, key: &str) -> bool {
+        let output = Command::new("git")
+            .args(["config", "--file"])
+            .arg(config)
+            .args(["--type=bool", "--get", key])
+            .output()
+            .expect("run Git config file boolean oracle");
+        assert!(
+            output.status.success(),
+            "Git config file boolean oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        match String::from_utf8(output.stdout)
+            .expect("Git config boolean output is UTF-8")
+            .trim()
+        {
+            "true" => true,
+            "false" => false,
+            value => panic!("unexpected Git config boolean output: {value:?}"),
+        }
+    }
+
+    #[test]
+    fn repository_ignorecase_matches_git_for_rules_negation_and_anchors() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.root.join(".git")).expect("create Git metadata");
+        fs::write(
+            fixture.root.join(".git/config"),
+            b"[CoRe]\nignoreCase = YeS\n",
+        )
+        .expect("write local config");
+        fs::write(
+            fixture.root.join(".gitignore"),
+            b"Build.LOG\nDist/\n!Kept.LOG\n/src/Anchored.LOG\n",
+        )
+        .expect("write ignore rules");
+        for path in [
+            "BUILD.log",
+            "DIST/deep.txt",
+            "kept.log",
+            "SRC/ANCHORED.log",
+            "other/ANCHORED.log",
+        ] {
+            fixture.write(path);
+        }
+
+        // The Git oracle is configured exactly as the repository is. This
+        // catches the rule compilation, not merely a hand-written expectation.
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("initialize Git oracle");
+        assert!(initialized.success());
+        let configured = Command::new("git")
+            .args(["config", "core.ignoreCase", "true"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("configure Git oracle");
+        assert!(configured.success());
+
+        let serial = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .threads(1)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("serial walk succeeds");
+        let parallel = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .threads(4)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("parallel walk succeeds");
+        let streamed = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .stream()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream succeeds");
+        for paths in [
+            relative_paths(serial.entries(), &fixture.root),
+            relative_paths(parallel.entries(), &fixture.root),
+            relative_paths(&streamed, &fixture.root),
+        ] {
+            for candidate in [
+                "BUILD.log",
+                "DIST/deep.txt",
+                "kept.log",
+                "SRC/ANCHORED.log",
+                "other/ANCHORED.log",
+            ] {
+                assert_eq!(
+                    !paths.contains(&PathBuf::from(candidate)),
+                    git_check_ignore(&fixture.root, candidate),
+                    "Ferralk must agree with Git for {candidate}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_ignorecase_false_and_walker_override_take_precedence() {
+        let fixture = Fixture::new();
+        fixture.write("BUILD.log");
+        fs::create_dir_all(fixture.root.join(".git")).expect("create Git metadata");
+        fs::write(
+            fixture.root.join(".git/config"),
+            b"[core]\nignorecase = true\nIGNORECASE = off\n",
+        )
+        .expect("write last-value local config");
+        fs::write(fixture.root.join(".gitignore"), b"build.log\n").expect("write rule");
+
+        let local_false = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk local false");
+        assert!(
+            relative_paths(local_false.entries(), &fixture.root)
+                .contains(&PathBuf::from("BUILD.log"))
+        );
+
+        let override_true = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .git_ignore_case(true)
+            .collect()
+            .expect("walk override true");
+        assert!(
+            !relative_paths(override_true.entries(), &fixture.root)
+                .contains(&PathBuf::from("BUILD.log"))
+        );
+    }
+
+    #[test]
+    fn numeric_and_empty_ignorecase_values_match_the_git_oracle() {
+        let fixture = Fixture::new();
+        fixture.write("BUILD.log");
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("initialize Git oracle");
+        assert!(initialized.success());
+        fs::write(fixture.root.join(".gitignore"), b"build.log\n").expect("write rule");
+        let config = fixture.root.join(".git/config");
+
+        for (value, expected) in [
+            ("", false),
+            ("\"\"", false),
+            ("+0", false),
+            ("-0", false),
+            ("+2", true),
+            ("-7", true),
+            ("  +2  # whitespace and comment", true),
+        ] {
+            fs::write(
+                &config,
+                format!("[core]\nignoreCase = {}\nIGNORECASE = {value}\n", !expected),
+            )
+            .expect("write duplicate config");
+            assert_eq!(
+                git_config_bool(&fixture.root, "core.ignoreCase"),
+                expected,
+                "Git must accept {value:?}",
+            );
+            let walked = Walker::new(&fixture.root)
+                .respect_git_ignore(true)
+                .collect()
+                .expect("walk with Git boolean value");
+            assert_eq!(
+                !relative_paths(walked.entries(), &fixture.root)
+                    .contains(&PathBuf::from("BUILD.log")),
+                expected,
+                "the later {value:?} value must override the earlier opposite value",
+            );
+        }
+
+        fs::write(&config, b"[core]\nignoreCase = false\nIGNORECASE\n")
+            .expect("write bare boolean config");
+        assert!(git_config_bool(&fixture.root, "core.ignoreCase"));
+        let bare_true = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk with bare true");
+        assert!(
+            !relative_paths(bare_true.entries(), &fixture.root)
+                .contains(&PathBuf::from("BUILD.log")),
+            "a bare key must retain Git's true behavior"
+        );
+
+        fs::write(
+            &config,
+            b"[core]\nignoreCase = false\nIGNORECASE = t\\\nr\\\nue\n\
+              [core \"unrelated\"]\nignoreCase = false\n",
+        )
+        .expect("write continued and subsection config");
+        assert!(git_config_bool(&fixture.root, "core.ignoreCase"));
+        let continued_true = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk with continued boolean config");
+        assert!(
+            !relative_paths(continued_true.entries(), &fixture.root)
+                .contains(&PathBuf::from("BUILD.log")),
+            "a later subsection must not override the top-level continued true value"
+        );
+    }
+
+    #[test]
+    fn case_variant_ignore_file_follows_the_filesystem_canonical_open() {
+        let fixture = Fixture::new();
+        fixture.write("build.log");
+        fs::write(fixture.root.join(".GITIGNORE"), b"build.log\n")
+            .expect("write case variant ignore file");
+        let canonical_open_resolves = fs::read(fixture.root.join(".gitignore")).is_ok();
+
+        let walked = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("walk succeeds");
+        let paths = relative_paths(walked.entries(), &fixture.root);
+        assert!(paths.contains(&PathBuf::from(".GITIGNORE")));
+        assert_eq!(
+            !paths.contains(&PathBuf::from("build.log")),
+            canonical_open_resolves,
+            "a case variant is a rule file only if Git's canonical open resolves it"
+        );
+    }
+
+    #[test]
+    fn multi_root_walks_keep_each_repository_ignorecase_setting() {
+        let fixture = Fixture::new();
+        let nested = fixture.root.join("nested");
+        fixture.write("nested/BUILD.log");
+        fs::create_dir_all(fixture.root.join(".git")).expect("create outer Git metadata");
+        fs::create_dir_all(nested.join(".git")).expect("create nested Git metadata");
+        fs::write(
+            fixture.root.join(".git/config"),
+            b"[core]\nignorecase = true\n",
+        )
+        .expect("write outer config");
+        fs::write(nested.join(".git/config"), b"[core]\nignorecase = false\n")
+            .expect("write nested config");
+        fs::write(fixture.root.join(".gitignore"), b"build.log\n").expect("write outer rule");
+        fs::write(nested.join(".gitignore"), b"build.log\n").expect("write nested rule");
+
+        let walked = Walker::new(&fixture.root)
+            .add_root(&nested)
+            .expect("add nested root")
+            .add_root(&nested)
+            .expect("add duplicate nested root")
+            .respect_git_ignore(true)
+            .collect()
+            .expect("multi-root walk succeeds");
+        let emitted = walked
+            .entries()
+            .iter()
+            .filter(|entry| entry.path() == nested.join("BUILD.log"))
+            .count();
+        // The outer root folds and suppresses this entry. Each independent
+        // nested root uses its explicit false setting and emits one copy.
+        assert_eq!(emitted, 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn repository_precomposeunicode_matches_the_macos_git_oracle() {
+        let fixture = Fixture::new();
+        let decomposed = "cafe\u{301}.txt";
+        fs::write(fixture.root.join(".gitignore"), "caf\u{e9}.txt\n").expect("write NFC rule");
+        fixture.write(decomposed);
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("initialize Git oracle");
+        assert!(initialized.success());
+        let config = fixture.root.join(".git/config");
+        fs::write(
+            &config,
+            b"[core]\nprecomposeUnicode = false\nPRECOMPOSEUNICODE = t\\\nr\\\nue\n\
+              [core \"unrelated\"]\nprecomposeUnicode = false\n",
+        )
+        .expect("write continued precompose Unicode config");
+        assert!(git_config_bool(&fixture.root, "core.precomposeUnicode"));
+
+        assert!(git_check_ignore(&fixture.root, decomposed));
+        let enabled = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk with NFC adaptation");
+        assert!(
+            !relative_paths(enabled.entries(), &fixture.root).contains(&PathBuf::from(decomposed))
+        );
+
+        let forced_false = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .git_precompose_unicode(false)
+            .collect()
+            .expect("walk with explicit false override");
+        assert!(
+            relative_paths(forced_false.entries(), &fixture.root)
+                .contains(&PathBuf::from(decomposed))
+        );
+
+        fs::write(
+            &config,
+            b"[core]\nprecomposeUnicode = \"\"\n\
+              [core \"unrelated\"]\nprecomposeUnicode = true\n",
+        )
+        .expect("write empty precompose Unicode config");
+        assert!(!git_config_bool(&fixture.root, "core.precomposeUnicode"));
+        assert!(!git_check_ignore(&fixture.root, decomposed));
+        let disabled = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk without NFC adaptation");
+        assert!(
+            relative_paths(disabled.entries(), &fixture.root).contains(&PathBuf::from(decomposed))
+        );
+
+        let forced_true = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .git_precompose_unicode(true)
+            .collect()
+            .expect("walk with explicit true override");
+        assert!(
+            !relative_paths(forced_true.entries(), &fixture.root)
+                .contains(&PathBuf::from(decomposed))
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn source_walk_gitignore_matches_non_utf8_file_names_on_linux() {
@@ -4046,6 +4462,52 @@ mod tests {
             !relative_paths(submodule_result.entries(), &submodule)
                 .contains(&PathBuf::from("submodule-secret.txt")),
             "the submodule pointer must use its own info/exclude"
+        );
+    }
+
+    #[test]
+    fn linked_worktree_config_overrides_the_common_repository_setting() {
+        let fixture = Fixture::new();
+        let checkout = fixture.root.join("linked-worktree");
+        let common_git = fixture.root.join("main/.git");
+        let private_git = common_git.join("worktrees/linked-worktree");
+        fs::create_dir_all(&checkout).expect("create linked checkout");
+        fs::create_dir_all(&private_git).expect("create private Git directory");
+        fs::write(private_git.join("commondir"), b"../..\n").expect("write commondir");
+        fs::create_dir_all(&common_git).expect("create common Git directory");
+        fs::write(
+            common_git.join("config"),
+            b"[extensions]\nworktreeConfig = f\\\nalse\nWORKTREECONFIG = t\\\nr\\\nue\n\
+              [extensions \"unrelated\"]\nworktreeConfig = false\n\
+              [core]\nignorecase = false\n",
+        )
+        .expect("write continued common config");
+        fs::write(
+            private_git.join("config.worktree"),
+            b"[CORE]\nignoreCASE = t\\\nr\\\nue\n\
+              [core \"unrelated\"]\nignoreCASE = false\n",
+        )
+        .expect("write continued private worktree config");
+        fs::write(
+            checkout.join(".git"),
+            b"gitdir: ../main/.git/worktrees/linked-worktree\n",
+        )
+        .expect("write worktree pointer");
+        fs::write(checkout.join(".gitignore"), b"build.log\n").expect("write ignore rule");
+        fs::write(checkout.join("BUILD.log"), b"fixture").expect("write mixed-case candidate");
+
+        assert!(git_config_file_bool(
+            &common_git.join("config"),
+            "extensions.worktreeConfig"
+        ));
+
+        let walked = Walker::new(&checkout)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk linked worktree");
+        assert!(
+            !relative_paths(walked.entries(), &checkout).contains(&PathBuf::from("BUILD.log")),
+            "private config.worktree must win after the common config"
         );
     }
 
