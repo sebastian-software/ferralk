@@ -20,7 +20,7 @@ use std::{
     },
 };
 
-use ferralk_glob::{Pattern, PatternError, PatternOptions};
+use ferralk_glob::{Pattern, PatternError, PatternOptions, WalkerPathViability};
 
 pub use ferralk_glob;
 
@@ -1154,13 +1154,13 @@ fn walker_pattern_for_root(
         absolute::Rewrite::Relative => {
             absolute::reject_path_shaped(pattern, syntax)?;
             let parsed = Pattern::compile(pattern, options)?;
-            reject_unwalkable_relative_pattern(pattern, parsed.parsed_path_component_ranges())?;
+            reject_unwalkable_relative_pattern(parsed.walker_path_viability())?;
             Ok(Some(pattern.to_vec()))
         }
         absolute::Rewrite::Rooted(rooted) => {
             absolute::reject_path_shaped(&rooted, syntax)?;
             let parsed = Pattern::compile(&rooted, options)?;
-            reject_unwalkable_relative_pattern(&rooted, parsed.parsed_path_component_ranges())?;
+            reject_unwalkable_relative_pattern(parsed.walker_path_viability())?;
             Ok(Some(rooted))
         }
         absolute::Rewrite::Outside => Ok(None),
@@ -1172,53 +1172,29 @@ fn walker_pattern_for_root(
 /// A leading `./` remains the conventional harmless spelling for a pattern
 /// below the root, but `.` and `./` name the root itself, which a walk never
 /// emits. Any other real `.` component (`src/./x` or `src/.`) likewise names
-/// a spelling no root-relative candidate uses. Backslashes, classes, braces,
-/// and extglobs are matcher syntax, so the check sees only slash-delimited
-/// components as the compiled glob parser reports them.
-fn reject_unwalkable_relative_pattern(
-    pattern: &[u8],
-    component_ranges: &[std::ops::Range<usize>],
-) -> Result<(), PatternError> {
-    let components = component_ranges
-        .iter()
-        .map(|range| (&pattern[range.clone()], range.start))
-        .collect::<Vec<_>>();
-    let last = components
-        .iter()
-        .rev()
-        .find(|(component, _)| !component.is_empty())
-        .copied();
-    let Some((last, last_offset)) = last else {
-        return Ok(());
+/// a spelling no root-relative candidate uses. The glob compiler summarizes
+/// its actual expanded alternatives and extglob branches, so this policy never
+/// reparses matcher syntax.
+fn reject_unwalkable_relative_pattern(viability: WalkerPathViability) -> Result<(), PatternError> {
+    let message = match viability {
+        WalkerPathViability::Viable => return Ok(()),
+        WalkerPathViability::ParentComponent => {
+            "`..` in a walker-relative pattern is not resolved, because resolving it lexically would be wrong across a symlink"
+        }
+        WalkerPathViability::Root => {
+            "a walker-relative pattern that names the walk root itself selects nothing; add `/**` to select what is inside it"
+        }
+        WalkerPathViability::TrailingDot => {
+            "a walker-relative pattern ending in `/.` selects that directory itself; add `/**` to select what is inside it"
+        }
+        WalkerPathViability::DotComponent => {
+            "a walker-relative pattern with a `.` component is not normalized; remove `/.` to name the entry below that directory"
+        }
     };
-    let names_root = components
-        .iter()
-        .all(|(component, _)| component.is_empty() || component == b".");
-    for (index, (component, offset)) in components.iter().copied().enumerate() {
-        if component == b".." {
-            return Err(PatternError::new(
-                offset,
-                "`..` in a walker-relative pattern is not resolved, because resolving it lexically would be wrong across a symlink",
-            ));
-        }
-        if component == b"." && !(index == 0 && pattern.starts_with(b"./")) {
-            let message = if names_root {
-                "a walker-relative pattern that names the walk root itself selects nothing; add `/**` to select what is inside it"
-            } else if component == last {
-                "a walker-relative pattern ending in `/.` selects that directory itself; add `/**` to select what is inside it"
-            } else {
-                "a walker-relative pattern with a `.` component is not normalized; remove `/.` to name the entry below that directory"
-            };
-            return Err(PatternError::new(offset, message));
-        }
-    }
-    if last == b"." && names_root {
-        return Err(PatternError::new(
-            last_offset,
-            "a walker-relative pattern that names the walk root itself selects nothing; add `/**` to select what is inside it",
-        ));
-    }
-    Ok(())
+    // Branch expansion can create several equally valid source locations, so
+    // the compiler deliberately exposes a semantic summary rather than a raw
+    // range that would misleadingly point into one spelling.
+    Err(PatternError::new(0, message))
 }
 
 /// The pattern dialect every walker pattern is compiled in. Only
@@ -2851,6 +2827,8 @@ mod tests {
             "src/[]/../].rs",
             "{dead/../branch,src/main.rs}",
             "@(dead/../branch|src/main.rs)",
+            "src/[{],a}/../].rs",
+            "@(dead/{),x}/../branch|src/main.rs)",
         ] {
             for mode in [
                 WildcardMode::ComponentScoped,
@@ -2859,7 +2837,7 @@ mod tests {
                 Walker::new(&fixture.root)
                     .wildcard_mode(mode)
                     .include(pattern)
-                    .expect("matcher text is not a path operation");
+                    .unwrap_or_else(|error| panic!("{pattern} must stay matcher text: {error}"));
             }
         }
 
@@ -2868,19 +2846,47 @@ mod tests {
         // slash or `..` text inside either class stays matcher syntax too.
         // Extglobs retain their component-scoped matching rule, so only the
         // separator-crossing walk reads its slash-containing arm as one path.
-        for (pattern, matching_path) in [
-            ("{dead/../branch,src/main.rs}", "src/main.rs"),
-            ("@(dead/../branch|src/main.rs)", "src/main.rs"),
-            ("src/[[:alpha:]/../].rs", "src/a.rs"),
-            ("src/[]/../].rs", "src/].rs"),
+        for (pattern, matching_paths, component_scoped_paths) in [
+            (
+                "{dead/../branch,src/main.rs}",
+                &["src/main.rs"][..],
+                &["src/main.rs"][..],
+            ),
+            (
+                "@(dead/../branch|src/main.rs)",
+                &["src/main.rs"][..],
+                &[][..],
+            ),
+            (
+                "src/[[:alpha:]/../].rs",
+                &["src/a.rs"][..],
+                &["src/a.rs"][..],
+            ),
+            ("src/[]/../].rs", &["src/].rs"][..], &["src/].rs"][..]),
+            (
+                "src/[{],a}/../].rs",
+                &["src/a.rs", "src/].rs"][..],
+                &["src/a.rs", "src/].rs"][..],
+            ),
+            (
+                "@(dead/{),x}/../branch|src/main.rs)",
+                &["src/main.rs"][..],
+                &[][..],
+            ),
         ] {
             let matcher = Pattern::compile(pattern, traversal_pattern_options(false))
                 .expect("the reviewer regression is valid matcher syntax");
-            assert!(matcher.is_match(matching_path));
+            for matching_path in matching_paths {
+                assert!(matcher.is_match(matching_path));
+            }
             for mode in [
                 WildcardMode::ComponentScoped,
                 WildcardMode::SeparatorCrossing,
             ] {
+                Walker::new(&fixture.root)
+                    .wildcard_mode(mode)
+                    .exclude(pattern)
+                    .expect("the viable group arm is accepted for excludes");
                 for threads in [1, 4] {
                     let result = Walker::new(&fixture.root)
                         .wildcard_mode(mode)
@@ -2890,13 +2896,15 @@ mod tests {
                         .options(WalkOptions::default().sort(true).files_only(true))
                         .collect()
                         .expect("walk succeeds");
-                    let expected = if mode == WildcardMode::ComponentScoped
-                        && pattern == "@(dead/../branch|src/main.rs)"
-                    {
-                        Vec::new()
+                    let mut expected = if mode == WildcardMode::ComponentScoped {
+                        component_scoped_paths
                     } else {
-                        vec![PathBuf::from(matching_path)]
-                    };
+                        matching_paths
+                    }
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                    expected.sort();
                     assert_eq!(
                         relative_paths(result.entries(), &fixture.root),
                         expected,
@@ -2911,14 +2919,18 @@ mod tests {
                     .stream()
                     .collect::<Result<Vec<_>, _>>()
                     .expect("stream succeeds");
-                let expected = if mode == WildcardMode::ComponentScoped
-                    && pattern == "@(dead/../branch|src/main.rs)"
-                {
-                    Vec::new()
+                let mut actual = relative_paths(&streamed, &fixture.root);
+                actual.sort();
+                let mut expected = if mode == WildcardMode::ComponentScoped {
+                    component_scoped_paths
                 } else {
-                    vec![PathBuf::from(matching_path)]
-                };
-                assert_eq!(relative_paths(&streamed, &fixture.root), expected);
+                    matching_paths
+                }
+                .iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+                expected.sort();
+                assert_eq!(actual, expected);
             }
         }
 
@@ -2927,6 +2939,9 @@ mod tests {
             "src/{live,dead}/../main.rs",
             "{dead/[}]]/../x,src/main.rs}",
             "@(dead/[)]]/../x|src/main.rs)",
+            "{dead/../branch}",
+            "@(dead/../branch)",
+            "@(dead|src)/../main.rs",
         ] {
             assert!(
                 Walker::new(&fixture.root).include(pattern).is_err(),
@@ -2940,6 +2955,9 @@ mod tests {
             for pattern in [
                 "{dead/[}]]/../x,src/main.rs}",
                 "@(dead/[)]]/../x|src/main.rs)",
+                "{dead/../branch}",
+                "@(dead/../branch)",
+                "@(dead|src)/../main.rs",
             ] {
                 assert!(
                     Walker::new(&fixture.root)
