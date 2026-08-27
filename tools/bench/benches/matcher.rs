@@ -229,6 +229,35 @@ fn matcher(c: &mut Criterion) {
     c.bench_function("alternation/braces/non_matching", |benchmark| {
         benchmark.iter(|| black_box(alternation_braces.is_match(black_box(alternation_other))))
     });
+
+    // A positive extglob without an outer star uses the Thompson NFA. Keep an
+    // equivalent brace spelling beside it so the per-match state-management
+    // cost remains visible independently of the compatible extglob fallback.
+    let nfa_extglob = Pattern::compile("@(src|tests)/lib.rs", alternation_options)
+        .expect("fixed extglob benchmark pattern is valid");
+    let nfa_braces = Pattern::compile("{src,tests}/lib.rs", alternation_options)
+        .expect("fixed brace benchmark pattern is valid");
+    let nfa_matching = "src/lib.rs";
+    let nfa_non_matching = "vendor/lib.rs";
+    for candidate in [nfa_matching, nfa_non_matching] {
+        assert_eq!(
+            nfa_extglob.is_match_glob_path(candidate),
+            nfa_braces.is_match_glob_path(candidate),
+            "fixed extglob and brace benchmark inputs must have equal semantics"
+        );
+    }
+    c.bench_function("extglob_nfa/fixed/matching", |benchmark| {
+        benchmark.iter(|| black_box(nfa_extglob.is_match_glob_path(black_box(nfa_matching))))
+    });
+    c.bench_function("extglob_nfa/fixed/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(nfa_extglob.is_match_glob_path(black_box(nfa_non_matching))))
+    });
+    c.bench_function("extglob_nfa/brace/matching", |benchmark| {
+        benchmark.iter(|| black_box(nfa_braces.is_match_glob_path(black_box(nfa_matching))))
+    });
+    c.bench_function("extglob_nfa/brace/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(nfa_braces.is_match_glob_path(black_box(nfa_non_matching))))
+    });
     // The walker compiles every traversal pattern with extglob enabled, so a
     // pattern without extglob syntax used to pay a scan per entry too.
     let extglob_free = Pattern::compile("src/**/*.ts", alternation_options)
