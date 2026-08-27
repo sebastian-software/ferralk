@@ -118,7 +118,8 @@ jobs:
       - name: Check the platform-neutral fuzz targets
         run: >-
           cargo check --manifest-path fuzz/Cargo.toml
-          --bin pattern_parser --bin pattern_matcher --bin ferralk_vs_fast_glob
+          --bin pattern_parser --bin pattern_matcher --bin ignore_rule_parser
+          --bin ferralk_vs_fast_glob
           --locked
 
   msrv-policy:
