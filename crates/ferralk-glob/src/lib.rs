@@ -201,13 +201,20 @@ impl Pattern {
         options: PatternOptions,
     ) -> Result<Self, PatternError> {
         let pattern = pattern.as_ref();
-        // Every expanded byte keeps the offset from this original source. The
-        // compiler later owns any map needed by an extglob program, so this
-        // short-lived identity map does not enlarge `Pattern`'s public shape.
-        let source_offsets = (0..pattern.len()).collect::<Vec<_>>();
+        // Direct source is an implicit identity range. Brace expansion only
+        // materializes the few source spans whose byte positions actually
+        // change; a literal never pays one `usize` per input byte.
+        let source_provenance = SourceProvenance::Contiguous { source_start: 0 };
         let mut budget = IrBudget::new();
-        let mut compiled =
-            Self::compile_within(pattern, options, &mut budget, Some(&source_offsets))?;
+        let mut provenance_budget = ProvenanceBudget::new();
+        let mut compiled = Self::compile_within(
+            pattern,
+            options,
+            &mut budget,
+            &mut provenance_budget,
+            Some(&source_provenance),
+            pattern.starts_with(b"./"),
+        )?;
         let (viability, offset) = walker_path_analysis(&compiled.alternatives, &mut budget)?;
         compiled.walker_path_viability = viability;
         compiled.walker_path_problem_offset = offset;
@@ -249,7 +256,9 @@ impl Pattern {
         pattern: &[u8],
         options: PatternOptions,
         budget: &mut IrBudget,
-        walker_source_offsets: Option<&[usize]>,
+        provenance_budget: &mut ProvenanceBudget,
+        walker_source_provenance: Option<&SourceProvenance>,
+        leading_dot_is_normalized: bool,
     ) -> Result<Self, PatternError> {
         if options.braces {
             let parse_options = PatternOptions {
@@ -259,15 +268,18 @@ impl Pattern {
             let mut alternatives = Vec::new();
             let expanded = expand_brace_alternatives_with_provenance(
                 pattern,
-                walker_source_offsets,
+                walker_source_provenance,
                 options.escape,
+                provenance_budget,
             )?;
             for alternative in expanded {
                 let compiled = Self::compile_within(
                     &alternative.bytes,
                     parse_options,
                     budget,
-                    alternative.source_offsets.as_deref(),
+                    provenance_budget,
+                    alternative.source_provenance.as_ref(),
+                    leading_dot_is_normalized,
                 )?;
                 alternatives.extend(compiled.alternatives);
             }
@@ -279,7 +291,7 @@ impl Pattern {
         // particular an escaped dot and an ordinary dot both become a literal
         // matcher token, but only the latter is a path operation a walker
         // must reject.
-        let mut walker_path = WalkerPathShapeBuilder::default();
+        let mut walker_path = WalkerPathShapeBuilder::new(leading_dot_is_normalized);
         let mut index = 0;
         // Charged as the tokens appear rather than per byte: a literal run is
         // one token however long it is, so billing bytes would reject patterns
@@ -348,7 +360,7 @@ impl Pattern {
                     literals.push(byte);
                     walker_path.literal(
                         byte,
-                        walker_source_offsets.and_then(|offsets| offsets.get(index).copied()),
+                        walker_source_provenance.and_then(|provenance| provenance.offset_at(index)),
                     );
                     index += 1;
                 }
@@ -357,7 +369,14 @@ impl Pattern {
         flush_literals(&mut tokens, &mut literals);
         budget.charge(tokens.len() - charged, 0)?;
 
-        let extglob = compile_extglob(pattern, options, budget, walker_source_offsets)?;
+        let extglob = compile_extglob(
+            pattern,
+            options,
+            budget,
+            provenance_budget,
+            walker_source_provenance,
+            leading_dot_is_normalized,
+        )?;
         let fast_path = FastPath::compile(&tokens, options);
         let sweep = compile_sweep(&tokens, &fast_path, extglob.as_ref(), options, budget)?;
         let walker_path_shape = walker_path.finish();
@@ -713,7 +732,8 @@ impl Pattern {
             },
         );
         budget.charge(tokens.len(), 0)?;
-        let extglob = compile_extglob(&raw, options, budget, None)?;
+        let mut provenance_budget = ProvenanceBudget::new();
+        let extglob = compile_extglob(&raw, options, budget, &mut provenance_budget, None, false)?;
         let sweep = compile_sweep(&tokens, &fast_path, extglob.as_ref(), options, budget)?;
         Ok(CompiledAlternative {
             extglob,
@@ -2264,11 +2284,19 @@ impl WalkerComponent {
 /// real literal dot shape, a wildcard-bearing shape, or a separator.
 #[derive(Default)]
 struct WalkerPathShapeBuilder {
+    leading_dot_is_normalized: bool,
     components: Vec<WalkerComponent>,
     current: WalkerComponent,
 }
 
 impl WalkerPathShapeBuilder {
+    fn new(leading_dot_is_normalized: bool) -> Self {
+        Self {
+            leading_dot_is_normalized,
+            components: Vec::new(),
+            current: WalkerComponent::default(),
+        }
+    }
     fn literal(&mut self, byte: u8, offset: Option<usize>) {
         self.current.push_literal(byte, offset);
     }
@@ -2288,6 +2316,7 @@ impl WalkerPathShapeBuilder {
     fn finish(mut self) -> WalkerPathShape {
         self.components.push(self.current);
         WalkerPathShape {
+            leading_dot_is_normalized: self.leading_dot_is_normalized,
             components: self.components,
         }
     }
@@ -2295,6 +2324,7 @@ impl WalkerPathShapeBuilder {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct WalkerPathState {
+    leading_dot_is_normalized: bool,
     /// The number of components already closed by a separator, saturated once
     /// the first-component distinction no longer matters.
     completed_components: u8,
@@ -2305,9 +2335,10 @@ struct WalkerPathState {
     current: WalkerComponent,
 }
 
-impl Default for WalkerPathState {
-    fn default() -> Self {
+impl WalkerPathState {
+    fn new(leading_dot_is_normalized: bool) -> Self {
         Self {
+            leading_dot_is_normalized,
             completed_components: 0,
             all_empty_or_dot: true,
             first_parent: None,
@@ -2316,9 +2347,6 @@ impl Default for WalkerPathState {
             current: WalkerComponent::default(),
         }
     }
-}
-
-impl WalkerPathState {
     fn literal(&mut self, byte: u8, offset: Option<usize>) {
         self.current.push_literal(byte, offset);
     }
@@ -2359,7 +2387,10 @@ impl WalkerPathState {
         if component.kind == WalkerComponentKind::Parent && self.first_parent.is_none() {
             self.first_parent = Some(component);
         }
-        if component.kind == WalkerComponentKind::Dot && !first && self.first_dot.is_none() {
+        if component.kind == WalkerComponentKind::Dot
+            && (!first || !self.leading_dot_is_normalized)
+            && self.first_dot.is_none()
+        {
             self.first_dot = Some(component);
         }
         if component.kind != WalkerComponentKind::Empty {
@@ -2368,16 +2399,30 @@ impl WalkerPathState {
         self.completed_components = self.completed_components.saturating_add(1).min(2);
     }
 
-    fn finish(mut self) -> WalkerPathSummary {
+    fn finish(mut self) -> WalkerPathEvaluation {
         let component = std::mem::take(&mut self.current);
+        let selects_candidate = component.kind != WalkerComponentKind::Empty;
         self.record_component(component);
-        WalkerPathSummary {
-            all_empty_or_dot: self.all_empty_or_dot,
-            first_parent: self.first_parent,
-            first_dot: self.first_dot,
-            last_nonempty: self.last_nonempty,
+        WalkerPathEvaluation {
+            selects_candidate,
+            problem: WalkerPathSummary {
+                all_empty_or_dot: self.all_empty_or_dot,
+                first_parent: self.first_parent,
+                first_dot: self.first_dot,
+                last_nonempty: self.last_nonempty,
+            }
+            .problem(),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct WalkerPathEvaluation {
+    /// A trailing empty component is a directory spelling (`src/`), not an
+    /// emitted root-relative candidate. Nullable groups must not use it as a
+    /// viable escape from their real invalid arms.
+    selects_candidate: bool,
+    problem: Option<WalkerPathProblem>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2420,6 +2465,7 @@ impl WalkerPathSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WalkerPathShape {
+    leading_dot_is_normalized: bool,
     components: Vec<WalkerComponent>,
 }
 
@@ -2429,13 +2475,13 @@ impl WalkerPathShape {
     }
 
     fn problem(&self) -> Option<WalkerPathProblem> {
-        let mut state = WalkerPathState::default();
+        let mut state = WalkerPathState::new(self.leading_dot_is_normalized);
         state.append_shape(self);
-        state.finish().problem()
+        state.finish().problem
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct WalkerPathProblem {
     viability: WalkerPathViability,
     offset: Option<usize>,
@@ -2480,7 +2526,7 @@ impl CompiledExtglob {
         &self,
         budget: &mut IrBudget,
     ) -> Result<Option<WalkerPathProblem>, PatternError> {
-        let mut states = vec![WalkerPathState::default()];
+        let mut states = vec![WalkerPathState::new(self.leading_dot_is_normalized)];
         let mut index = 0;
         while let Some(step) = self.steps.get(index) {
             match step {
@@ -2494,9 +2540,9 @@ impl CompiledExtglob {
                     for state in &mut states {
                         state.literal(
                             *byte,
-                            self.walker_source_offsets
+                            self.walker_source_provenance
                                 .as_ref()
-                                .and_then(|offsets| offsets.get(index).copied()),
+                                .and_then(|provenance| provenance.offset_at(index)),
                         );
                     }
                     index += 1;
@@ -2536,13 +2582,24 @@ impl CompiledExtglob {
             }
         }
         let mut first_problem = None;
+        let mut saw_unselectable = false;
         for state in states {
-            let Some(problem) = state.finish().problem() else {
+            let evaluation = state.finish();
+            if !evaluation.selects_candidate {
+                saw_unselectable = true;
+                continue;
+            }
+            let Some(problem) = evaluation.problem else {
                 return Ok(None);
             };
             first_problem.get_or_insert(problem);
         }
-        Ok(first_problem)
+        Ok(first_problem.or_else(|| {
+            saw_unselectable.then_some(WalkerPathProblem {
+                viability: WalkerPathViability::Root,
+                offset: None,
+            })
+        }))
     }
 }
 
@@ -2791,6 +2848,36 @@ impl IrBudget {
     }
 }
 
+/// Bounds source-span metadata independently from matcher IR.
+///
+/// `SourceSpan` is three machine words. Capping the count at the established
+/// brace-copy byte ceiling keeps provenance below that ceiling while charging
+/// every materialized span before its vector allocation.
+struct ProvenanceBudget {
+    remaining: usize,
+}
+
+impl ProvenanceBudget {
+    const fn new() -> Self {
+        Self {
+            remaining: MAX_BRACE_EXPANSION_BYTES / std::mem::size_of::<SourceSpan>(),
+        }
+    }
+
+    fn charge(&mut self, spans: usize, offset: usize) -> Result<(), PatternError> {
+        match self.remaining.checked_sub(spans) {
+            Some(remaining) => {
+                self.remaining = remaining;
+                Ok(())
+            }
+            None => Err(PatternError {
+                offset,
+                message: "brace provenance is too large",
+            }),
+        }
+    }
+}
+
 /// Expands brace alternatives into the plain patterns a pattern stands for.
 ///
 /// [`Pattern::compile`] expands braces before it compiles anything; this
@@ -2828,19 +2915,115 @@ pub fn expand_braces(
     if !options.braces {
         return Ok(vec![pattern.to_vec()]);
     }
-    Ok(
-        expand_brace_alternatives_with_provenance(pattern, None, options.escape)?
-            .into_iter()
-            .map(|alternative| alternative.bytes)
-            .collect(),
-    )
+    let mut provenance_budget = ProvenanceBudget::new();
+    Ok(expand_brace_alternatives_with_provenance(
+        pattern,
+        None,
+        options.escape,
+        &mut provenance_budget,
+    )?
+    .into_iter()
+    .map(|alternative| alternative.bytes)
+    .collect())
 }
 
-/// One brace-expanded byte sequence and, when compilation requested it, the
-/// original byte position of every surviving byte.
+/// A contiguous output range that came from a contiguous source range.
+///
+/// Brace expansion removes delimiters and alternatives but never manufactures
+/// matcher bytes, so a handful of these spans preserves exact offsets without
+/// an `usize` allocation per source byte.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceSpan {
+    output_start: usize,
+    source_start: usize,
+    len: usize,
+}
+
+/// Original byte provenance for a compiled byte sequence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SourceProvenance {
+    Contiguous { source_start: usize },
+    Spans(Vec<SourceSpan>),
+}
+
+impl SourceProvenance {
+    fn offset_at(&self, index: usize) -> Option<usize> {
+        match self {
+            Self::Contiguous { source_start } => Some(source_start + index),
+            Self::Spans(spans) => spans.iter().find_map(|span| {
+                (index >= span.output_start && index - span.output_start < span.len)
+                    .then_some(span.source_start + index - span.output_start)
+            }),
+        }
+    }
+
+    fn span_count_in(&self, start: usize, end: usize) -> usize {
+        match self {
+            Self::Contiguous { .. } => usize::from(start < end),
+            Self::Spans(spans) => spans
+                .iter()
+                .filter(|span| span.output_start < end && span.output_start + span.len > start)
+                .count(),
+        }
+    }
+
+    fn append_range(
+        &self,
+        start: usize,
+        end: usize,
+        output_start: usize,
+        target: &mut Vec<SourceSpan>,
+    ) {
+        if start == end {
+            return;
+        }
+        match self {
+            Self::Contiguous { source_start } => target.push(SourceSpan {
+                output_start,
+                source_start: source_start + start,
+                len: end - start,
+            }),
+            Self::Spans(spans) => {
+                for span in spans {
+                    let span_end = span.output_start + span.len;
+                    let overlap_start = span.output_start.max(start);
+                    let overlap_end = span_end.min(end);
+                    if overlap_start < overlap_end {
+                        target.push(SourceSpan {
+                            output_start: output_start + overlap_start - start,
+                            source_start: span.source_start + overlap_start - span.output_start,
+                            len: overlap_end - overlap_start,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn slice(
+        &self,
+        start: usize,
+        end: usize,
+        provenance_budget: &mut ProvenanceBudget,
+        error_offset: usize,
+    ) -> Result<Self, PatternError> {
+        if let Self::Contiguous { source_start } = self {
+            return Ok(Self::Contiguous {
+                source_start: source_start + start,
+            });
+        }
+        let span_count = self.span_count_in(start, end);
+        provenance_budget.charge(span_count, error_offset)?;
+        let mut spans = Vec::with_capacity(span_count);
+        self.append_range(start, end, 0, &mut spans);
+        Ok(Self::Spans(spans))
+    }
+}
+
+/// One brace-expanded byte sequence and its compact source provenance.
 struct BraceExpansion {
     bytes: Vec<u8>,
-    source_offsets: Option<Vec<usize>>,
+    source_provenance: Option<SourceProvenance>,
 }
 
 /// Expands brace groups into one pattern per combination.
@@ -2863,20 +3046,21 @@ struct BraceExpansion {
 /// limit rejects exactly the patterns whose finished expansion would.
 fn expand_brace_alternatives_with_provenance(
     pattern: &[u8],
-    source_offsets: Option<&[usize]>,
+    source_provenance: Option<&SourceProvenance>,
     escapes: bool,
+    provenance_budget: &mut ProvenanceBudget,
 ) -> Result<Vec<BraceExpansion>, PatternError> {
     let Some(first_open) = first_unescaped_brace(pattern, escapes) else {
         return Ok(vec![BraceExpansion {
             bytes: pattern.to_vec(),
-            source_offsets: source_offsets.map(ToOwned::to_owned),
+            source_provenance: source_provenance.cloned(),
         }]);
     };
 
     let mut expanded = Vec::new();
     let mut pending = vec![BraceExpansion {
         bytes: pattern.to_vec(),
-        source_offsets: source_offsets.map(ToOwned::to_owned),
+        source_provenance: source_provenance.cloned(),
     }];
     let mut written = pattern.len();
     while let Some(current) = pending.pop() {
@@ -2913,19 +3097,41 @@ fn expand_brace_alternatives_with_provenance(
             bytes.extend_from_slice(&current.bytes[..open]);
             bytes.extend_from_slice(alternative);
             bytes.extend_from_slice(&current.bytes[close + 1..]);
-            let source_offsets = current.source_offsets.as_ref().map(|offsets| {
-                let mut combined = Vec::with_capacity(length);
-                combined.extend_from_slice(&offsets[..open]);
-                let alternative_start = open + 1 + range.start;
-                combined.extend_from_slice(
-                    &offsets[alternative_start..alternative_start + alternative.len()],
-                );
-                combined.extend_from_slice(&offsets[close + 1..]);
-                combined
-            });
+            let source_provenance = current
+                .source_provenance
+                .as_ref()
+                .map(|provenance| {
+                    let alternative_start = open + 1 + range.start;
+                    let span_count = provenance.span_count_in(0, open)
+                        + provenance.span_count_in(
+                            alternative_start,
+                            alternative_start + alternative.len(),
+                        )
+                        + provenance.span_count_in(close + 1, current.bytes.len());
+                    // This charges compact provenance before it is materialized.
+                    // Its bounded metadata budget prevents expansion from turning
+                    // a small matcher into an unbounded offset side allocation.
+                    provenance_budget.charge(span_count, first_open)?;
+                    let mut spans = Vec::with_capacity(span_count);
+                    provenance.append_range(0, open, 0, &mut spans);
+                    provenance.append_range(
+                        alternative_start,
+                        alternative_start + alternative.len(),
+                        open,
+                        &mut spans,
+                    );
+                    provenance.append_range(
+                        close + 1,
+                        current.bytes.len(),
+                        open + alternative.len(),
+                        &mut spans,
+                    );
+                    Ok::<_, PatternError>(SourceProvenance::Spans(spans))
+                })
+                .transpose()?;
             pending.push(BraceExpansion {
                 bytes,
-                source_offsets,
+                source_provenance,
             });
         }
     }
@@ -2934,8 +3140,9 @@ fn expand_brace_alternatives_with_provenance(
 
 #[cfg(test)]
 fn expand_brace_alternatives(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8>>, PatternError> {
+    let mut provenance_budget = ProvenanceBudget::new();
     Ok(
-        expand_brace_alternatives_with_provenance(pattern, None, escapes)?
+        expand_brace_alternatives_with_provenance(pattern, None, escapes, &mut provenance_budget)?
             .into_iter()
             .map(|alternative| alternative.bytes)
             .collect(),
@@ -3053,7 +3260,8 @@ struct CompiledExtglob {
     groups: Vec<ExtglobGroup>,
     /// Original-source byte offsets for `steps`, retained after brace
     /// expansion so walker diagnostics preserve `PatternError` provenance.
-    walker_source_offsets: Option<Vec<usize>>,
+    walker_source_provenance: Option<SourceProvenance>,
+    leading_dot_is_normalized: bool,
 }
 
 /// What the walk does at one byte offset.
@@ -3110,7 +3318,9 @@ fn compile_extglob(
     pattern: &[u8],
     options: PatternOptions,
     budget: &mut IrBudget,
-    walker_source_offsets: Option<&[usize]>,
+    provenance_budget: &mut ProvenanceBudget,
+    walker_source_provenance: Option<&SourceProvenance>,
+    leading_dot_is_normalized: bool,
 ) -> Result<Option<CompiledExtglob>, PatternError> {
     if !options.extglob || !contains_extglob(pattern, options.escape) {
         return Ok(None);
@@ -3133,7 +3343,8 @@ fn compile_extglob(
             options,
             &mut groups,
             budget,
-            walker_source_offsets,
+            provenance_budget,
+            walker_source_provenance,
         )?;
         match &step {
             ExtglobStep::Group(group) => pending.push(groups[*group].rest),
@@ -3157,7 +3368,8 @@ fn compile_extglob(
     Ok(Some(CompiledExtglob {
         steps,
         groups,
-        walker_source_offsets: walker_source_offsets.map(ToOwned::to_owned),
+        walker_source_provenance: walker_source_provenance.cloned(),
+        leading_dot_is_normalized,
     }))
 }
 
@@ -3168,7 +3380,8 @@ fn compile_extglob_step(
     options: PatternOptions,
     groups: &mut Vec<ExtglobGroup>,
     budget: &mut IrBudget,
-    walker_source_offsets: Option<&[usize]>,
+    provenance_budget: &mut ProvenanceBudget,
+    walker_source_provenance: Option<&SourceProvenance>,
 ) -> Result<ExtglobStep, PatternError> {
     if let Some(kind) = detect_extglob_at(pattern, index) {
         let open = index + 1;
@@ -3180,11 +3393,19 @@ fn compile_extglob_step(
         let mut alternatives = Vec::new();
         for range in split_extglob_alternatives(&pattern[open + 1..close], options.escape) {
             let start = open + 1 + range.start;
+            let alternative_provenance = match walker_source_provenance {
+                Some(provenance) => {
+                    Some(provenance.slice(start, open + 1 + range.end, provenance_budget, index)?)
+                }
+                None => None,
+            };
             alternatives.push(compile_extglob_alternative(
                 &pattern[start..open + 1 + range.end],
                 options,
                 budget,
-                walker_source_offsets.map(|offsets| &offsets[start..open + 1 + range.end]),
+                provenance_budget,
+                alternative_provenance.as_ref(),
+                false,
             )?);
         }
         groups.push(ExtglobGroup {
@@ -3227,7 +3448,9 @@ fn compile_extglob_alternative(
     alternative: &[u8],
     options: PatternOptions,
     budget: &mut IrBudget,
-    walker_source_offsets: Option<&[usize]>,
+    provenance_budget: &mut ProvenanceBudget,
+    walker_source_provenance: Option<&SourceProvenance>,
+    leading_dot_is_normalized: bool,
 ) -> Result<ExtglobAlternative, PatternError> {
     let options = PatternOptions {
         braces: false,
@@ -3239,12 +3462,18 @@ fn compile_extglob_alternative(
     // A syntax error in one alternative is not a compile failure — it is an
     // alternative that matches nothing, as it always was. Running out of budget
     // is a different thing and has to reach the caller.
-    let compiled =
-        match Pattern::compile_within(alternative, options, budget, walker_source_offsets) {
-            Ok(pattern) => Some(pattern.alternatives),
-            Err(error) if error.message() == TOO_MUCH_COMPILED_IR => return Err(error),
-            Err(_) => None,
-        };
+    let compiled = match Pattern::compile_within(
+        alternative,
+        options,
+        budget,
+        provenance_budget,
+        walker_source_provenance,
+        leading_dot_is_normalized,
+    ) {
+        Ok(pattern) => Some(pattern.alternatives),
+        Err(error) if error.message() == TOO_MUCH_COMPILED_IR => return Err(error),
+        Err(_) => None,
+    };
     let width = compiled.as_deref().and_then(fixed_token_width);
     Ok(ExtglobAlternative { compiled, width })
 }
@@ -4195,6 +4424,26 @@ mod tests {
             WalkerPathViability::Viable
         );
 
+        // Only a raw spelling that starts with `./` is normalized by walker
+        // filters. A compiler-produced leading component is still a real
+        // unmatchable dot component, and a nullable empty arm ending in `/`
+        // cannot rescue an otherwise invalid positive arm.
+        for source in ["@(./a.rs)", "{./a.rs}", "src/?(./a.rs)", "src/*(./a.rs)"] {
+            assert_eq!(
+                Pattern::compile(source, options)
+                    .expect("edge-normalization regression compiles")
+                    .walker_path_viability(),
+                WalkerPathViability::DotComponent,
+                "{source} has no selectable walker candidate"
+            );
+        }
+        assert_eq!(
+            Pattern::compile("./a.rs", options)
+                .expect("raw normalized spelling compiles")
+                .walker_path_viability(),
+            WalkerPathViability::Viable
+        );
+
         // Each group has two compiler arms, but their walker summaries are
         // equal. This used to construct 2^32 duplicate state vectors; the
         // canonical state set stays one state per group transition.
@@ -4244,6 +4493,50 @@ mod tests {
         assert_eq!(
             super::expand_brace_alternatives(b"{x,{y,z}}!", true).unwrap(),
             vec![b"x!".to_vec(), b"y!".to_vec(), b"z!".to_vec()]
+        );
+    }
+
+    #[test]
+    fn brace_provenance_stays_span_bounded_for_large_and_branching_sources() {
+        let mut provenance_budget = super::ProvenanceBudget::new();
+        let literal = vec![b'x'; 1 << 20];
+        let expanded = super::expand_brace_alternatives_with_provenance(
+            &literal,
+            Some(&super::SourceProvenance::Contiguous { source_start: 0 }),
+            true,
+            &mut provenance_budget,
+        )
+        .expect("large literal has no provenance allocation per byte");
+        assert!(matches!(
+            expanded[0].source_provenance,
+            Some(super::SourceProvenance::Contiguous { source_start: 0 })
+        ));
+
+        let branching = "{a,b}".repeat(12);
+        let expanded = super::expand_brace_alternatives_with_provenance(
+            branching.as_bytes(),
+            Some(&super::SourceProvenance::Contiguous { source_start: 0 }),
+            true,
+            &mut provenance_budget,
+        )
+        .expect("bounded brace expansion compiles");
+        assert_eq!(expanded.len(), 1 << 12);
+        let span_count = expanded
+            .iter()
+            .map(|alternative| match &alternative.source_provenance {
+                Some(super::SourceProvenance::Spans(spans)) => spans.len(),
+                Some(super::SourceProvenance::Contiguous { .. }) | None => 0,
+            })
+            .sum::<usize>();
+        assert!(
+            span_count <= 12 * (1 << 12),
+            "one compact source span per selected brace arm, never one usize per output byte"
+        );
+
+        let mut capped = super::ProvenanceBudget::new();
+        assert!(
+            capped.charge(super::MAX_BRACE_EXPANSION_BYTES, 0).is_err(),
+            "provenance rejects before a span vector can exceed its byte bound"
         );
     }
 

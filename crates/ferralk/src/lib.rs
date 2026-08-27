@@ -2971,6 +2971,10 @@ mod tests {
             "@(dead/../branch)",
             "@(dead|src)/../main.rs",
             "src/@(./a.rs)",
+            "@(./a.rs)",
+            "{./a.rs}",
+            "src/?(./a.rs)",
+            "src/*(./a.rs)",
         ] {
             assert!(
                 Walker::new(&fixture.root).include(pattern).is_err(),
@@ -2988,6 +2992,10 @@ mod tests {
                 "@(dead/../branch)",
                 "@(dead|src)/../main.rs",
                 "src/@(./a.rs)",
+                "@(./a.rs)",
+                "{./a.rs}",
+                "src/?(./a.rs)",
+                "src/*(./a.rs)",
             ] {
                 assert!(
                     Walker::new(&fixture.root)
