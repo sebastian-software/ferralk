@@ -544,6 +544,17 @@ mod tests {
         }
     }
 
+    fn getdents_latch_state_for_test() -> bool {
+        // A panic drops `GetdentsLatch` before it releases its guard. Acquire
+        // the same lock again before observing the restored state so another
+        // parallel latch test cannot change it between restoration and this
+        // assertion.
+        let _lock = GETDENTS_LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        GETDENTS_UNSUPPORTED.load(Ordering::SeqCst)
+    }
+
     fn record(name: &[u8], directory_type: u8) -> Vec<u8> {
         let length = (NAME_OFFSET + name.len() + 1 + 7) & !7;
         let mut record = vec![0_u8; length];
@@ -891,7 +902,7 @@ mod tests {
         }));
         assert!(result.is_err(), "the injected panic was caught");
         assert_eq!(
-            GETDENTS_UNSUPPORTED.load(Ordering::SeqCst),
+            getdents_latch_state_for_test(),
             before.expect("guard recorded the prior latch state")
         );
     }
