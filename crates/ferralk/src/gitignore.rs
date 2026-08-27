@@ -15,7 +15,11 @@
 //! exactly once, whatever the worker count. A shared cache would add
 //! synchronization to a problem the task graph has already solved.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use super::{
     DirectoryBackend, Listing, Walker, glob_path_bytes,
@@ -25,10 +29,18 @@ use super::{
 /// Ignore files of a directory, in increasing precedence: a later file wins.
 const IGNORE_FILES: [&str; 2] = [".gitignore", ".ignore"];
 
-/// Repository-wide excludes, which the root's own ignore files override. Git
-/// reads this file for the repository the walk root belongs to; ferralk applies
-/// ignore rules from the walk root downwards, so it reads the one there.
-const REPOSITORY_EXCLUDE_FILE: &str = ".git/info/exclude";
+/// Repository-wide excludes, which the root's own ignore files override.
+const REPOSITORY_EXCLUDE_FILE: &str = "info/exclude";
+
+/// The repository-local filesystem adaptations Git applies before ignore
+/// matching. They are derived once per walk root and carried through every
+/// traversal frontend, including the deliberately non-Git nested-repository
+/// traversal described in the public compatibility notes.
+#[derive(Debug, Clone, Copy, Default)]
+struct GitIgnoreAdaptation {
+    case_insensitive: bool,
+    precompose_unicode: bool,
+}
 
 /// The ignore rules in force inside one directory.
 #[derive(Debug, Clone, Default)]
@@ -36,6 +48,7 @@ pub(crate) struct IgnoreScope {
     /// Innermost directory with rules. Each node links to the next ancestor
     /// that has any; directories without ignore files never appear.
     rules: Option<Arc<IgnoreNode>>,
+    adaptation: GitIgnoreAdaptation,
 }
 
 impl IgnoreScope {
@@ -50,7 +63,18 @@ impl IgnoreScope {
         if !walker.respect_git_ignore {
             return Self::default();
         }
-        Self::default().link(read_rules(backend, root, &[REPOSITORY_EXCLUDE_FILE]))
+        let layout = repository_layout(root);
+        let adaptation = GitIgnoreAdaptation::effective(walker, layout.as_ref());
+        Self {
+            rules: None,
+            adaptation,
+        }
+        .link(read_repository_rules(
+            backend,
+            root,
+            layout.as_ref(),
+            adaptation,
+        ))
     }
 
     /// Adds `directory`'s own ignore files to the chain. Called once, when the
@@ -69,12 +93,12 @@ impl IgnoreScope {
         }
         let present = IGNORE_FILES
             .into_iter()
-            .filter(|file| listing.contains(file))
+            .filter(|file| listing.contains_git_ignore_name(file))
             .collect::<Vec<_>>();
         if present.is_empty() {
             return self;
         }
-        let rules = read_rules(backend, directory, &present);
+        let rules = read_rules(backend, directory, &present, self.adaptation);
         self.link(rules)
     }
 
@@ -105,6 +129,7 @@ impl IgnoreScope {
                 rules,
                 parent: self.rules,
             })),
+            adaptation: self.adaptation,
         }
     }
 }
@@ -137,8 +162,13 @@ fn read_rules<B: DirectoryBackend + ?Sized>(
     backend: &B,
     directory: &Path,
     files: &[&str],
+    adaptation: GitIgnoreAdaptation,
 ) -> RuleSet {
-    let mut builder = RuleSetBuilder::new(directory);
+    let mut builder = RuleSetBuilder::new(
+        directory,
+        adaptation.case_insensitive,
+        adaptation.precompose_unicode,
+    );
     for file in files {
         let path = directory.join(file);
         if let Ok(contents) = backend.read_ignore_file(&path) {
@@ -148,28 +178,580 @@ fn read_rules<B: DirectoryBackend + ?Sized>(
     builder.build()
 }
 
+/// Reads the repository-wide exclude file for `root`.
+///
+/// A normal checkout has a `.git` directory. Linked worktrees and submodules
+/// instead put a `gitdir: ...` pointer in `.git`; a linked worktree's private
+/// git directory can in turn point at the common repository directory through
+/// `commondir`. Git reads `info/exclude` from that common directory. Every
+/// malformed or unreadable metadata file behaves like an unreadable exclude:
+/// it contributes no rules.
+fn read_repository_rules<B: DirectoryBackend + ?Sized>(
+    backend: &B,
+    root: &Path,
+    layout: Option<&RepositoryLayout>,
+    adaptation: GitIgnoreAdaptation,
+) -> RuleSet {
+    let mut builder = RuleSetBuilder::new(
+        root,
+        adaptation.case_insensitive,
+        adaptation.precompose_unicode,
+    );
+    let Some(layout) = layout else {
+        return builder.build();
+    };
+    let path = layout.common_directory.join(REPOSITORY_EXCLUDE_FILE);
+    if let Ok(contents) = backend.read_repository_file(&path) {
+        add_rules(&mut builder, &contents);
+    }
+    builder.build()
+}
+
+/// The private git directory and its common directory. They are the same for
+/// ordinary checkouts; linked worktrees use a private directory below
+/// `worktrees/` and a shared common directory.
+#[derive(Debug)]
+struct RepositoryLayout {
+    private_directory: PathBuf,
+    common_directory: PathBuf,
+}
+
+/// Resolves the Git directories relevant to repository-local config and the
+/// repository-wide exclude file.
+///
+/// Only the exact `gitdir: ` pointer format Git writes is accepted. The path
+/// has one line, may be absolute or relative to the pointer file, and may use
+/// a single `commondir` indirection relative to the resulting git directory.
+fn repository_layout(root: &Path) -> Option<RepositoryLayout> {
+    let dot_git = root.join(".git");
+    let metadata = fs::metadata(&dot_git).ok()?;
+    if metadata.is_dir() {
+        return Some(RepositoryLayout {
+            private_directory: dot_git.clone(),
+            common_directory: dot_git,
+        });
+    }
+    if !metadata.is_file() {
+        return None;
+    }
+
+    let private_directory =
+        resolve_metadata_path(root, parse_gitdir_pointer(&fs::read(&dot_git).ok()?)?)?;
+    let common_dir = private_directory.join("commondir");
+    match fs::read(common_dir) {
+        Ok(contents) => Some(RepositoryLayout {
+            common_directory: resolve_metadata_path(
+                &private_directory,
+                parse_metadata_path(&contents)?,
+            )?,
+            private_directory,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(RepositoryLayout {
+            common_directory: private_directory.clone(),
+            private_directory,
+        }),
+        Err(_) => None,
+    }
+}
+
+#[derive(Default)]
+struct GitConfig {
+    ignore_case: Option<bool>,
+    precompose_unicode: Option<bool>,
+    worktree_config: Option<bool>,
+}
+
+#[derive(Clone, Copy)]
+enum GitConfigSection {
+    Core,
+    Extensions,
+}
+
+impl GitIgnoreAdaptation {
+    /// Repository-local config is deliberately the whole implicit surface.
+    /// Git also reads system/global files, conditional includes and environment
+    /// overrides; a library cannot safely inherit those process-wide settings,
+    /// so callers may provide the final effective values on `Walker`.
+    fn effective(walker: &Walker, layout: Option<&RepositoryLayout>) -> Self {
+        let config = layout.map(read_repository_config).unwrap_or_default();
+        Self {
+            case_insensitive: walker
+                .git_ignore_case
+                .or(config.ignore_case)
+                .unwrap_or(false),
+            // Git implements this adaptation only on macOS. Keeping that gate
+            // here means `git_precompose_unicode(true)` expresses Git's
+            // effective configuration rather than asking another platform to
+            // invent a filesystem transformation Git itself would not make.
+            precompose_unicode: cfg!(target_os = "macos")
+                && walker
+                    .git_precompose_unicode
+                    .or(config.precompose_unicode)
+                    .unwrap_or(false),
+        }
+    }
+}
+
+fn read_repository_config(layout: &RepositoryLayout) -> GitConfig {
+    let mut config = GitConfig::default();
+    if let Ok(contents) = fs::read(layout.common_directory.join("config")) {
+        apply_config(&mut config, &contents);
+    }
+    if config.worktree_config == Some(true)
+        && let Ok(contents) = fs::read(layout.private_directory.join("config.worktree"))
+    {
+        // Worktree config is read after the common config, so its last value
+        // wins just as `git config --worktree` does.
+        apply_config(&mut config, &contents);
+    }
+    config
+}
+
+/// Reads the tiny, stable config surface this adapter needs. Git config names
+/// are case-insensitive; values follow Git's boolean grammar, including empty
+/// and base-zero integer values. Quoted subsections deliberately remain
+/// distinct from their top-level section, and backslash-newline continuations
+/// are joined before comments, quoting, escapes, or boolean decoding. Unsupported
+/// config forms leave the repository-local default intact rather than guessing.
+fn apply_config(config: &mut GitConfig, contents: &[u8]) {
+    let mut section = None;
+    for line in logical_config_lines(contents) {
+        let line = trim_ascii(strip_config_comment(&line));
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with(b"[") {
+            section = parse_top_level_section(line);
+            continue;
+        }
+        let Some(section) = section else {
+            continue;
+        };
+        let (key, value) =
+            line.iter()
+                .position(|byte| *byte == b'=')
+                .map_or((trim_ascii(line), None), |index| {
+                    (
+                        trim_ascii(&line[..index]),
+                        Some(trim_ascii(&line[index + 1..])),
+                    )
+                });
+        let Some(value) = parse_git_bool(value.unwrap_or(b"true")) else {
+            continue;
+        };
+        match section {
+            GitConfigSection::Core if key.eq_ignore_ascii_case(b"ignorecase") => {
+                config.ignore_case = Some(value);
+            }
+            GitConfigSection::Core if key.eq_ignore_ascii_case(b"precomposeunicode") => {
+                config.precompose_unicode = Some(value);
+            }
+            GitConfigSection::Extensions if key.eq_ignore_ascii_case(b"worktreeconfig") => {
+                config.worktree_config = Some(value);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Produces the logical config lines that Git's value parser sees. A terminal
+/// backslash in an assignment value consumes the following physical newline,
+/// then parsing resumes with the next line's bytes (including indentation).
+/// It works inside and outside quotes, but a backslash in a comment is ignored.
+/// A terminal backslash at EOF is consumed with Git's synthetic final newline.
+/// Every other quote and escape is retained for `parse_git_bool`.
+fn logical_config_lines(contents: &[u8]) -> Vec<Vec<u8>> {
+    let mut physical = contents.split_inclusive(|byte| *byte == b'\n').map(|line| {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        line.strip_suffix(b"\r").unwrap_or(line)
+    });
+    let mut logical = Vec::new();
+    while let Some(line) = physical.next() {
+        let mut line = line.to_vec();
+        while config_value_continues(&line) {
+            line.pop();
+            let Some(next) = physical.next() else {
+                break;
+            };
+            line.extend_from_slice(next);
+        }
+        logical.push(line);
+    }
+    logical
+}
+
+/// Whether the terminal backslash is consumed by Git as a value continuation.
+/// Only a valid-looking assignment can start a value parser; any following
+/// physical line, including one that looks like a section header, is then part
+/// of that continued value.
+fn config_value_continues(line: &[u8]) -> bool {
+    let line = trim_ascii_start(line);
+    let Some(first) = line.first() else {
+        return false;
+    };
+    if matches!(first, b'#' | b';' | b'[') || !first.is_ascii_alphabetic() {
+        return false;
+    }
+    let key_end = line
+        .iter()
+        .position(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'-'))
+        .unwrap_or(line.len());
+    let Some(value) = trim_ascii_start(&line[key_end..]).strip_prefix(b"=") else {
+        return false;
+    };
+    let mut quoted = false;
+    let mut bytes = value.iter();
+    while let Some(byte) = bytes.next() {
+        if *byte == b'\\' {
+            if bytes.next().is_none() {
+                return true;
+            }
+        } else if *byte == b'"' {
+            quoted = !quoted;
+        } else if !quoted && matches!(*byte, b'#' | b';') {
+            return false;
+        }
+    }
+    false
+}
+
+/// Returns only the top-level sections whose variables this adapter consumes.
+/// Git gives a quoted subsection a dotted key prefix, so it must never alias
+/// that subsection with its parent section.
+fn parse_top_level_section(line: &[u8]) -> Option<GitConfigSection> {
+    let name = line.strip_prefix(b"[")?.strip_suffix(b"]")?;
+    if name.eq_ignore_ascii_case(b"core") {
+        Some(GitConfigSection::Core)
+    } else if name.eq_ignore_ascii_case(b"extensions") {
+        Some(GitConfigSection::Extensions)
+    } else {
+        None
+    }
+}
+
+fn strip_config_comment(line: &[u8]) -> &[u8] {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in line.iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if *byte == b'\\' {
+            escaped = true;
+        } else if *byte == b'"' {
+            quoted = !quoted;
+        } else if !quoted && matches!(*byte, b'#' | b';') {
+            return &line[..index];
+        }
+    }
+    line
+}
+
+fn parse_git_bool(value: &[u8]) -> Option<bool> {
+    let value = std::str::from_utf8(value).ok()?;
+    let value = decode_git_config_value(value.trim())?;
+    if value.is_empty() {
+        Some(false)
+    } else if value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("yes")
+        || value.eq_ignore_ascii_case("on")
+    {
+        Some(true)
+    } else if value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("no")
+        || value.eq_ignore_ascii_case("off")
+    {
+        Some(false)
+    } else {
+        parse_git_config_int(&value).map(|value| value != 0)
+    }
+}
+
+fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    &bytes[start..]
+}
+
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let bytes = trim_ascii_start(bytes);
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(0, |index| index + 1);
+    &bytes[..end]
+}
+
+/// Decodes the quoted escapes that Git's config parser resolves before it
+/// hands a value to its boolean parser. Whitespace outside quotes is already
+/// trimmed by the caller; whitespace inside quotes deliberately remains part
+/// of the value and therefore makes a boolean invalid, as it does in Git.
+fn decode_git_config_value(value: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(value.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            decoded.push(match character {
+                't' => '\t',
+                'b' => '\u{8}',
+                'n' => '\n',
+                '\\' | '"' => character,
+                _ => return None,
+            });
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else {
+            decoded.push(character);
+        }
+    }
+    (!quoted && !escaped).then_some(decoded)
+}
+
+/// Git parses a numeric boolean through its signed `int` config grammar:
+/// optional sign, C base-zero notation, and K/M/G binary scaling. Values that
+/// overflow that `int` are invalid rather than silently changing the setting.
+fn parse_git_config_int(value: &str) -> Option<i32> {
+    let (negative, value) = match value.as_bytes().first() {
+        Some(b'+') => (false, &value[1..]),
+        Some(b'-') => (true, &value[1..]),
+        _ => (false, value),
+    };
+    let (digits, scale) = match value.as_bytes().last() {
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 1024_i64),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 1024_i64.pow(2)),
+        Some(b'g' | b'G') => (&value[..value.len() - 1], 1024_i64.pow(3)),
+        _ => (value, 1),
+    };
+    let (radix, digits) = if let Some(digits) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, digits)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (8, &digits[1..])
+    } else {
+        (10, digits)
+    };
+    let magnitude = i64::from_str_radix(digits, radix)
+        .ok()?
+        .checked_mul(scale)?;
+    let value = if negative {
+        magnitude.checked_neg()?
+    } else {
+        magnitude
+    };
+    i32::try_from(value).ok()
+}
+
+fn parse_gitdir_pointer(contents: &[u8]) -> Option<PathBuf> {
+    parse_metadata_path(contents.strip_prefix(b"gitdir: ")?)
+}
+
+/// Parses the one native path Git writes into a `gitdir` or `commondir` file.
+/// Rejecting additional lines and NUL keeps a malformed metadata file from
+/// being interpreted as a path by accident.
+fn parse_metadata_path(contents: &[u8]) -> Option<PathBuf> {
+    let contents = contents.strip_suffix(b"\n").unwrap_or(contents);
+    let contents = contents.strip_suffix(b"\r").unwrap_or(contents);
+    if contents.is_empty()
+        || contents
+            .iter()
+            .any(|byte| matches!(*byte, b'\0' | b'\n' | b'\r'))
+    {
+        return None;
+    }
+    path_from_git_bytes(contents)
+}
+
+#[cfg(unix)]
+fn path_from_git_bytes(contents: &[u8]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    Some(PathBuf::from(std::ffi::OsString::from_vec(
+        contents.to_vec(),
+    )))
+}
+
+#[cfg(not(unix))]
+fn path_from_git_bytes(contents: &[u8]) -> Option<PathBuf> {
+    std::str::from_utf8(contents).ok().map(PathBuf::from)
+}
+
+fn resolve_metadata_path(base: &Path, path: PathBuf) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path)
+    } else if path.as_os_str().is_empty() {
+        None
+    } else {
+        Some(base.join(path))
+    }
+}
+
 /// Feeds one ignore file's lines to the builder.
 ///
-/// A leading byte-order mark is dropped the way Git drops it, and a line that
-/// is not UTF-8 ends the file, keeping the lines before it.
+/// Ignore files are byte streams. Git strips one BOM at the file start, treats
+/// NUL as the end of a rule line, and otherwise keeps parsing after invalid
+/// UTF-8 bytes.
 fn add_rules(builder: &mut RuleSetBuilder, contents: &[u8]) {
-    let text = match std::str::from_utf8(contents) {
-        Ok(text) => text,
-        Err(error) => {
-            let valid = &contents[..error.valid_up_to()];
-            let complete = valid
-                .iter()
-                .rposition(|&byte| byte == b'\n')
-                .map_or(0, |index| index + 1);
-            std::str::from_utf8(&valid[..complete]).unwrap_or_default()
-        }
-    };
-    for (index, line) in text.lines().enumerate() {
-        let line = if index == 0 {
-            line.trim_start_matches('\u{feff}')
-        } else {
-            line
-        };
+    let contents = contents.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(contents);
+    for line in contents.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line = line.split(|byte| *byte == b'\0').next().unwrap_or(line);
         builder.add_line(line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{GitConfig, RuleSetBuilder, add_rules, apply_config, parse_git_bool};
+
+    #[test]
+    fn byte_lines_continue_after_invalid_utf8_and_match_byte_patterns() {
+        let root = Path::new("/fixture");
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        add_rules(&mut builder, b"first.txt\n\xE9latin1.txt\nsecond.txt\n");
+        let rules = builder.build();
+
+        assert_eq!(rules.matched(b"/fixture/second.txt", false), Some(true));
+        assert_eq!(rules.matched(b"/fixture/\xE9latin1.txt", false), Some(true));
+    }
+
+    #[test]
+    fn nul_ends_a_rule_and_one_initial_bom_is_stripped() {
+        let root = Path::new("/fixture");
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        add_rules(
+            &mut builder,
+            b"\xEF\xBB\xBF\xEF\xBB\xBFdouble.txt\r\nsec\0ret.txt\r\n",
+        );
+        let rules = builder.build();
+
+        assert_eq!(
+            rules.matched(b"/fixture/\xEF\xBB\xBFdouble.txt", false),
+            Some(true)
+        );
+        assert_eq!(rules.matched(b"/fixture/double.txt", false), None);
+        assert_eq!(rules.matched(b"/fixture/sec", false), Some(true));
+        assert_eq!(rules.matched(b"/fixture/secret.txt", false), None);
+    }
+
+    #[test]
+    fn local_config_is_case_insensitive_and_uses_the_last_boolean_value() {
+        let mut config = GitConfig::default();
+        apply_config(
+            &mut config,
+            b"[CoRe]\nignoreCase = on\nprecomposeUnicode = 0 # comment\n\
+              ignorecase = false\n[ExTeNsIoNs]\nworktreeConfig\n",
+        );
+        assert_eq!(config.ignore_case, Some(false));
+        assert_eq!(config.precompose_unicode, Some(false));
+        assert_eq!(config.worktree_config, Some(true));
+    }
+
+    #[test]
+    fn local_config_boolean_values_follow_git_grammar() {
+        for (value, expected) in [
+            ("", Some(false)),
+            ("\"\"", Some(false)),
+            ("true", Some(true)),
+            ("No", Some(false)),
+            ("+0", Some(false)),
+            ("-0", Some(false)),
+            ("+2", Some(true)),
+            ("-7", Some(true)),
+            ("0x0", Some(false)),
+            ("0x2", Some(true)),
+            ("010", Some(true)),
+            ("1G", Some(true)),
+            ("2G", None),
+            ("09", None),
+            ("1.0", None),
+            ("invalid", None),
+        ] {
+            assert_eq!(parse_git_bool(value.as_bytes()), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_later_boolean_does_not_override_a_valid_value() {
+        let mut config = GitConfig::default();
+        apply_config(
+            &mut config,
+            b"[core]\nignorecase = false\nignorecase = not-a-bool\n",
+        );
+        assert_eq!(config.ignore_case, Some(false));
+    }
+
+    #[test]
+    fn config_subsections_and_continuations_follow_git_value_boundaries() {
+        let mut config = GitConfig::default();
+        apply_config(
+            &mut config,
+            b"[core \"unrelated\"]\nignorecase = false\nprecomposeunicode = false\n\
+              [extensions \"unrelated\"]\nworktreeconfig = false\n  [CoRe] # top-level comment\nignorecase = f\\\nalse\nprecomposeunicode = \"tr\\\nue\" # comment\n\
+              [extensions]\nworktreeconfig = f\\\nalse\nworktreeconfig = t\\\nr\\\nue\n",
+        );
+
+        assert_eq!(config.ignore_case, Some(false));
+        assert_eq!(config.precompose_unicode, Some(true));
+        assert_eq!(config.worktree_config, Some(true));
+
+        apply_config(
+            &mut config,
+            b"[core]\nignorecase = true\nignorecase = f\\\n  alse\n\
+              precomposeunicode = true\nprecomposeunicode = tr\\\n# comment\n\
+              [extensions]\nworktreeconfig = true\nworktreeconfig = tr\\",
+        );
+
+        // Continuation indentation is not trimmed, a continued comment leaves
+        // the preceding invalid fragment, and an EOF backslash is consumed.
+        // None is a valid boolean, so all earlier values remain in force.
+        assert_eq!(config.ignore_case, Some(true));
+        assert_eq!(config.precompose_unicode, Some(true));
+        assert_eq!(config.worktree_config, Some(true));
+
+        let mut continued_header = GitConfig::default();
+        apply_config(
+            &mut continued_header,
+            b"[core]\nignorecase = true\nignorecase = f\\\n[extensions]\nworktreeconfig = true\n",
+        );
+        // The continued value consumes the section-looking line, so its invalid
+        // boolean cannot replace `true` and the following key remains in core.
+        assert_eq!(continued_header.ignore_case, Some(true));
+        assert_eq!(continued_header.worktree_config, None);
+    }
+
+    #[test]
+    fn config_parser_keeps_core_values_across_non_utf8_irrelevant_lines() {
+        let mut config = GitConfig::default();
+        apply_config(
+            &mut config,
+            b"# comment before \xff\n[user]\nname = Jos\xe9\nemail = user\\\n\xff@example.test\n\
+              [core]\nignorecase = true\nprecomposeunicode = false\n\
+              [remote]\nurl = ssh://\xff@example.test\n# comment after \xff\n",
+        );
+
+        assert_eq!(config.ignore_case, Some(true));
+        assert_eq!(config.precompose_unicode, Some(false));
+    }
+
+    #[test]
+    fn config_parser_rejects_non_utf8_relevant_boolean_values() {
+        let mut config = GitConfig::default();
+        apply_config(
+            &mut config,
+            b"[core]\nignorecase = false\nignorecase = tr\xffue\n\
+              precomposeunicode = true\nprecomposeunicode = fa\xfflse\n",
+        );
+
+        assert_eq!(config.ignore_case, Some(false));
+        assert_eq!(config.precompose_unicode, Some(true));
     }
 }

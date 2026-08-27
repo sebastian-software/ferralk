@@ -6,7 +6,10 @@
 //!
 //! `getdirentries64` is the reader the walk uses. It is the core Darwin dirent
 //! syscall — every local filesystem serves it — and one record carries exactly
-//! what [`Listing::push`] stores: the entry name and its `d_type`.
+//! what [`Listing::push`] stores: the entry name and its `d_type`. Darwin libc
+//! uses the private `__getdirentries64` stub linked below too; consumers that
+//! need App Store compatibility should leave the `native-macos` feature off,
+//! because private-symbol scans can reject that linkage.
 //!
 //! `getattrlistbulk` was the reader until 2026-08-20. It returns the same two
 //! facts in a richer per-entry record, and assembling that record is work the
@@ -20,24 +23,31 @@
 //! `parse_bulk_record` is a fuzz target and both readers are checked against the
 //! portable backend by the parity test below. Nothing in the walk calls them.
 //!
-//! Either reader reports an unsupported operation as
-//! [`io::ErrorKind::Unsupported`], which is the safe adapter's signal to read
-//! the directory through the portable backend instead.
+//! When the private reader is unavailable, the already-open directory handle
+//! is transferred to the public `fdopendir`/`readdir` API. That keeps an
+//! `O_NOFOLLOW` descendant protected during the portable degradation: no
+//! fallback reopens its original path.
 
 use std::{
     cell::RefCell,
-    ffi::{OsStr, c_int, c_void},
+    ffi::{CString, OsStr, c_int, c_void},
     fs::{self, File, OpenOptions},
     io,
     ops::Range,
-    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawFd},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::OpenOptionsExt,
+        io::{AsRawFd, FromRawFd, IntoRawFd},
+    },
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use super::Listing;
+use super::{Listing, defer_entry_stat_error};
 
 const BUFFER_SIZE: usize = 32 * 1024;
+const GETDIRENTRIES64_EXTENDED_BUFFER_MINIMUM: usize = 1024;
+const GETDIRENTRIES64_EOF: u32 = 0x1;
 const RECORD_LENGTH_OFFSET: usize = 16;
 const NAME_LENGTH_OFFSET: usize = 18;
 const TYPE_OFFSET: usize = 20;
@@ -88,6 +98,35 @@ std::thread_local! {
     static DIRENTRIES_BUFFER: RefCell<Box<[u8; BUFFER_SIZE]>> = RefCell::new(Box::new([0; BUFFER_SIZE]));
 }
 
+/// Distinguishes a rejected private reader from an error while using it.
+///
+/// A capability result is produced only by `__getdirentries64` returning raw
+/// `EINVAL` or `ENOTSUP` before the first accepted batch. In particular, an
+/// entry's metadata error can also have `ErrorKind::Unsupported`, but its
+/// directory descriptor has already advanced and must never be reread through
+/// the portable stream.
+#[derive(Debug)]
+pub(super) enum NativeDirectoryReadError {
+    CapabilityUnavailable(io::Error),
+    Io(io::Error),
+}
+
+impl From<io::Error> for NativeDirectoryReadError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl NativeDirectoryReadError {
+    pub(super) fn into_io_error(self) -> io::Error {
+        match self {
+            Self::CapabilityUnavailable(error) | Self::Io(error) => error,
+        }
+    }
+}
+
+type NativeDirectoryReadResult = Result<(), NativeDirectoryReadError>;
+
 #[repr(C)]
 struct AttrList {
     bitmap_count: u16,
@@ -116,18 +155,16 @@ unsafe extern "C" {
     ) -> isize;
 }
 
-pub(super) fn read_directory(path: &Path, listing: &mut Listing) -> io::Result<()> {
+pub(super) fn read_directory(
+    path: &Path,
+    refuse_final_symlink: bool,
+    listing: &mut Listing,
+) -> NativeDirectoryReadResult {
     if NATIVE_UNSUPPORTED.load(Ordering::Relaxed) {
-        return Err(unsupported("getdirentries64 is unavailable on this system"));
+        read_portable_directory_from_path(path, refuse_final_symlink, listing)?;
+        return Ok(());
     }
-    let result = read_direntries_directory(path, listing);
-    if result
-        .as_ref()
-        .is_err_and(|error| error.kind() == io::ErrorKind::Unsupported)
-    {
-        NATIVE_UNSUPPORTED.store(true, Ordering::Relaxed);
-    }
-    result
+    read_direntries_directory(path, refuse_final_symlink, listing)
 }
 
 fn unsupported(message: &'static str) -> io::Error {
@@ -138,13 +175,19 @@ fn unsupported(message: &'static str) -> io::Error {
 ///
 /// `O_DIRECTORY` makes the open fail with `ENOTDIR` instead of blocking when
 /// the scheduled path was replaced by a FIFO between scheduling and open.
-/// `O_NOFOLLOW` is deliberately absent: a walk that follows symlinks has to be
-/// able to open through one.
-fn open_directory(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(O_DIRECTORY)
-        .open(path)
+/// For a scheduled non-root directory in a no-follow walk, `O_NOFOLLOW` makes
+/// the final component check and open one operation. A directory exchanged for
+/// a symlink is therefore refused (`ENOTDIR` or `ELOOP`, depending on the
+/// Darwin open path) instead of escaping through that link. User-supplied
+/// symlink roots retain portable semantics.
+fn open_directory(path: &Path, refuse_final_symlink: bool) -> io::Result<File> {
+    let flags = O_DIRECTORY
+        | if refuse_final_symlink {
+            libc::O_NOFOLLOW
+        } else {
+            0
+        };
+    OpenOptions::new().read(true).custom_flags(flags).open(path)
 }
 
 /// The `getattrlistbulk` reader, kept as the regression boundary the module
@@ -168,7 +211,7 @@ fn read_bulk_directory_with_buffer(
     buffer: &mut [u8],
     listing: &mut Listing,
 ) -> io::Result<()> {
-    let directory = open_directory(path)?;
+    let directory = open_directory(path, false)?;
     listing.clear();
     let attributes = AttrList {
         bitmap_count: ATTR_BIT_MAP_COUNT,
@@ -194,8 +237,10 @@ fn read_bulk_directory_with_buffer(
         let name = OsStr::from_bytes(&reader.buffer[name]);
         // An entry that vanished between the read and its stat costs that one
         // entry; the rest of the listing is still valid and is returned.
-        if let Some((is_dir, is_symlink)) = bulk_entry_kind(path, name, object_type)? {
-            listing.push(name, is_dir, is_symlink);
+        match bulk_entry_kind(path, name, object_type) {
+            Ok(Some((is_dir, is_symlink))) => listing.push(name, is_dir, is_symlink),
+            Ok(None) => {}
+            Err(error) => defer_entry_stat_error(listing, path.join(name), error)?,
         }
     }
     Ok(())
@@ -393,20 +438,188 @@ fn bulk_entry_kind(
     }
 }
 
-fn read_direntries_directory(path: &Path, listing: &mut Listing) -> io::Result<()> {
+fn read_direntries_directory(
+    path: &Path,
+    refuse_final_symlink: bool,
+    listing: &mut Listing,
+) -> NativeDirectoryReadResult {
     DIRENTRIES_BUFFER.with(|buffer| {
         let mut buffer = buffer.borrow_mut();
-        read_direntries_directory_with_buffer(path, &mut buffer[..], listing)
+        read_direntries_directory_with_buffer(path, refuse_final_symlink, &mut buffer[..], listing)
     })
 }
 
 fn read_direntries_directory_with_buffer(
     path: &Path,
+    refuse_final_symlink: bool,
     buffer: &mut [u8],
     listing: &mut Listing,
+) -> NativeDirectoryReadResult {
+    let used_portable_fallback = read_open_directory_with_portable_fallback(
+        path,
+        refuse_final_symlink,
+        buffer,
+        listing,
+        read_direntries_from_open_directory,
+    )?;
+    if used_portable_fallback {
+        NATIVE_UNSUPPORTED.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Reads an already-open directory with the private reader, degrading through
+/// the same descriptor if that reader is unavailable before its first batch.
+///
+/// The boolean reports whether the portable descriptor reader ran, allowing
+/// the caller to latch the native capability without making the descriptor
+/// escape this function.
+fn read_open_directory_with_portable_fallback(
+    path: &Path,
+    refuse_final_symlink: bool,
+    buffer: &mut [u8],
+    listing: &mut Listing,
+    native: impl FnOnce(&File, &Path, &mut [u8], &mut Listing) -> NativeDirectoryReadResult,
+) -> Result<bool, NativeDirectoryReadError> {
+    let directory = open_directory(path, refuse_final_symlink)?;
+    match native(&directory, path, buffer, listing) {
+        Ok(()) => Ok(false),
+        Err(NativeDirectoryReadError::CapabilityUnavailable(_)) => {
+            read_portable_directory_from_open_file(directory, path, listing)?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Opens a directory once with the native walk's flags, then uses the public
+/// descriptor reader. This is the latched capability path: it must not call
+/// `std::fs::read_dir(path)`, because a scheduled no-follow descendant may
+/// have changed between scheduling and this open.
+fn read_portable_directory_from_path(
+    path: &Path,
+    refuse_final_symlink: bool,
+    listing: &mut Listing,
 ) -> io::Result<()> {
-    let directory = open_directory(path)?;
+    let directory = open_directory(path, refuse_final_symlink)?;
+    read_portable_directory_from_open_file(directory, path, listing)
+}
+
+/// Enumerates exactly the directory a `File` already refers to.
+///
+/// `fdopendir` takes ownership of the descriptor on success; `DirectoryStream`
+/// then closes it exactly once. `readdir` supplies names relative to that
+/// descriptor, and `fstatat` resolves its rare `DT_UNKNOWN` records relative
+/// to the same descriptor too, so neither operation reopens `path`.
+fn read_portable_directory_from_open_file(
+    directory: File,
+    reported_path: &Path,
+    listing: &mut Listing,
+) -> io::Result<()> {
+    let descriptor = directory.into_raw_fd();
+    // SAFETY: `descriptor` is a live directory descriptor transferred from
+    // `directory`. On success `fdopendir` owns it; on failure we reconstruct
+    // the `File` below so it is still closed exactly once.
+    let stream = unsafe { libc::fdopendir(descriptor) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: `fdopendir` did not take ownership on failure, and this is
+        // the sole reconstruction of the descriptor transferred above.
+        unsafe { drop(File::from_raw_fd(descriptor)) };
+        return Err(error);
+    }
+    let stream = DirectoryStream(stream);
+    listing.clear();
+    loop {
+        // SAFETY: `__error` returns this thread's writable errno slot. Clearing
+        // it lets a null `readdir` result distinguish EOF from a read failure.
+        unsafe { *libc::__error() = 0 };
+        // SAFETY: `stream` owns a valid `DIR` until its Drop calls `closedir`;
+        // the returned pointer is consumed before the next `readdir` call.
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(0) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: a successful `readdir` result points to a valid Darwin
+        // `dirent`; `d_namlen` bounds the name within its fixed d_name buffer.
+        let entry = unsafe { &*entry };
+        let name = unsafe {
+            std::slice::from_raw_parts(entry.d_name.as_ptr().cast::<u8>(), entry.d_namlen as usize)
+        };
+        if name.is_empty() || name == b"." || name == b".." {
+            continue;
+        }
+        let name = OsStr::from_bytes(name);
+        match descriptor_entry_kind(descriptor, name, entry.d_type) {
+            Ok(Some((is_dir, is_symlink))) => listing.push(name, is_dir, is_symlink),
+            Ok(None) => {}
+            Err(error) => defer_entry_stat_error(listing, reported_path.join(name), error)?,
+        }
+    }
+}
+
+/// Owns the `DIR` returned by `fdopendir`, including its directory descriptor.
+struct DirectoryStream(*mut libc::DIR);
+
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: this is the one `closedir` corresponding to successful
+        // `fdopendir`; libc closes the transferred descriptor with the stream.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+/// Resolves an unknown `d_type` relative to the protected directory descriptor.
+fn descriptor_entry_kind(
+    directory: c_int,
+    name: &OsStr,
+    directory_type: u8,
+) -> io::Result<Option<(bool, bool)>> {
+    match directory_type {
+        DT_DIR => Ok(Some((true, false))),
+        DT_REG | DT_FIFO | DT_CHR | DT_BLK | DT_SOCK => Ok(Some((false, false))),
+        DT_LNK => Ok(Some((false, true))),
+        _ => {
+            let name = CString::new(name.as_bytes()).map_err(|_| malformed_record())?;
+            // SAFETY: zeroed `stat` is valid output storage, `directory` is a
+            // live descriptor held by `DirectoryStream`, and `name` remains
+            // NUL-terminated and live for the call.
+            let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+            let result = unsafe {
+                libc::fstatat(
+                    directory,
+                    name.as_ptr(),
+                    &mut metadata,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                return if is_vanished_entry(&error) {
+                    Ok(None)
+                } else {
+                    Err(error)
+                };
+            }
+            let kind = metadata.st_mode & libc::S_IFMT;
+            Ok(Some((kind == libc::S_IFDIR, kind == libc::S_IFLNK)))
+        }
+    }
+}
+
+fn read_direntries_from_open_directory(
+    directory: &File,
+    path: &Path,
+    buffer: &mut [u8],
+    listing: &mut Listing,
+) -> NativeDirectoryReadResult {
     let mut base = 0_u64;
+    let mut primed = false;
     listing.clear();
     loop {
         let byte_count = loop {
@@ -426,13 +639,20 @@ fn read_direntries_directory_with_buffer(
             }
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
+                if is_unsupported_direntries_error(&error, primed) {
+                    return Err(NativeDirectoryReadError::CapabilityUnavailable(error));
+                }
+                return Err(error.into());
             }
         };
         if byte_count == 0 {
             return Ok(());
         }
+        primed = true;
         parse_records(path, &buffer[..byte_count], listing)?;
+        if has_direntries_eof_flag(buffer) {
+            return Ok(());
+        }
     }
 }
 
@@ -444,10 +664,21 @@ fn malformed_bulk_record() -> io::Error {
 }
 
 fn parse_records(directory: &Path, records: &[u8], listing: &mut Listing) -> io::Result<()> {
+    parse_records_with_entry_kind(directory, records, listing, entry_kind)
+}
+
+fn parse_records_with_entry_kind(
+    directory: &Path,
+    records: &[u8],
+    listing: &mut Listing,
+    mut classify: impl FnMut(&Path, &OsStr, u8) -> io::Result<Option<(bool, bool)>>,
+) -> io::Result<()> {
     for_each_record(records, |name, directory_type| {
         let name = OsStr::from_bytes(name);
-        if let Some((is_dir, is_symlink)) = entry_kind(directory, name, directory_type)? {
-            listing.push(name, is_dir, is_symlink);
+        match classify(directory, name, directory_type) {
+            Ok(Some((is_dir, is_symlink))) => listing.push(name, is_dir, is_symlink),
+            Ok(None) => {}
+            Err(error) => defer_entry_stat_error(listing, directory.join(name), error)?,
         }
         Ok(())
     })
@@ -508,9 +739,8 @@ fn for_each_record(
 
 /// Classifies one entry, or reports that it no longer exists.
 ///
-/// `Ok(None)` means the entry disappeared or became unreadable between the
-/// directory read and its stat. That costs one entry rather than the whole
-/// listing, which is what a caller racing with a deletion needs.
+/// `Ok(None)` means the entry disappeared between the directory read and its
+/// stat. Persistent failures use the listing-level error channel instead.
 fn entry_kind(
     directory: &Path,
     name: &OsStr,
@@ -537,13 +767,34 @@ fn stat_entry_kind(path: &Path) -> io::Result<Option<(bool, bool)>> {
     }
 }
 
-/// Whether a per-entry stat failure describes that entry rather than the
-/// directory. A genuine fault, `EIO` for instance, still ends the read.
+/// Whether a per-entry stat failure describes an entry that vanished after its
+/// directory record was read. `NotADirectory` is also a replacement race: a
+/// parent component that was a directory during listing is no longer one.
 fn is_vanished_entry(error: &io::Error) -> bool {
     matches!(
         error.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::NotADirectory
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
     )
+}
+
+/// Darwin uses raw errno 45 (`ENOTSUP`) for a filesystem that refuses this
+/// private syscall. `std::io` calls it `Uncategorized`, so preserve the native
+/// backend's documented portable-fallback signal ourselves. `EINVAL` is a
+/// capability result only before the first accepted batch, matching the bulk
+/// reader's established contract.
+fn is_unsupported_direntries_error(error: &io::Error, primed: bool) -> bool {
+    !primed && matches!(error.raw_os_error(), Some(22 | 45))
+}
+
+/// XNU reserves the final word of an extended (at least 1024-byte) buffer for
+/// `getdirentries64_flags_t`. It lies outside `byte_count`, so inspecting it
+/// after parsing cannot relax the parser's bounds.
+fn has_direntries_eof_flag(buffer: &[u8]) -> bool {
+    if buffer.len() < GETDIRENTRIES64_EXTENDED_BUFFER_MINIMUM {
+        return false;
+    }
+    let tail = &buffer[buffer.len() - std::mem::size_of::<u32>()..];
+    u32::from_ne_bytes(tail.try_into().expect("tail has u32 width")) & GETDIRENTRIES64_EOF != 0
 }
 
 fn malformed_record() -> io::Error {
@@ -563,14 +814,18 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use crate::{DirectoryBackend, ErrorPolicy, StdBackend, WalkEntry, WalkOptions, Walker};
+    use crate::{
+        DirectoryBackend, ErrorPolicy, StdBackend, SystemBackend, WalkEntry, WalkOptions, Walker,
+    };
 
     use super::{
         ATTR_CMN_ERROR, ATTR_CMN_NAME, ATTR_CMN_OBJTYPE, ATTR_CMN_RETURNED_ATTRS,
-        ATTRIBUTE_RECORD_HEADER_SIZE, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG, DT_SOCK, Listing,
-        NAME_OFFSET, VBLK, VCHR, VDIR, VFIFO, VSOCK, bulk_entry_kind, entry_kind,
-        is_unsupported_bulk_error, open_directory, parse_bulk_record, parse_records,
-        read_bulk_directory, read_directory, read_direntries_directory,
+        ATTRIBUTE_RECORD_HEADER_SIZE, BUFFER_SIZE, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG,
+        DT_SOCK, Listing, NAME_OFFSET, NativeDirectoryReadError, VBLK, VCHR, VDIR, VFIFO, VSOCK,
+        bulk_entry_kind, entry_kind, for_each_record, has_direntries_eof_flag,
+        is_unsupported_bulk_error, is_unsupported_direntries_error, open_directory,
+        parse_bulk_record, parse_records, parse_records_with_entry_kind, read_bulk_directory,
+        read_directory, read_direntries_directory, read_open_directory_with_portable_fallback,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -753,9 +1008,223 @@ mod tests {
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(&path, b"fixture").expect("write fixture file");
-        let error = open_directory(&path).expect_err("a regular file is not a directory");
+        let error = open_directory(&path, false).expect_err("a regular file is not a directory");
         assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn no_follow_directory_open_rejects_a_swapped_symlink_but_follow_opens_it() {
+        let root = fixture_root("no-follow");
+        let target = root.join("target");
+        let link = root.join("scheduled");
+        fs::create_dir_all(&target).expect("create target directory");
+        fs::write(target.join("inside"), b"fixture").expect("write target entry");
+        symlink(&target, &link).expect("replace scheduled directory with a link");
+
+        let error = open_directory(&link, true).expect_err("no-follow rejects the replacement");
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ELOOP) | Some(libc::ENOTDIR)
+            ),
+            "a no-follow directory open rejects the changed path: {error}"
+        );
+        let mut listing = Listing::default();
+        read_directory(&link, false, &mut listing).expect("follow mode still opens through a link");
+        assert!(listing.contains("inside"));
+        fs::remove_dir_all(root).expect("remove no-follow fixture");
+    }
+
+    #[test]
+    fn no_follow_fallback_preserves_the_boundary_and_roots_stay_compatible() {
+        let root = fixture_root("no-follow-fallback");
+        let target = root.join("target");
+        let link = root.join("scheduled");
+        fs::create_dir_all(&target).expect("create target directory");
+        fs::write(target.join("inside"), b"fixture").expect("write target entry");
+        symlink(&target, &link).expect("replace scheduled directory with a link");
+
+        let mut listing = Listing::default();
+        let error = crate::read_native_or_portable(
+            &mut listing,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "portable fallback would lose no-follow",
+                ))
+            },
+        )
+        .expect_err("a safe fallback never reopens the changed path");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+
+        // A user-provided root is not a scheduled descendant. It keeps the
+        // portable reader's long-standing ability to start at a directory
+        // symlink while only scheduled no-follow descents get O_NOFOLLOW.
+        SystemBackend
+            .read_directory(&link, false, false, &mut listing)
+            .expect("a directory symlink remains a valid root");
+        assert!(listing.contains("inside"));
+        fs::remove_dir_all(root).expect("remove no-follow fallback fixture");
+    }
+
+    #[test]
+    fn unsupported_no_follow_descendant_reuses_its_open_descriptor() {
+        let root = fixture_root("descriptor-fallback");
+        let descendant = root.join("scheduled");
+        let moved = root.join("opened-before-swap");
+        let target = root.join("target");
+        fs::create_dir_all(descendant.join("nested")).expect("create scheduled subtree");
+        fs::write(descendant.join("nested/inside"), b"fixture").expect("write nested entry");
+        fs::create_dir_all(&target).expect("create swapped target");
+        fs::write(target.join("escaped"), b"fixture").expect("write target entry");
+
+        let mut buffer = vec![0_u8; BUFFER_SIZE];
+        let mut listing = Listing::default();
+        let used_portable_fallback = read_open_directory_with_portable_fallback(
+            &descendant,
+            true,
+            &mut buffer,
+            &mut listing,
+            |_, _, _, _| {
+                // The native reader has already opened `descendant` with
+                // O_NOFOLLOW. Replacing its path here makes a path-based
+                // fallback escape to `target`, while the descriptor fallback
+                // still enumerates the opened subtree.
+                fs::rename(&descendant, &moved).expect("move opened directory");
+                symlink(&target, &descendant).expect("replace path with a link");
+                Err(NativeDirectoryReadError::CapabilityUnavailable(
+                    std::io::Error::from_raw_os_error(45),
+                ))
+            },
+        )
+        .expect("unsupported native read degrades through the descriptor");
+
+        assert!(used_portable_fallback);
+        assert!(listing.contains("nested"), "the descendant is not lost");
+        assert!(
+            !listing.contains("escaped"),
+            "the fallback never reopens the swapped path"
+        );
+        fs::remove_dir_all(root).expect("remove descriptor fallback fixture");
+    }
+
+    #[test]
+    fn entry_unsupported_after_a_batch_never_restarts_the_descriptor_reader() {
+        let root = fixture_root("entry-unsupported-after-batch");
+        fs::create_dir_all(&root).expect("create fixture directory");
+        fs::write(root.join("from-portable-fallback"), b"fixture")
+            .expect("write portable fallback marker");
+        let mut records = record(b"sibling", DT_REG);
+        records.extend(record(b"unknown", 0));
+
+        let mut buffer = vec![0_u8; BUFFER_SIZE];
+        let mut listing = Listing::default();
+        let error = read_open_directory_with_portable_fallback(
+            &root,
+            true,
+            &mut buffer,
+            &mut listing,
+            |_, path, _, listing| {
+                // This models a native call that accepted `records` as its
+                // first batch. The DT_UNKNOWN classification then reports an
+                // ordinary metadata Unsupported error, which is not a reader
+                // capability signal even though it has the same ErrorKind.
+                listing.clear();
+                parse_records_with_entry_kind(path, &records, listing, |_, _, directory_type| {
+                    if directory_type == 0 {
+                        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+                    } else {
+                        Ok(Some((false, false)))
+                    }
+                })?;
+                Ok(())
+            },
+        )
+        .expect_err("an entry metadata error is not a capability fallback");
+
+        assert_eq!(
+            error.into_io_error().kind(),
+            std::io::ErrorKind::Unsupported,
+            "the entry failure still reaches the walker error policy"
+        );
+        assert!(
+            listing.contains("sibling"),
+            "the accepted batch is retained"
+        );
+        assert!(
+            !listing.contains("from-portable-fallback"),
+            "the advanced descriptor was never resumed through fdopendir"
+        );
+        fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn checked_in_macos_native_fuzz_seeds_are_valid_and_reproducible() {
+        let long_name = [b'x'; 255];
+        let mut multi = record(b"nested", DT_DIR);
+        multi.extend(record(b"file", DT_REG));
+        let dirent_seeds: [(&[u8], Vec<u8>); 4] = [
+            (
+                include_bytes!("../../../fuzz/corpus/macos_dirent_parser/single-regular"),
+                record(b"one", DT_REG),
+            ),
+            (
+                include_bytes!("../../../fuzz/corpus/macos_dirent_parser/minimal-name"),
+                record(b"a", DT_REG),
+            ),
+            (
+                include_bytes!("../../../fuzz/corpus/macos_dirent_parser/multi-directory-regular"),
+                multi,
+            ),
+            (
+                include_bytes!("../../../fuzz/corpus/macos_dirent_parser/long-name"),
+                record(&long_name, DT_REG),
+            ),
+        ];
+        for (seed, expected) in dirent_seeds {
+            assert_eq!(
+                seed,
+                expected.as_slice(),
+                "seed matches the generator record"
+            );
+            let mut records = 0;
+            for_each_record(seed, |_, _| {
+                records += 1;
+                Ok(())
+            })
+            .expect("dirent seed reaches the parser visitor");
+            assert!(records > 0);
+        }
+
+        let bulk_seeds: [(&[u8], Vec<u8>); 3] = [
+            (
+                include_bytes!("../../../fuzz/corpus/macos_bulk_record_parser/name-and-type"),
+                bulk_record(b"entry", VDIR),
+            ),
+            (
+                include_bytes!("../../../fuzz/corpus/macos_bulk_record_parser/no-object-type"),
+                bulk_record_without(b"unknown", ATTR_CMN_OBJTYPE),
+            ),
+            (
+                include_bytes!("../../../fuzz/corpus/macos_bulk_record_parser/long-name"),
+                bulk_record(&long_name, VDIR),
+            ),
+        ];
+        for (seed, expected) in bulk_seeds {
+            assert_eq!(
+                seed,
+                expected.as_slice(),
+                "seed matches the generator record"
+            );
+            assert!(
+                parse_bulk_record(seed)
+                    .expect("bulk seed passes structural validation")
+                    .is_some(),
+                "bulk seed reaches a usable parser record"
+            );
+        }
     }
 
     #[test]
@@ -771,6 +1240,55 @@ mod tests {
             &std::io::Error::from_raw_os_error(13),
             false
         ));
+    }
+
+    #[test]
+    fn direntries_capability_errors_fall_back_only_before_the_first_batch() {
+        for error in [
+            std::io::Error::from_raw_os_error(22),
+            std::io::Error::from_raw_os_error(45),
+        ] {
+            assert!(is_unsupported_direntries_error(&error, false));
+            assert!(!is_unsupported_direntries_error(&error, true));
+        }
+        assert!(!is_unsupported_direntries_error(
+            &std::io::Error::from_raw_os_error(13),
+            false
+        ));
+    }
+
+    #[test]
+    fn unsupported_native_reader_uses_the_portable_system_fallback() {
+        let root = fixture_root("fallback");
+        fs::create_dir_all(&root).expect("create fallback fixture");
+        fs::write(root.join("survivor"), b"fixture").expect("write fallback entry");
+        let mut listing = Listing::default();
+        // This is the same `Unsupported` result the reader emits after a raw
+        // ENOTSUP or pre-first-batch EINVAL. Exercise the adapter without
+        // mutating its process-wide capability latch during parallel tests.
+        crate::read_native_or_portable(
+            &mut listing,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+            |listing| StdBackend.read_directory(&root, false, false, listing),
+        )
+        .expect("unsupported native read falls back portably");
+        assert!(listing.contains("survivor"));
+        fs::remove_dir_all(root).expect("remove fallback fixture");
+    }
+
+    #[test]
+    fn direntries_extended_tail_marks_the_final_data_batch_without_expanding_parse_bounds() {
+        let mut buffer = vec![0_u8; 1024];
+        let record = record(b"entry", DT_REG);
+        buffer[..record.len()].copy_from_slice(&record);
+        let tail_start = buffer.len() - 4;
+        buffer[tail_start..].copy_from_slice(&1_u32.to_ne_bytes());
+        let mut listing = Listing::default();
+        parse_records(Path::new("/tmp"), &buffer[..record.len()], &mut listing)
+            .expect("the parser sees only returned dirent bytes");
+        assert_eq!(listing.entries()[0].name(), "entry");
+        assert!(has_direntries_eof_flag(&buffer));
+        assert!(!has_direntries_eof_flag(&buffer[..1023]));
     }
 
     #[test]
@@ -807,19 +1325,20 @@ mod tests {
         };
         let portable = describe(&|listing| {
             StdBackend
-                .read_directory(&root, listing)
+                .read_directory(&root, false, false, listing)
                 .expect("portable reader succeeds");
         });
         // What the walk actually reads through.
         assert_eq!(
             describe(&|listing| {
-                read_directory(&root, listing).expect("native reader succeeds");
+                read_directory(&root, false, listing).expect("native reader succeeds");
             }),
             portable
         );
         assert_eq!(
             describe(&|listing| {
-                read_direntries_directory(&root, listing).expect("direntries reader succeeds");
+                read_direntries_directory(&root, false, listing)
+                    .expect("direntries reader succeeds");
             }),
             portable
         );
@@ -898,6 +1417,7 @@ mod tests {
             path: root.clone(),
             depth: 0,
             root: 0,
+            cycle_guard: std::sync::Arc::new(crate::CycleGuard::default()),
             ignores: crate::IgnoreScope::for_root(walker, &StdBackend, &root),
         };
         state

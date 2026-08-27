@@ -46,7 +46,7 @@ callers do not need lossy UTF-8 conversion.
 `Walker` replaces zlob's output-buffer-oriented traversal with owned entries,
 structured errors, and an explicit root:
 
-```rust
+```rust,no_run
 use ferralk::{ErrorPolicy, WalkOptions, Walker};
 
 let result = Walker::new(".")
@@ -74,6 +74,7 @@ let result = Walker::new(".")
 | walker `max_depth` | `WalkOptions::max_depth(depth)` |
 | walker entry depth | `WalkEntry::depth()` counts relative components below the root |
 | walker entry basename | `WalkEntry::basename()` preserves the native `OsStr` name |
+| match a walker entry with `Pattern` | `entry.path_bytes()` passes its native encoded bytes to the byte-first matcher without allocation |
 | walker entry kind | `WalkEntry::{kind,is_symlink}` exposes file, directory, or symlink identity |
 | thread count | `Walker::threads(n)`; `collect()` defaults to available parallelism |
 | metadata requests | `WalkOptions::metadata(true)` |
@@ -82,6 +83,32 @@ let result = Walker::new(".")
 `collect()` has no deterministic ordering unless `WalkOptions::sort(true)` is
 selected. `stream()` is intentionally single-threaded and unsorted so it can
 deliver entries incrementally.
+
+### Git filesystem adaptations
+
+When Git ignore support is enabled, Ferralk reads `core.ignoreCase` and
+`core.precomposeUnicode` from repository-local config. A linked worktree reads
+the common `config` first and private `config.worktree` last when
+`extensions.worktreeConfig=true`. This makes Git's normal per-repository
+filesystem probe observable without a runtime Git subprocess: `ignoreCase`
+uses ASCII-only rule/candidate folding, and macOS-only `precomposeUnicode`
+converts valid UTF-8 candidate components to NFC before matching. Raw invalid
+bytes stay raw. The supported local boolean parser follows Git for named forms,
+bare keys, empty assignments, and signed base-zero integers with `K`/`M`/`G`
+scaling; a malformed value is ignored and therefore cannot override an earlier
+valid local value. It consumes only exact top-level `[core]` and `[extensions]`
+sections (never a quoted subsection) and applies Git's backslash-newline value
+continuations before comment, quote, escape, and boolean processing; indentation
+on the continued physical line remains meaningful.
+
+Git's system/global configuration, conditional includes, and environment
+overrides are deliberately not inherited by a library walk. If one of those
+sources changes Git's effective value, pass it explicitly with
+`Walker::git_ignore_case` or (on macOS) `Walker::git_precompose_unicode`; an
+explicit Walker setting wins over repository-local config. Ferralk identifies a
+case variant of `.gitignore`/`.ignore` in a listing only to attempt Git's
+canonical open, so a case-sensitive filesystem continues to expose that
+variant as an ordinary file.
 
 `Walker::match_hidden` and `WalkOptions::skip_hidden` are separate mechanisms
 and not each other's inverse: `match_hidden` is matcher semantics, deciding
@@ -101,7 +128,9 @@ described next.
 on Windows too — so a pattern built by joining `PathBuf`s carries separators
 the matcher reads as "the next byte, literally":
 
-```rust
+```rust,no_run
+# use ferralk::Walker;
+# let root = std::path::PathBuf::from(".");
 // WRONG on Windows. `PathBuf::join` produces `C:\repo\src\**\*.ts`, where
 // every `\` escapes the byte after it: the pattern asks for a file whose
 // name contains a literal `*`, which Windows cannot even create.
@@ -153,7 +182,9 @@ there a file may genuinely be named `src*.ts`.
 that a path is not automatically a valid pattern: if any component contains
 `*`, `?`, `[` or `{`, those bytes are syntax and need escaping with `\`.
 
-```rust
+```rust,no_run
+# use ferralk::Walker;
+# let root = std::path::PathBuf::from(".");
 let as_pattern = root.to_string_lossy().replace('\\', "/");
 let walker = Walker::new(&root).include(format!("{as_pattern}/src/**/*.ts"))?;
 # Ok::<(), ferralk::ferralk_glob::PatternError>(())
@@ -168,8 +199,12 @@ that hold one, not as a way to spell a relative one.
 `Walker::add_root` and `Walker::add_roots` extend a walk to more than one tree.
 A caller with several source directories used to build one walker per directory,
 and with it one thread pool per directory; the roots are now the walk's initial
-directories and everything downstream of that is shared — the scheduler, the
-helper-spawn floor, and the visited-directory guard.
+directories and share the scheduler and helper-spawn floor. The
+visited-directory guard stays per root traversal: descendants of one root share
+its guard, while separately supplied roots — including duplicates, overlaps and
+symlink aliases — receive independent guards. Following symlinks therefore
+still stops genuine cycles within each root without deduplicating one root's
+entries against another's.
 
 | Question | Answer |
 | --- | --- |

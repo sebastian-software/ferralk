@@ -1,0 +1,16 @@
+[package]
+name = "doc-tests"
+description = "Unpublished doctest harness for Ferralk's Markdown guides."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ferralk = { path = "../../crates/ferralk" }
+ferralk-glob = { path = "../../crates/ferralk-glob" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

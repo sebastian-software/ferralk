@@ -1,4 +1,5 @@
 #![deny(unsafe_code)]
+#![warn(missing_docs)]
 #![doc = "Portable filesystem walking."]
 
 //! A safe std::fs walker with a portable `std::fs` backend.
@@ -15,12 +16,12 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
 
-use ferralk_glob::{Pattern, PatternError, PatternOptions};
+use ferralk_glob::{Pattern, PatternError, PatternOptions, WalkerPathViability};
 
 pub use ferralk_glob;
 
@@ -53,8 +54,10 @@ mod absolute;
 /// Walker-pattern entry point for the corpus harness, exported the way the
 /// fuzz entry points are: for `tools/`, not for consumers.
 ///
-/// Returns the pattern the walker would compile, or `None` when the pattern
-/// names paths outside `root` and so can select nothing. `windows_paths`
+/// Returns the pattern after the walker's absolute-root rewrite, or `None`
+/// when the pattern names paths outside `root` and so can select nothing. The
+/// walker additionally compiles and validates this spelling before using it.
+/// `windows_paths`
 /// chooses which spelling of a path the rules read instead of the host's, so
 /// one corpus case describes one rule on every platform - including the rules
 /// that only apply to Windows, which would otherwise be recorded where nothing
@@ -70,7 +73,7 @@ pub fn corpus_rewrite_absolute_pattern(
     } else {
         absolute::Syntax::Posix
     };
-    walker_pattern_for_root(pattern, root, syntax)
+    rewrite_pattern_for_root(pattern, root, syntax)
 }
 mod classify;
 mod gitignore;
@@ -80,10 +83,12 @@ mod ignore_rules;
 /// the native dirent parsers are: for the harness in `fuzz/`, not for consumers.
 #[doc(hidden)]
 pub use ignore_rules::fuzz_rule as fuzz_ignore_rule;
+#[doc(hidden)]
+pub use ignore_rules::fuzz_rule_bytes as fuzz_ignore_rule_bytes;
 mod parallel;
 mod scheduler;
 
-use classify::{DirectoryTask, EmittedEntry, EntryAction, classify_entry};
+use classify::{DirectoryTask, EmittedEntry, EntryAction, TraversalContext, classify_entry};
 use gitignore::IgnoreScope;
 
 /// Controls what a walk does after a recoverable filesystem error.
@@ -91,14 +96,21 @@ use gitignore::IgnoreScope;
 pub enum ErrorPolicy {
     /// Stop immediately and return the first error.
     Abort,
-    /// Continue walking and do not retain recoverable errors.
+    /// Continue walking and do not retain recoverable errors discovered below
+    /// a root. A caller-supplied root that cannot be opened is still retained
+    /// (or yielded by [`Walker::stream`]), so it cannot look like an empty
+    /// tree.
     Skip,
     /// Continue walking and return accumulated recoverable errors.
     #[default]
     Collect,
 }
 
-/// Cloneable cooperative cancellation handle for a walk.
+/// Cloneable, caller-controlled cooperative cancellation handle for a walk.
+///
+/// A walker only observes this handle; internal aborts, worker startup
+/// failures, visitor stops, and panics never cancel it. This lets callers
+/// share one token across walks or reuse it after an individual walk fails.
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
@@ -163,7 +175,13 @@ pub struct WalkOptions {
 }
 
 impl WalkOptions {
-    /// Follows directory symlinks while retaining a canonical-path cycle guard.
+    /// Follows directory symlinks discovered below a walk root while retaining
+    /// a canonical-path cycle guard.
+    ///
+    /// A root supplied to [`Walker::new`] or [`Walker::add_root`] is always
+    /// opened as a directory, so a root that is a symlink to a directory is
+    /// traversed even when this option is `false`. This option controls only
+    /// symlink entries discovered while walking that root.
     #[must_use]
     pub const fn follow_symlinks(mut self, enabled: bool) -> Self {
         self.follow_symlinks = enabled;
@@ -292,7 +310,11 @@ pub enum WalkEntryKind {
 }
 
 /// One matching filesystem entry.
-#[derive(Debug)]
+///
+/// Entries are [`Clone`], so callers can retain an entry in more than one
+/// collection. Cloning preserves the captured path, walk-root identity, entry
+/// flags, depth, and optional metadata snapshot.
+#[derive(Debug, Clone)]
 pub struct WalkEntry {
     path: PathBuf,
     /// The walk root this entry was found under. Shared per root rather than
@@ -316,6 +338,29 @@ impl WalkEntry {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Encoded bytes of [`Self::path`], ready for byte-first matchers.
+    ///
+    /// This is exactly [`OsStr::as_encoded_bytes`] on the path's native
+    /// representation: raw filesystem bytes on Unix and lossless WTF-8 on
+    /// Windows. It performs no allocation or Unicode conversion, so it is the
+    /// bridge to [`ferralk_glob::Pattern`] when a visitor needs to match the
+    /// entry itself.
+    ///
+    /// ```no_run
+    /// use ferralk::{Verdict, Walker, ferralk_glob::{Pattern, PatternOptions}};
+    ///
+    /// let matcher = Pattern::compile("**/*.rs", PatternOptions::default().recursive_double_star(true))?;
+    /// let result = Walker::new("src").visit(|entry| {
+    ///     matcher.is_match(entry.path_bytes()).then_some(Verdict::Keep).unwrap_or(Verdict::Skip)
+    /// })?;
+    /// # let _ = result;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn path_bytes(&self) -> &[u8] {
+        self.path.as_os_str().as_encoded_bytes()
     }
 
     /// The walk root this entry was found under, exactly as it was given to
@@ -534,6 +579,10 @@ pub struct Walker {
     error_policy: ErrorPolicy,
     cancellation: Option<CancellationToken>,
     respect_git_ignore: bool,
+    /// Explicit effective Git settings. `None` reads supported
+    /// repository-local config; `Some` wins over it.
+    git_ignore_case: Option<bool>,
+    git_precompose_unicode: Option<bool>,
     wildcard_mode: WildcardMode,
     threads: usize,
 }
@@ -568,7 +617,11 @@ impl RootPlan {
 impl Walker {
     /// Starts a walk rooted at root.
     ///
-    /// Further roots may be added with [`Walker::add_root`].
+    /// Further roots may be added with [`Walker::add_root`]. `root` must name
+    /// a readable directory: a plain file produces a `read_dir` not-a-directory
+    /// error and no entry for the file. A directory symlink supplied as the
+    /// root is traversed regardless of [`WalkOptions::follow_symlinks`], which
+    /// only controls symlinks discovered below the root.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
@@ -580,6 +633,8 @@ impl Walker {
             error_policy: ErrorPolicy::default(),
             cancellation: None,
             respect_git_ignore: false,
+            git_ignore_case: None,
+            git_precompose_unicode: None,
             wildcard_mode: WildcardMode::default(),
             threads: std::thread::available_parallelism()
                 .map(std::num::NonZeroUsize::get)
@@ -587,8 +642,8 @@ impl Walker {
         }
     }
 
-    /// Adds an OR-ed include pattern. No includes means every non-excluded
-    /// entry is returned.
+    /// Adds an OR-ed include pattern and returns the builder for consuming
+    /// chains. No includes means every non-excluded entry is returned.
     ///
     /// The pattern may be absolute. See [`Walker::exclude`] for what that
     /// means and when it is rejected.
@@ -596,14 +651,52 @@ impl Walker {
     /// ```
     /// use ferralk::Walker;
     ///
-    /// // On a Unix host these two select the same entries of a walk rooted at
-    /// // `/repo`. The Windows spelling of the second is `C:/repo/src/**/*.ts`
-    /// // for a walk rooted at `C:/repo`.
-    /// let written_relative = Walker::new("/repo").include("src/**/*.ts")?;
-    /// let held_absolute = Walker::new("/repo").include("/repo/src/**/*.ts")?;
+    /// // These select the same entries. The absolute spelling follows the
+    /// // host's path syntax: `/repo` on Unix and `C:/repo` on Windows.
+    /// let (root, absolute) = if cfg!(windows) {
+    ///     ("C:/repo", "C:/repo/src/**/*.ts")
+    /// } else {
+    ///     ("/repo", "/repo/src/**/*.ts")
+    /// };
+    /// let written_relative = Walker::new(root).include("src/**/*.ts")?;
+    /// let held_absolute = Walker::new(root).include(absolute)?;
     /// # Ok::<(), ferralk::ferralk_glob::PatternError>(())
     /// ```
+    ///
+    /// For a caller-supplied list that may contain invalid patterns, use
+    /// [`Walker::try_include`] instead. It borrows the builder, so rejecting a
+    /// pattern leaves the caller's configured walker available for the next
+    /// pattern.
     pub fn include(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
+        self.try_include(pattern)?;
+        Ok(self)
+    }
+
+    /// Adds an OR-ed include pattern without consuming the builder.
+    ///
+    /// This is the borrowed counterpart to [`Walker::include`]. It is useful
+    /// when applying a user-supplied pattern list: an invalid pattern returns
+    /// its [`PatternError`] and leaves this walker unchanged, so later entries
+    /// can still be considered. A valid pattern has the same semantics as
+    /// [`Walker::include`] and composes with every root and matcher mode
+    /// already configured on this walker.
+    ///
+    /// ```no_run
+    /// use ferralk::Walker;
+    ///
+    /// let mut walker = Walker::new("workspace");
+    /// for pattern in ["src/**/*.rs", "[a", "tests/**/*.rs"] {
+    ///     if let Err(error) = walker.try_include(pattern) {
+    ///         eprintln!("skipping {pattern:?}: {error}");
+    ///     }
+    /// }
+    ///
+    /// // The two valid patterns remain configured despite the rejected `[a`.
+    /// let result = walker.collect()?;
+    /// # let _ = result;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn try_include(&mut self, pattern: impl AsRef<[u8]>) -> Result<&mut Self, PatternError> {
         let pattern = pattern.as_ref();
         // Compiled for every root before any of them is changed, so a pattern
         // one root rejects leaves the walker as it was rather than half updated.
@@ -626,8 +719,8 @@ impl Walker {
     /// would otherwise have to sort them itself - which is the arithmetic this
     /// exists to remove. What counts as absolute is the platform's own rule:
     /// a leading `/` on Unix, a drive letter or a UNC share on Windows, where a
-    /// single leading separator is drive-relative and so stays a walker
-    /// pattern.
+    /// single leading separator is drive-relative and so is compiled as a
+    /// walker pattern rather than treated as absolute.
     ///
     /// A pattern that names paths outside the walk root selects nothing, which
     /// is what it would have selected had it been matched against absolute
@@ -677,7 +770,22 @@ impl Walker {
     ///     assert!(Walker::new("/repo").exclude("/**/*.tmp").is_err());
     /// }
     /// ```
+    ///
+    /// For a caller-supplied list that may contain invalid patterns, use
+    /// [`Walker::try_exclude`] instead. It preserves the configured builder
+    /// when a pattern is rejected.
     pub fn exclude(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
+        self.try_exclude(pattern)?;
+        Ok(self)
+    }
+
+    /// Adds an OR-ed exclude pattern without consuming the builder.
+    ///
+    /// This is the borrowed counterpart to [`Walker::exclude`]. It has the
+    /// same all-or-nothing compilation rule as [`Walker::try_include`]: a
+    /// rejected pattern leaves every root and previously configured filter
+    /// unchanged, while a valid one composes with them.
+    pub fn try_exclude(&mut self, pattern: impl AsRef<[u8]>) -> Result<&mut Self, PatternError> {
         let pattern = pattern.as_ref();
         let compiled = self.compile_for_every_root(pattern)?;
         for (root, pattern) in self.roots.iter_mut().zip(compiled) {
@@ -690,9 +798,10 @@ impl Walker {
     /// Adds another root to the same walk.
     ///
     /// One walker, one thread pool, several trees: the roots become the walk's
-    /// initial directories and share everything downstream of that - the
-    /// scheduler, the helper-spawn floor, and the visited-directory guard. A
-    /// caller with several source trees no longer pays pool startup per tree.
+    /// initial directories and share the scheduler and helper-spawn floor. Each
+    /// root keeps its own visited-directory guard, so following symlinks still
+    /// preserves the same concatenation semantics as separate walks. A caller
+    /// with several source trees no longer pays pool startup per tree.
     ///
     /// # Semantics
     ///
@@ -715,7 +824,9 @@ impl Walker {
     ///   wants each path once passes roots that do not contain one another.
     /// - **A root that cannot be read is an ordinary walk error** for that
     ///   root's path, and the other roots are still walked, subject to
-    ///   [`ErrorPolicy`].
+    ///   [`ErrorPolicy`]. Even [`ErrorPolicy::Skip`] reports that root error,
+    ///   because a caller-supplied root must not be indistinguishable from an
+    ///   empty tree.
     ///
     /// The order roots are visited in is not part of the contract, any more
     /// than the order of entries within one root is: the scheduler hands the
@@ -873,6 +984,36 @@ impl Walker {
         self
     }
 
+    /// Overrides the repository-local `core.ignoreCase` value used by
+    /// [`Walker::respect_git_ignore`].
+    ///
+    /// Git sets this value when `git init` or `git clone` probes a
+    /// case-insensitive filesystem. When enabled, Ferralk mirrors Git's
+    /// ASCII-only ignore-rule case folding. The override takes precedence over
+    /// the repository's local config and is useful when Git's effective value
+    /// comes from a global config, include, or environment that Ferralk does
+    /// not read.
+    #[must_use]
+    pub const fn git_ignore_case(mut self, enabled: bool) -> Self {
+        self.git_ignore_case = Some(enabled);
+        self
+    }
+
+    /// Overrides the repository-local `core.precomposeUnicode` value used by
+    /// [`Walker::respect_git_ignore`].
+    ///
+    /// Git implements this filesystem adaptation only on macOS. There, an
+    /// enabled value converts valid UTF-8 candidate path components to NFC
+    /// before ignore matching; invalid bytes remain byte-exact. On other
+    /// platforms this method is retained for portable builder code but has no
+    /// effect, matching Git's platform applicability. The override takes
+    /// precedence over repository-local config.
+    #[must_use]
+    pub const fn git_precompose_unicode(mut self, enabled: bool) -> Self {
+        self.git_precompose_unicode = Some(enabled);
+        self
+    }
+
     /// Limits `collect()` to this many workers. Zero is clamped to one;
     /// `stream()` remains single-threaded to preserve incremental delivery.
     #[must_use]
@@ -991,7 +1132,7 @@ impl Walker {
             next_entry: 0,
             path: PathBuf::new(),
             directory: PathBuf::new(),
-            visited_directories: HashSet::new(),
+            cycle_guard: Arc::new(CycleGuard::default()),
             ignores: IgnoreScope::default(),
             depth: 0,
             root: 0,
@@ -1034,6 +1175,7 @@ impl Walker {
                 path: plan.path.clone(),
                 depth: 0,
                 root: index,
+                cycle_guard: Arc::new(CycleGuard::default()),
                 ignores: IgnoreScope::for_root(self, backend, &plan.path),
             })
             .collect()
@@ -1079,7 +1221,7 @@ fn compile_for_root(
     root: &[u8],
     options: PatternOptions,
 ) -> Result<TraversalPattern, PatternError> {
-    match walker_pattern_for_root(pattern, root, absolute::Syntax::NATIVE)? {
+    match walker_pattern_for_root(pattern, root, absolute::Syntax::NATIVE, options)? {
         Some(usable) => TraversalPattern::compile(&usable, options),
         // Compiled even though it can never match, so that a pattern the caller
         // wrote badly is still reported, and kept rather than dropped, because
@@ -1104,6 +1246,27 @@ fn walker_pattern_for_root(
     pattern: &[u8],
     root: &[u8],
     syntax: absolute::Syntax,
+    options: PatternOptions,
+) -> Result<Option<Vec<u8>>, PatternError> {
+    let Some(rewritten) = rewrite_pattern_for_root(pattern, root, syntax)? else {
+        return Ok(None);
+    };
+    let parsed = Pattern::compile(pattern_without_directory_marker(&rewritten), options)?;
+    reject_unwalkable_relative_pattern(
+        parsed.walker_path_viability(),
+        parsed.walker_path_problem_offset(),
+    )?;
+    Ok(Some(rewritten))
+}
+
+/// Applies only the root-to-pattern relation shared by the walk and corpus
+/// harness. Walker construction adds the compiled root-relative candidate
+/// validation afterwards; the corpus records absolute rewrite semantics even
+/// for synthetic platform spellings that do not describe this host's walker.
+fn rewrite_pattern_for_root(
+    pattern: &[u8],
+    root: &[u8],
+    syntax: absolute::Syntax,
 ) -> Result<Option<Vec<u8>>, PatternError> {
     match absolute::rewrite_in(pattern, root, syntax)? {
         absolute::Rewrite::Relative => {
@@ -1116,6 +1279,51 @@ fn walker_pattern_for_root(
         }
         absolute::Rewrite::Outside => Ok(None),
     }
+}
+
+/// The one trailing slash [`TraversalPattern`] treats as a directory-only
+/// marker is not part of the root-relative candidate spelling. Validation uses
+/// the same marker-free bytes so `aaa/` remains valid while `src//bar` and
+/// other leading or interior empty components stay unselectable.
+fn pattern_without_directory_marker(pattern: &[u8]) -> &[u8] {
+    if pattern.len() > 1 {
+        pattern.strip_suffix(b"/").unwrap_or(pattern)
+    } else {
+        pattern
+    }
+}
+
+/// Rejects root-relative path spellings that name no walk candidate.
+///
+/// A leading `./` remains the conventional harmless spelling for a pattern
+/// below the root, but `.` and `./` name the root itself, which a walk never
+/// emits. Any other real `.` component (`src/./x` or `src/.`) likewise names
+/// a spelling no root-relative candidate uses. The glob compiler summarizes
+/// its actual expanded alternatives and extglob branches, so this policy never
+/// reparses matcher syntax.
+fn reject_unwalkable_relative_pattern(
+    viability: WalkerPathViability,
+    offset: Option<usize>,
+) -> Result<(), PatternError> {
+    let message = match viability {
+        WalkerPathViability::Viable => return Ok(()),
+        WalkerPathViability::ParentComponent => {
+            "`..` in a walker-relative pattern is not resolved, because resolving it lexically would be wrong across a symlink"
+        }
+        WalkerPathViability::Root => {
+            "a walker-relative pattern that names the walk root itself selects nothing; add `/**` to select what is inside it"
+        }
+        WalkerPathViability::TrailingDot => {
+            "a walker-relative pattern ending in `/.` selects that directory itself; add `/**` to select what is inside it"
+        }
+        WalkerPathViability::DotComponent => {
+            "a walker-relative pattern with a `.` component is not normalized; remove `/.` to name the entry below that directory"
+        }
+    };
+    // Brace expansion can create several equally valid source locations. The
+    // compiler carries an offset whenever it is determinate and uses this
+    // established fallback only for genuinely ambiguous expanded branches.
+    Err(PatternError::new(offset.unwrap_or(0), message))
 }
 
 /// The pattern dialect every walker pattern is compiled in. Only
@@ -1402,16 +1610,20 @@ fn has_closing_parenthesis(pattern: &[u8], open: usize) -> bool {
 }
 
 /// The filesystem calls that traversal and classification make, so one mock
-/// can drive the serial and the parallel frontend alike. Reading `.gitignore`
-/// files is not part of it: those go through the `ignore` crate, which owns
-/// its own IO.
+/// can drive the serial and the parallel frontend alike.
 trait DirectoryBackend {
     /// Reads one directory into `listing`, replacing whatever it held.
     ///
     /// The listing is the caller's, and the caller reuses it for every
     /// directory it reads, so a backend that can name an entry without
     /// allocating leaves the walk allocating nothing per entry at all.
-    fn read_directory(&self, path: &Path, listing: &mut Listing) -> std::io::Result<()>;
+    fn read_directory(
+        &self,
+        path: &Path,
+        follow_symlinks: bool,
+        refuse_final_symlink: bool,
+        listing: &mut Listing,
+    ) -> std::io::Result<()>;
 
     /// Follows symlinks; decides whether a link points at a directory.
     fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
@@ -1429,9 +1641,22 @@ trait DirectoryBackend {
         fs::canonicalize(path)
     }
 
-    /// Reads one ignore file. Missing files are the common case and are
-    /// reported as an error rather than probed for beforehand.
+    /// Reads an in-tree ignore file. Missing files are the common case and
+    /// are reported as an error rather than probed for beforehand.
+    ///
+    /// On Unix this refuses symlinks atomically. Git likewise refuses an
+    /// in-tree `.gitignore` that resolves through a link, so its rules cannot
+    /// redirect a walk to an arbitrary file outside the tree.
     fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        read_in_tree_ignore_file(path)
+    }
+
+    /// Reads repository metadata such as `.git/info/exclude`.
+    ///
+    /// Unlike in-tree rule files, Git permits this file to be a link. Keeping
+    /// this separate prevents a repository-wide exclude from weakening the
+    /// in-tree no-follow rule above.
+    fn read_repository_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         fs::read(path)
     }
 
@@ -1454,6 +1679,35 @@ trait DirectoryBackend {
     }
 }
 
+/// Reads a rule file found in the tree being walked.
+///
+/// Unix opens the final path component with `O_NOFOLLOW`, so exchanging a
+/// regular rule file for a symlink between a metadata check and an open cannot
+/// make a walk read a target outside the tree. Other supported platforms do
+/// not expose an equivalent through `std`, so they reject a symlink before the
+/// regular `fs::read`; Windows will receive an atomic implementation once its
+/// stable standard-library API exposes one.
+#[cfg(unix)]
+fn read_in_tree_ignore_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt};
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    Ok(contents)
+}
+
+#[cfg(not(unix))]
+fn read_in_tree_ignore_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    fs::read(path)
+}
+
 /// What identifies a directory that the follow-symlinks guard has seen.
 ///
 /// On Unix this is `(st_dev, st_ino)`: sixteen `Copy` bytes from the one
@@ -1469,6 +1723,22 @@ trait DirectoryBackend {
 type CycleKey = (u64, u64);
 #[cfg(not(unix))]
 type CycleKey = PathBuf;
+
+/// Directories one root traversal has already entered while following links.
+///
+/// A separately supplied root receives its own guard; descendant tasks share
+/// their root's guard, which breaks cycles without deduplicating overlaps.
+#[derive(Debug, Default)]
+pub(crate) struct CycleGuard(Mutex<HashSet<CycleKey>>);
+
+impl CycleGuard {
+    fn mark(&self, key: CycleKey) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key)
+    }
+}
 
 /// Names the call whose failure ends a directory in follow mode, so the
 /// reported operation stays the one that actually ran.
@@ -1495,6 +1765,42 @@ pub(crate) struct Listing {
     /// Entries in use. `entries` may be longer: the tail is buffers kept for
     /// the next directory.
     len: usize,
+    /// Per-entry failures discovered while a backend was completing an
+    /// otherwise usable listing. They are delivered after its siblings, so a
+    /// persistent stat failure cannot make those siblings disappear.
+    deferred_errors: Vec<DeferredListingError>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DeferredListingError {
+    path: PathBuf,
+    source: DeferredIoError,
+}
+
+/// An `io::Error` representation that can live in the public stream without
+/// changing its auto-trait contract. `std::io::Error` may carry an arbitrary
+/// error object, which is not necessarily unwind-safe; a deferred listing
+/// error needs only the externally observable kind and message until it is
+/// delivered as a fresh `io::Error`.
+#[derive(Debug)]
+struct DeferredIoError {
+    kind: std::io::ErrorKind,
+    message: String,
+}
+
+impl From<std::io::Error> for DeferredIoError {
+    fn from(source: std::io::Error) -> Self {
+        Self {
+            kind: source.kind(),
+            message: source.to_string(),
+        }
+    }
+}
+
+impl DeferredIoError {
+    fn into_io_error(self) -> std::io::Error {
+        std::io::Error::new(self.kind, self.message)
+    }
 }
 
 /// One entry of a [`Listing`].
@@ -1523,6 +1829,7 @@ impl Listing {
     /// Drops the previous directory's entries, keeping their buffers.
     pub(crate) fn clear(&mut self) {
         self.len = 0;
+        self.deferred_errors.clear();
     }
 
     /// Adds one entry, reusing the buffer left by the directory before.
@@ -1542,32 +1849,112 @@ impl Listing {
         &self.entries[..self.len]
     }
 
+    /// Records a failure for one entry without throwing away the successfully
+    /// read siblings. Consumers report these after the listing is consumed.
+    pub(crate) fn defer_error(&mut self, path: PathBuf, source: std::io::Error) {
+        self.deferred_errors.push(DeferredListingError {
+            path,
+            source: source.into(),
+        });
+    }
+
+    pub(crate) fn take_deferred_error(&mut self) -> Option<DeferredListingError> {
+        (!self.deferred_errors.is_empty()).then(|| self.deferred_errors.remove(0))
+    }
+
     /// Whether the directory holds an entry of this name, which is how the
     /// ignore chain recognizes its own files without probing for them.
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.entries().iter().any(|entry| entry.name == *name)
     }
+
+    /// Whether a directory contains a possible spelling of a Git ignore file.
+    /// The caller still opens the canonical name: on a case-sensitive
+    /// filesystem that open fails for `.GITIGNORE`, while on APFS/NTFS it
+    /// resolves exactly as Git's `open(".gitignore")` does.
+    pub(crate) fn contains_git_ignore_name(&self, name: &str) -> bool {
+        self.contains(name)
+            || self.entries().iter().any(|entry| {
+                entry
+                    .name
+                    .as_encoded_bytes()
+                    .eq_ignore_ascii_case(name.as_bytes())
+            })
+    }
 }
 
+#[cfg_attr(all(feature = "native-macos", target_os = "macos"), allow(dead_code))]
 struct StdBackend;
 
 impl DirectoryBackend for StdBackend {
-    fn read_directory(&self, path: &Path, listing: &mut Listing) -> std::io::Result<()> {
-        listing.clear();
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            // `DirEntry` hands its name out by value and nothing else out at
-            // all, so this one allocation is the standard library's and is the
-            // floor for the portable backend. The native backends read names
-            // out of a buffer they own and reach zero.
-            listing.push(
-                &entry.file_name(),
-                file_type.is_dir(),
-                file_type.is_symlink(),
-            );
+    fn read_directory(
+        &self,
+        path: &Path,
+        _follow_symlinks: bool,
+        _refuse_final_symlink: bool,
+        listing: &mut Listing,
+    ) -> std::io::Result<()> {
+        read_portable_directory(path, path, listing)
+    }
+}
+
+/// Reads a directory through the portable `std::fs` backend. `directory` is
+/// the path opened by the operating system; `reported_path` keeps deferred
+/// per-entry errors anchored at the caller's path when a native no-follow
+/// descriptor is exposed through `/dev/fd` for a safe fallback.
+#[cfg_attr(all(feature = "native-macos", target_os = "macos"), allow(dead_code))]
+fn read_portable_directory(
+    directory: &Path,
+    reported_path: &Path,
+    listing: &mut Listing,
+) -> std::io::Result<()> {
+    listing.clear();
+    for entry in fs::read_dir(directory)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                defer_entry_stat_error(listing, reported_path.to_path_buf(), error)?;
+                continue;
+            }
+        };
+        // `DirEntry` only exposes its name by value. Retain that one
+        // allocation for the listing and do not construct a full path unless
+        // the uncommon `file_type` failure needs it for error reporting.
+        let name = entry.file_name();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                defer_entry_stat_error(listing, reported_path.join(&name), error)?;
+                continue;
+            }
+        };
+        // The standard library's one `file_name` allocation is the portable
+        // backend's floor. The native backends read names out of a buffer they
+        // own and reach zero.
+        listing.push(&name, file_type.is_dir(), file_type.is_symlink());
+    }
+    Ok(())
+}
+
+/// Keeps the three directory readers on the same `DT_UNKNOWN` contract.
+///
+/// `NotFound` and `NotADirectory` describe a path that changed after its
+/// directory record was read, so that one entry is dropped. `PermissionDenied`
+/// is persistent often enough that silently treating it as a race loses data;
+/// it is delayed until the usable listing has been delivered. Other failures
+/// make the directory read fail normally.
+pub(crate) fn defer_entry_stat_error(
+    listing: &mut Listing,
+    path: PathBuf,
+    error: std::io::Error,
+) -> std::io::Result<()> {
+    match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => Ok(()),
+        std::io::ErrorKind::PermissionDenied => {
+            listing.defer_error(path, error);
+            Ok(())
         }
-        Ok(())
+        _ => Err(error),
     }
 }
 
@@ -1575,17 +1962,41 @@ impl DirectoryBackend for StdBackend {
 /// portable backend everywhere else.
 struct SystemBackend;
 
+#[cfg(any(
+    all(feature = "native-macos", target_os = "macos"),
+    all(feature = "native-linux", target_os = "linux")
+))]
+#[cfg_attr(all(feature = "native-macos", target_os = "macos"), allow(dead_code))]
+fn read_native_or_portable(
+    listing: &mut Listing,
+    native: impl FnOnce(&mut Listing) -> std::io::Result<()>,
+    fallback: impl FnOnce(&mut Listing) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match native(listing) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => fallback(listing),
+        Err(error) => Err(error),
+    }
+}
+
 impl DirectoryBackend for SystemBackend {
-    fn read_directory(&self, path: &Path, listing: &mut Listing) -> std::io::Result<()> {
+    fn read_directory(
+        &self,
+        path: &Path,
+        follow_symlinks: bool,
+        refuse_final_symlink: bool,
+        listing: &mut Listing,
+    ) -> std::io::Result<()> {
         #[cfg(all(feature = "native-macos", target_os = "macos"))]
         {
-            match macos_native::read_directory(path, listing) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                    StdBackend.read_directory(path, listing)
-                }
-                Err(error) => Err(error),
-            }
+            // macOS performs its capability fallback inside the native module,
+            // where it still owns the protected directory descriptor. Keeping
+            // ordinary `Unsupported` I/O errors out of the generic adapter is
+            // essential: a DT_UNKNOWN stat may report that kind after a batch,
+            // and a path fallback would discard the usable siblings.
+            let _ = follow_symlinks;
+            macos_native::read_directory(path, refuse_final_symlink, listing)
+                .map_err(macos_native::NativeDirectoryReadError::into_io_error)
         }
         #[cfg(all(
             feature = "native-linux",
@@ -1593,19 +2004,26 @@ impl DirectoryBackend for SystemBackend {
             not(all(feature = "native-macos", target_os = "macos"))
         ))]
         {
-            match linux_native::read_directory(path, listing) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                    StdBackend.read_directory(path, listing)
-                }
-                Err(error) => Err(error),
-            }
+            read_native_or_portable(
+                listing,
+                |listing| linux_native::read_directory(path, refuse_final_symlink, listing),
+                |listing| {
+                    if refuse_final_symlink {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "native directory reader is unavailable and the portable fallback cannot preserve no-follow traversal",
+                        ))
+                    } else {
+                        StdBackend.read_directory(path, follow_symlinks, false, listing)
+                    }
+                },
+            )
         }
         #[cfg(not(any(
             all(feature = "native-macos", target_os = "macos"),
             all(feature = "native-linux", target_os = "linux")
         )))]
-        StdBackend.read_directory(path, listing)
+        StdBackend.read_directory(path, follow_symlinks, refuse_final_symlink, listing)
     }
 }
 
@@ -1622,7 +2040,8 @@ pub struct WalkStream {
     /// The same directory without an entry on it, kept so `path` can be reset
     /// by [`reset_to_directory`] rather than by `PathBuf::pop`.
     directory: PathBuf,
-    visited_directories: HashSet<CycleKey>,
+    /// The guard belonging to the directory currently being delivered.
+    cycle_guard: Arc<CycleGuard>,
     /// Ignore rules of the directory whose entries are being delivered.
     ignores: IgnoreScope,
     /// Depth of that same directory, so its entries need not recount it.
@@ -1654,6 +2073,7 @@ impl WalkStream {
         operation: &'static str,
         path: PathBuf,
         source: std::io::Error,
+        is_root: bool,
     ) -> Option<Result<WalkEntry, WalkError>> {
         let error = WalkError::new(operation, path, source);
         match self.walker.error_policy {
@@ -1661,8 +2081,8 @@ impl WalkStream {
                 self.stopped = true;
                 Some(Err(error))
             }
-            ErrorPolicy::Skip => None,
-            ErrorPolicy::Collect => Some(Err(error)),
+            ErrorPolicy::Skip if !is_root => None,
+            ErrorPolicy::Skip | ErrorPolicy::Collect => Some(Err(error)),
         }
     }
 
@@ -1671,25 +2091,32 @@ impl WalkStream {
             path,
             depth,
             root,
+            cycle_guard,
             ignores,
         } = task;
         if self.walker.options.follow_symlinks {
             match SystemBackend.cycle_key(&path) {
                 Ok(key) => {
-                    if !self.visited_directories.insert(key) {
+                    if !cycle_guard.mark(key) {
                         return None;
                     }
                 }
-                Err(source) => return self.error(CYCLE_KEY_OPERATION, path, source),
+                Err(source) => return self.error(CYCLE_KEY_OPERATION, path, source, depth == 0),
             }
         }
-        match SystemBackend.read_directory(&path, &mut self.listing) {
+        match SystemBackend.read_directory(
+            &path,
+            self.walker.options.follow_symlinks,
+            !self.walker.options.follow_symlinks && depth > 0,
+            &mut self.listing,
+        ) {
             Ok(()) => {
                 // The directory's own ignore files join the chain here, once,
                 // recognized in the listing that was just read.
                 self.ignores = ignores.enter(&self.walker, &SystemBackend, &path, &self.listing);
                 self.depth = depth;
                 self.root = root;
+                self.cycle_guard = cycle_guard;
                 self.next_entry = 0;
                 self.directory = path;
                 reset_to_directory(&mut self.path, &self.directory);
@@ -1701,7 +2128,7 @@ impl WalkStream {
                 // the directory the stream delivered previously.
                 self.listing.clear();
                 self.next_entry = 0;
-                self.error("read_dir", path, source)
+                self.error("read_dir", path, source, depth == 0)
             }
         }
     }
@@ -1719,7 +2146,10 @@ impl WalkStream {
             &self.listing.entries()[index],
             &self.ignores,
             self.depth,
-            self.root,
+            TraversalContext {
+                root: self.root,
+                cycle_guard: &self.cycle_guard,
+            },
         );
         // Only an emitted entry needs a path of its own, and the stream hands
         // every one of them to the caller.
@@ -1739,7 +2169,7 @@ impl WalkStream {
                 if let Some(task) = descend {
                     self.pending_directories.push(task);
                 }
-                self.error(failure.operation, failure.path, failure.source)
+                self.error(failure.operation, failure.path, failure.source, false)
             }
         };
         reset_to_directory(&mut self.path, &self.directory);
@@ -1764,6 +2194,14 @@ impl Iterator for WalkStream {
                 }
                 continue;
             }
+            if let Some(error) = self.listing.take_deferred_error() {
+                if let Some(result) =
+                    self.error("read_dir", error.path, error.source.into_io_error(), false)
+                {
+                    return Some(result);
+                }
+                continue;
+            }
             let task = self.pending_directories.pop()?;
             if let Some(result) = self.prepare_directory(task) {
                 return Some(result);
@@ -1778,7 +2216,6 @@ struct WalkState<'walker> {
     visitor: EntryVisitor<'walker>,
     entries: Vec<WalkEntry>,
     errors: Vec<WalkError>,
-    visited_directories: HashSet<CycleKey>,
     /// Buffers of directories this frontend has finished with. It descends by
     /// recursion, so several directories are open at once and each needs its
     /// own; a pool hands the deepest frame the buffers the last one returned.
@@ -1847,7 +2284,6 @@ impl<'walker> WalkState<'walker> {
             visitor,
             entries: Vec::new(),
             errors: Vec::new(),
-            visited_directories: HashSet::new(),
             scratch: Vec::new(),
             spare: PathBuf::new(),
             cancelled: false,
@@ -1882,13 +2318,27 @@ impl<'walker> WalkState<'walker> {
             path,
             depth,
             root,
+            cycle_guard,
             ignores,
         } = task;
-        if self.walker.options.follow_symlinks && !self.mark_directory(backend, &path)? {
+        let is_root = depth == 0;
+        if self.walker.options.follow_symlinks
+            && !self.mark_directory(backend, &cycle_guard, &path, is_root)?
+        {
             return Ok(());
         }
         let mut scratch = self.scratch.pop().unwrap_or_default();
-        let outcome = self.walk_listing(backend, &path, depth, root, ignores, &mut scratch);
+        let outcome = self.walk_listing(
+            backend,
+            &path,
+            depth,
+            TraversalContext {
+                root,
+                cycle_guard: &cycle_guard,
+            },
+            ignores,
+            &mut scratch,
+        );
         scratch.listing.clear();
         self.scratch.push(scratch);
         outcome
@@ -1901,12 +2351,18 @@ impl<'walker> WalkState<'walker> {
         backend: &impl DirectoryBackend,
         path: &Path,
         depth: usize,
-        root: usize,
+        context: TraversalContext<'_>,
         ignores: IgnoreScope,
         scratch: &mut DirectoryScratch,
     ) -> Result<(), WalkError> {
-        if let Err(source) = backend.read_directory(path, &mut scratch.listing) {
-            return self.handle_error("read_dir", path.to_path_buf(), source);
+        let is_root = depth == 0;
+        if let Err(source) = backend.read_directory(
+            path,
+            self.walker.options.follow_symlinks,
+            !self.walker.options.follow_symlinks && depth > 0,
+            &mut scratch.listing,
+        ) {
+            return self.handle_error("read_dir", path.to_path_buf(), source, is_root);
         }
         // The directory's own ignore files join the chain here, once,
         // recognized in the listing that was just read.
@@ -1933,11 +2389,14 @@ impl<'walker> WalkState<'walker> {
                 &scratch.listing.entries()[index],
                 &ignores,
                 depth,
-                root,
+                context,
             );
             let outcome = self.act(backend, action, &scratch.path);
             reset_to_directory(&mut scratch.path, path);
             outcome?;
+        }
+        while let Some(error) = scratch.listing.take_deferred_error() {
+            self.handle_error("read_dir", error.path, error.source.into_io_error(), false)?;
         }
         Ok(())
     }
@@ -1945,12 +2404,19 @@ impl<'walker> WalkState<'walker> {
     fn mark_directory(
         &mut self,
         backend: &impl DirectoryBackend,
+        cycle_guard: &CycleGuard,
         directory: &Path,
+        is_root: bool,
     ) -> Result<bool, WalkError> {
         match backend.cycle_key(directory) {
-            Ok(key) => Ok(self.visited_directories.insert(key)),
+            Ok(key) => Ok(cycle_guard.mark(key)),
             Err(source) => {
-                self.handle_error(CYCLE_KEY_OPERATION, directory.to_path_buf(), source)?;
+                self.handle_error(
+                    CYCLE_KEY_OPERATION,
+                    directory.to_path_buf(),
+                    source,
+                    is_root,
+                )?;
                 Ok(false)
             }
         }
@@ -1983,7 +2449,7 @@ impl<'walker> WalkState<'walker> {
                 Ok(())
             }
             EntryAction::Failed { failure, descend } => {
-                self.handle_error(failure.operation, failure.path, failure.source)?;
+                self.handle_error(failure.operation, failure.path, failure.source, false)?;
                 if let Some(task) = descend {
                     self.walk_directory(backend, task)?;
                 }
@@ -1997,12 +2463,13 @@ impl<'walker> WalkState<'walker> {
         operation: &'static str,
         path: PathBuf,
         source: std::io::Error,
+        is_root: bool,
     ) -> Result<(), WalkError> {
         let error = WalkError::new(operation, path, source);
         match self.walker.error_policy {
             ErrorPolicy::Abort => Err(error),
-            ErrorPolicy::Skip => Ok(()),
-            ErrorPolicy::Collect => {
+            ErrorPolicy::Skip if !is_root => Ok(()),
+            ErrorPolicy::Skip | ErrorPolicy::Collect => {
                 self.errors.push(error);
                 Ok(())
             }
@@ -2033,6 +2500,7 @@ mod tests {
         collections::{HashMap, HashSet},
         fs,
         path::{Path, PathBuf},
+        process::Command,
         sync::{
             Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -2041,12 +2509,21 @@ mod tests {
     };
 
     use super::{
-        CancellationToken, ErrorPolicy, TraversalPattern, Verdict, WalkEntry, WalkEntryKind,
-        WalkOptions, Walker, WildcardMode, glob_path_bytes, literal_extension,
-        literal_pattern_root, traversal_pattern_options,
+        CancellationToken, ErrorPolicy, Pattern, PatternOptions, TraversalPattern, Verdict,
+        WalkEntry, WalkEntryKind, WalkOptions, WalkStream, Walker, WildcardMode, glob_path_bytes,
+        literal_extension, literal_pattern_root, traversal_pattern_options,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    const HOSTILE_GIT_CONFIG_FIXTURE: &str = "FERRALK_HOSTILE_GIT_CONFIG_FIXTURE";
+
+    #[test]
+    fn walk_stream_keeps_its_unwind_auto_traits() {
+        fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+
+        assert_unwind_safe::<WalkStream>();
+    }
 
     /// Compiles one walker pattern the way `include` and `exclude` do, in the
     /// default dialect where a wildcard does not cover a leading period.
@@ -2296,6 +2773,7 @@ mod tests {
             path: path.clone(),
             depth: 0,
             root: 0,
+            cycle_guard: std::sync::Arc::new(super::CycleGuard::default()),
             ignores: super::IgnoreScope::for_root(walker, backend, &path),
         }
     }
@@ -2347,8 +2825,14 @@ mod tests {
     }
 
     impl super::DirectoryBackend for CountingBackend {
-        fn read_directory(&self, path: &Path, listing: &mut super::Listing) -> std::io::Result<()> {
-            super::StdBackend.read_directory(path, listing)
+        fn read_directory(
+            &self,
+            path: &Path,
+            follow_symlinks: bool,
+            refuse_final_symlink: bool,
+            listing: &mut super::Listing,
+        ) -> std::io::Result<()> {
+            super::StdBackend.read_directory(path, follow_symlinks, refuse_final_symlink, listing)
         }
 
         fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
@@ -2391,6 +2875,45 @@ mod tests {
             .collect()
     }
 
+    fn rooted_relative_paths(entries: &[WalkEntry]) -> Vec<(PathBuf, PathBuf)> {
+        let mut paths = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.root().to_path_buf(),
+                    entry
+                        .path()
+                        .strip_prefix(entry.root())
+                        .expect("entry is rooted in its declared root")
+                        .to_path_buf(),
+                )
+            })
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+        paths
+    }
+
+    type RootFilterSources = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+    fn configured_filter_sources(walker: &Walker) -> Vec<RootFilterSources> {
+        walker
+            .roots
+            .iter()
+            .map(|root| {
+                (
+                    root.includes
+                        .iter()
+                        .map(|pattern| pattern.source.clone())
+                        .collect(),
+                    root.excludes
+                        .iter()
+                        .map(|pattern| pattern.source.clone())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn include_exclude_and_sort_are_applied_to_relative_paths() {
         let fixture = Fixture::new();
@@ -2412,6 +2935,85 @@ mod tests {
             vec![PathBuf::from("src/main.rs")]
         );
         assert!(result.errors().is_empty());
+    }
+
+    #[test]
+    fn borrowed_pattern_lists_keep_the_builder_and_filter_every_frontend() {
+        let fixture = Fixture::new();
+        let alpha = fixture.root.join("alpha");
+        let beta = fixture.root.join("beta");
+        for root in ["alpha", "beta"] {
+            fixture.write(format!("{root}/src/keep.rs"));
+            fixture.write(format!("{root}/src/remove.rs"));
+            fixture.write(format!("{root}/src/ignore.txt"));
+            fixture.write(format!("{root}/.hidden.rs"));
+        }
+
+        let mut walker = Walker::new(&alpha)
+            .add_root(&beta)
+            .expect("valid second root")
+            .match_hidden(true)
+            .wildcard_mode(WildcardMode::SeparatorCrossing)
+            .options(WalkOptions::default().files_only(true).sort(true));
+
+        walker
+            .try_include("*.rs")
+            .expect("first supplied include is valid");
+        let before_bad_include = walker.clone();
+        assert!(walker.try_include("[a").is_err());
+        assert_eq!(walker.include_sources, before_bad_include.include_sources);
+        assert_eq!(walker.exclude_sources, before_bad_include.exclude_sources);
+        assert_eq!(
+            configured_filter_sources(&walker),
+            configured_filter_sources(&before_bad_include),
+            "a rejected include must not update any root"
+        );
+        walker
+            .try_include("**/also.rs")
+            .expect("a later supplied include still composes");
+
+        walker
+            .try_exclude("**/remove.rs")
+            .expect("first supplied exclude is valid");
+        let before_bad_exclude = walker.clone();
+        assert!(walker.try_exclude("[a").is_err());
+        assert_eq!(walker.include_sources, before_bad_exclude.include_sources);
+        assert_eq!(walker.exclude_sources, before_bad_exclude.exclude_sources);
+        assert_eq!(
+            configured_filter_sources(&walker),
+            configured_filter_sources(&before_bad_exclude),
+            "a rejected exclude must not update any root"
+        );
+        walker
+            .try_exclude("**/generated/**")
+            .expect("a later supplied exclude still composes");
+
+        let expected = vec![
+            (alpha.clone(), PathBuf::from(".hidden.rs")),
+            (alpha.clone(), PathBuf::from("src/keep.rs")),
+            (beta.clone(), PathBuf::from(".hidden.rs")),
+            (beta.clone(), PathBuf::from("src/keep.rs")),
+        ];
+        for threads in [1, 4] {
+            let collected = walker
+                .clone()
+                .threads(threads)
+                .collect()
+                .expect("collect succeeds");
+            assert_eq!(rooted_relative_paths(collected.entries()), expected);
+
+            let visited = walker
+                .clone()
+                .threads(threads)
+                .visit(|_| Verdict::Keep)
+                .expect("visit succeeds");
+            assert_eq!(rooted_relative_paths(visited.entries()), expected);
+        }
+        let streamed = walker
+            .stream()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream succeeds");
+        assert_eq!(rooted_relative_paths(&streamed), expected);
     }
 
     #[test]
@@ -2468,6 +3070,320 @@ mod tests {
             relative_paths(brace.entries(), &fixture.root),
             vec![PathBuf::from("docs/d.md"), PathBuf::from("src/b.txt")]
         );
+    }
+
+    #[test]
+    fn relative_patterns_that_name_no_candidate_are_rejected_with_guidance() {
+        let fixture = Fixture::new();
+        fixture.write("src/main.rs");
+        fixture.write("src/a.rs");
+        fixture.write("src/].rs");
+        // Windows normalizes a path component ending in dots, so these two
+        // valid matcher strings cannot be represented as fixture paths there.
+        #[cfg(not(windows))]
+        {
+            fixture.write("prefix../bar");
+            fixture.write("foo/..suffix/bar");
+        }
+
+        for mode in [
+            WildcardMode::ComponentScoped,
+            WildcardMode::SeparatorCrossing,
+        ] {
+            for add in [
+                |walker: Walker| walker.include("."),
+                |walker: Walker| walker.include("./"),
+                |walker: Walker| walker.include("src/."),
+                |walker: Walker| walker.include("src/./main.rs"),
+                |walker: Walker| walker.include("././src/**"),
+                |walker: Walker| walker.include("src/../main.rs"),
+                |walker: Walker| walker.include("+(dead/../branch)"),
+                |walker: Walker| walker.exclude("."),
+                |walker: Walker| walker.exclude("./"),
+                |walker: Walker| walker.exclude("src/."),
+                |walker: Walker| walker.exclude("src/./main.rs"),
+                |walker: Walker| walker.exclude("././src/**"),
+                |walker: Walker| walker.exclude("src/../main.rs"),
+                |walker: Walker| walker.exclude("+(dead/../branch)"),
+            ] {
+                let error = add(Walker::new(&fixture.root).wildcard_mode(mode))
+                    .expect_err("unwalkable relative pattern is refused");
+                assert!(
+                    error.message().contains("select")
+                        || error.message().contains("not normalized")
+                        || error.message().starts_with("`..`"),
+                    "the rejection explains why the pattern cannot select: {error}"
+                );
+            }
+        }
+
+        // On a relative walk root `/bar` cannot be rewritten as an absolute
+        // pattern; on Windows it remains a root-relative empty-leading
+        // spelling. Either path must refuse it at pattern-add time.
+        for mode in [
+            WildcardMode::ComponentScoped,
+            WildcardMode::SeparatorCrossing,
+        ] {
+            assert!(
+                Walker::new(".")
+                    .wildcard_mode(mode)
+                    .include("/bar")
+                    .is_err(),
+                "include rejects an unselectable leading empty component under {mode:?}"
+            );
+            assert!(
+                Walker::new(".")
+                    .wildcard_mode(mode)
+                    .exclude("/bar")
+                    .is_err(),
+                "exclude rejects an unselectable leading empty component under {mode:?}"
+            );
+        }
+
+        // Dots that are matcher text, rather than slash-delimited path
+        // components, remain valid in every mode. In particular this keeps
+        // escaped, class, brace and extglob literals out of the path check.
+        for pattern in [
+            "./src/**",
+            "...",
+            ".hidden",
+            r"\.\.",
+            r"src\..\main.rs",
+            "[.]",
+            "{..,src}",
+            "@(..)",
+            "src/[[:alpha:]/../].rs",
+            "src/[]/../].rs",
+            "{dead/../branch,src/main.rs}",
+            "@(dead/../branch|src/main.rs)",
+            "src/[{],a}/../].rs",
+            "@(dead/{),x}/../branch|src/main.rs)",
+            "prefix@(../bar)",
+            "@(foo/..)suffix/bar",
+        ] {
+            for mode in [
+                WildcardMode::ComponentScoped,
+                WildcardMode::SeparatorCrossing,
+            ] {
+                Walker::new(&fixture.root)
+                    .wildcard_mode(mode)
+                    .include(pattern)
+                    .unwrap_or_else(|error| panic!("{pattern} must stay matcher text: {error}"));
+            }
+        }
+
+        // A dead brace or extglob arm must not reject a viable one. Character
+        // classes use the glob parser's POSIX and leading-`]` grammar, so a
+        // slash or `..` text inside either class stays matcher syntax too.
+        // Extglobs retain their component-scoped matching rule, so only the
+        // separator-crossing walk reads its slash-containing arm as one path.
+        for (pattern, matching_paths, component_scoped_paths) in [
+            (
+                "{dead/../branch,src/main.rs}",
+                &["src/main.rs"][..],
+                &["src/main.rs"][..],
+            ),
+            (
+                "@(dead/../branch|src/main.rs)",
+                &["src/main.rs"][..],
+                &[][..],
+            ),
+            (
+                "src/[[:alpha:]/../].rs",
+                &["src/a.rs"][..],
+                &["src/a.rs"][..],
+            ),
+            ("src/[]/../].rs", &["src/].rs"][..], &["src/].rs"][..]),
+            (
+                "src/[{],a}/../].rs",
+                &["src/a.rs", "src/].rs"][..],
+                &["src/a.rs", "src/].rs"][..],
+            ),
+            (
+                "@(dead/{),x}/../branch|src/main.rs)",
+                &["src/main.rs"][..],
+                &[][..],
+            ),
+            ("prefix@(../bar)", &["prefix../bar"][..], &[][..]),
+            ("@(foo/..)suffix/bar", &["foo/..suffix/bar"][..], &[][..]),
+        ] {
+            let matcher = Pattern::compile(pattern, traversal_pattern_options(false))
+                .expect("the reviewer regression is valid matcher syntax");
+            for matching_path in matching_paths {
+                assert!(matcher.is_match(matching_path));
+            }
+            let matching_paths_on_disk =
+                if cfg!(windows) && matches!(pattern, "prefix@(../bar)" | "@(foo/..)suffix/bar") {
+                    &[][..]
+                } else {
+                    matching_paths
+                };
+            for mode in [
+                WildcardMode::ComponentScoped,
+                WildcardMode::SeparatorCrossing,
+            ] {
+                Walker::new(&fixture.root)
+                    .wildcard_mode(mode)
+                    .exclude(pattern)
+                    .expect("the viable group arm is accepted for excludes");
+                for threads in [1, 4] {
+                    let result = Walker::new(&fixture.root)
+                        .wildcard_mode(mode)
+                        .threads(threads)
+                        .include(pattern)
+                        .expect("the viable group arm is accepted")
+                        .options(WalkOptions::default().sort(true).files_only(true))
+                        .collect()
+                        .expect("walk succeeds");
+                    let mut expected = if mode == WildcardMode::ComponentScoped {
+                        component_scoped_paths
+                    } else {
+                        matching_paths_on_disk
+                    }
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                    expected.sort();
+                    assert_eq!(
+                        relative_paths(result.entries(), &fixture.root),
+                        expected,
+                        "{pattern} must keep its viable arm under {mode:?} on {threads} threads"
+                    );
+                }
+                let streamed = Walker::new(&fixture.root)
+                    .wildcard_mode(mode)
+                    .include(pattern)
+                    .expect("the viable group arm is accepted")
+                    .options(WalkOptions::default().files_only(true))
+                    .stream()
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("stream succeeds");
+                let mut actual = relative_paths(&streamed, &fixture.root);
+                actual.sort();
+                let mut expected = if mode == WildcardMode::ComponentScoped {
+                    component_scoped_paths
+                } else {
+                    matching_paths_on_disk
+                }
+                .iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+                expected.sort();
+                assert_eq!(actual, expected);
+            }
+        }
+
+        for pattern in [
+            "src/../main.rs",
+            "src/{live,dead}/../main.rs",
+            "{dead/[}]]/../x,src/main.rs}",
+            "@(dead/[)]]/../x|src/main.rs)",
+            "{dead/../branch}",
+            "@(dead/../branch)",
+            "@(dead|src)/../main.rs",
+            "src/@(./a.rs)",
+            "@(./a.rs)",
+            "{./a.rs}",
+            "src/?(./a.rs)",
+            "src/*(./a.rs)",
+            "src/?(./a.rs)/bar",
+            "src/*(./a.rs)/bar",
+            "src/?()/bar",
+            "src/*()/bar",
+            "?()/bar",
+            "*()/bar",
+            "src//bar",
+            "src/{}/bar",
+            "src/{,./a.rs}/bar",
+        ] {
+            assert!(
+                Walker::new(&fixture.root).include(pattern).is_err(),
+                "a parser-top-level `..` component stays invalid: {pattern}"
+            );
+        }
+        for mode in [
+            WildcardMode::ComponentScoped,
+            WildcardMode::SeparatorCrossing,
+        ] {
+            for pattern in [
+                "{dead/[}]]/../x,src/main.rs}",
+                "@(dead/[)]]/../x|src/main.rs)",
+                "{dead/../branch}",
+                "@(dead/../branch)",
+                "@(dead|src)/../main.rs",
+                "src/@(./a.rs)",
+                "@(./a.rs)",
+                "{./a.rs}",
+                "src/?(./a.rs)",
+                "src/*(./a.rs)",
+                "src/?(./a.rs)/bar",
+                "src/*(./a.rs)/bar",
+                "src/?()/bar",
+                "src/*()/bar",
+                "?()/bar",
+                "*()/bar",
+                "src//bar",
+                "src/{}/bar",
+                "src/{,./a.rs}/bar",
+            ] {
+                assert!(
+                    Walker::new(&fixture.root)
+                        .wildcard_mode(mode)
+                        .include(pattern)
+                        .is_err(),
+                    "include rejects parser-top-level `..` under {mode:?}: {pattern}"
+                );
+                assert!(
+                    Walker::new(&fixture.root)
+                        .wildcard_mode(mode)
+                        .exclude(pattern)
+                        .is_err(),
+                    "exclude rejects parser-top-level `..` under {mode:?}: {pattern}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn relative_pattern_errors_keep_determinate_component_offsets() {
+        for (pattern, offset) in [
+            ("src/../main.rs", 4),
+            ("src/./main.rs", 4),
+            ("src/.", 4),
+            ("é/../main.rs", 3),
+            ("src/@(./a.rs)", 6),
+            ("{src}/../main.rs", 6),
+            ("{a,b}/../main.rs", 6),
+            ("src/{x}/.", 8),
+        ] {
+            for mode in [
+                WildcardMode::ComponentScoped,
+                WildcardMode::SeparatorCrossing,
+            ] {
+                for error in [
+                    Walker::new(".")
+                        .wildcard_mode(mode)
+                        .include(pattern)
+                        .expect_err("unwalkable include is refused"),
+                    Walker::new(".")
+                        .wildcard_mode(mode)
+                        .exclude(pattern)
+                        .expect_err("unwalkable exclude is refused"),
+                ] {
+                    assert_eq!(
+                        error.offset(),
+                        offset,
+                        "{pattern} keeps its component offset under {mode:?}"
+                    );
+                }
+            }
+        }
+
+        for pattern in [r"src/\./main.rs", r"src/\../main.rs", "src/@(..)suffix"] {
+            Walker::new(".")
+                .include(pattern)
+                .unwrap_or_else(|error| panic!("{pattern} remains matcher text: {error}"));
+        }
     }
 
     #[test]
@@ -3012,6 +3928,29 @@ mod tests {
     }
 
     #[test]
+    fn walk_entries_are_cloneable_with_their_metadata_snapshot() {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("five.bin"), b"12345").expect("write clone fixture");
+
+        let result = Walker::new(&fixture.root)
+            .options(WalkOptions::default().sort(true).metadata(true))
+            .collect()
+            .expect("walk succeeds");
+        let entry = result
+            .entries()
+            .iter()
+            .find(|entry| entry.path().ends_with("five.bin"))
+            .expect("fixture file is returned");
+        let clone = entry.clone();
+
+        assert_eq!(clone.path(), entry.path());
+        assert_eq!(clone.root(), entry.root());
+        assert_eq!(clone.kind(), entry.kind());
+        assert_eq!(clone.depth(), entry.depth());
+        assert_eq!(clone.metadata().map(fs::Metadata::len), Some(5));
+    }
+
+    #[test]
     fn root_gitignore_rules_and_negation_apply_to_collect_and_stream() {
         let fixture = Fixture::new();
         fixture.write("generated.tmp");
@@ -3054,6 +3993,485 @@ mod tests {
         assert!(streamed_paths.contains(&PathBuf::from("src/keep.tmp")));
         assert!(!streamed_paths.contains(&PathBuf::from("build/keep.txt")));
         assert!(!streamed_paths.contains(&PathBuf::from("build")));
+    }
+
+    /// Starts a Git oracle process that is independent of the developer's
+    /// global and system configuration, just like the corpus harness.
+    fn git_command() -> Command {
+        let mut command = Command::new("git");
+        command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        command
+    }
+
+    fn git_check_ignore(root: &Path, candidate: &str) -> bool {
+        let status = git_command()
+            .args(["check-ignore", "--no-index", "--quiet", "--", candidate])
+            .current_dir(root)
+            .status()
+            .expect("run Git ignore oracle");
+        match status.code() {
+            Some(0) => true,
+            Some(1) => false,
+            other => panic!("git check-ignore failed with {other:?}"),
+        }
+    }
+
+    fn git_config_bool(root: &Path, key: &str) -> bool {
+        let output = git_command()
+            .args(["config", "--type=bool", "--get", key])
+            .current_dir(root)
+            .output()
+            .expect("run Git config boolean oracle");
+        assert!(
+            output.status.success(),
+            "Git config boolean oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        match String::from_utf8(output.stdout)
+            .expect("Git config boolean output is UTF-8")
+            .trim()
+        {
+            "true" => true,
+            "false" => false,
+            value => panic!("unexpected Git config boolean output: {value:?}"),
+        }
+    }
+
+    fn git_config_file_bool(config: &Path, key: &str) -> bool {
+        let output = git_command()
+            .args(["config", "--file"])
+            .arg(config)
+            .args(["--type=bool", "--get", key])
+            .output()
+            .expect("run Git config file boolean oracle");
+        assert!(
+            output.status.success(),
+            "Git config file boolean oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        match String::from_utf8(output.stdout)
+            .expect("Git config boolean output is UTF-8")
+            .trim()
+        {
+            "true" => true,
+            "false" => false,
+            value => panic!("unexpected Git config boolean output: {value:?}"),
+        }
+    }
+
+    #[test]
+    fn git_oracle_ignores_an_inherited_global_excludes_file() {
+        if let Some(root) = std::env::var_os(HOSTILE_GIT_CONFIG_FIXTURE) {
+            let root = PathBuf::from(root);
+            assert!(
+                !git_check_ignore(&root, "unignored.log"),
+                "the oracle must not read the hostile inherited excludes file"
+            );
+            return;
+        }
+
+        let fixture = Fixture::new();
+        fixture.write("unignored.log");
+        let initialized = git_command()
+            .args(["init", "--quiet"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("initialize hostile-config Git fixture");
+        assert!(initialized.success());
+        let excludes = fixture.root.join("hostile-excludes");
+        fs::write(&excludes, b"*.log\n").expect("write hostile global excludes file");
+        let config = fixture.root.join("hostile-gitconfig");
+        let excludes = excludes.display().to_string();
+        let excludes = excludes.replace('\\', "\\\\").replace('"', "\\\"");
+        fs::write(
+            &config,
+            format!("[core]\n\texcludesFile = \"{excludes}\"\n"),
+        )
+        .expect("write hostile global Git config");
+
+        // Environment mutation is process-global, so run a second copy of
+        // this one test instead. It inherits the hostile config just as a
+        // developer's test process would, while Git itself is still spawned
+        // exclusively through `git_command`.
+        let status = Command::new(std::env::current_exe().expect("locate test binary"))
+            .args([
+                "tests::git_oracle_ignores_an_inherited_global_excludes_file",
+                "--exact",
+            ])
+            .env(HOSTILE_GIT_CONFIG_FIXTURE, &fixture.root)
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .status()
+            .expect("run isolated Git oracle regression test");
+        assert!(
+            status.success(),
+            "hostile-config child test failed: {status}"
+        );
+    }
+
+    #[test]
+    fn repository_ignorecase_matches_git_for_rules_negation_and_anchors() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.root.join(".git")).expect("create Git metadata");
+        fs::write(
+            fixture.root.join(".git/config"),
+            b"[CoRe]\nignoreCase = YeS\n",
+        )
+        .expect("write local config");
+        fs::write(
+            fixture.root.join(".gitignore"),
+            b"Build.LOG\nDist/\n!Kept.LOG\n/src/Anchored.LOG\n",
+        )
+        .expect("write ignore rules");
+        for path in [
+            "BUILD.log",
+            "DIST/deep.txt",
+            "kept.log",
+            "SRC/ANCHORED.log",
+            "other/ANCHORED.log",
+        ] {
+            fixture.write(path);
+        }
+
+        // The Git oracle is configured exactly as the repository is. This
+        // catches the rule compilation, not merely a hand-written expectation.
+        let initialized = git_command()
+            .args(["init", "--quiet"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("initialize Git oracle");
+        assert!(initialized.success());
+        let configured = git_command()
+            .args(["config", "core.ignoreCase", "true"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("configure Git oracle");
+        assert!(configured.success());
+
+        let serial = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .threads(1)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("serial walk succeeds");
+        let parallel = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .threads(4)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("parallel walk succeeds");
+        let streamed = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .stream()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream succeeds");
+        for paths in [
+            relative_paths(serial.entries(), &fixture.root),
+            relative_paths(parallel.entries(), &fixture.root),
+            relative_paths(&streamed, &fixture.root),
+        ] {
+            for candidate in [
+                "BUILD.log",
+                "DIST/deep.txt",
+                "kept.log",
+                "SRC/ANCHORED.log",
+                "other/ANCHORED.log",
+            ] {
+                assert_eq!(
+                    !paths.contains(&PathBuf::from(candidate)),
+                    git_check_ignore(&fixture.root, candidate),
+                    "Ferralk must agree with Git for {candidate}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_utf8_unrelated_config_value_does_not_hide_repository_ignorecase() {
+        let fixture = Fixture::new();
+        fixture.write("BUILD.log");
+        fs::write(fixture.root.join(".gitignore"), b"build.log\n").expect("write rule");
+        let initialized = git_command()
+            .args(["init", "--quiet"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("initialize Git oracle");
+        assert!(initialized.success());
+        fs::write(
+            fixture.root.join(".git/config"),
+            b"[user]\nname = Jos\xe9\n[core]\nignorecase = true\n",
+        )
+        .expect("write Latin-1 local config");
+
+        assert!(git_config_bool(&fixture.root, "core.ignoreCase"));
+        assert!(git_check_ignore(&fixture.root, "BUILD.log"));
+        let walked = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk with non-UTF-8 config");
+        assert!(
+            !relative_paths(walked.entries(), &fixture.root).contains(&PathBuf::from("BUILD.log")),
+            "Ferralk must retain core.ignoreCase and agree with Git"
+        );
+    }
+
+    #[test]
+    fn explicit_ignorecase_false_and_walker_override_take_precedence() {
+        let fixture = Fixture::new();
+        fixture.write("BUILD.log");
+        fs::create_dir_all(fixture.root.join(".git")).expect("create Git metadata");
+        fs::write(
+            fixture.root.join(".git/config"),
+            b"[core]\nignorecase = true\nIGNORECASE = off\n",
+        )
+        .expect("write last-value local config");
+        fs::write(fixture.root.join(".gitignore"), b"build.log\n").expect("write rule");
+
+        let local_false = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk local false");
+        assert!(
+            relative_paths(local_false.entries(), &fixture.root)
+                .contains(&PathBuf::from("BUILD.log"))
+        );
+
+        let override_true = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .git_ignore_case(true)
+            .collect()
+            .expect("walk override true");
+        assert!(
+            !relative_paths(override_true.entries(), &fixture.root)
+                .contains(&PathBuf::from("BUILD.log"))
+        );
+    }
+
+    #[test]
+    fn numeric_and_empty_ignorecase_values_match_the_git_oracle() {
+        let fixture = Fixture::new();
+        fixture.write("BUILD.log");
+        let initialized = git_command()
+            .args(["init", "--quiet"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("initialize Git oracle");
+        assert!(initialized.success());
+        fs::write(fixture.root.join(".gitignore"), b"build.log\n").expect("write rule");
+        let config = fixture.root.join(".git/config");
+
+        for (value, expected) in [
+            ("", false),
+            ("\"\"", false),
+            ("+0", false),
+            ("-0", false),
+            ("+2", true),
+            ("-7", true),
+            ("  +2  # whitespace and comment", true),
+        ] {
+            fs::write(
+                &config,
+                format!("[core]\nignoreCase = {}\nIGNORECASE = {value}\n", !expected),
+            )
+            .expect("write duplicate config");
+            assert_eq!(
+                git_config_bool(&fixture.root, "core.ignoreCase"),
+                expected,
+                "Git must accept {value:?}",
+            );
+            let walked = Walker::new(&fixture.root)
+                .respect_git_ignore(true)
+                .collect()
+                .expect("walk with Git boolean value");
+            assert_eq!(
+                !relative_paths(walked.entries(), &fixture.root)
+                    .contains(&PathBuf::from("BUILD.log")),
+                expected,
+                "the later {value:?} value must override the earlier opposite value",
+            );
+        }
+
+        fs::write(&config, b"[core]\nignoreCase = false\nIGNORECASE\n")
+            .expect("write bare boolean config");
+        assert!(git_config_bool(&fixture.root, "core.ignoreCase"));
+        let bare_true = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk with bare true");
+        assert!(
+            !relative_paths(bare_true.entries(), &fixture.root)
+                .contains(&PathBuf::from("BUILD.log")),
+            "a bare key must retain Git's true behavior"
+        );
+
+        fs::write(
+            &config,
+            b"[core]\nignoreCase = false\nIGNORECASE = t\\\nr\\\nue\n\
+              [core \"unrelated\"]\nignoreCase = false\n",
+        )
+        .expect("write continued and subsection config");
+        assert!(git_config_bool(&fixture.root, "core.ignoreCase"));
+        let continued_true = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk with continued boolean config");
+        assert!(
+            !relative_paths(continued_true.entries(), &fixture.root)
+                .contains(&PathBuf::from("BUILD.log")),
+            "a later subsection must not override the top-level continued true value"
+        );
+    }
+
+    #[test]
+    fn case_variant_ignore_file_follows_the_filesystem_canonical_open() {
+        let fixture = Fixture::new();
+        fixture.write("build.log");
+        fs::write(fixture.root.join(".GITIGNORE"), b"build.log\n")
+            .expect("write case variant ignore file");
+        let canonical_open_resolves = fs::read(fixture.root.join(".gitignore")).is_ok();
+
+        let walked = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("walk succeeds");
+        let paths = relative_paths(walked.entries(), &fixture.root);
+        assert!(paths.contains(&PathBuf::from(".GITIGNORE")));
+        assert_eq!(
+            !paths.contains(&PathBuf::from("build.log")),
+            canonical_open_resolves,
+            "a case variant is a rule file only if Git's canonical open resolves it"
+        );
+    }
+
+    #[test]
+    fn multi_root_walks_keep_each_repository_ignorecase_setting() {
+        let fixture = Fixture::new();
+        let nested = fixture.root.join("nested");
+        fixture.write("nested/BUILD.log");
+        fs::create_dir_all(fixture.root.join(".git")).expect("create outer Git metadata");
+        fs::create_dir_all(nested.join(".git")).expect("create nested Git metadata");
+        fs::write(
+            fixture.root.join(".git/config"),
+            b"[core]\nignorecase = true\n",
+        )
+        .expect("write outer config");
+        fs::write(nested.join(".git/config"), b"[core]\nignorecase = false\n")
+            .expect("write nested config");
+        fs::write(fixture.root.join(".gitignore"), b"build.log\n").expect("write outer rule");
+        fs::write(nested.join(".gitignore"), b"build.log\n").expect("write nested rule");
+
+        let walked = Walker::new(&fixture.root)
+            .add_root(&nested)
+            .expect("add nested root")
+            .add_root(&nested)
+            .expect("add duplicate nested root")
+            .respect_git_ignore(true)
+            .collect()
+            .expect("multi-root walk succeeds");
+        let emitted = walked
+            .entries()
+            .iter()
+            .filter(|entry| entry.path() == nested.join("BUILD.log"))
+            .count();
+        // The outer root folds and suppresses this entry. Each independent
+        // nested root uses its explicit false setting and emits one copy.
+        assert_eq!(emitted, 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn repository_precomposeunicode_matches_the_macos_git_oracle() {
+        let fixture = Fixture::new();
+        let decomposed = "cafe\u{301}.txt";
+        fs::write(fixture.root.join(".gitignore"), "caf\u{e9}.txt\n").expect("write NFC rule");
+        fixture.write(decomposed);
+        let initialized = git_command()
+            .args(["init", "--quiet"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("initialize Git oracle");
+        assert!(initialized.success());
+        let config = fixture.root.join(".git/config");
+        fs::write(
+            &config,
+            b"[core]\nprecomposeUnicode = false\nPRECOMPOSEUNICODE = t\\\nr\\\nue\n\
+              [core \"unrelated\"]\nprecomposeUnicode = false\n",
+        )
+        .expect("write continued precompose Unicode config");
+        assert!(git_config_bool(&fixture.root, "core.precomposeUnicode"));
+
+        assert!(git_check_ignore(&fixture.root, decomposed));
+        let enabled = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk with NFC adaptation");
+        assert!(
+            !relative_paths(enabled.entries(), &fixture.root).contains(&PathBuf::from(decomposed))
+        );
+
+        let forced_false = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .git_precompose_unicode(false)
+            .collect()
+            .expect("walk with explicit false override");
+        assert!(
+            relative_paths(forced_false.entries(), &fixture.root)
+                .contains(&PathBuf::from(decomposed))
+        );
+
+        fs::write(
+            &config,
+            b"[core]\nprecomposeUnicode = \"\"\n\
+              [core \"unrelated\"]\nprecomposeUnicode = true\n",
+        )
+        .expect("write empty precompose Unicode config");
+        assert!(!git_config_bool(&fixture.root, "core.precomposeUnicode"));
+        assert!(!git_check_ignore(&fixture.root, decomposed));
+        let disabled = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk without NFC adaptation");
+        assert!(
+            relative_paths(disabled.entries(), &fixture.root).contains(&PathBuf::from(decomposed))
+        );
+
+        let forced_true = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .git_precompose_unicode(true)
+            .collect()
+            .expect("walk with explicit true override");
+        assert!(
+            !relative_paths(forced_true.entries(), &fixture.root)
+                .contains(&PathBuf::from(decomposed))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_walk_gitignore_matches_non_utf8_file_names_on_linux() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let fixture = Fixture::new();
+        let name = std::ffi::OsString::from_vec(b"\xE9latin1.txt".to_vec());
+        fs::write(fixture.root.join(".gitignore"), b"\xE9latin1.txt\n")
+            .expect("write byte-pattern gitignore");
+        fixture.write(Path::new(&name));
+
+        let ignored = fixture.root.join(&name);
+        let result = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk succeeds");
+        assert!(
+            !result
+                .entries()
+                .iter()
+                .any(|entry| entry.path() == ignored.as_path()),
+            "the byte-pattern rule has to hide its byte-named file"
+        );
     }
 
     #[test]
@@ -3193,6 +4611,273 @@ mod tests {
         assert_eq!(relative_paths(serial.entries(), &fixture.root), expected);
         assert_eq!(relative_paths(parallel.entries(), &fixture.root), expected);
         assert_eq!(relative_paths(&streamed, &fixture.root), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_in_tree_ignore_files_do_not_apply_but_repository_excludes_can_follow_links() {
+        use std::os::unix::fs::symlink;
+
+        for ignore_file in [".gitignore", ".ignore"] {
+            let fixture = Fixture::new();
+            fixture.write("linked.tmp");
+            fs::write(fixture.root.join("rules-source"), b"linked.tmp\n")
+                .expect("write linked ignore source");
+            symlink("rules-source", fixture.root.join(ignore_file))
+                .expect("create linked in-tree ignore file");
+
+            let result = Walker::new(&fixture.root)
+                .respect_git_ignore(true)
+                .options(WalkOptions::default().sort(true))
+                .collect()
+                .expect("walk succeeds when a linked ignore file is refused");
+            assert!(
+                relative_paths(result.entries(), &fixture.root)
+                    .contains(&PathBuf::from("linked.tmp")),
+                "{ignore_file} must not redirect in-tree rules through its target"
+            );
+        }
+
+        let fixture = Fixture::new();
+        fixture.write("repository-only.tmp");
+        fs::write(fixture.root.join("rules-source"), b"repository-only.tmp\n")
+            .expect("write repository exclude source");
+        fs::create_dir_all(fixture.root.join(".git/info")).expect("create git info directory");
+        symlink("../../rules-source", fixture.root.join(".git/info/exclude"))
+            .expect("link repository exclude");
+
+        let result = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk succeeds when repository exclude is linked");
+        assert!(
+            !relative_paths(result.entries(), &fixture.root)
+                .contains(&PathBuf::from("repository-only.tmp")),
+            ".git/info/exclude remains allowed to follow links"
+        );
+    }
+
+    #[test]
+    fn linked_worktree_and_submodule_gitdir_pointers_read_the_right_info_exclude() {
+        let fixture = Fixture::new();
+
+        // This is the shape `git worktree add` writes: the checkout's `.git`
+        // points at a private worktree directory, whose `commondir` points
+        // back at the main repository's `.git` directory.
+        let worktree = fixture.root.join("linked-worktree");
+        let common_git = fixture.root.join("main/.git");
+        let private_git = common_git.join("worktrees/linked-worktree");
+        fs::create_dir_all(private_git.join("refs")).expect("create private git directory");
+        fs::create_dir_all(common_git.join("info")).expect("create common git info");
+        fs::write(common_git.join("info/exclude"), b"worktree-secret.txt\n")
+            .expect("write common exclude");
+        fs::write(private_git.join("commondir"), b"../..\n").expect("write commondir");
+        fs::create_dir_all(&worktree).expect("create linked worktree");
+        fs::write(
+            worktree.join(".git"),
+            b"gitdir: ../main/.git/worktrees/linked-worktree\n",
+        )
+        .expect("write linked-worktree pointer");
+        fs::write(worktree.join("worktree-secret.txt"), b"fixture")
+            .expect("write linked-worktree secret");
+
+        let worktree_result = Walker::new(&worktree)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk linked worktree");
+        assert!(
+            !relative_paths(worktree_result.entries(), &worktree)
+                .contains(&PathBuf::from("worktree-secret.txt")),
+            "the linked worktree must use its common info/exclude"
+        );
+
+        // A submodule has the same pointer-file form but normally points
+        // directly at `.git/modules/<name>` with no `commondir` file.
+        let submodule = fixture.root.join("super/dependency");
+        let submodule_git = fixture.root.join("super/.git/modules/dependency");
+        fs::create_dir_all(submodule_git.join("info")).expect("create submodule git info");
+        fs::write(
+            submodule_git.join("info/exclude"),
+            b"submodule-secret.txt\n",
+        )
+        .expect("write submodule exclude");
+        fs::create_dir_all(&submodule).expect("create submodule checkout");
+        fs::write(
+            submodule.join(".git"),
+            b"gitdir: ../.git/modules/dependency\n",
+        )
+        .expect("write submodule pointer");
+        fs::write(submodule.join("submodule-secret.txt"), b"fixture")
+            .expect("write submodule secret");
+
+        let submodule_result = Walker::new(&submodule)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk submodule checkout");
+        assert!(
+            !relative_paths(submodule_result.entries(), &submodule)
+                .contains(&PathBuf::from("submodule-secret.txt")),
+            "the submodule pointer must use its own info/exclude"
+        );
+    }
+
+    #[test]
+    fn linked_worktree_config_overrides_the_common_repository_setting() {
+        let fixture = Fixture::new();
+        let checkout = fixture.root.join("linked-worktree");
+        let common_git = fixture.root.join("main/.git");
+        let private_git = common_git.join("worktrees/linked-worktree");
+        fs::create_dir_all(&checkout).expect("create linked checkout");
+        fs::create_dir_all(&private_git).expect("create private Git directory");
+        fs::write(private_git.join("commondir"), b"../..\n").expect("write commondir");
+        fs::create_dir_all(&common_git).expect("create common Git directory");
+        fs::write(
+            common_git.join("config"),
+            b"[extensions]\nworktreeConfig = f\\\nalse\nWORKTREECONFIG = t\\\nr\\\nue\n\
+              [extensions \"unrelated\"]\nworktreeConfig = false\n\
+              [core]\nignorecase = false\n",
+        )
+        .expect("write continued common config");
+        fs::write(
+            private_git.join("config.worktree"),
+            b"[CORE]\nignoreCASE = t\\\nr\\\nue\n\
+              [core \"unrelated\"]\nignoreCASE = false\n",
+        )
+        .expect("write continued private worktree config");
+        fs::write(
+            checkout.join(".git"),
+            b"gitdir: ../main/.git/worktrees/linked-worktree\n",
+        )
+        .expect("write worktree pointer");
+        fs::write(checkout.join(".gitignore"), b"build.log\n").expect("write ignore rule");
+        fs::write(checkout.join("BUILD.log"), b"fixture").expect("write mixed-case candidate");
+
+        assert!(git_config_file_bool(
+            &common_git.join("config"),
+            "extensions.worktreeConfig"
+        ));
+
+        let walked = Walker::new(&checkout)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk linked worktree");
+        assert!(
+            !relative_paths(walked.entries(), &checkout).contains(&PathBuf::from("BUILD.log")),
+            "private config.worktree must win after the common config"
+        );
+    }
+
+    #[test]
+    fn absolute_and_malformed_gitdir_pointers_are_handled_without_rules() {
+        let fixture = Fixture::new();
+        let checkout = fixture.root.join("absolute-worktree");
+        let git_directory = fixture.root.join("separate-git-directory");
+        fs::create_dir_all(git_directory.join("info")).expect("create separate git info");
+        fs::write(git_directory.join("info/exclude"), b"absolute-secret.txt\n")
+            .expect("write absolute exclude");
+        fs::create_dir_all(&checkout).expect("create absolute checkout");
+        fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", git_directory.display()),
+        )
+        .expect("write absolute pointer");
+        fs::write(checkout.join("absolute-secret.txt"), b"fixture").expect("write absolute secret");
+
+        let absolute_result = Walker::new(&checkout)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk absolute pointer checkout");
+        assert!(
+            !relative_paths(absolute_result.entries(), &checkout)
+                .contains(&PathBuf::from("absolute-secret.txt"))
+        );
+
+        let malformed = fixture.root.join("malformed-pointer");
+        fs::create_dir_all(&malformed).expect("create malformed checkout");
+        fs::write(malformed.join(".git"), b"gitdir: \nextra data\n")
+            .expect("write malformed pointer");
+        fs::write(malformed.join("not-excluded.txt"), b"fixture")
+            .expect("write malformed candidate");
+        let malformed_result = Walker::new(&malformed)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("malformed metadata is skipped");
+        assert!(
+            relative_paths(malformed_result.entries(), &malformed)
+                .contains(&PathBuf::from("not-excluded.txt")),
+            "a malformed pointer must add no repository rules"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_gitdir_pointer_is_skipped_like_unreadable_repository_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        let checkout = fixture.root.join("unreadable-pointer");
+        fs::create_dir_all(&checkout).expect("create checkout");
+        let pointer = checkout.join(".git");
+        fs::write(&pointer, b"gitdir: ../missing-git-directory\n").expect("write pointer file");
+        fs::write(checkout.join("not-excluded.txt"), b"fixture").expect("write candidate");
+
+        let original_permissions = fs::metadata(&pointer)
+            .expect("read pointer metadata")
+            .permissions();
+        fs::set_permissions(&pointer, fs::Permissions::from_mode(0o000))
+            .expect("make pointer unreadable");
+        if fs::read(&pointer).is_ok() {
+            // A privileged test process can bypass mode bits. There is no
+            // portable way to arrange an unreadable regular file for it.
+            fs::set_permissions(&pointer, original_permissions)
+                .expect("restore pointer permissions");
+            return;
+        }
+
+        let result = Walker::new(&checkout)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("unreadable metadata is skipped rather than reported");
+        fs::set_permissions(&pointer, original_permissions).expect("restore pointer permissions");
+
+        assert!(
+            result.errors().is_empty(),
+            "unreadable repository metadata follows the existing silent policy"
+        );
+        assert!(
+            relative_paths(result.entries(), &checkout)
+                .contains(&PathBuf::from("not-excluded.txt")),
+            "an unreadable pointer must add no repository rules"
+        );
+    }
+
+    #[test]
+    fn nested_repositories_remain_traversed_with_the_outer_ignore_chain() {
+        let fixture = Fixture::new();
+        fixture.write("nested/.git/config");
+        fixture.write("nested/outer.tmp");
+        fixture.write("nested/keep.tmp");
+        fixture.write("nested/inner-only.tmp");
+        fs::write(fixture.root.join(".gitignore"), b"*.tmp\n").expect("write outer ignore rules");
+        fs::write(
+            fixture.root.join("nested/.gitignore"),
+            b"!keep.tmp\ninner-only.tmp\n",
+        )
+        .expect("write nested repository rules");
+
+        let result = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("walk nested repository");
+        let paths = relative_paths(result.entries(), &fixture.root);
+        assert!(paths.contains(&PathBuf::from("nested/keep.tmp")));
+        assert!(!paths.contains(&PathBuf::from("nested/outer.tmp")));
+        assert!(!paths.contains(&PathBuf::from("nested/inner-only.tmp")));
+        assert!(
+            !paths.contains(&PathBuf::from("nested/.git/config")),
+            "the nested repository's control directory remains skipped"
+        );
     }
 
     #[test]
@@ -4058,10 +5743,26 @@ mod tests {
         threads: usize,
         frontend: Frontend,
     ) -> RootedOutcome {
+        multi_root_outcome_with_following(roots, include, threads, frontend, false)
+    }
+
+    /// The same acceptance harness under either symlink policy. Keeping the
+    /// policy explicit lets the multi-root contract pin the cycle guard too:
+    /// following links must change what one root sees, never whether another
+    /// root gets to see its own traversal.
+    fn multi_root_outcome_with_following(
+        roots: &[PathBuf],
+        include: Option<&str>,
+        threads: usize,
+        frontend: Frontend,
+        follow_symlinks: bool,
+    ) -> RootedOutcome {
         let (first, rest) = roots.split_first().expect("at least one root");
-        let mut walker = Walker::new(first)
-            .threads(threads)
-            .options(WalkOptions::default().files_only(true));
+        let mut walker = Walker::new(first).threads(threads).options(
+            WalkOptions::default()
+                .files_only(true)
+                .follow_symlinks(follow_symlinks),
+        );
         for root in rest {
             walker = walker.add_root(root).expect("the root takes the patterns");
         }
@@ -4184,6 +5885,92 @@ mod tests {
             vec![(outer.clone(), 2), (inner.clone(), 1)],
             "each copy is one level below the root it came from"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn following_links_keeps_overlapping_and_duplicate_roots_independent() {
+        use std::os::unix::fs::symlink;
+
+        // `back` makes a genuine cycle for every root traversal. The nested
+        // and duplicate roots must nevertheless reproduce their corresponding
+        // single-root walks exactly, including the root and depth carried by
+        // every overlapping path.
+        let fixture = Fixture::new();
+        fixture.write("outer/own.txt");
+        fixture.write("outer/inner/shared.txt");
+        fixture.write("outer/inner/deep/leaf.txt");
+        symlink("..", fixture.root.join("outer/inner/back")).expect("create cycle");
+
+        let outer = fixture.root.join("outer");
+        let inner = outer.join("inner");
+        let alias = fixture.root.join("outer-alias");
+        symlink("outer", &alias).expect("create root alias");
+        let overlapping = [outer.clone(), inner.clone()];
+        let duplicate = [outer.clone(), outer.clone()];
+        let aliases = [outer.clone(), alias];
+        for roots in [&overlapping[..], &duplicate[..], &aliases[..]] {
+            for (frontend, threads) in [
+                (Frontend::Collect, 1),
+                (Frontend::Collect, 4),
+                (Frontend::Visit, 1),
+                (Frontend::Visit, 4),
+                (Frontend::Stream, 1),
+            ] {
+                let together =
+                    multi_root_outcome_with_following(roots, None, threads, frontend, true);
+                let separately = RootedOutcome::concatenated(roots.iter().map(|root| {
+                    multi_root_outcome_with_following(
+                        std::slice::from_ref(root),
+                        None,
+                        threads,
+                        frontend,
+                        true,
+                    )
+                }));
+                assert_eq!(
+                    together, separately,
+                    "{frontend:?} with {threads} thread(s) and roots {roots:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parallel_following_links_keeps_root_attribution_stable_under_stress() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let outer = fixture.root.join("outer");
+        let inner = outer.join("inner");
+        for branch in 0..32 {
+            for leaf in 0..8 {
+                fixture.write(format!("outer/inner/branch-{branch}/leaf-{leaf}.txt"));
+            }
+        }
+        symlink("..", inner.join("back")).expect("create cycle");
+        let roots = [outer, inner];
+        let expected = RootedOutcome::concatenated(roots.iter().map(|root| {
+            multi_root_outcome_with_following(
+                std::slice::from_ref(root),
+                None,
+                1,
+                Frontend::Collect,
+                true,
+            )
+        }));
+
+        // The workers can race over the two roots' overlapping subtrees on
+        // every run. A shared guard used to make which root won observable in
+        // both `root()` and `depth()`; repeat far beyond one schedule.
+        for run in 0..24 {
+            assert_eq!(
+                multi_root_outcome_with_following(&roots, None, 4, Frontend::Collect, true),
+                expected,
+                "parallel run {run} changed overlap attribution"
+            );
+        }
     }
 
     /// Patterns are root-relative and apply under every root; an absolute one
@@ -4315,6 +6102,53 @@ mod tests {
             assert_eq!(result.errors()[0].operation(), "read_dir");
             assert_eq!(result.errors()[0].path(), missing);
         }
+    }
+
+    #[test]
+    fn skip_reports_a_failed_root_while_walking_the_other_roots() {
+        let fixture = Fixture::new();
+        fixture.write("alpha/one.rs");
+        fixture.write("gamma/two.rs");
+        let missing = fixture.root.join("beta");
+        let build = || {
+            Walker::new(fixture.root.join("alpha"))
+                .add_root(&missing)
+                .expect("root")
+                .add_root(fixture.root.join("gamma"))
+                .expect("root")
+                .error_policy(ErrorPolicy::Skip)
+                .options(WalkOptions::default().sort(true).files_only(true))
+        };
+
+        for threads in [1, 4] {
+            let result = build()
+                .threads(threads)
+                .collect()
+                .expect("Skip preserves the other roots");
+            assert_eq!(
+                relative_paths(result.entries(), &fixture.root),
+                vec![PathBuf::from("alpha/one.rs"), PathBuf::from("gamma/two.rs")]
+            );
+            assert_eq!(result.errors().len(), 1);
+            assert_eq!(result.errors()[0].path(), missing);
+        }
+
+        let mut stream = build().stream();
+        let mut entries = Vec::new();
+        let mut errors = Vec::new();
+        for item in &mut stream {
+            match item {
+                Ok(entry) => entries.push(entry),
+                Err(error) => errors.push(error),
+            }
+        }
+        entries.sort_by(|left, right| left.path().cmp(right.path()));
+        assert_eq!(
+            relative_paths(&entries, &fixture.root),
+            vec![PathBuf::from("alpha/one.rs"), PathBuf::from("gamma/two.rs")]
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path(), missing);
     }
 
     /// `*.tmp/**` used to close `a/b.tmp` in both modes, because the subtree
@@ -4799,13 +6633,20 @@ mod tests {
             fn read_directory(
                 &self,
                 path: &Path,
+                follow_symlinks: bool,
+                refuse_final_symlink: bool,
                 listing: &mut super::Listing,
             ) -> std::io::Result<()> {
                 self.reads
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push(path.to_path_buf());
-                super::StdBackend.read_directory(path, listing)
+                super::StdBackend.read_directory(
+                    path,
+                    follow_symlinks,
+                    refuse_final_symlink,
+                    listing,
+                )
             }
 
             fn symlink_metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
@@ -4881,6 +6722,105 @@ mod tests {
         );
     }
 
+    /// Native directory records on DT_UNKNOWN filesystems and portable
+    /// `DirEntry::file_type` both use this channel. Keeping the test at the
+    /// backend boundary pins the policy independently of the local filesystem
+    /// (whose dirents normally already carry a type).
+    #[test]
+    fn deferred_entry_stat_failures_keep_siblings_and_report_permissions() {
+        struct UnknownTypeBackend {
+            root: PathBuf,
+            failure: std::io::ErrorKind,
+        }
+
+        impl super::DirectoryBackend for UnknownTypeBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                listing.clear();
+                if path == self.root {
+                    listing.push("before".as_ref(), false, false);
+                    super::defer_entry_stat_error(
+                        listing,
+                        self.root.join("unknown"),
+                        std::io::Error::from(self.failure),
+                    )?;
+                    listing.push("after".as_ref(), false, false);
+                }
+                Ok(())
+            }
+        }
+
+        let fixture = Fixture::new();
+        let permission = UnknownTypeBackend {
+            root: fixture.root.clone(),
+            failure: std::io::ErrorKind::PermissionDenied,
+        };
+        let walker = Walker::new(&fixture.root)
+            .threads(1)
+            .error_policy(ErrorPolicy::Collect);
+        let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
+        state
+            .walk_directory(
+                &permission,
+                directory_task(&walker, &permission, fixture.root.clone()),
+            )
+            .expect("collect keeps the usable listing");
+        assert_eq!(
+            relative_paths(&state.entries, &fixture.root),
+            [PathBuf::from("before"), PathBuf::from("after")]
+        );
+        assert_eq!(state.errors.len(), 1);
+        assert_eq!(state.errors[0].operation(), "read_dir");
+        assert_eq!(state.errors[0].path(), fixture.root.join("unknown"));
+        assert_eq!(
+            state.errors[0].source.kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let parallel = UnknownTypeBackend {
+            root: fixture.root.clone(),
+            failure: std::io::ErrorKind::PermissionDenied,
+        };
+        let result = Walker::new(&fixture.root)
+            .threads(4)
+            .error_policy(ErrorPolicy::Collect)
+            .collect_with(&parallel)
+            .expect("parallel collect keeps the usable listing");
+        assert_eq!(
+            relative_paths(result.entries(), &fixture.root),
+            [PathBuf::from("before"), PathBuf::from("after")]
+        );
+        assert_eq!(result.errors().len(), 1);
+        assert_eq!(result.errors()[0].path(), fixture.root.join("unknown"));
+
+        for race in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::NotADirectory,
+        ] {
+            let backend = UnknownTypeBackend {
+                root: fixture.root.clone(),
+                failure: race,
+            };
+            let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
+            state
+                .walk_directory(
+                    &backend,
+                    directory_task(&walker, &backend, fixture.root.clone()),
+                )
+                .expect("a changed entry costs only that entry");
+            assert_eq!(
+                relative_paths(&state.entries, &fixture.root),
+                [PathBuf::from("before"), PathBuf::from("after")]
+            );
+            assert!(state.errors.is_empty(), "{race:?} is a replacement race");
+        }
+    }
+
     #[test]
     fn literal_include_roots_prune_unrelated_sibling_directories() {
         /// One directory of the mock tree: entry names and whether each is a
@@ -4896,6 +6836,8 @@ mod tests {
             fn read_directory(
                 &self,
                 path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
                 listing: &mut super::Listing,
             ) -> std::io::Result<()> {
                 self.reads.borrow_mut().push(path.to_path_buf());
@@ -4941,6 +6883,8 @@ mod tests {
             fn read_directory(
                 &self,
                 path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
                 listing: &mut super::Listing,
             ) -> std::io::Result<()> {
                 listing.clear();
@@ -4996,6 +6940,8 @@ mod tests {
             fn read_directory(
                 &self,
                 path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
                 listing: &mut super::Listing,
             ) -> std::io::Result<()> {
                 listing.clear();
@@ -5065,6 +7011,8 @@ mod tests {
             fn read_directory(
                 &self,
                 path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
                 listing: &mut super::Listing,
             ) -> std::io::Result<()> {
                 listing.clear();
@@ -5331,7 +7279,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_and_skip_distinguish_recoverable_root_errors() {
+    fn a_failed_root_is_reported_under_every_error_policy() {
         let missing = std::env::temp_dir().join(format!(
             "ferralk-missing-{}",
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
@@ -5341,20 +7289,73 @@ mod tests {
             .collect()
             .expect("collect policy retains the error");
         assert_eq!(collected.errors().len(), 1);
-        assert!(
-            Walker::new(&missing)
+        for threads in [1, 4] {
+            let skipped = Walker::new(&missing)
+                .threads(threads)
                 .error_policy(ErrorPolicy::Skip)
                 .collect()
-                .expect("skip policy ignores the error")
-                .errors()
-                .is_empty()
-        );
+                .expect("Skip keeps walking after a caller-supplied root failure");
+            assert_eq!(skipped.errors().len(), 1);
+            assert_eq!(skipped.errors()[0].operation(), "read_dir");
+            assert_eq!(skipped.errors()[0].path(), missing);
+        }
+        let streamed = Walker::new(&missing)
+            .error_policy(ErrorPolicy::Skip)
+            .stream()
+            .collect::<Result<Vec<_>, _>>()
+            .expect_err("stream reports a failed caller-supplied root under Skip");
+        assert_eq!(streamed.operation(), "read_dir");
+        assert_eq!(streamed.path(), missing);
         assert!(
             Walker::new(&missing)
                 .error_policy(ErrorPolicy::Abort)
                 .collect()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_plain_file_root_reports_not_a_directory_without_emitting_it() {
+        let fixture = Fixture::new();
+        let file = fixture.root.join("not-a-directory.txt");
+        fs::write(&file, b"fixture").expect("write file root");
+
+        for threads in [1, 4] {
+            let result = Walker::new(&file)
+                .threads(threads)
+                .error_policy(ErrorPolicy::Skip)
+                .collect()
+                .expect("root error is collected while the walk completes");
+            assert!(result.entries().is_empty());
+            assert_eq!(result.errors().len(), 1);
+            assert_eq!(result.errors()[0].operation(), "read_dir");
+            assert_eq!(result.errors()[0].path(), file);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_symlink_root_is_traversed_even_without_following_descendants() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        fixture.write("real/inside.txt");
+        let link = fixture.root.join("linked-root");
+        symlink("real", &link).expect("create directory symlink root");
+
+        for threads in [1, 4] {
+            for follow_symlinks in [false, true] {
+                let result = Walker::new(&link)
+                    .threads(threads)
+                    .options(WalkOptions::default().follow_symlinks(follow_symlinks))
+                    .collect()
+                    .expect("directory symlink root is opened");
+                assert_eq!(
+                    relative_paths(result.entries(), &link),
+                    vec![PathBuf::from("inside.txt")]
+                );
+            }
+        }
     }
 
     #[test]
@@ -5400,6 +7401,32 @@ mod tests {
             .stream();
         assert!(cancelled.next().is_none());
         assert!(cancelled.was_cancelled());
+    }
+
+    #[test]
+    fn path_bytes_bridge_entries_to_byte_first_matchers() {
+        let fixture = Fixture::new();
+        fixture.write("src/main.rs");
+
+        let result = Walker::new(&fixture.root)
+            .collect()
+            .expect("fixture has no I/O errors");
+        let entry = result
+            .entries()
+            .iter()
+            .find(|entry| entry.path().ends_with("src/main.rs"))
+            .expect("walk reports the fixture file");
+        let matcher = Pattern::compile(
+            "**/main.rs",
+            PatternOptions::default().recursive_double_star(true),
+        )
+        .expect("valid pattern");
+
+        assert_eq!(
+            entry.path_bytes(),
+            entry.path().as_os_str().as_encoded_bytes()
+        );
+        assert!(matcher.is_match(entry.path_bytes()));
     }
 
     #[cfg(unix)]
@@ -5538,7 +7565,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn parallel_abort_returns_an_error_and_cancels_the_shared_token() {
+    fn parallel_abort_returns_an_error_without_cancelling_the_caller_token() {
         use std::os::unix::fs::symlink;
 
         let fixture = Fixture::new();
@@ -5549,6 +7576,15 @@ mod tests {
         symlink("missing-right", fixture.root.join("right/dangling"))
             .expect("create right dangling symlink");
         let cancellation = CancellationToken::default();
+        let serial_cancellation = CancellationToken::default();
+
+        let serial_error = Walker::new(&fixture.root)
+            .threads(1)
+            .options(WalkOptions::default().follow_symlinks(true))
+            .error_policy(ErrorPolicy::Abort)
+            .cancellation(serial_cancellation.clone())
+            .collect()
+            .expect_err("serial abort returns the first metadata error");
 
         let error = Walker::new(&fixture.root)
             .threads(4)
@@ -5559,7 +7595,22 @@ mod tests {
             .expect_err("abort policy returns the first metadata error");
 
         assert_eq!(error.operation(), "metadata");
-        assert!(cancellation.is_cancelled());
+        assert_eq!(serial_error.operation(), error.operation());
+        assert!(
+            !serial_cancellation.is_cancelled(),
+            "serial abort leaves the caller-owned token alone"
+        );
+        assert!(
+            !cancellation.is_cancelled(),
+            "parallel abort must match serial token ownership"
+        );
+
+        let reused = Walker::new(&fixture.root)
+            .threads(4)
+            .cancellation(cancellation.clone())
+            .collect()
+            .expect("the same token can drive a later walk");
+        assert!(!reused.was_cancelled());
     }
 
     #[cfg(target_os = "linux")]

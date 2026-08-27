@@ -82,6 +82,11 @@
         {
           "type": "toml",
           "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value==\"doc-tests\")].version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
           "jsonpath": "$.package[?(@.name.value==\"ferralk\")].version"
         },
         {
@@ -113,6 +118,18 @@
           "type": "toml",
           "path": "Cargo.lock",
           "jsonpath": "$.package[?(@.name.value==\"oracle\")].version"
+        },
+        {
+          "type": "generic",
+          "path": "README.md"
+        },
+        {
+          "type": "generic",
+          "path": "docs/usage.md"
+        },
+        {
+          "type": "generic",
+          "path": "docs/external-release-gates.md"
         }
       ]
     }

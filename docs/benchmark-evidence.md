@@ -330,6 +330,19 @@ today nothing downstream of `Listing::push` can accept one. The spread on the
 noisier rows is real, which is why the anchor is inside each run and why the
 `getdirentries64` measurement was taken twice.
 
+### Final-batch EOF flag, 2026-08-27
+
+Darwin's extended `__getdirentries64` buffer reserves its final four bytes for
+`GETDIRENTRIES64_EOF` when the buffer is at least 1024 bytes. A small-directory
+C probe on the same APFS setup returned data and this flag on its first call;
+the old reader then issued one empty terminal syscall. The native reader now
+checks that tail only after parsing `buffer[..byte_count]`, so the flag cannot
+expand parser input or weaken record bounds. A final flagged batch now follows
+`open + read + close`, rather than `open + read + empty read + close`: one
+directory-read syscall is removed for directories that fit their final batch.
+This is a syscall-count observation, not a new wall-time benchmark; cache,
+tree shape, filesystem and concurrent work determine the realised speedup.
+
 ## Selecting without a caller-side matcher
 
 The `caller_match` arms in [`walker.rs`](../tools/bench/benches/walker.rs) model
@@ -454,8 +467,11 @@ is cheap next to reading a few hundred directory entries.
 What one walker actually buys is structural rather than measurable here: one
 helper-spawn decision taken over the whole walk instead of per tree, so three
 small roots stay serial where three separate walkers would each weigh
-themselves; one visited-directory set; and one place for the caller's patterns
-instead of a loop that rebuilds them per root. Criterion's sequential arms
+themselves; one visited-directory guard per root traversal, shared only with
+that root's descendants; and one place for the caller's patterns instead of a
+loop that rebuilds them per root. The independent guards preserve overlapping,
+duplicate and alias roots as the concatenation of their single-root walks while
+still ending genuine cycles within each root. Criterion's sequential arms
 disagreed with the paired measurement on the smallest shape — it reported the
 one-walker arm slower — which is drift between arms measured minutes apart, and
 the reason the table above is paired.

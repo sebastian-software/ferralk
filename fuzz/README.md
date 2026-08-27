@@ -2,9 +2,15 @@
 
 `pattern_parser` and `pattern_matcher` exercise parsing and matching with
 arbitrary bytes and option combinations. Their checked-in seeds derive from the
-executable matcher corpus. On macOS, `macos_dirent_parser` additionally fuzzes
-the feature-gated `getdirentries64` and `getattrlistbulk` record validators
-without issuing syscalls or touching paths.
+executable matcher corpus. On macOS, `macos_dirent_parser` and
+`macos_bulk_record_parser` separately fuzz the feature-gated `getdirentries64`
+and `getattrlistbulk` record validators without issuing syscalls or touching
+paths. Linux has the equivalent `linux_dirent_parser`. The native targets keep
+small structure-aware checked-in records and CI preserves each target's corpus
+between runs, so their bounded budgets start from valid parser shapes.
+`cargo run --manifest-path fuzz/Cargo.toml --bin generate_macos_native_seeds`
+regenerates the macOS records byte-for-byte; macOS-native tests replay and
+validate every checked-in seed before CI fuzzes it.
 
 `ferralk_vs_fast_glob` is differential: it feeds one pattern and one candidate
 to both ferralk and Oxc fast-glob and asserts the same verdict. It keeps only
@@ -33,8 +39,9 @@ chosen target with a custom budget on demand.
 Install cargo-fuzz, then run cargo fuzz run pattern_parser, cargo fuzz run
 pattern_matcher, or cargo fuzz run ferralk_vs_fast_glob from the repository
 root.
-Run `cargo fuzz run macos_dirent_parser` on macOS for the native record parser.
-Run `cargo fuzz run linux_dirent_parser` on Linux for the native record parser.
+Run `cargo fuzz run macos_dirent_parser` or `cargo fuzz run
+macos_bulk_record_parser` on macOS for the native record parsers. Run `cargo
+fuzz run linux_dirent_parser` on Linux for the native record parser.
 
 Crash artifacts belong under fuzz/artifacts. Minimize a saved input with
 `cargo fuzz tmin` followed by the target and artifact, then convert the

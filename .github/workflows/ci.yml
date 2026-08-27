@@ -5,9 +5,11 @@ on:
   push:
     branches: [main]
   schedule:
-    # Surface new RustSec advisories in quiet phases. Only the audit job runs
-    # on this trigger; every other job is guarded below.
+    # Surface RustSec advisories and Rust stable-release drift in quiet phases.
+    # Only security-audit and msrv-policy run on this trigger.
     - cron: "0 6 * * 1"
+  # Runs only the MSRV policy check, without the ordinary CI matrix.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -18,7 +20,7 @@ env:
 jobs:
   lint:
     name: format and lints
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -44,7 +46,7 @@ jobs:
 
   test:
     name: test (${{ matrix.os }})
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -56,22 +58,25 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test
       - run: cargo test -p corpus -p harness -p bench
+      - run: cargo test -p doc-tests
       - run: cargo run -p harness -- corpus
 
   macos-native:
     name: macOS native backend
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test -p ferralk --features native-macos
-      - run: cargo check --manifest-path fuzz/Cargo.toml --bin macos_dirent_parser --locked
+      - run: >-
+          cargo check --manifest-path fuzz/Cargo.toml
+          --bin macos_dirent_parser --bin macos_bulk_record_parser --locked
 
   linux-native:
     name: Linux native backend
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -82,19 +87,21 @@ jobs:
 
   msrv:
     name: msrv (workspace rust-version)
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # ADR-0004 keeps the MSRV at current stable minus two releases. The
-      # workspace manifest is the single place it is written down.
-      - name: Read the MSRV from the workspace manifest
+      # fuzz crate is a separate workspace, but shares this same floor.
+      - name: Read and align the declared MSRVs
         id: msrv
         run: |
-          version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
-          test -n "$version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Workspace MSRV is $version"
+          workspace_version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          fuzz_version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' fuzz/Cargo.toml)
+          test -n "$workspace_version"
+          test "$fuzz_version" = "$workspace_version"
+          echo "version=$workspace_version" >> "$GITHUB_OUTPUT"
+          echo "Workspace and fuzz MSRV is $workspace_version"
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master branch
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
@@ -108,6 +115,50 @@ jobs:
           cargo check -p ferralk -p bench
           --features ferralk/native-linux,bench/native-linux
           --all-targets --locked
+      - name: Check the platform-neutral fuzz targets
+        run: >-
+          cargo check --manifest-path fuzz/Cargo.toml
+          --bin pattern_parser --bin pattern_matcher --bin ignore_rule_parser
+          --bin ferralk_vs_fast_glob
+          --locked
+
+  msrv-policy:
+    name: MSRV stable-minus-two policy
+    # Fetching release metadata is intentionally kept off ordinary pull
+    # requests: a network outage must not make deterministic CI flaky.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check the manifest against Rust stable
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 --retry-delay 5 --silent --show-error \
+            https://static.rust-lang.org/dist/channel-rust-stable.toml \
+            --output channel-rust-stable.toml
+
+          stable=$(awk '
+            $0 == "[pkg.rust]" { in_rust = 1; next }
+            /^\[/ { in_rust = 0 }
+            in_rust && $1 == "version" {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' channel-rust-stable.toml)
+          test -n "$stable"
+
+          IFS=. read -r major minor patch <<EOF
+          $stable
+          EOF
+          test "$major" = 1
+          test "$minor" -ge 2
+          expected="$major.$((minor - 2))"
+          declared=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          test -n "$declared"
+
+          echo "Rust stable is $stable; policy expects MSRV $expected."
+          test "$declared" = "$expected"
 
   semver:
     name: public API compatibility
@@ -125,6 +176,7 @@ jobs:
 
   security-audit:
     name: dependency and unsafe audit
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -140,7 +192,7 @@ jobs:
 
   coverage:
     name: coverage
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

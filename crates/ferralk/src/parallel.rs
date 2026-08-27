@@ -2,7 +2,6 @@
 
 use std::{
     any::Any,
-    collections::HashSet,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     path::{Path, PathBuf},
     sync::{
@@ -12,12 +11,15 @@ use std::{
     thread,
 };
 
+#[cfg(test)]
+use std::collections::HashSet;
+
 use crossbeam_deque::{Steal, Stealer, Worker};
 
 use super::{
-    CANCELLATION_STRIDE, CYCLE_KEY_OPERATION, CycleKey, DirectoryBackend, EntryVisitor,
+    CANCELLATION_STRIDE, CYCLE_KEY_OPERATION, CycleGuard, DirectoryBackend, EntryVisitor,
     ErrorPolicy, Listing, Verdict, WalkEntry, WalkError, WalkResult, Walker,
-    classify::{DirectoryTask, EmittedEntry, EntryAction, classify_entry},
+    classify::{DirectoryTask, EmittedEntry, EntryAction, TraversalContext, classify_entry},
     own_path, reset_to_directory,
     scheduler::{CacheLine, Coordinator, Scheduler, WorkerSlot},
 };
@@ -37,10 +39,20 @@ pub(super) fn collect<B: DirectoryBackend + Sync>(
     // are several initial tasks and nothing more: the caller reads them in
     // order, and whatever they uncover is ordinary work for the same pool.
     let roots = walker.root_tasks(backend);
-    for root in roots {
-        shared.coordinator.begin_task();
-        let _root_task = shared.coordinator.claim_task();
-        process_directory(&shared, &mut caller, root);
+    catch_worker_panic(&shared, || {
+        for root in roots {
+            if shared.should_stop() {
+                break;
+            }
+            shared.coordinator.begin_task();
+            let _root_task = shared.coordinator.claim_task();
+            process_directory(&shared, &mut caller, root);
+        }
+    });
+
+    if shared.should_stop() {
+        drop(caller_slot);
+        return finish(shared, std::mem::take(&mut caller.entries));
     }
 
     // A walk that never crosses the floor never builds any of what follows.
@@ -56,15 +68,14 @@ pub(super) fn collect<B: DirectoryBackend + Sync>(
     // finishes every root, in the order the eager route read them.
     //
     // Panics are caught here the way `run_worker` catches them, because this
-    // stands in for `run_worker` on the route that never widens. Reading the
-    // roots above is outside it on both routes alike.
+    // stands in for `run_worker` on the route that never widens.
     let widened =
         catch_worker_panic(&shared, || drain_alone(&shared, &mut caller)).unwrap_or(false);
     if !widened {
         drop(caller_slot);
         return finish(shared, std::mem::take(&mut caller.entries));
     }
-    shared.widen();
+    shared.coordinator.widen();
 
     // Every helper slot is built here so the stealer list is complete and stays
     // lock-free once the walk runs. Only the threads are lazy: a slot stays
@@ -275,16 +286,14 @@ struct Shared<'backend> {
     /// Set by a [`Verdict::Stop`]. Kept apart from `cancellation` so a stop
     /// never reaches into a token the caller owns and may reuse.
     stopped: AtomicBool,
-    /// Whether the caller is still the only worker. See [`Shared::schedule`].
-    lone: AtomicBool,
     /// Work seen so far, the size signal behind [`HELPER_WORK_FLOOR`]: entries
     /// plus [`DIRECTORY_WEIGHT`] for each listing they came from. Accumulated
     /// per listing rather than per entry, so a directory costs one atomic add
     /// however much it holds - and the weight rides along in that same add.
     ///
     /// On its own cache line: every worker adds to it once per directory and
-    /// every `grow` reads it, so packing it beside `stopped` and `lone` -
-    /// which the same loops read - made three unrelated values share one line.
+    /// every `grow` reads it, so packing it beside `stopped` — which the same
+    /// loops read — made unrelated values share one line.
     work_seen: CacheLine<AtomicUsize>,
     /// Every filesystem call of the walk goes through here, which is what lets
     /// a test mock drive the parallel frontend the same way it drives the
@@ -293,16 +302,13 @@ struct Shared<'backend> {
     scheduler: Scheduler<DirectoryTask>,
     /// Task accounting, worker slots and the parking protocol.
     coordinator: Coordinator,
-    cancellation: super::CancellationToken,
+    /// Caller-controlled external cancellation. Internal shutdown is always
+    /// represented by `stopped`, so one walk cannot poison a shared token.
+    cancellation: Option<super::CancellationToken>,
     errors: Mutex<Vec<WalkError>>,
     abort_error: Mutex<Option<WalkError>>,
     startup_error: Mutex<Option<WalkError>>,
     panic: Mutex<Option<Box<dyn Any + Send + 'static>>>,
-    /// The follow-symlinks guard. One mutex rather than shards: the key is
-    /// sixteen `Copy` bytes, so the critical section is a hash and an insert,
-    /// and the measurement in the pull request found sharding unmeasurable
-    /// against a walk that is dominated by syscalls.
-    visited_directories: Mutex<HashSet<CycleKey>>,
 }
 
 impl<'backend> Shared<'backend> {
@@ -311,12 +317,11 @@ impl<'backend> Shared<'backend> {
         backend: &'backend (dyn DirectoryBackend + Sync),
         visitor: EntryVisitor<'backend>,
     ) -> Self {
-        let cancellation = walker.cancellation.clone().unwrap_or_default();
+        let cancellation = walker.cancellation.clone();
         Self {
             walker,
             visitor,
             stopped: AtomicBool::new(false),
-            lone: AtomicBool::new(true),
             work_seen: CacheLine(AtomicUsize::new(0)),
             backend,
             scheduler: Scheduler::new(),
@@ -326,34 +331,11 @@ impl<'backend> Shared<'backend> {
             abort_error: Mutex::new(None),
             startup_error: Mutex::new(None),
             panic: Mutex::new(None),
-            visited_directories: Mutex::new(HashSet::new()),
         }
     }
 
     fn schedule(&self, worker: &Worker<DirectoryTask>, task: DirectoryTask) {
-        self.coordinator.begin_task();
-        worker.push(task);
-        // A walk that has not widened yet has nobody to wake, and the
-        // notification is a lock and a broadcast for every directory it finds.
-        // [`Shared::widen`] clears this before the first helper can exist, and
-        // starting a thread synchronizes with it, so no helper can park without
-        // having seen the flag already cleared.
-        //
-        // Past that, exactly one task became available, so one parked worker is
-        // woken rather than all of them. A worker that wakes to find the task
-        // already taken by somebody who never parked parks again; nothing is
-        // stranded, because whoever took it holds it.
-        if !self.lone.load(Ordering::Relaxed) {
-            self.coordinator.wake_one_waiter();
-        }
-    }
-
-    /// Announces that this walk is about to have more than one worker.
-    ///
-    /// Called once, before the pool is built, so every notification a helper
-    /// could need is sent from then on.
-    fn widen(&self) {
-        self.lone.store(false, Ordering::Relaxed);
+        self.coordinator.schedule(|| worker.push(task));
     }
 
     /// Whether the tree has shown enough work to be worth a helper.
@@ -370,7 +352,10 @@ impl<'backend> Shared<'backend> {
     }
 
     fn should_stop(&self) -> bool {
-        self.cancellation.is_cancelled() || self.stopped.load(Ordering::Acquire)
+        self.cancellation
+            .as_ref()
+            .is_some_and(super::CancellationToken::is_cancelled)
+            || self.stopped.load(Ordering::Acquire)
     }
 
     /// Runs the visitor and keeps the entry if it survived.
@@ -394,25 +379,29 @@ impl<'backend> Shared<'backend> {
             Verdict::Skip => *spare = entry.path,
             Verdict::Stop => {
                 *spare = entry.path;
-                self.stopped.store(true, Ordering::Release);
-                self.coordinator.wake_waiters();
+                self.stop();
             }
         }
     }
 
-    fn record_error(&self, operation: &'static str, path: PathBuf, source: std::io::Error) {
+    fn record_error(
+        &self,
+        operation: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+        is_root: bool,
+    ) {
         let error = WalkError::new(operation, path, source);
         match self.walker.error_policy {
             ErrorPolicy::Abort => {
                 let mut abort_error = lock(&self.abort_error);
                 if abort_error.is_none() {
                     *abort_error = Some(error);
-                    self.cancellation.cancel();
-                    self.coordinator.wake_waiters();
+                    self.stop();
                 }
             }
-            ErrorPolicy::Skip => {}
-            ErrorPolicy::Collect => lock(&self.errors).push(error),
+            ErrorPolicy::Skip if !is_root => {}
+            ErrorPolicy::Skip | ErrorPolicy::Collect => lock(&self.errors).push(error),
         }
     }
 
@@ -428,8 +417,7 @@ impl<'backend> Shared<'backend> {
                     .into(),
                 source,
             ));
-            self.cancellation.cancel();
-            self.coordinator.wake_waiters();
+            self.stop();
         }
     }
 
@@ -437,9 +425,16 @@ impl<'backend> Shared<'backend> {
         let mut panic = lock(&self.panic);
         if panic.is_none() {
             *panic = Some(payload);
-            self.cancellation.cancel();
-            self.coordinator.wake_waiters();
+            self.stop();
         }
+    }
+
+    /// Stops only this walk. The configured token is caller-owned external
+    /// cancellation: internal aborts, startup failures, and panics must wake
+    /// siblings without poisoning a token the caller may share or reuse.
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.coordinator.wake_waiters();
     }
 }
 
@@ -595,6 +590,7 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
         path,
         depth,
         root,
+        cycle_guard,
         ignores,
     } = task;
     #[cfg(test)]
@@ -604,11 +600,19 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
     if shared.should_stop() {
         return;
     }
-    if shared.walker.options.follow_symlinks && !mark_directory(shared, &path) {
+    let is_root = depth == 0;
+    if shared.walker.options.follow_symlinks
+        && !mark_directory(shared, &cycle_guard, &path, is_root)
+    {
         return;
     }
-    if let Err(source) = shared.backend.read_directory(&path, &mut worker.listing) {
-        shared.record_error("read_dir", path, source);
+    if let Err(source) = shared.backend.read_directory(
+        &path,
+        shared.walker.options.follow_symlinks,
+        !shared.walker.options.follow_symlinks && depth > 0,
+        &mut worker.listing,
+    ) {
+        shared.record_error("read_dir", path, source, is_root);
         return;
     }
     // One add for the whole listing: the entries it returned, and the listing
@@ -642,20 +646,36 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
             &worker.listing.entries()[index],
             &ignores,
             depth,
-            root,
+            TraversalContext {
+                root,
+                cycle_guard: &cycle_guard,
+            },
         );
         act(shared, worker, action);
         reset_to_directory(&mut worker.path, &path);
     }
+    while let Some(error) = worker.listing.take_deferred_error() {
+        shared.record_error("read_dir", error.path, error.source.into_io_error(), false);
+    }
 }
 
-fn mark_directory(shared: &Shared, directory: &Path) -> bool {
+fn mark_directory(
+    shared: &Shared,
+    cycle_guard: &CycleGuard,
+    directory: &Path,
+    is_root: bool,
+) -> bool {
     // The key is computed outside the lock, so the critical section holds only
     // the hash and the insert.
     match shared.backend.cycle_key(directory) {
-        Ok(key) => lock(&shared.visited_directories).insert(key),
+        Ok(key) => cycle_guard.mark(key),
         Err(source) => {
-            shared.record_error(CYCLE_KEY_OPERATION, directory.to_path_buf(), source);
+            shared.record_error(
+                CYCLE_KEY_OPERATION,
+                directory.to_path_buf(),
+                source,
+                is_root,
+            );
             false
         }
     }
@@ -676,7 +696,7 @@ fn act(shared: &Shared, worker: &mut WorkerScratch, action: EntryAction) {
             if let Some(task) = descend {
                 shared.schedule(&worker.queue, task);
             }
-            shared.record_error(failure.operation, failure.path, failure.source);
+            shared.record_error(failure.operation, failure.path, failure.source, false);
         }
     }
 }
@@ -829,7 +849,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
         thread,
@@ -1023,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_panic_cancels_siblings_and_resumes_on_the_caller() {
+    fn worker_panic_stops_siblings_without_cancelling_the_caller_token() {
         let cancellation = CancellationToken::default();
         let walker = Arc::new(Walker::new(".").cancellation(cancellation.clone()));
         let shared = Arc::new(Shared::new(
@@ -1033,7 +1053,10 @@ mod tests {
         ));
 
         catch_worker_panic(&shared, || panic!("injected worker panic"));
-        assert!(cancellation.is_cancelled());
+        assert!(
+            !cancellation.is_cancelled(),
+            "a panic must not cancel a caller-owned token"
+        );
         assert!(catch_unwind(AssertUnwindSafe(|| finish(shared, Vec::new()))).is_err());
     }
 
@@ -1194,10 +1217,10 @@ mod tests {
 
     /// A tree below the floor never builds the scoped machinery, so a panic
     /// there unwinds through a different frame than a widened walk's does. It
-    /// still has to reach the caller, and still has to cancel the walk on its
-    /// way out — the two routes may not differ on what a panic means.
+    /// still has to reach the caller and stop this walk on its way out — the
+    /// two routes may not differ on what a panic means.
     #[test]
-    fn a_panic_below_the_floor_resumes_on_the_caller_and_cancels() {
+    fn a_panic_below_the_floor_resumes_on_the_caller_without_poisoning_its_token() {
         let root = unique_root("lean-panic");
         // One subdirectory holding four files: below every floor, so the walk
         // never widens and the panic is raised on the caller thread itself.
@@ -1217,16 +1240,153 @@ mod tests {
                 .cancellation(walk_cancellation)
                 .collect()
         }));
-        let _ = fs::remove_dir_all(&root);
-
         assert!(
             outcome.is_err(),
             "the injected panic must resume on the caller"
         );
         assert!(
-            cancellation.is_cancelled(),
-            "and must cancel the walk on its way out"
+            !cancellation.is_cancelled(),
+            "the caller-owned token remains reusable after a panic"
         );
+        let reused = Walker::new(&root)
+            .threads(4)
+            .cancellation(cancellation.clone())
+            .collect()
+            .expect("the same token can drive a later walk");
+        let _ = fs::remove_dir_all(&root);
+        assert!(!reused.was_cancelled());
+    }
+
+    #[test]
+    fn root_visitor_panic_uses_the_parallel_shutdown_protocol() {
+        let root = unique_root("root-visitor-panic");
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir_all(&first).expect("create first root");
+        fs::create_dir_all(&second).expect("create second root");
+        let panic_path = first.join("panic.txt");
+        fs::write(&panic_path, b"fixture").expect("write first root file");
+        fs::write(second.join("unvisited.txt"), b"fixture").expect("write second root file");
+
+        let cancellation = CancellationToken::default();
+        let seen_second = Arc::new(AtomicBool::new(false));
+        let walk_first = first.clone();
+        let walk_second = second.clone();
+        let walk_panic_path = panic_path.clone();
+        let walk_cancellation = cancellation.clone();
+        let walk_seen_second = Arc::clone(&seen_second);
+        let (sender, receiver) = mpsc::channel();
+        let runner = thread::Builder::new()
+            .name("ferralk-root-panic-regression".into())
+            .spawn(move || {
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    Walker::new(&walk_first)
+                        .add_root(&walk_second)
+                        .expect("second root")
+                        .threads(4)
+                        .cancellation(walk_cancellation)
+                        .visit(move |entry| {
+                            if entry.path() == walk_panic_path {
+                                panic!("injected root visitor panic");
+                            }
+                            if entry.path().starts_with(&walk_second) {
+                                walk_seen_second.store(true, Ordering::Release);
+                            }
+                            crate::Verdict::Keep
+                        })
+                }));
+                let _ = sender.send(outcome.is_err());
+            })
+            .expect("spawn the walking thread");
+
+        assert_eq!(
+            receiver.recv_timeout(RESUME_TIMEOUT),
+            Ok(true),
+            "a root visitor panic must resume without hanging"
+        );
+        runner.join().expect("the walking thread joins");
+        assert!(
+            !cancellation.is_cancelled(),
+            "the panic must leave the caller-owned token reusable"
+        );
+        assert!(
+            !seen_second.load(Ordering::Acquire),
+            "a root panic must stop the remaining roots"
+        );
+        let reused = Walker::new(&first)
+            .threads(4)
+            .cancellation(cancellation.clone())
+            .collect()
+            .expect("the same token can drive a later walk");
+        let _ = fs::remove_dir_all(&root);
+        assert!(!reused.was_cancelled());
+    }
+
+    #[test]
+    fn deeper_visitor_panic_matches_the_root_panic_protocol() {
+        let root = unique_root("deep-visitor-panic");
+        create_wide_fixture(&root);
+        let panic_path = root.join("branch-3").join("nested-2").join("file-0.txt");
+
+        let cancellation = CancellationToken::default();
+        let walk_root = root.clone();
+        let walk_panic_path = panic_path.clone();
+        let walk_cancellation = cancellation.clone();
+        let (sender, receiver) = mpsc::channel();
+        let runner = thread::Builder::new()
+            .name("ferralk-deep-panic-regression".into())
+            .spawn(move || {
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    Walker::new(&walk_root)
+                        .threads(4)
+                        .cancellation(walk_cancellation)
+                        .visit(move |entry| {
+                            if entry.path() == walk_panic_path {
+                                panic!("injected deep visitor panic");
+                            }
+                            crate::Verdict::Keep
+                        })
+                }));
+                let _ = sender.send(outcome.is_err());
+            })
+            .expect("spawn the walking thread");
+
+        assert_eq!(
+            receiver.recv_timeout(RESUME_TIMEOUT),
+            Ok(true),
+            "a deeper visitor panic must resume without hanging"
+        );
+        runner.join().expect("the walking thread joins");
+        assert!(
+            !cancellation.is_cancelled(),
+            "root and deeper panics have the same token-ownership contract"
+        );
+        let reused = Walker::new(&root)
+            .threads(4)
+            .cancellation(cancellation.clone())
+            .collect()
+            .expect("the same token can drive a later walk");
+        let _ = fs::remove_dir_all(&root);
+        assert!(!reused.was_cancelled());
+    }
+
+    #[test]
+    fn externally_cancelled_token_still_ends_a_parallel_walk() {
+        let root = unique_root("external-cancellation");
+        create_wide_fixture(&root);
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let result = Walker::new(&root)
+            .threads(4)
+            .cancellation(cancellation.clone())
+            .collect()
+            .expect("external cancellation is a normal partial result");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(result.was_cancelled());
+        assert!(result.entries().is_empty());
+        assert!(cancellation.is_cancelled());
     }
 
     #[test]
@@ -1256,7 +1416,6 @@ mod tests {
                 .expect("spawn the walking thread");
 
             let resumed = receiver.recv_timeout(RESUME_TIMEOUT);
-            let _ = fs::remove_dir_all(&root);
             assert_eq!(
                 resumed,
                 Ok(true),
@@ -1264,14 +1423,21 @@ mod tests {
             );
             runner.join().expect("the walking thread joins");
             assert!(
-                cancellation.is_cancelled(),
-                "round {round}: the panic must cancel the sibling workers"
+                !cancellation.is_cancelled(),
+                "round {round}: a panic must not cancel the caller-owned token"
             );
+            let reused = Walker::new(&root)
+                .threads(4)
+                .cancellation(cancellation.clone())
+                .collect()
+                .expect("the same token can drive a later walk");
+            let _ = fs::remove_dir_all(&root);
+            assert!(!reused.was_cancelled());
         }
     }
 
     #[test]
-    fn worker_start_failure_returns_a_structured_error_and_cancels() {
+    fn worker_start_failure_returns_a_structured_error_without_cancelling_the_token() {
         let root = unique_root("worker-start");
         // Wide enough to reach the size floor, or no helper is ever attempted
         // and there is nothing for the injected failure to land on.
@@ -1284,10 +1450,18 @@ mod tests {
             .cancellation(cancellation.clone())
             .collect()
             .expect_err("injected worker start failure is returned");
-        let _ = fs::remove_dir_all(&root);
-
         assert_eq!(error.operation(), "spawn_worker");
         assert_eq!(error.path(), PathBuf::from(&root));
-        assert!(cancellation.is_cancelled());
+        assert!(
+            !cancellation.is_cancelled(),
+            "a startup failure must not cancel a caller-owned token"
+        );
+        let reused = Walker::new(&root)
+            .threads(4)
+            .cancellation(cancellation.clone())
+            .collect()
+            .expect("the same token can drive a later walk");
+        let _ = fs::remove_dir_all(&root);
+        assert!(!reused.was_cancelled());
     }
 }

@@ -412,7 +412,7 @@ fn globwalk_serial(root: &Path, globs: &[&str; 2]) -> usize {
         .file_type(GlobwalkFileType::FILE)
         .build()
         .expect("benchmark globwalk builds")
-        .filter_map(Result::ok)
+        .map(|entry| entry.expect("benchmark walk succeeds"))
         .count()
 }
 

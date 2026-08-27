@@ -23,7 +23,7 @@
 //! - Asterisks that do not form a whole component are ordinary stars in Git and
 //!   must not cross a separator, so `a**b` collapses to `a*b`.
 
-use std::path::Path;
+use std::{borrow::Cow, path::Path};
 
 use ferralk_glob::{Pattern, PatternOptions};
 use memchr::memmem;
@@ -37,12 +37,15 @@ use super::glob_path_bytes;
 /// rule is expected to see dotfiles. Recursive stars are off because a `**`
 /// component never reaches the compiler - it becomes [`Component::AnyDirs`] -
 /// and any other run has already collapsed to a single star.
-fn component_options() -> PatternOptions {
+fn component_options(case_insensitive: bool) -> PatternOptions {
     PatternOptions::default()
         .braces(false)
         .extglob(false)
         .recursive_double_star(false)
         .match_hidden(true)
+        // Git's WM_CASEFOLD is ASCII-only. `PatternOptions` has exactly that
+        // contract, including in literals and bracket classes.
+        .case_insensitive(case_insensitive)
 }
 
 /// The rules of one ignore file, in file order.
@@ -63,6 +66,7 @@ pub(crate) struct RuleSet {
     /// chain, so each set slices off its own prefix instead of walking the
     /// components again.
     root_len: usize,
+    precompose_unicode: bool,
     rules: Vec<Rule>,
 }
 
@@ -75,10 +79,22 @@ impl RuleSet {
     ///
     /// `path` is the candidate's whole path in glob bytes; the part below this
     /// set's directory is what the rules see. Last-match-wins is Git's rule, so
-    /// the scan runs backwards and stops at the first hit. Nothing here
-    /// allocates.
+    /// the scan runs backwards and stops at the first hit. The ordinary
+    /// byte-exact path is allocation-free; enabled precomposition allocates
+    /// only when a valid UTF-8 component actually changes under NFC.
     pub(crate) fn matched(&self, path: &[u8], is_dir: bool) -> Option<bool> {
         let candidate = path.get(self.root_len..).unwrap_or(path);
+        if self.precompose_unicode {
+            let candidate = normalize_candidate(candidate);
+            self.matched_candidate(&candidate, is_dir)
+        } else {
+            // The ordinary byte-exact path neither allocates nor constructs a
+            // normalization iterator.
+            self.matched_candidate(candidate, is_dir)
+        }
+    }
+
+    fn matched_candidate(&self, candidate: &[u8], is_dir: bool) -> Option<bool> {
         self.rules
             .iter()
             .rev()
@@ -192,25 +208,35 @@ fn split_component(candidate: &[u8]) -> (&[u8], &[u8]) {
 /// Collects the rules of one or more ignore files for the same directory.
 pub(crate) struct RuleSetBuilder {
     root_len: usize,
+    case_insensitive: bool,
+    precompose_unicode: bool,
     rules: Vec<Rule>,
 }
 
 impl RuleSetBuilder {
-    pub(crate) fn new(root: &Path) -> Self {
+    pub(crate) fn new(root: &Path, case_insensitive: bool, precompose_unicode: bool) -> Self {
         let root = glob_path_bytes(root);
         // The separator between the directory and what follows it belongs to
-        // the prefix, unless the directory already ends in one.
-        let root_len = root.len() + usize::from(!root.ends_with(b"/"));
+        // the prefix, unless the directory already ends in one. The empty
+        // root is used by the fuzz helper, where candidates are already
+        // relative and so have no prefix to remove.
+        let root_len = if root.is_empty() {
+            0
+        } else {
+            root.len() + usize::from(!root.ends_with(b"/"))
+        };
         Self {
             root_len,
+            case_insensitive,
+            precompose_unicode,
             rules: Vec::new(),
         }
     }
 
     /// Adds one line. A line that is blank, a comment, or malformed adds
     /// nothing, which is what Git does with it.
-    pub(crate) fn add_line(&mut self, line: &str) {
-        if let Some(rule) = parse_rule(line) {
+    pub(crate) fn add_line(&mut self, line: impl AsRef<[u8]>) {
+        if let Some(rule) = parse_rule_with_options(line, self.case_insensitive) {
             self.rules.push(rule);
         }
     }
@@ -218,6 +244,7 @@ impl RuleSetBuilder {
     pub(crate) fn build(self) -> RuleSet {
         RuleSet {
             root_len: self.root_len,
+            precompose_unicode: self.precompose_unicode,
             rules: self.rules,
         }
     }
@@ -229,14 +256,29 @@ impl RuleSetBuilder {
 /// surface the harness needs: parsing and matching are the two halves that must
 /// stay total, whatever bytes arrive.
 pub fn fuzz_rule(line: &str, candidate: &[u8], is_dir: bool) -> Option<bool> {
-    let mut builder = RuleSetBuilder::new(Path::new(""));
+    fuzz_rule_bytes(line.as_bytes(), candidate, is_dir)
+}
+
+/// Byte-oriented fuzz entry point for the rule layer.
+///
+/// Ignore files are bytes, so this also reaches patterns that are not valid
+/// UTF-8. It shares the same empty-root setup as [`fuzz_rule`].
+#[doc(hidden)]
+pub fn fuzz_rule_bytes(line: &[u8], candidate: &[u8], is_dir: bool) -> Option<bool> {
+    let mut builder = RuleSetBuilder::new(Path::new(""), false, false);
     builder.add_line(line);
     builder.build().matched(candidate, is_dir)
 }
 
 /// Reads one `gitignore(5)` line into a rule, or nothing.
-fn parse_rule(line: &str) -> Option<Rule> {
-    if line.is_empty() || line.starts_with('#') {
+#[cfg(test)]
+fn parse_rule(line: impl AsRef<[u8]>) -> Option<Rule> {
+    parse_rule_with_options(line, false)
+}
+
+fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Option<Rule> {
+    let line = line.as_ref();
+    if line.is_empty() || line.starts_with(b"#") {
         return None;
     }
     let body = strip_trailing_spaces(line);
@@ -244,7 +286,7 @@ fn parse_rule(line: &str) -> Option<Rule> {
         return None;
     }
 
-    let (negated, body) = match body.strip_prefix('!') {
+    let (negated, body) = match body.strip_prefix(b"!") {
         Some(rest) => (true, rest),
         None => (false, body),
     };
@@ -254,15 +296,20 @@ fn parse_rule(line: &str) -> Option<Rule> {
         return None;
     }
 
-    let (directory_only, body) = match body.strip_suffix('/') {
+    let (directory_only, body) = match body.strip_suffix(b"/") {
         Some(rest) => (true, rest),
         None => (false, body),
     };
     // A separator anywhere but at the end binds the rule to its own directory;
     // without one it matches at any level.
-    let anchored = body.contains('/');
-    let body = body.strip_prefix('/').unwrap_or(body);
+    let anchored = body.contains(&b'/');
+    let body = body.strip_prefix(b"/").unwrap_or(body);
     if body.is_empty() {
+        return None;
+    }
+    // A single leading separator is the anchor. Any other empty component is
+    // unmatchable in Git, rather than an alternate spelling of a valid rule.
+    if body.split(|byte| *byte == b'/').any(<[u8]>::is_empty) {
         return None;
     }
 
@@ -271,13 +318,13 @@ fn parse_rule(line: &str) -> Option<Rule> {
     if !anchored {
         components.push(Component::AnyDirs);
     }
-    for part in body.split('/').filter(|part| !part.is_empty()) {
-        if let Some(literal) = longest_literal_run(part.as_bytes())
+    for part in body.split(|byte| *byte == b'/') {
+        if let Some(literal) = longest_literal_run(part)
             && gate.as_ref().is_none_or(|best| best.len() < literal.len())
         {
             gate = Some(literal);
         }
-        let component = compile_component(part)?;
+        let component = compile_component(part, case_insensitive)?;
         // Two runs in a row are one run, and collapsing them keeps the matcher
         // from backtracking between them for nothing.
         if matches!(component, Component::AnyDirs)
@@ -289,7 +336,7 @@ fn parse_rule(line: &str) -> Option<Rule> {
     }
     if matches!(components.last(), Some(Component::AnyDirs)) {
         // `abc/**` is what is inside `abc`, so one component has to follow.
-        components.push(compile_component("*")?);
+        components.push(compile_component(b"*", case_insensitive)?);
     }
     // A body of nothing but separators is not a rule.
     if components.len() == usize::from(!anchored) {
@@ -298,25 +345,70 @@ fn parse_rule(line: &str) -> Option<Rule> {
 
     Some(Rule {
         components,
-        gate: gate.map(|literal| memmem::Finder::new(&literal).into_owned()),
+        // This prefilter is byte-exact, so it would reject a case-folded
+        // candidate before the rule matcher can evaluate it.
+        gate: (!case_insensitive)
+            .then(|| gate.map(|literal| memmem::Finder::new(&literal).into_owned()))
+            .flatten(),
         negated,
         directory_only,
     })
 }
 
-fn compile_component(part: &str) -> Option<Component> {
-    if part == "**" {
+fn compile_component(part: &[u8], case_insensitive: bool) -> Option<Component> {
+    if part == b"**" {
         return Some(Component::AnyDirs);
     }
-    Pattern::compile(collapse_partial_stars(part.as_bytes()), component_options())
-        .ok()
-        .map(Component::Pattern)
+    Pattern::compile(
+        collapse_partial_stars(part),
+        component_options(case_insensitive),
+    )
+    .ok()
+    .map(Component::Pattern)
+}
+
+/// Adapts the candidate that one ignore file sees, not its raw pattern. Mac
+/// Git precomposes filesystem names this way before matching; each path
+/// component is independent so an invalid UTF-8 component cannot make a valid
+/// sibling component lose its NFC conversion.
+#[cfg(target_os = "macos")]
+fn normalize_candidate(candidate: &[u8]) -> Cow<'_, [u8]> {
+    use unicode_normalization::{UnicodeNormalization, is_nfc};
+
+    if candidate
+        .split(|byte| *byte == b'/')
+        .all(|component| std::str::from_utf8(component).map_or(true, is_nfc))
+    {
+        return Cow::Borrowed(candidate);
+    }
+
+    let mut normalized = Vec::with_capacity(candidate.len());
+    for (index, component) in candidate.split(|byte| *byte == b'/').enumerate() {
+        if index != 0 {
+            normalized.push(b'/');
+        }
+        match std::str::from_utf8(component) {
+            Ok(component) => {
+                for character in component.nfc() {
+                    let mut encoded = [0; 4];
+                    normalized.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+                }
+            }
+            Err(_) => normalized.extend_from_slice(component),
+        }
+    }
+    Cow::Owned(normalized)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn normalize_candidate(candidate: &[u8]) -> Cow<'_, [u8]> {
+    Cow::Borrowed(candidate)
 }
 
 /// Drops the trailing spaces Git drops: those that are not escaped.
-fn strip_trailing_spaces(line: &str) -> &str {
+fn strip_trailing_spaces(line: &[u8]) -> &[u8] {
     let mut end = line.len();
-    while end > 0 && line.as_bytes()[end - 1] == b' ' {
+    while end > 0 && line[end - 1] == b' ' {
         if trailing_backslashes(&line[..end - 1]) % 2 == 1 {
             break;
         }
@@ -325,8 +417,8 @@ fn strip_trailing_spaces(line: &str) -> &str {
     &line[..end]
 }
 
-fn trailing_backslashes(text: &str) -> usize {
-    text.bytes().rev().take_while(|byte| *byte == b'\\').count()
+fn trailing_backslashes(text: &[u8]) -> usize {
+    text.iter().rev().take_while(|byte| **byte == b'\\').count()
 }
 
 /// The longest run of bytes one component matches literally.
@@ -366,7 +458,11 @@ fn longest_literal_run(part: &[u8]) -> Option<Vec<u8>> {
                     if part[scan] == b'[' && part.get(scan + 1) == Some(&b':') {
                         match part[scan + 2..].windows(2).position(|pair| pair == b":]") {
                             Some(end) => scan += 2 + end + 2,
-                            None => scan += 1,
+                            // The rest of an unclosed POSIX class cannot be a
+                            // literal run. Skipping it also keeps malformed
+                            // input linear instead of re-scanning the suffix
+                            // at every nested `[:` opener.
+                            None => scan = part.len(),
                         }
                     } else {
                         scan += 1;
@@ -430,7 +526,7 @@ fn collapse_partial_stars(part: &[u8]) -> Vec<u8> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{RuleSetBuilder, parse_rule};
+    use super::{RuleSetBuilder, fuzz_rule, fuzz_rule_bytes, parse_rule};
 
     /// Rule shapes to compare, one per line of a synthetic ignore file.
     const RULES: &[&str] = &[
@@ -538,7 +634,7 @@ mod tests {
 
     fn ours(rule: &str, path: &str, is_dir: bool) -> Option<bool> {
         let root = PathBuf::from("/fixture");
-        let mut builder = RuleSetBuilder::new(&root);
+        let mut builder = RuleSetBuilder::new(&root, false, false);
         builder.add_line(rule);
         builder.build().matched(&candidate(&root, path), is_dir)
     }
@@ -595,6 +691,12 @@ mod tests {
         assert!(parse_rule("# comment").is_none());
         assert!(parse_rule("   ").is_none(), "spaces alone are not a rule");
         assert!(parse_rule("/").is_none(), "a lone separator is not a rule");
+        for rule in ["a//b", "//foo", "x///y"] {
+            assert!(
+                parse_rule(rule).is_none(),
+                "repeated separators are unmatchable: {rule}"
+            );
+        }
         assert!(
             parse_rule("foo\\").is_none(),
             "a dangling escape matches nothing"
@@ -614,16 +716,35 @@ mod tests {
     }
 
     #[test]
+    fn fuzz_rule_uses_empty_root_candidates_without_dropping_a_byte() {
+        assert_eq!(fuzz_rule("abc", b"abc", false), Some(true));
+        assert_eq!(fuzz_rule("abc", b"Xabc", false), None);
+        assert_eq!(fuzz_rule("/a", b"a", false), Some(true));
+        assert_eq!(fuzz_rule("/a", b"Xa", false), None);
+        assert_eq!(
+            fuzz_rule_bytes(b"\xE9latin1.txt", b"\xE9latin1.txt", false),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn deeply_nested_unclosed_posix_openers_are_rejected() {
+        let mut rule = String::from("[");
+        rule.push_str("[:".repeat(32_768).as_str());
+        assert!(parse_rule(&rule).is_none());
+    }
+
+    #[test]
     fn trailing_spaces_are_dropped_unless_escaped() {
         let root = Path::new("/fixture");
-        let mut builder = RuleSetBuilder::new(root);
+        let mut builder = RuleSetBuilder::new(root, false, false);
         builder.add_line("trailing ");
         assert_eq!(
             builder.build().matched(&candidate(root, "trailing"), false),
             Some(true)
         );
 
-        let mut builder = RuleSetBuilder::new(root);
+        let mut builder = RuleSetBuilder::new(root, false, false);
         builder.add_line("trailing\\ ");
         let rules = builder.build();
         assert_eq!(
@@ -636,7 +757,7 @@ mod tests {
     #[test]
     fn the_last_matching_rule_decides() {
         let root = Path::new("/fixture");
-        let mut builder = RuleSetBuilder::new(root);
+        let mut builder = RuleSetBuilder::new(root, false, false);
         builder.add_line("*.log");
         builder.add_line("!keep.log");
         builder.add_line("keep.log");
@@ -658,7 +779,7 @@ mod tests {
     #[test]
     fn many_runs_do_not_explode() {
         let root = PathBuf::from("/fixture");
-        let mut builder = RuleSetBuilder::new(&root);
+        let mut builder = RuleSetBuilder::new(&root, false, false);
         builder.add_line("**/a/**/a/**/a/**/a/**/a/**/a/**/a/**/x");
         let rules = builder.build();
         let deep = "a/".repeat(24) + "b";
@@ -670,6 +791,29 @@ mod tests {
             "matching took {:?}",
             start.elapsed()
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn precomposeunicode_normalizes_only_valid_candidate_components() {
+        let root = PathBuf::from("/fixture");
+        let mut enabled = RuleSetBuilder::new(&root, false, true);
+        enabled.add_line("caf\u{e9}.txt");
+        let enabled = enabled.build();
+
+        let decomposed = b"/fixture/cafe\xCC\x81.txt";
+        assert_eq!(enabled.matched(decomposed, false), Some(true));
+
+        // An invalid component remains byte-exact without preventing a later
+        // valid component from receiving the NFC adaptation.
+        assert_eq!(
+            enabled.matched(b"/fixture/bad\xFF/cafe\xCC\x81.txt", false),
+            Some(true)
+        );
+
+        let mut disabled = RuleSetBuilder::new(&root, false, false);
+        disabled.add_line("caf\u{e9}.txt");
+        assert_eq!(disabled.build().matched(decomposed, false), None);
     }
 
     /// What one verdict costs, both engines, in one process.
@@ -701,7 +845,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
-            let mut ours = RuleSetBuilder::new(&root);
+            let mut ours = RuleSetBuilder::new(&root, false, false);
             for line in &lines {
                 ours.add_line(line);
             }

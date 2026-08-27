@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.8.0](https://github.com/sebastian-software/ferralk/compare/v0.7.0...v0.8.0) (2026-08-27)
+
+
+### Features
+
+* add non-consuming walker pattern builders ([#153](https://github.com/sebastian-software/ferralk/issues/153)) ([e5b7534](https://github.com/sebastian-software/ferralk/commit/e5b7534016d556b9aaba3ad9bf9751341e5a9900))
+* document crates and maintain MSRV policy ([#151](https://github.com/sebastian-software/ferralk/issues/151)) ([15a3df2](https://github.com/sebastian-software/ferralk/commit/15a3df278b0ddcf4121c29878b9f0abdc36685d9))
+
+
+### Bug Fixes
+
+* align Git ignore filesystem adaptations ([#152](https://github.com/sebastian-software/ferralk/issues/152)) ([bf850e6](https://github.com/sebastian-software/ferralk/commit/bf850e6a25dbf79b56a0d70907b9126d230cb78d))
+* clarify walker root semantics ([#148](https://github.com/sebastian-software/ferralk/issues/148)) ([81d7ac2](https://github.com/sebastian-software/ferralk/commit/81d7ac2328a29e9c5607c73c9a0ea26750da3574))
+* scope symlink cycle guards per root ([#150](https://github.com/sebastian-software/ferralk/issues/150)) ([d609d53](https://github.com/sebastian-software/ferralk/commit/d609d539a7186056c6805d80f93ab7a99a555a8d))
+
+
+### Compatibility notes
+
+* **Breaking:** pattern compilation now rejects `.` and `..` path components
+  instead of accepting them. Correct the pattern before constructing a matcher
+  or walker.
+* `ErrorPolicy::Skip` now reports every failure for a caller-supplied root,
+  including read, metadata, and canonicalize failures in follow-symlink walks.
+  It still skips recoverable failures discovered below a root.
+
+## [0.7.0](https://github.com/sebastian-software/ferralk/compare/v0.6.1...v0.7.0) (2026-08-27)
+
+
+### Features
+
+* bridge walker paths to byte matchers ([#147](https://github.com/sebastian-software/ferralk/issues/147)) ([82e8dc7](https://github.com/sebastian-software/ferralk/commit/82e8dc79e2a3015bd8356b17137f18ab5800d724))
+
+
+### Bug Fixes
+
+* align Git ignore repository semantics ([#144](https://github.com/sebastian-software/ferralk/issues/144)) ([71e7622](https://github.com/sebastian-software/ferralk/commit/71e762223e5da08bfde35c8f25450d475f558eb0))
+* align gitignore byte parsing and fuzz matching ([#143](https://github.com/sebastian-software/ferralk/issues/143)) ([6e9d83e](https://github.com/sebastian-software/ferralk/commit/6e9d83e680a3e529763c9e2e6ba383fb68a90a96))
+* harden native directory backend contracts ([#146](https://github.com/sebastian-software/ferralk/issues/146)) ([6da4add](https://github.com/sebastian-software/ferralk/commit/6da4add1691d9b53cdd4979c1e3fc65ede7fa48f))
+* isolate parallel walker shutdown ([#145](https://github.com/sebastian-software/ferralk/issues/145)) ([cdcb1c9](https://github.com/sebastian-software/ferralk/commit/cdcb1c9ed57bbae000ed1afee7f4a8b340493106))
+* memoize extglob repetition states ([#141](https://github.com/sebastian-software/ferralk/issues/141)) ([068927c](https://github.com/sebastian-software/ferralk/commit/068927cb2ae2043f1769c817997756ec7fd529a2))
+
+
+### Compatibility notes
+
+* **Breaking:** walker-internal aborts, visitor stops, worker-start failures,
+  and worker panics no longer cancel a caller-shared `CancellationToken`.
+  Walkers only observe that token; callers retain ownership and may reuse it.
+
+## [0.6.1](https://github.com/sebastian-software/ferralk/compare/v0.6.0...v0.6.1) (2026-08-26)
+
+
+### Bug Fixes
+
+* **deps:** pin dependencies ([#102](https://github.com/sebastian-software/ferralk/issues/102)) ([b9f73f0](https://github.com/sebastian-software/ferralk/commit/b9f73f0ad206c65347d443884bc0c9c5e35422bb))
+* discard partial stream listings after read errors ([#138](https://github.com/sebastian-software/ferralk/issues/138)) ([b23872f](https://github.com/sebastian-software/ferralk/commit/b23872fba53a017aa915f6d81ecce5c28f231d96))
+* handle literal-dot extglobs and malformed POSIX classes ([#137](https://github.com/sebastian-software/ferralk/issues/137)) ([8e78680](https://github.com/sebastian-software/ferralk/commit/8e78680ad92204797837dfa358bcedfeaa55bafc))
+
 ## [0.6.0](https://github.com/sebastian-software/ferralk/compare/v0.5.3...v0.6.0) (2026-08-25)
 
 

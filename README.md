@@ -17,12 +17,12 @@ compatible with zlob and deliberately has no C ABI.
 
 Ferralk is pre-1.0. The public API and release cadence are still being refined;
 do not rely on a 1.0 stability guarantee yet. Both crates are published on
-crates.io; use the current 0.6 release line for applications.
+crates.io; use the current 0.8.0 release line for applications. <!-- x-release-please-version -->
 
 ```toml
 [dependencies]
-ferralk = "0.6"
-ferralk-glob = "0.6"
+ferralk = "0.8.0" # x-release-please-version
+ferralk-glob = "0.8.0" # x-release-please-version
 ```
 
 For an unreleased Git dependency, pin a revision for repeatable builds.
@@ -151,8 +151,9 @@ unsorted so it can yield entries incrementally.
 
 ```sh
 cargo test --workspace --locked
-cargo fmt --check
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo run -p harness -- corpus
 ```
 
 See [CONTRIBUTING](CONTRIBUTING.md) for repository policy — commit signing and
@@ -163,5 +164,6 @@ the corpus, fuzzing, and benchmark commands.
 ## License and attribution
 
 Ferralk is MIT licensed. It is an independent project inspired by zlob 1.6.3;
-provenance and attribution are recorded in [NOTICE](NOTICE) and the
+provenance and attribution are recorded in
+[NOTICE](https://github.com/sebastian-software/ferralk/blob/main/NOTICE) and the
 [frozen reference](docs/zlob-1.6.3-reference.md).

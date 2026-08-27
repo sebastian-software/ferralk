@@ -17,7 +17,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use super::Listing;
+use super::{Listing, defer_entry_stat_error};
 
 const BUFFER_SIZE: usize = 32 * 1024;
 const RECORD_LENGTH_OFFSET: usize = 16;
@@ -66,13 +66,17 @@ unsafe extern "C" {
     fn syscall(number: c_long, ...) -> c_long;
 }
 
-pub(super) fn read_directory(path: &Path, listing: &mut Listing) -> io::Result<()> {
+pub(super) fn read_directory(
+    path: &Path,
+    refuse_final_symlink: bool,
+    listing: &mut Listing,
+) -> io::Result<()> {
     if GETDENTS_UNSUPPORTED.load(Ordering::Relaxed) {
         return Err(unsupported("getdents64 is unavailable on this system"));
     }
     let result = DIRECTORY_BUFFER.with(|buffer| {
         let mut buffer = buffer.borrow_mut();
-        read_directory_with_buffer(path, &mut buffer[..], listing)
+        read_directory_with_buffer(path, refuse_final_symlink, &mut buffer[..], listing)
     });
     if result
         .as_ref()
@@ -91,21 +95,28 @@ fn unsupported(message: &'static str) -> io::Error {
 ///
 /// `O_DIRECTORY` makes the open fail with `ENOTDIR` instead of blocking when
 /// the scheduled path was replaced by a FIFO between scheduling and open.
-/// `O_NOFOLLOW` is deliberately absent: a walk that follows symlinks has to be
-/// able to open through one.
-fn open_directory(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(O_DIRECTORY)
-        .open(path)
+/// For a scheduled non-root directory in a no-follow walk, `O_NOFOLLOW` makes
+/// the final component check and open one operation. A directory exchanged for
+/// a symlink is therefore refused (`ELOOP` or `ENOTDIR`, according to the
+/// kernel's flag handling) instead of escaping through that link. User-supplied
+/// symlink roots retain portable semantics.
+fn open_directory(path: &Path, refuse_final_symlink: bool) -> io::Result<File> {
+    let flags = O_DIRECTORY
+        | if refuse_final_symlink {
+            libc::O_NOFOLLOW
+        } else {
+            0
+        };
+    OpenOptions::new().read(true).custom_flags(flags).open(path)
 }
 
 fn read_directory_with_buffer(
     path: &Path,
+    refuse_final_symlink: bool,
     buffer: &mut [u8],
     listing: &mut Listing,
 ) -> io::Result<()> {
-    let directory = open_directory(path)?;
+    let directory = open_directory(path, refuse_final_symlink)?;
     listing.clear();
     loop {
         let byte_count = read_batch(&directory, buffer)?;
@@ -171,8 +182,10 @@ fn parse_records(directory: &Path, records: &[u8], listing: &mut Listing) -> io:
         let name = OsStr::from_bytes(name);
         // An entry that vanished between the read and its stat costs that one
         // entry; the rest of the listing is still valid and is returned.
-        if let Some((is_dir, is_symlink)) = entry_kind(directory, name, directory_type)? {
-            listing.push(name, is_dir, is_symlink);
+        match entry_kind(directory, name, directory_type) {
+            Ok(Some((is_dir, is_symlink))) => listing.push(name, is_dir, is_symlink),
+            Ok(None) => {}
+            Err(error) => defer_entry_stat_error(listing, directory.join(name), error)?,
         }
         Ok(())
     })
@@ -231,9 +244,8 @@ fn for_each_record(
 
 /// Classifies one entry, or reports that it no longer exists.
 ///
-/// `Ok(None)` means the entry disappeared or became unreadable between the
-/// directory read and its stat. That costs one entry rather than the whole
-/// listing, which is what a caller racing with a deletion needs.
+/// `Ok(None)` means the entry disappeared between the directory read and its
+/// stat. Persistent failures use the listing-level error channel instead.
 fn entry_kind(
     directory: &Path,
     name: &OsStr,
@@ -257,12 +269,13 @@ fn entry_kind(
     }
 }
 
-/// Whether a per-entry stat failure describes that entry rather than the
-/// directory. A genuine fault, `EIO` for instance, still ends the read.
+/// Whether a per-entry stat failure describes an entry that vanished after its
+/// directory record was read. `NotADirectory` is also a replacement race: a
+/// parent component that was a directory during listing is no longer one.
 fn is_vanished_entry(error: &io::Error) -> bool {
     matches!(
         error.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::NotADirectory
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
     )
 }
 
@@ -369,9 +382,29 @@ mod tests {
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(&path, b"fixture").expect("write fixture file");
-        let error = open_directory(&path).expect_err("a regular file is not a directory");
+        let error = open_directory(&path, false).expect_err("a regular file is not a directory");
         assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn no_follow_directory_open_rejects_a_swapped_symlink_but_follow_opens_it() {
+        let root = fixture_root("no-follow");
+        let target = root.join("target");
+        let link = root.join("scheduled");
+        fs::create_dir_all(&target).expect("create target directory");
+        fs::write(target.join("inside"), b"fixture").expect("write target entry");
+        symlink(&target, &link).expect("replace scheduled directory with a link");
+
+        let error = open_directory(&link, true).expect_err("no-follow rejects the replacement");
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::ELOOP | libc::ENOTDIR)
+        ));
+        let mut listing = Listing::default();
+        read_directory(&link, false, &mut listing).expect("follow mode still opens through a link");
+        assert!(listing.contains("inside"));
+        fs::remove_dir_all(root).expect("remove no-follow fixture");
     }
 
     #[test]
@@ -407,11 +440,11 @@ mod tests {
         };
         assert_eq!(
             describe(&|listing| {
-                read_directory(&root, listing).expect("native reader succeeds");
+                read_directory(&root, false, listing).expect("native reader succeeds");
             }),
             describe(&|listing| {
                 StdBackend
-                    .read_directory(&root, listing)
+                    .read_directory(&root, false, false, listing)
                     .expect("portable reader succeeds");
             })
         );
@@ -483,6 +516,7 @@ mod tests {
             path: root.clone(),
             depth: 0,
             root: 0,
+            cycle_guard: std::sync::Arc::new(crate::CycleGuard::default()),
             ignores: crate::IgnoreScope::for_root(walker, &StdBackend, &root),
         };
         state

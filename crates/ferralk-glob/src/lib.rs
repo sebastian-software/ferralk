@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 #![doc = "Portable, byte-first glob matching."]
 
 //! Compiled, byte-first glob patterns with explicit behaviour-changing options.
@@ -13,7 +14,13 @@
 //! `test/test_fnmatch.zig`. Deliberate differences live in
 //! the checked-in corpus and compatibility matrix.
 
-use std::{cell::RefCell, error::Error, fmt, ops::RangeInclusive};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashSet},
+    error::Error,
+    fmt,
+    ops::RangeInclusive,
+};
 
 use memchr::{memchr, memchr2, memchr3, memmem};
 
@@ -26,6 +33,8 @@ use sweep::SweepEngine;
 pub struct Pattern {
     alternatives: Vec<CompiledAlternative>,
     path_filter_alternatives: Option<Vec<CompiledAlternative>>,
+    walker_path_viability: WalkerPathViability,
+    walker_path_problem_offset: Option<usize>,
     options: PatternOptions,
 }
 
@@ -40,6 +49,12 @@ pub struct PatternOptions {
     escape: bool,
     component_wildcards: bool,
     root_component_wildcards: bool,
+    /// Whether byte zero of this candidate starts a path component.
+    ///
+    /// Extglob alternatives borrow a range from their enclosing candidate.
+    /// The range can start in the middle of a component, where a leading dot
+    /// is an ordinary byte rather than a hidden-name marker.
+    candidate_starts_component: bool,
 }
 
 impl Default for PatternOptions {
@@ -53,6 +68,7 @@ impl Default for PatternOptions {
             escape: true,
             component_wildcards: false,
             root_component_wildcards: false,
+            candidate_starts_component: true,
         }
     }
 }
@@ -144,6 +160,26 @@ impl fmt::Display for PatternError {
 
 impl Error for PatternError {}
 
+/// Whether a compiled pattern has an arm a walker can spell as a candidate.
+///
+/// This is compiler metadata for path-consuming embeddings. It is calculated
+/// after brace expansion from the compiled token and extglob branch objects,
+/// rather than by parsing the source expression again.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkerPathViability {
+    /// At least one compiled arm avoids root-only, `.` and `..` components.
+    Viable,
+    /// Every compiled arm contains a literal `..` component.
+    ParentComponent,
+    /// Every compiled arm names only the walk root.
+    Root,
+    /// Every compiled arm ends in a literal `.` component.
+    TrailingDot,
+    /// Every compiled arm contains a non-final literal `.` component.
+    DotComponent,
+}
+
 impl Pattern {
     /// Reports whether the enabled syntax options make a pattern non-literal.
     ///
@@ -174,11 +210,68 @@ impl Pattern {
     }
 
     /// Compiles a pattern once for repeated matching against raw path bytes.
+    ///
+    /// ```
+    /// use ferralk_glob::{Pattern, PatternOptions};
+    ///
+    /// let source_file = Pattern::compile(
+    ///     "src/**/*.{rs,toml}",
+    ///     PatternOptions::default()
+    ///         .recursive_double_star(true)
+    ///         .braces(true),
+    /// )?;
+    ///
+    /// assert!(source_file.is_match_glob_path("src/lib.rs"));
+    /// assert!(!source_file.is_match_glob_path("src/generated/lib.rs.bak"));
+    /// # Ok::<(), ferralk_glob::PatternError>(())
+    /// ```
     pub fn compile(
         pattern: impl AsRef<[u8]>,
         options: PatternOptions,
     ) -> Result<Self, PatternError> {
-        Self::compile_within(pattern.as_ref(), options, &mut IrBudget::new())
+        let pattern = pattern.as_ref();
+        // Direct source is an implicit identity range. Brace expansion only
+        // materializes the few source spans whose byte positions actually
+        // change; a literal never pays one `usize` per input byte.
+        let source_provenance = SourceProvenance::Contiguous { source_start: 0 };
+        let mut budget = IrBudget::new();
+        let mut provenance_budget = ProvenanceBudget::new();
+        let mut compiled = Self::compile_within(
+            pattern,
+            options,
+            &mut budget,
+            &mut provenance_budget,
+            Some(&source_provenance),
+            pattern.starts_with(b"./"),
+        )?;
+        let (viability, offset) = walker_path_analysis(&compiled.alternatives, &mut budget)?;
+        compiled.walker_path_viability = viability;
+        compiled.walker_path_problem_offset = offset;
+        Ok(compiled)
+    }
+
+    /// Summarizes whether a walker can represent a match from this pattern.
+    ///
+    /// The summary is derived from the actual alternatives and extglob arms
+    /// [`Pattern::compile`] created. It intentionally exposes semantics rather
+    /// than source offsets, which can no longer identify one branch after
+    /// brace expansion.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn walker_path_viability(&self) -> WalkerPathViability {
+        self.walker_path_viability
+    }
+
+    /// Byte offset of the determinate component behind walker viability.
+    ///
+    /// The compiler retains original source provenance through brace expansion
+    /// whenever an offending byte survives in an expanded arm. It returns
+    /// `None` only when no one source location is available and an embedding
+    /// must use its conventional fallback location.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn walker_path_problem_offset(&self) -> Option<usize> {
+        self.walker_path_problem_offset
     }
 
     /// The compile every alternative shares, carrying the budget that bounds
@@ -192,6 +285,9 @@ impl Pattern {
         pattern: &[u8],
         options: PatternOptions,
         budget: &mut IrBudget,
+        provenance_budget: &mut ProvenanceBudget,
+        walker_source_provenance: Option<&SourceProvenance>,
+        leading_dot_is_normalized: bool,
     ) -> Result<Self, PatternError> {
         if options.braces {
             let parse_options = PatternOptions {
@@ -199,14 +295,32 @@ impl Pattern {
                 ..options
             };
             let mut alternatives = Vec::new();
-            for alternative in expand_brace_alternatives(pattern, options.escape)? {
-                let compiled = Self::compile_within(&alternative, parse_options, budget)?;
+            let expanded = expand_brace_alternatives_with_provenance(
+                pattern,
+                walker_source_provenance,
+                options.escape,
+                provenance_budget,
+            )?;
+            for alternative in expanded {
+                let compiled = Self::compile_within(
+                    &alternative.bytes,
+                    parse_options,
+                    budget,
+                    provenance_budget,
+                    alternative.source_provenance.as_ref(),
+                    leading_dot_is_normalized,
+                )?;
                 alternatives.extend(compiled.alternatives);
             }
             return Self::from_alternatives(alternatives, options, budget);
         }
         let mut tokens = Vec::new();
         let mut literals = Vec::new();
+        // Keep the walker-only path shape beside the token build. In
+        // particular an escaped dot and an ordinary dot both become a literal
+        // matcher token, but only the latter is a path operation a walker
+        // must reject.
+        let mut walker_path = WalkerPathShapeBuilder::new(leading_dot_is_normalized);
         let mut index = 0;
         // Charged as the tokens appear rather than per byte: a literal run is
         // one token however long it is, so billing bytes would reject patterns
@@ -220,26 +334,32 @@ impl Pattern {
                 b'/' => {
                     flush_literals(&mut tokens, &mut literals);
                     tokens.push(Token::Separator);
+                    walker_path.separator();
                     index += 1;
                 }
                 b'*' if options.recursive_double_star && pattern.get(index + 1) == Some(&b'*') => {
                     flush_literals(&mut tokens, &mut literals);
                     if pattern.get(index + 2) == Some(&b'/') {
                         tokens.push(Token::RecursivePrefix);
+                        walker_path.wildcard();
+                        walker_path.separator();
                         index += 3;
                     } else {
                         tokens.push(Token::RecursiveStar);
+                        walker_path.wildcard();
                         index += 2;
                     }
                 }
                 b'*' => {
                     flush_literals(&mut tokens, &mut literals);
                     tokens.push(Token::Star);
+                    walker_path.wildcard();
                     index += 1;
                 }
                 b'?' => {
                     flush_literals(&mut tokens, &mut literals);
                     tokens.push(Token::Any);
+                    walker_path.wildcard();
                     index += 1;
                 }
                 b'[' => {
@@ -249,21 +369,28 @@ impl Pattern {
                     // the one unit the loop charges for the token itself.
                     budget.charge(class.members.len(), 0)?;
                     tokens.push(Token::Class(class));
+                    walker_path.wildcard();
                     index = next;
                 }
                 b'\\' if options.escape => {
                     if let Some(&escaped) = pattern.get(index + 1) {
                         literals.push(escaped);
+                        walker_path.escaped();
                         index += 2;
                     } else {
                         // zlob's fnmatch core treats a trailing backslash as
                         // a literal backslash instead of rejecting the pattern.
                         literals.push(b'\\');
+                        walker_path.escaped();
                         index += 1;
                     }
                 }
                 byte => {
                     literals.push(byte);
+                    walker_path.literal(
+                        byte,
+                        walker_source_provenance.and_then(|provenance| provenance.offset_at(index)),
+                    );
                     index += 1;
                 }
             }
@@ -271,9 +398,17 @@ impl Pattern {
         flush_literals(&mut tokens, &mut literals);
         budget.charge(tokens.len() - charged, 0)?;
 
-        let extglob = compile_extglob(pattern, options, budget)?;
+        let extglob = compile_extglob(
+            pattern,
+            options,
+            budget,
+            provenance_budget,
+            walker_source_provenance,
+            leading_dot_is_normalized,
+        )?;
         let fast_path = FastPath::compile(&tokens, options);
         let sweep = compile_sweep(&tokens, &fast_path, extglob.as_ref(), options, budget)?;
+        let walker_path_shape = walker_path.finish();
         Self::from_alternatives(
             vec![CompiledAlternative {
                 extglob,
@@ -282,6 +417,7 @@ impl Pattern {
                 prefilter: Prefilter::compile(&tokens),
                 sweep,
                 tokens,
+                walker_path_shape,
             }],
             options,
             budget,
@@ -589,6 +725,8 @@ impl Pattern {
         Ok(Self {
             alternatives,
             path_filter_alternatives,
+            walker_path_viability: WalkerPathViability::Viable,
+            walker_path_problem_offset: None,
             options,
         })
     }
@@ -623,7 +761,8 @@ impl Pattern {
             },
         );
         budget.charge(tokens.len(), 0)?;
-        let extglob = compile_extglob(&raw, options, budget)?;
+        let mut provenance_budget = ProvenanceBudget::new();
+        let extglob = compile_extglob(&raw, options, budget, &mut provenance_budget, None, false)?;
         let sweep = compile_sweep(&tokens, &fast_path, extglob.as_ref(), options, budget)?;
         Ok(CompiledAlternative {
             extglob,
@@ -632,6 +771,7 @@ impl Pattern {
             prefilter: Prefilter::compile(&tokens),
             sweep,
             tokens,
+            walker_path_shape: alternative.walker_path_shape.clone(),
         })
     }
 
@@ -770,7 +910,9 @@ impl Pattern {
         let &byte = path.get(path_index)?;
         (accepts(byte)
             && (!Self::component_wildcard(tokens, token_index, options) || !is_separator(byte))
-            && (options.match_hidden || byte != b'.' || !at_component_start(path, path_index)))
+            && (options.match_hidden
+                || byte != b'.'
+                || !at_component_start(path, path_index, options)))
         .then_some((token_index + 1, path_index + 1))
     }
 
@@ -1150,7 +1292,7 @@ fn star_consumes_byte(
     recursive: bool,
 ) -> bool {
     (recursive || !options.component_wildcards || !is_separator(byte))
-        && (options.match_hidden || byte != b'.' || !at_component_start(path, path_index))
+        && (options.match_hidden || byte != b'.' || !at_component_start(path, path_index, options))
 }
 
 /// First index at or after `path_index` that a star may not consume.
@@ -1174,6 +1316,7 @@ fn star_barrier(
         barrier = barrier.min(next_component_dot(
             path,
             path_index,
+            options.candidate_starts_component,
             &mut scans.component_dot,
         ));
     }
@@ -1256,11 +1399,16 @@ fn next_separator(bytes: &[u8]) -> Option<usize> {
 ///
 /// Past index 0 a component starts exactly after a separator, so the blocked
 /// positions are the dots that directly follow one.
-fn next_component_dot(path: &[u8], index: usize, cache: &mut FirstAtOrAfter) -> usize {
+fn next_component_dot(
+    path: &[u8],
+    index: usize,
+    candidate_starts_component: bool,
+    cache: &mut FirstAtOrAfter,
+) -> usize {
     if let Some(found) = cache.get(index) {
         return found;
     }
-    if index == 0 && path.first() == Some(&b'.') {
+    if index == 0 && candidate_starts_component && path.first() == Some(&b'.') {
         return cache.record(0, 0);
     }
     let start = index.saturating_sub(1);
@@ -1327,6 +1475,11 @@ struct CompiledAlternative {
     /// Necessary conditions on a candidate, read off `tokens` at compile time
     /// and checked before the general engine runs. See [`Prefilter`].
     prefilter: Prefilter,
+    /// Walker-only path shape recorded while this alternative's tokens were
+    /// compiled. It retains distinctions (such as escaped dots) that matcher
+    /// tokens intentionally erase, and can be appended to an extglob's outer
+    /// component without reparsing source syntax.
+    walker_path_shape: WalkerPathShape,
     /// The bit-parallel engine for the general path, present when
     /// [`compile_sweep`] found the tokens suitable. It answers exactly like
     /// the memoized matcher and replaces it in the dispatch, never a fast
@@ -1679,7 +1832,7 @@ impl FastPath {
                             }
                             if !options.match_hidden
                                 && byte == b'.'
-                                && at_component_start(path, path_index)
+                                && at_component_start(path, path_index, options)
                             {
                                 return false;
                             }
@@ -1694,7 +1847,7 @@ impl FastPath {
                                 || !class.matches(byte, options.case_insensitive)
                                 || (!options.match_hidden
                                     && byte == b'.'
-                                    && at_component_start(path, path_index))
+                                    && at_component_start(path, path_index, options))
                             {
                                 return false;
                             }
@@ -1709,7 +1862,13 @@ impl FastPath {
                 path_index == path.len()
             }
             Self::Star => {
-                options.match_hidden || !contains_hidden_component_in(path, 0, path.len())
+                options.match_hidden
+                    || !contains_hidden_component_in(
+                        path,
+                        0,
+                        path.len(),
+                        options.candidate_starts_component,
+                    )
             }
             Self::PrefixStar { prefix } => {
                 let Some(variable) = strip_literal_prefix(path, prefix, options.case_insensitive)
@@ -1717,14 +1876,25 @@ impl FastPath {
                     return false;
                 };
                 options.match_hidden
-                    || !contains_hidden_component_in(path, path.len() - variable.len(), path.len())
+                    || !contains_hidden_component_in(
+                        path,
+                        path.len() - variable.len(),
+                        path.len(),
+                        options.candidate_starts_component,
+                    )
             }
             Self::StarSuffix { suffix } => {
                 let Some(variable) = strip_literal_suffix(path, suffix, options.case_insensitive)
                 else {
                     return false;
                 };
-                options.match_hidden || !contains_hidden_component_in(path, 0, variable.len())
+                options.match_hidden
+                    || !contains_hidden_component_in(
+                        path,
+                        0,
+                        variable.len(),
+                        options.candidate_starts_component,
+                    )
             }
             Self::InfixStar { prefix, suffix } => {
                 let Some(remainder) = strip_literal_prefix(path, prefix, options.case_insensitive)
@@ -1742,6 +1912,7 @@ impl FastPath {
                         path,
                         variable_start,
                         variable_start + variable.len(),
+                        options.candidate_starts_component,
                     )
             }
             Self::StaticStar { prefix, suffix } => {
@@ -1755,7 +1926,12 @@ impl FastPath {
                     return false;
                 }
                 options.match_hidden
-                    || !contains_hidden_component_in(path, variable_start, variable_end)
+                    || !contains_hidden_component_in(
+                        path,
+                        variable_start,
+                        variable_end,
+                        options.candidate_starts_component,
+                    )
             }
             Self::RecursiveTerminalPrefix { prefix } => {
                 let Some(remainder) = strip_literal_prefix(path, prefix, options.case_insensitive)
@@ -1769,6 +1945,7 @@ impl FastPath {
                                 path,
                                 path.len() - remainder.len() + 1,
                                 path.len(),
+                                options.candidate_starts_component,
                             ))
             }
             Self::RecursivePrefixSuffix {
@@ -1806,6 +1983,7 @@ impl FastPath {
                         path,
                         variable_start,
                         variable_start + variable.len(),
+                        options.candidate_starts_component,
                     )
             }
         }
@@ -1893,14 +2071,21 @@ fn strip_literal_suffix<'a>(
         .then_some(&path[..start])
 }
 
-fn contains_hidden_component_in(path: &[u8], start: usize, end: usize) -> bool {
+fn contains_hidden_component_in(
+    path: &[u8],
+    start: usize,
+    end: usize,
+    candidate_starts_component: bool,
+) -> bool {
     let Some(segment) = path.get(start..end) else {
         return false;
     };
     let mut offset = start;
     while let Some(found) = memchr(b'.', &segment[offset - start..]) {
         let index = offset + found;
-        if index == 0 || is_separator(path[index - 1]) {
+        if (index == 0 && candidate_starts_component)
+            || (index > 0 && is_separator(path[index - 1]))
+        {
             return true;
         }
         offset = index + 1;
@@ -2002,6 +2187,8 @@ enum PosixClass {
     Xdigit,
 }
 
+const MAX_POSIX_CLASS_NAME_LEN: usize = 6;
+
 impl PosixClass {
     fn matches(self, byte: u8, case_insensitive: bool) -> bool {
         let folded = fold_ascii(byte, case_insensitive);
@@ -2067,16 +2254,21 @@ fn parse_class(
                 index + 1,
             ));
         }
-        if byte == b'['
-            && pattern.get(index + 1) == Some(&b':')
-            && let Some(end) = memmem::find(&pattern[index + 2..], b":]")
-            && let Some(class) = parse_posix_class(&pattern[index + 2..index + 2 + end])
-        {
-            let name_end = index + 2 + end;
-            members.extend(class_members(std::mem::take(&mut values)));
-            members.push(ClassMember::Posix(class));
-            index = name_end + 2;
-            continue;
+        if byte == b'[' && pattern.get(index + 1) == Some(&b':') {
+            let name_start = index + 2;
+            // POSIX class names are a closed, short set. Bounding the search
+            // keeps every malformed opener constant-time while preserving the
+            // old rule that only the first `:]` can close this opener.
+            let search_end = pattern.len().min(name_start + MAX_POSIX_CLASS_NAME_LEN + 2);
+            if let Some(posix_end) = memmem::find(&pattern[name_start..search_end], b":]")
+                && let Some(class) = parse_posix_class(&pattern[name_start..name_start + posix_end])
+            {
+                let name_end = name_start + posix_end;
+                members.extend(class_members(std::mem::take(&mut values)));
+                members.push(ClassMember::Posix(class));
+                index = name_end + 2;
+                continue;
+            }
         }
         if byte == b'\\' && escapes {
             let Some(&escaped) = pattern.get(index + 1) else {
@@ -2097,6 +2289,528 @@ fn parse_class(
         offset: start,
         message: "unclosed character class",
     })
+}
+
+/// One component's only path-relevant literal shapes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+enum WalkerComponentKind {
+    #[default]
+    Empty,
+    Dot,
+    Parent,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+struct WalkerComponent {
+    kind: WalkerComponentKind,
+    /// The first literal dot in this component, when it still has a
+    /// determinate location in the caller's unexpanded source bytes.
+    offset: Option<usize>,
+}
+
+impl WalkerComponent {
+    fn push_literal(&mut self, byte: u8, offset: Option<usize>) {
+        match (self.kind, byte) {
+            (WalkerComponentKind::Empty, b'.') => {
+                self.kind = WalkerComponentKind::Dot;
+                self.offset = offset;
+            }
+            (WalkerComponentKind::Dot, b'.') => self.kind = WalkerComponentKind::Parent,
+            (
+                WalkerComponentKind::Empty | WalkerComponentKind::Dot | WalkerComponentKind::Parent,
+                _,
+            ) => {
+                self.kind = WalkerComponentKind::Other;
+                self.offset = None;
+            }
+            (WalkerComponentKind::Other, _) => {}
+        }
+    }
+
+    fn wildcard(&mut self) {
+        self.kind = WalkerComponentKind::Other;
+        self.offset = None;
+    }
+
+    fn append(&mut self, other: Self) {
+        match other.kind {
+            WalkerComponentKind::Empty => {}
+            WalkerComponentKind::Dot => self.push_literal(b'.', other.offset),
+            WalkerComponentKind::Parent => {
+                self.push_literal(b'.', other.offset);
+                self.push_literal(b'.', None);
+            }
+            WalkerComponentKind::Other => self.wildcard(),
+        }
+    }
+}
+
+/// Path-shape events emitted alongside the ordinary token compiler.
+///
+/// This is deliberately not a second parser: each method is called from the
+/// same match arm that creates a token. It keeps only whether a component is a
+/// real literal dot shape, a wildcard-bearing shape, or a separator.
+#[derive(Default)]
+struct WalkerPathShapeBuilder {
+    leading_dot_is_normalized: bool,
+    components: Vec<WalkerComponent>,
+    current: WalkerComponent,
+}
+
+impl WalkerPathShapeBuilder {
+    fn new(leading_dot_is_normalized: bool) -> Self {
+        Self {
+            leading_dot_is_normalized,
+            components: Vec::new(),
+            current: WalkerComponent::default(),
+        }
+    }
+    fn literal(&mut self, byte: u8, offset: Option<usize>) {
+        self.current.push_literal(byte, offset);
+    }
+
+    fn escaped(&mut self) {
+        self.current.wildcard();
+    }
+
+    fn wildcard(&mut self) {
+        self.current.wildcard();
+    }
+
+    fn separator(&mut self) {
+        self.components.push(std::mem::take(&mut self.current));
+    }
+
+    fn finish(mut self) -> WalkerPathShape {
+        self.components.push(self.current);
+        WalkerPathShape {
+            leading_dot_is_normalized: self.leading_dot_is_normalized,
+            components: self.components,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WalkerPathState {
+    leading_dot_is_normalized: bool,
+    /// The number of components already closed by a separator, saturated once
+    /// the first-component distinction no longer matters.
+    completed_components: u8,
+    all_empty_or_dot: bool,
+    first_parent: Option<WalkerComponent>,
+    first_dot: Option<WalkerComponent>,
+    last_nonempty: Option<WalkerComponent>,
+    /// A separator closed an empty component. Such a leading or interior
+    /// component is not a spelling the walker can select, even when later
+    /// matcher text makes the final component nonempty.
+    has_empty_leading_or_interior_component: bool,
+    current: WalkerComponent,
+}
+
+impl WalkerPathState {
+    fn new(leading_dot_is_normalized: bool) -> Self {
+        Self {
+            leading_dot_is_normalized,
+            completed_components: 0,
+            all_empty_or_dot: true,
+            first_parent: None,
+            first_dot: None,
+            last_nonempty: None,
+            has_empty_leading_or_interior_component: false,
+            current: WalkerComponent::default(),
+        }
+    }
+    fn literal(&mut self, byte: u8, offset: Option<usize>) {
+        self.current.push_literal(byte, offset);
+    }
+
+    fn escaped(&mut self) {
+        // An escape is matcher text, including for `\.` and `\/`. It may
+        // match a punctuation byte but does not request filesystem path
+        // normalization.
+        self.current.wildcard();
+    }
+
+    fn wildcard(&mut self) {
+        self.current.wildcard();
+    }
+
+    fn separator(&mut self) {
+        let component = std::mem::take(&mut self.current);
+        self.has_empty_leading_or_interior_component |=
+            component.kind == WalkerComponentKind::Empty;
+        self.record_component(component);
+    }
+
+    fn append_shape(&mut self, shape: &WalkerPathShape) {
+        for (index, component) in shape.components.iter().copied().enumerate() {
+            self.current.append(component);
+            if index + 1 != shape.components.len() {
+                self.separator();
+            }
+        }
+    }
+
+    fn record_component(&mut self, component: WalkerComponent) {
+        let first = self.completed_components == 0;
+        if !matches!(
+            component.kind,
+            WalkerComponentKind::Empty | WalkerComponentKind::Dot
+        ) {
+            self.all_empty_or_dot = false;
+        }
+        if component.kind == WalkerComponentKind::Parent && self.first_parent.is_none() {
+            self.first_parent = Some(component);
+        }
+        if component.kind == WalkerComponentKind::Dot
+            && (!first || !self.leading_dot_is_normalized)
+            && self.first_dot.is_none()
+        {
+            self.first_dot = Some(component);
+        }
+        if component.kind != WalkerComponentKind::Empty {
+            self.last_nonempty = Some(component);
+        }
+        self.completed_components = self.completed_components.saturating_add(1).min(2);
+    }
+
+    fn finish(mut self) -> WalkerPathEvaluation {
+        let component = std::mem::take(&mut self.current);
+        let selects_candidate = component.kind != WalkerComponentKind::Empty
+            && !self.has_empty_leading_or_interior_component;
+        self.record_component(component);
+        WalkerPathEvaluation {
+            selects_candidate,
+            problem: WalkerPathSummary {
+                all_empty_or_dot: self.all_empty_or_dot,
+                first_parent: self.first_parent,
+                first_dot: self.first_dot,
+                last_nonempty: self.last_nonempty,
+            }
+            .problem(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WalkerPathEvaluation {
+    /// A walker candidate ends in a nonempty component and contains no empty
+    /// leading or interior component. Nullable groups must not use an empty
+    /// arm as a viable escape from their real invalid arms.
+    selects_candidate: bool,
+    problem: Option<WalkerPathProblem>,
+}
+
+impl WalkerPathEvaluation {
+    fn complete_problem(self) -> Option<WalkerPathProblem> {
+        self.problem.or_else(|| {
+            (!self.selects_candidate).then_some(WalkerPathProblem {
+                viability: WalkerPathViability::Root,
+                offset: None,
+            })
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WalkerPathSummary {
+    all_empty_or_dot: bool,
+    first_parent: Option<WalkerComponent>,
+    first_dot: Option<WalkerComponent>,
+    last_nonempty: Option<WalkerComponent>,
+}
+
+impl WalkerPathSummary {
+    fn problem(self) -> Option<WalkerPathProblem> {
+        if self.all_empty_or_dot {
+            return Some(WalkerPathProblem {
+                viability: WalkerPathViability::Root,
+                offset: self.last_nonempty.and_then(|component| component.offset),
+            });
+        }
+        if let Some(component) = self.first_parent {
+            return Some(WalkerPathProblem {
+                viability: WalkerPathViability::ParentComponent,
+                offset: component.offset,
+            });
+        }
+        if self
+            .last_nonempty
+            .is_some_and(|component| component.kind == WalkerComponentKind::Dot)
+        {
+            return Some(WalkerPathProblem {
+                viability: WalkerPathViability::TrailingDot,
+                offset: self.last_nonempty.and_then(|component| component.offset),
+            });
+        }
+        self.first_dot.map(|component| WalkerPathProblem {
+            viability: WalkerPathViability::DotComponent,
+            offset: component.offset,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WalkerPathShape {
+    leading_dot_is_normalized: bool,
+    components: Vec<WalkerComponent>,
+}
+
+impl WalkerPathShape {
+    fn has_separator(&self) -> bool {
+        self.components.len() > 1
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(
+            self.components.as_slice(),
+            [WalkerComponent {
+                kind: WalkerComponentKind::Empty,
+                ..
+            }]
+        )
+    }
+
+    fn problem(&self) -> Option<WalkerPathProblem> {
+        let mut state = WalkerPathState::new(self.leading_dot_is_normalized);
+        state.append_shape(self);
+        state.finish().complete_problem()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WalkerPathProblem {
+    viability: WalkerPathViability,
+    offset: Option<usize>,
+}
+
+/// The semantic summary of the alternatives the compiler actually built.
+///
+/// Brace expansion happens before this sees an alternative, while extglob
+/// alternatives arrive through their compiled branch objects. The walker
+/// policy therefore never needs a second source grammar.
+fn walker_path_analysis(
+    alternatives: &[CompiledAlternative],
+    budget: &mut IrBudget,
+) -> Result<(WalkerPathViability, Option<usize>), PatternError> {
+    let mut first_problem = None;
+    for alternative in alternatives {
+        match alternative.walker_path_problem(budget)? {
+            None => return Ok((WalkerPathViability::Viable, None)),
+            Some(problem) => first_problem.get_or_insert(problem),
+        };
+    }
+    match first_problem {
+        Some(problem) => Ok((problem.viability, problem.offset)),
+        None => Ok((WalkerPathViability::Viable, None)),
+    }
+}
+
+impl CompiledAlternative {
+    fn walker_path_problem(
+        &self,
+        budget: &mut IrBudget,
+    ) -> Result<Option<WalkerPathProblem>, PatternError> {
+        match &self.extglob {
+            Some(program) => program.walker_path_problem(budget),
+            None => Ok(self.walker_path_shape.problem()),
+        }
+    }
+}
+
+impl CompiledExtglob {
+    fn walker_path_problem(
+        &self,
+        budget: &mut IrBudget,
+    ) -> Result<Option<WalkerPathProblem>, PatternError> {
+        let mut states = vec![WalkerPathState::new(self.leading_dot_is_normalized)];
+        let mut index = 0;
+        while let Some(step) = self.steps.get(index) {
+            match step {
+                ExtglobStep::Byte(b'/') => {
+                    for state in &mut states {
+                        state.separator();
+                    }
+                    index += 1;
+                }
+                ExtglobStep::Byte(byte) => {
+                    for state in &mut states {
+                        state.literal(
+                            *byte,
+                            self.walker_source_provenance
+                                .as_ref()
+                                .and_then(|provenance| provenance.offset_at(index)),
+                        );
+                    }
+                    index += 1;
+                }
+                ExtglobStep::Escape { .. } => {
+                    for state in &mut states {
+                        state.escaped();
+                    }
+                    index += 2;
+                }
+                ExtglobStep::Group(group) => {
+                    states = self.groups[*group].apply_to(states, budget)?;
+                    index = self.groups[*group].rest;
+                }
+                ExtglobStep::Star { next } | ExtglobStep::Class { next, .. } => {
+                    for state in &mut states {
+                        state.wildcard();
+                    }
+                    index = *next;
+                }
+                ExtglobStep::Any | ExtglobStep::UnclosedGroup { .. } => {
+                    for state in &mut states {
+                        state.wildcard();
+                    }
+                    index += 1;
+                }
+                // A group interior is skipped by its group's `rest` jump.
+                // Outside a group, a no-match step still occupies matcher
+                // text, so keep the compiled program's following top-level
+                // components visible to the walker analysis.
+                ExtglobStep::NoMatch => {
+                    for state in &mut states {
+                        state.wildcard();
+                    }
+                    index += 1;
+                }
+            }
+        }
+        let mut first_problem = None;
+        let mut saw_unselectable = false;
+        for state in states {
+            let evaluation = state.finish();
+            if !evaluation.selects_candidate {
+                saw_unselectable = true;
+                continue;
+            }
+            let Some(problem) = evaluation.problem else {
+                return Ok(None);
+            };
+            first_problem.get_or_insert(problem);
+        }
+        Ok(first_problem.or_else(|| {
+            saw_unselectable.then_some(WalkerPathProblem {
+                viability: WalkerPathViability::Root,
+                offset: None,
+            })
+        }))
+    }
+}
+
+impl ExtglobGroup {
+    fn apply_to(
+        &self,
+        states: Vec<WalkerPathState>,
+        budget: &mut IrBudget,
+    ) -> Result<Vec<WalkerPathState>, PatternError> {
+        match self.kind {
+            ExtglobKind::Negated => {
+                let mut states = states;
+                for state in &mut states {
+                    // A negated arm can generate arbitrary matcher text. A
+                    // later outer `/.` or `/..` remains visible after this
+                    // placeholder.
+                    state.wildcard();
+                }
+                Ok(states)
+            }
+            ExtglobKind::Optional => {
+                let mut output = states.clone();
+                output.extend(self.exact_states(&states, budget)?);
+                Ok(deduplicate_walker_states(output))
+            }
+            ExtglobKind::ZeroOrMore => self.fixed_point(states, false, budget),
+            ExtglobKind::OneOrMore => self.fixed_point(states, true, budget),
+            ExtglobKind::ExactlyOne => self.exact_states(&states, budget),
+        }
+    }
+
+    fn fixed_point(
+        &self,
+        states: Vec<WalkerPathState>,
+        require_one: bool,
+        budget: &mut IrBudget,
+    ) -> Result<Vec<WalkerPathState>, PatternError> {
+        let mut seen = HashSet::new();
+        let mut all = Vec::new();
+        let mut frontier = if require_one {
+            self.exact_states(&states, budget)?
+        } else {
+            states
+        };
+        frontier.retain(|state| seen.insert(state.clone()));
+        all.extend(frontier.iter().cloned());
+        while !frontier.is_empty() {
+            let next = self.exact_states(&frontier, budget)?;
+            frontier = next
+                .into_iter()
+                .filter(|state| seen.insert(state.clone()))
+                .collect();
+            all.extend(frontier.iter().cloned());
+        }
+        Ok(all)
+    }
+
+    fn exact_states(
+        &self,
+        states: &[WalkerPathState],
+        budget: &mut IrBudget,
+    ) -> Result<Vec<WalkerPathState>, PatternError> {
+        let mut seen = HashSet::new();
+        let mut output = Vec::new();
+        for alternative in &self.alternatives {
+            let Some(compiled) = &alternative.compiled else {
+                continue;
+            };
+            for arm in compiled {
+                for state in states {
+                    // The state product is compiler-owned semantic IR. Charge
+                    // every attempted transition before it can allocate, so
+                    // an adversarial sequence of distinct groups is bounded
+                    // by the same limit as the matcher IR.
+                    budget.charge(1, self.start)?;
+                    let mut state = state.clone();
+                    if arm.walker_path_shape.has_separator() {
+                        state.append_shape(&arm.walker_path_shape);
+                    } else if arm.walker_path_shape.is_empty() {
+                        // A syntactically empty arm (`?()`/`*()`) matches no
+                        // matcher text and therefore leaves this canonical
+                        // path state unchanged.
+                    } else {
+                        // A group that remains inside its containing component
+                        // is matcher text (`@(..)`), not a path operation.
+                        state.wildcard();
+                    }
+                    if seen.insert(state.clone()) {
+                        output.push(state);
+                    }
+                }
+            }
+        }
+        if output.is_empty() {
+            // An uncompileable arm has no viable matcher branch, but its
+            // surrounding program still carries top-level path components
+            // that must not be hidden by an empty state set.
+            let mut fallback = states.to_vec();
+            for state in &mut fallback {
+                state.wildcard();
+            }
+            output = deduplicate_walker_states(fallback);
+        }
+        Ok(output)
+    }
+}
+
+fn deduplicate_walker_states(states: Vec<WalkerPathState>) -> Vec<WalkerPathState> {
+    let mut seen = HashSet::new();
+    states
+        .into_iter()
+        .filter(|state| seen.insert(state.clone()))
+        .collect()
 }
 
 fn parse_posix_class(name: &[u8]) -> Option<PosixClass> {
@@ -2188,12 +2902,15 @@ const MAX_BRACE_EXPANSION_BYTES: usize = 1 << 26;
 /// budget cannot express: 20 MB of expanded text became 1.9 GB of compiled
 /// program, from a 5 KB pattern that sat inside both other budgets.
 ///
-/// A unit is one token, one program step, or one class member — a class token
-/// owns its member list, so it is charged for both. [`Token`] is 32 bytes and
-/// [`ExtglobStep`] is 40, pinned by a test so this arithmetic cannot go stale,
-/// which puts the ceiling around 40 MB of compiled program and tens of
-/// milliseconds of work. That is orders of magnitude past any real pattern: a
-/// language's extension list against a path glob is a few hundred units.
+/// A unit is one token, one program step, one class member, or one attempted
+/// compiler-derived walker-state transition — a class token owns its member
+/// list, so it is charged for both. The transition charge bounds the product
+/// of exact extglob arms without adding a separate viability limit. [`Token`]
+/// is 32 bytes and [`ExtglobStep`] is 40, pinned by a test so this arithmetic
+/// cannot go stale, which puts the ceiling around 40 MB of compiled program
+/// and tens of milliseconds of work. That is orders of magnitude past any
+/// real pattern: a language's extension list against a path glob is a few
+/// hundred units.
 const MAX_COMPILED_IR_UNITS: usize = 1 << 20;
 
 /// Tracks compiled units across every alternative of one [`Pattern::compile`].
@@ -2233,6 +2950,36 @@ impl IrBudget {
     }
 }
 
+/// Bounds source-span metadata independently from matcher IR.
+///
+/// `SourceSpan` is three machine words. Capping the count at the established
+/// brace-copy byte ceiling keeps provenance below that ceiling while charging
+/// every materialized span before its vector allocation.
+struct ProvenanceBudget {
+    remaining: usize,
+}
+
+impl ProvenanceBudget {
+    const fn new() -> Self {
+        Self {
+            remaining: MAX_BRACE_EXPANSION_BYTES / std::mem::size_of::<SourceSpan>(),
+        }
+    }
+
+    fn charge(&mut self, spans: usize, offset: usize) -> Result<(), PatternError> {
+        match self.remaining.checked_sub(spans) {
+            Some(remaining) => {
+                self.remaining = remaining;
+                Ok(())
+            }
+            None => Err(PatternError {
+                offset,
+                message: "brace provenance is too large",
+            }),
+        }
+    }
+}
+
 /// Expands brace alternatives into the plain patterns a pattern stands for.
 ///
 /// [`Pattern::compile`] expands braces before it compiles anything; this
@@ -2256,12 +3003,11 @@ impl IrBudget {
 ///
 /// # Errors
 ///
-/// Reports a pattern that asks for more than [`MAX_BRACE_ALTERNATIVES`]
-/// alternatives, or whose expansion would write more than
-/// [`MAX_BRACE_EXPANSION_BYTES`], so a caller never has to assume the expansion
-/// succeeds. Glob syntax is not checked here: an unclosed brace is ordinary
-/// text, the way [`Pattern::compile`] treats it, and anything else malformed is
-/// reported when the alternative it belongs to is compiled.
+/// Reports a pattern that exceeds the documented brace-expansion limits, so a
+/// caller never has to assume expansion succeeds. Glob syntax is not checked
+/// here: an unclosed brace is ordinary text, the way [`Pattern::compile`]
+/// treats it, and anything else malformed is reported when the alternative it
+/// belongs to is compiled.
 pub fn expand_braces(
     pattern: impl AsRef<[u8]>,
     options: PatternOptions,
@@ -2270,7 +3016,115 @@ pub fn expand_braces(
     if !options.braces {
         return Ok(vec![pattern.to_vec()]);
     }
-    expand_brace_alternatives(pattern, options.escape)
+    let mut provenance_budget = ProvenanceBudget::new();
+    Ok(expand_brace_alternatives_with_provenance(
+        pattern,
+        None,
+        options.escape,
+        &mut provenance_budget,
+    )?
+    .into_iter()
+    .map(|alternative| alternative.bytes)
+    .collect())
+}
+
+/// A contiguous output range that came from a contiguous source range.
+///
+/// Brace expansion removes delimiters and alternatives but never manufactures
+/// matcher bytes, so a handful of these spans preserves exact offsets without
+/// an `usize` allocation per source byte.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceSpan {
+    output_start: usize,
+    source_start: usize,
+    len: usize,
+}
+
+/// Original byte provenance for a compiled byte sequence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SourceProvenance {
+    Contiguous { source_start: usize },
+    Spans(Vec<SourceSpan>),
+}
+
+impl SourceProvenance {
+    fn offset_at(&self, index: usize) -> Option<usize> {
+        match self {
+            Self::Contiguous { source_start } => Some(source_start + index),
+            Self::Spans(spans) => spans.iter().find_map(|span| {
+                (index >= span.output_start && index - span.output_start < span.len)
+                    .then_some(span.source_start + index - span.output_start)
+            }),
+        }
+    }
+
+    fn span_count_in(&self, start: usize, end: usize) -> usize {
+        match self {
+            Self::Contiguous { .. } => usize::from(start < end),
+            Self::Spans(spans) => spans
+                .iter()
+                .filter(|span| span.output_start < end && span.output_start + span.len > start)
+                .count(),
+        }
+    }
+
+    fn append_range(
+        &self,
+        start: usize,
+        end: usize,
+        output_start: usize,
+        target: &mut Vec<SourceSpan>,
+    ) {
+        if start == end {
+            return;
+        }
+        match self {
+            Self::Contiguous { source_start } => target.push(SourceSpan {
+                output_start,
+                source_start: source_start + start,
+                len: end - start,
+            }),
+            Self::Spans(spans) => {
+                for span in spans {
+                    let span_end = span.output_start + span.len;
+                    let overlap_start = span.output_start.max(start);
+                    let overlap_end = span_end.min(end);
+                    if overlap_start < overlap_end {
+                        target.push(SourceSpan {
+                            output_start: output_start + overlap_start - start,
+                            source_start: span.source_start + overlap_start - span.output_start,
+                            len: overlap_end - overlap_start,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn slice(
+        &self,
+        start: usize,
+        end: usize,
+        provenance_budget: &mut ProvenanceBudget,
+        error_offset: usize,
+    ) -> Result<Self, PatternError> {
+        if let Self::Contiguous { source_start } = self {
+            return Ok(Self::Contiguous {
+                source_start: source_start + start,
+            });
+        }
+        let span_count = self.span_count_in(start, end);
+        provenance_budget.charge(span_count, error_offset)?;
+        let mut spans = Vec::with_capacity(span_count);
+        self.append_range(start, end, 0, &mut spans);
+        Ok(Self::Spans(spans))
+    }
+}
+
+/// One brace-expanded byte sequence and its compact source provenance.
+struct BraceExpansion {
+    bytes: Vec<u8>,
+    source_provenance: Option<SourceProvenance>,
 }
 
 /// Expands brace groups into one pattern per combination.
@@ -2283,35 +3137,48 @@ pub fn expand_braces(
 /// `expanded.len() + pending.len()` only ever grows and every pending entry
 /// yields at least one alternative, so it is a running lower bound on the final
 /// count. Checking it before each push therefore rejects exactly the patterns
-/// whose expansion would pass [`MAX_BRACE_ALTERNATIVES`], and bounds the memory
-/// rather than only the result.
+/// whose expansion would exceed the documented alternative limit, and bounds
+/// memory rather than only the result.
 ///
-/// The bytes written are counted against [`MAX_BRACE_EXPANSION_BYTES`] the same
-/// way, and that is what bounds the time: rewriting the whole pattern per group
-/// is quadratic in its length even where it expands to one alternative. The
-/// running total only grows too, so stopping at the first write that passes the
-/// limit rejects exactly the patterns whose finished expansion would.
-fn expand_brace_alternatives(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8>>, PatternError> {
+/// The bytes written are counted against the documented expansion-byte limit
+/// the same way, and that is what bounds the time: rewriting the whole pattern
+/// per group is quadratic in its length even where it expands to one
+/// alternative. The running total only grows too, so stopping at the first
+/// write that exceeds the limit rejects exactly the patterns whose finished
+/// expansion would.
+fn expand_brace_alternatives_with_provenance(
+    pattern: &[u8],
+    source_provenance: Option<&SourceProvenance>,
+    escapes: bool,
+    provenance_budget: &mut ProvenanceBudget,
+) -> Result<Vec<BraceExpansion>, PatternError> {
     let Some(first_open) = first_unescaped_brace(pattern, escapes) else {
-        return Ok(vec![pattern.to_vec()]);
+        return Ok(vec![BraceExpansion {
+            bytes: pattern.to_vec(),
+            source_provenance: source_provenance.cloned(),
+        }]);
     };
 
-    let mut expanded: Vec<Vec<u8>> = Vec::new();
-    let mut pending: Vec<Vec<u8>> = vec![pattern.to_vec()];
+    let mut expanded = Vec::new();
+    let mut pending = vec![BraceExpansion {
+        bytes: pattern.to_vec(),
+        source_provenance: source_provenance.cloned(),
+    }];
     let mut written = pattern.len();
     while let Some(current) = pending.pop() {
-        let Some(open) = first_unescaped_brace(&current, escapes) else {
+        let Some(open) = first_unescaped_brace(&current.bytes, escapes) else {
             expanded.push(current);
             continue;
         };
-        let Some(close) = matching_brace(&current, open, escapes) else {
+        let Some(close) = matching_brace(&current.bytes, open, escapes) else {
             // zlob treats an unmatched brace as ordinary text.
             expanded.push(current);
             continue;
         };
 
-        let alternatives = split_brace_alternatives(&current[open + 1..close], escapes);
-        for alternative in alternatives.iter().rev() {
+        let alternatives = split_brace_alternatives(&current.bytes[open + 1..close], escapes);
+        for range in alternatives.iter().rev() {
+            let alternative = &current.bytes[open + 1 + range.start..open + 1 + range.end];
             if expanded.len() + pending.len() >= MAX_BRACE_ALTERNATIVES {
                 return Err(PatternError {
                     // Offsets into a partly expanded pattern would not point
@@ -2320,7 +3187,7 @@ fn expand_brace_alternatives(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8
                     message: "too many brace alternatives",
                 });
             }
-            let length = open + alternative.len() + current.len() - close - 1;
+            let length = open + alternative.len() + current.bytes.len() - close - 1;
             written = written.saturating_add(length);
             if written > MAX_BRACE_EXPANSION_BYTES {
                 return Err(PatternError {
@@ -2328,14 +3195,60 @@ fn expand_brace_alternatives(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8
                     message: "brace expansion is too large",
                 });
             }
-            let mut combined = Vec::with_capacity(length);
-            combined.extend_from_slice(&current[..open]);
-            combined.extend_from_slice(alternative);
-            combined.extend_from_slice(&current[close + 1..]);
-            pending.push(combined);
+            let mut bytes = Vec::with_capacity(length);
+            bytes.extend_from_slice(&current.bytes[..open]);
+            bytes.extend_from_slice(alternative);
+            bytes.extend_from_slice(&current.bytes[close + 1..]);
+            let source_provenance = current
+                .source_provenance
+                .as_ref()
+                .map(|provenance| {
+                    let alternative_start = open + 1 + range.start;
+                    let span_count = provenance.span_count_in(0, open)
+                        + provenance.span_count_in(
+                            alternative_start,
+                            alternative_start + alternative.len(),
+                        )
+                        + provenance.span_count_in(close + 1, current.bytes.len());
+                    // This charges compact provenance before it is materialized.
+                    // Its bounded metadata budget prevents expansion from turning
+                    // a small matcher into an unbounded offset side allocation.
+                    provenance_budget.charge(span_count, first_open)?;
+                    let mut spans = Vec::with_capacity(span_count);
+                    provenance.append_range(0, open, 0, &mut spans);
+                    provenance.append_range(
+                        alternative_start,
+                        alternative_start + alternative.len(),
+                        open,
+                        &mut spans,
+                    );
+                    provenance.append_range(
+                        close + 1,
+                        current.bytes.len(),
+                        open + alternative.len(),
+                        &mut spans,
+                    );
+                    Ok::<_, PatternError>(SourceProvenance::Spans(spans))
+                })
+                .transpose()?;
+            pending.push(BraceExpansion {
+                bytes,
+                source_provenance,
+            });
         }
     }
     Ok(expanded)
+}
+
+#[cfg(test)]
+fn expand_brace_alternatives(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8>>, PatternError> {
+    let mut provenance_budget = ProvenanceBudget::new();
+    Ok(
+        expand_brace_alternatives_with_provenance(pattern, None, escapes, &mut provenance_budget)?
+            .into_iter()
+            .map(|alternative| alternative.bytes)
+            .collect(),
+    )
 }
 
 fn first_unescaped_brace(pattern: &[u8], escapes: bool) -> Option<usize> {
@@ -2378,7 +3291,7 @@ fn matching_brace(pattern: &[u8], open: usize, escapes: bool) -> Option<usize> {
     None
 }
 
-fn split_brace_alternatives(content: &[u8], escapes: bool) -> Vec<&[u8]> {
+fn split_brace_alternatives(content: &[u8], escapes: bool) -> Vec<std::ops::Range<usize>> {
     let mut alternatives = Vec::new();
     let mut start = 0;
     let mut depth = 0_usize;
@@ -2392,14 +3305,14 @@ fn split_brace_alternatives(content: &[u8], escapes: bool) -> Vec<&[u8]> {
             b'{' => depth += 1,
             b'}' => depth -= 1,
             b',' if depth == 0 => {
-                alternatives.push(&content[start..index]);
+                alternatives.push(start..index);
                 start = index + 1;
             }
             _ => {}
         }
         index += 1;
     }
-    alternatives.push(&content[start..]);
+    alternatives.push(start..content.len());
     alternatives
 }
 
@@ -2407,8 +3320,9 @@ fn is_separator(byte: u8) -> bool {
     byte == b'/' || (cfg!(windows) && byte == b'\\')
 }
 
-fn at_component_start(path: &[u8], index: usize) -> bool {
-    index == 0 || path.get(index - 1).is_some_and(|byte| is_separator(*byte))
+fn at_component_start(path: &[u8], index: usize, options: PatternOptions) -> bool {
+    (index == 0 && options.candidate_starts_component)
+        || (index > 0 && path.get(index - 1).is_some_and(|byte| is_separator(*byte)))
 }
 
 fn bytes_equal(expected: u8, actual: u8, case_insensitive: bool) -> bool {
@@ -2447,6 +3361,15 @@ enum ExtglobKind {
 struct CompiledExtglob {
     steps: Vec<ExtglobStep>,
     groups: Vec<ExtglobGroup>,
+    /// Dense memo state for every interpreter offset that participates in the
+    /// recurrence: the entry point plus each group start and continuation.
+    /// The byte-indexed step table remains the interpreter's address space.
+    memo_state_indices: Vec<usize>,
+    memo_state_count: usize,
+    /// Original-source byte offsets for `steps`, retained after brace
+    /// expansion so walker diagnostics preserve `PatternError` provenance.
+    walker_source_provenance: Option<SourceProvenance>,
+    leading_dot_is_normalized: bool,
 }
 
 /// What the walk does at one byte offset.
@@ -2490,6 +3413,8 @@ struct ExtglobAlternative {
 struct ExtglobGroup {
     kind: ExtglobKind,
     alternatives: Vec<ExtglobAlternative>,
+    /// Offset of this group's operator in the program.
+    start: usize,
     /// Offset just past the closing parenthesis.
     rest: usize,
 }
@@ -2501,6 +3426,9 @@ fn compile_extglob(
     pattern: &[u8],
     options: PatternOptions,
     budget: &mut IrBudget,
+    provenance_budget: &mut ProvenanceBudget,
+    walker_source_provenance: Option<&SourceProvenance>,
+    leading_dot_is_normalized: bool,
 ) -> Result<Option<CompiledExtglob>, PatternError> {
     if !options.extglob || !contains_extglob(pattern, options.escape) {
         return Ok(None);
@@ -2517,7 +3445,15 @@ fn compile_extglob(
             continue;
         }
         compiled[index] = true;
-        let step = compile_extglob_step(pattern, index, options, &mut groups, budget)?;
+        let step = compile_extglob_step(
+            pattern,
+            index,
+            options,
+            &mut groups,
+            budget,
+            provenance_budget,
+            walker_source_provenance,
+        )?;
         match &step {
             ExtglobStep::Group(group) => pending.push(groups[*group].rest),
             ExtglobStep::Star { next } | ExtglobStep::Class { next, .. } => pending.push(*next),
@@ -2530,11 +3466,34 @@ fn compile_extglob(
             ExtglobStep::Any | ExtglobStep::Byte(_) | ExtglobStep::UnclosedGroup { .. } => {
                 pending.push(index + 1);
             }
-            ExtglobStep::NoMatch => {}
+            // The matcher still stops at this state, but compiling the suffix
+            // records the same outer path structure for embeddings that need
+            // to classify every generated branch.
+            ExtglobStep::NoMatch => pending.push(index + 1),
         }
         steps[index] = step;
     }
-    Ok(Some(CompiledExtglob { steps, groups }))
+    let mut memo_state_indices = vec![usize::MAX; pattern.len() + 1];
+    let mut memo_state_count = 0;
+    let mut add_memo_state = |offset| {
+        if memo_state_indices[offset] == usize::MAX {
+            memo_state_indices[offset] = memo_state_count;
+            memo_state_count += 1;
+        }
+    };
+    add_memo_state(0);
+    for group in &groups {
+        add_memo_state(group.start);
+        add_memo_state(group.rest);
+    }
+    Ok(Some(CompiledExtglob {
+        steps,
+        groups,
+        memo_state_indices,
+        memo_state_count,
+        walker_source_provenance: walker_source_provenance.cloned(),
+        leading_dot_is_normalized,
+    }))
 }
 
 /// Classifies one byte offset the way the interpreter classified it.
@@ -2544,6 +3503,8 @@ fn compile_extglob_step(
     options: PatternOptions,
     groups: &mut Vec<ExtglobGroup>,
     budget: &mut IrBudget,
+    provenance_budget: &mut ProvenanceBudget,
+    walker_source_provenance: Option<&SourceProvenance>,
 ) -> Result<ExtglobStep, PatternError> {
     if let Some(kind) = detect_extglob_at(pattern, index) {
         let open = index + 1;
@@ -2553,12 +3514,27 @@ fn compile_extglob_step(
             });
         };
         let mut alternatives = Vec::new();
-        for alternative in split_extglob_alternatives(&pattern[open + 1..close], options.escape) {
-            alternatives.push(compile_extglob_alternative(alternative, options, budget)?);
+        for range in split_extglob_alternatives(&pattern[open + 1..close], options.escape) {
+            let start = open + 1 + range.start;
+            let alternative_provenance = match walker_source_provenance {
+                Some(provenance) => {
+                    Some(provenance.slice(start, open + 1 + range.end, provenance_budget, index)?)
+                }
+                None => None,
+            };
+            alternatives.push(compile_extglob_alternative(
+                &pattern[start..open + 1 + range.end],
+                options,
+                budget,
+                provenance_budget,
+                alternative_provenance.as_ref(),
+                false,
+            )?);
         }
         groups.push(ExtglobGroup {
             kind,
             alternatives,
+            start: index,
             rest: close + 1,
         });
         return Ok(ExtglobStep::Group(groups.len() - 1));
@@ -2595,6 +3571,9 @@ fn compile_extglob_alternative(
     alternative: &[u8],
     options: PatternOptions,
     budget: &mut IrBudget,
+    provenance_budget: &mut ProvenanceBudget,
+    walker_source_provenance: Option<&SourceProvenance>,
+    leading_dot_is_normalized: bool,
 ) -> Result<ExtglobAlternative, PatternError> {
     let options = PatternOptions {
         braces: false,
@@ -2606,7 +3585,14 @@ fn compile_extglob_alternative(
     // A syntax error in one alternative is not a compile failure — it is an
     // alternative that matches nothing, as it always was. Running out of budget
     // is a different thing and has to reach the caller.
-    let compiled = match Pattern::compile_within(alternative, options, budget) {
+    let compiled = match Pattern::compile_within(
+        alternative,
+        options,
+        budget,
+        provenance_budget,
+        walker_source_provenance,
+        leading_dot_is_normalized,
+    ) {
         Ok(pattern) => Some(pattern.alternatives),
         Err(error) if error.message() == TOO_MUCH_COMPILED_IR => return Err(error),
         Err(_) => None,
@@ -2692,7 +3678,7 @@ fn closing_extglob_parenthesis(pattern: &[u8], open: usize, escapes: bool) -> Op
     None
 }
 
-fn split_extglob_alternatives(content: &[u8], escapes: bool) -> Vec<&[u8]> {
+fn split_extglob_alternatives(content: &[u8], escapes: bool) -> Vec<std::ops::Range<usize>> {
     let mut alternatives = Vec::new();
     let mut start = 0;
     let mut depth = 0_usize;
@@ -2706,20 +3692,47 @@ fn split_extglob_alternatives(content: &[u8], escapes: bool) -> Vec<&[u8]> {
             b'(' => depth += 1,
             b')' if depth > 0 => depth -= 1,
             b'|' if depth == 0 => {
-                alternatives.push(&content[start..index]);
+                alternatives.push(start..index);
                 start = index + 1;
             }
             _ => {}
         }
         index += 1;
     }
-    alternatives.push(&content[start..]);
+    alternatives.push(start..content.len());
     alternatives
 }
 
+/// Reusable state for one extglob match on a thread.
+#[derive(Default)]
+struct ExtglobScratch {
+    /// One visited-position frame per repetition in flight.
+    visited: Vec<u64>,
+    /// Dense rows for extglob-recursive interpreter offsets. Each row lazily
+    /// allocates fixed-size candidate pages as states are explored.
+    failed: Vec<ExtglobFailedRow>,
+    #[cfg(test)]
+    /// The previous match's materialized failure pages, retained only as
+    /// deterministic test instrumentation.
+    failed_page_count: usize,
+    #[cfg(test)]
+    /// The previous match's distinct failed states, retained only as
+    /// deterministic test instrumentation.
+    failed_state_count: usize,
+    /// Deferred continuation positions, partitioned by active repetition
+    /// calls so sequential groups reuse one allocation without sharing work.
+    repeated: Vec<usize>,
+}
+
+/// Borrows the extglob scratch buffers for one match.
+struct ExtglobMatchState<'scratch> {
+    visited: &'scratch mut Vec<u64>,
+    failed: ExtglobFailedStates<'scratch>,
+    repeated: &'scratch mut Vec<usize>,
+}
+
 thread_local! {
-    /// Stack of visited-position bitsets, one frame per repetition in flight.
-    static EXTGLOB_VISITED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    static EXTGLOB_SCRATCH: RefCell<ExtglobScratch> = RefCell::new(ExtglobScratch::default());
 }
 
 /// Runs a compiled extglob program on the thread's reusable visited buffer.
@@ -2729,23 +3742,185 @@ thread_local! {
 /// the general scratch, so holding both at once would push every sub-match
 /// onto the re-entrancy fallback and allocate there.
 fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: PatternOptions) -> bool {
-    EXTGLOB_VISITED.with(|cell| match cell.try_borrow_mut() {
-        Ok(mut visited) => {
-            visited.clear();
-            let matched = match_extglob_from(program, path, 0, 0, options, &mut visited);
-            if visited.capacity() > RETAINED_SCRATCH_WORDS {
-                visited.shrink_to(RETAINED_SCRATCH_WORDS);
+    EXTGLOB_SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut scratch) => {
+            let matched = {
+                let ExtglobScratch {
+                    visited,
+                    failed,
+                    #[cfg(test)]
+                    failed_page_count,
+                    #[cfg(test)]
+                    failed_state_count,
+                    repeated,
+                } = &mut *scratch;
+                visited.clear();
+                failed.clear();
+                repeated.clear();
+                #[cfg(test)]
+                {
+                    *failed_page_count = 0;
+                    *failed_state_count = 0;
+                }
+                let mut state = ExtglobMatchState {
+                    visited,
+                    failed: ExtglobFailedStates::new(
+                        program,
+                        failed,
+                        #[cfg(test)]
+                        failed_page_count,
+                        #[cfg(test)]
+                        failed_state_count,
+                    ),
+                    repeated,
+                };
+                match_extglob_from(program, path, 0, 0, options, &mut state)
+            };
+            scratch.visited.clear();
+            if scratch.visited.capacity() > RETAINED_SCRATCH_WORDS {
+                scratch.visited.shrink_to(RETAINED_SCRATCH_WORDS);
+            }
+            scratch.failed.clear();
+            let retained_rows = RETAINED_SCRATCH_WORDS * std::mem::size_of::<u64>()
+                / std::mem::size_of::<ExtglobFailedRow>();
+            if scratch.failed.capacity() > retained_rows {
+                scratch.failed.shrink_to(retained_rows);
+            }
+            scratch.repeated.clear();
+            if scratch.repeated.capacity() > RETAINED_SCRATCH_WORDS {
+                scratch.repeated.shrink_to(RETAINED_SCRATCH_WORDS);
             }
             matched
         }
-        Err(_) => match_extglob_from(program, path, 0, 0, options, &mut Vec::new()),
+        Err(_) => {
+            let mut scratch = ExtglobScratch::default();
+            let ExtglobScratch {
+                visited,
+                failed,
+                #[cfg(test)]
+                failed_page_count,
+                #[cfg(test)]
+                failed_state_count,
+                repeated,
+            } = &mut scratch;
+            let mut state = ExtglobMatchState {
+                visited,
+                failed: ExtglobFailedStates::new(
+                    program,
+                    failed,
+                    #[cfg(test)]
+                    failed_page_count,
+                    #[cfg(test)]
+                    failed_state_count,
+                ),
+                repeated,
+            };
+            match_extglob_from(program, path, 0, 0, options, &mut state)
+        }
     })
 }
 
 /// Capacity the calling thread's extglob visited buffer currently holds.
 #[cfg(test)]
 fn extglob_visited_capacity() -> usize {
-    EXTGLOB_VISITED.with(|cell| cell.borrow().capacity())
+    EXTGLOB_SCRATCH.with(|cell| cell.borrow().visited.capacity())
+}
+
+/// Scratch capacities after an extglob match, used to keep the retained
+/// thread-local allocation bounded without relying on process RSS.
+#[cfg(test)]
+fn extglob_scratch_capacities() -> (usize, usize, usize) {
+    EXTGLOB_SCRATCH.with(|cell| {
+        let scratch = cell.borrow();
+        (
+            scratch.visited.capacity(),
+            scratch.failed.capacity() * std::mem::size_of::<ExtglobFailedRow>()
+                / std::mem::size_of::<u64>(),
+            scratch.repeated.capacity(),
+        )
+    })
+}
+
+#[cfg(test)]
+fn extglob_failed_len() -> usize {
+    EXTGLOB_SCRATCH.with(|cell| cell.borrow().failed.len())
+}
+
+#[cfg(test)]
+fn extglob_failed_stats() -> (usize, usize) {
+    EXTGLOB_SCRATCH.with(|cell| {
+        let scratch = cell.borrow();
+        (scratch.failed_page_count, scratch.failed_state_count)
+    })
+}
+
+/// Failure memoization for a single dense interpreter row.
+#[derive(Default)]
+struct ExtglobFailedRow {
+    pages: BTreeMap<usize, Box<[u64; EXTGLOB_MEMO_PAGE_WORDS]>>,
+}
+
+/// A page holds 4,096 candidate offsets. This keeps a sparse failed-state
+/// search compact without allocating the full state-by-candidate product.
+const EXTGLOB_MEMO_PAGE_WORDS: usize = 64;
+const EXTGLOB_MEMO_PAGE_BITS: usize = EXTGLOB_MEMO_PAGE_WORDS * u64::BITS as usize;
+
+/// A sparse paged bitset over dense extglob interpreter rows and candidate
+/// offsets. Its boolean semantics are identical to a flat matrix, while only
+/// recurrence states actually reached by the match materialize storage.
+struct ExtglobFailedStates<'scratch> {
+    rows: &'scratch mut [ExtglobFailedRow],
+    #[cfg(test)]
+    page_count: &'scratch mut usize,
+    #[cfg(test)]
+    state_count: &'scratch mut usize,
+}
+
+impl<'scratch> ExtglobFailedStates<'scratch> {
+    fn new(
+        program: &CompiledExtglob,
+        scratch: &'scratch mut Vec<ExtglobFailedRow>,
+        #[cfg(test)] page_count: &'scratch mut usize,
+        #[cfg(test)] state_count: &'scratch mut usize,
+    ) -> Self {
+        scratch.resize_with(program.memo_state_count, ExtglobFailedRow::default);
+        Self {
+            rows: scratch,
+            #[cfg(test)]
+            page_count,
+            #[cfg(test)]
+            state_count,
+        }
+    }
+
+    fn insert(&mut self, state_index: usize, path_index: usize) -> bool {
+        let candidate_page = path_index / EXTGLOB_MEMO_PAGE_BITS;
+        let page_bit = path_index % EXTGLOB_MEMO_PAGE_BITS;
+        let row = &mut self.rows[state_index];
+        let words = match row.pages.entry(candidate_page) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let words = entry.insert(Box::new([0; EXTGLOB_MEMO_PAGE_WORDS]));
+                #[cfg(test)]
+                {
+                    *self.page_count += 1;
+                }
+                words
+            }
+        };
+        let word = &mut words[page_bit / u64::BITS as usize];
+        let mask = 1_u64 << (page_bit % u64::BITS as usize);
+        if *word & mask != 0 {
+            false
+        } else {
+            *word |= mask;
+            #[cfg(test)]
+            {
+                *self.state_count += 1;
+            }
+            true
+        }
+    }
 }
 
 /// Reserves a zeroed frame of `positions` bits and returns its first word.
@@ -2774,7 +3949,7 @@ fn match_extglob_from(
     start: usize,
     start_path_index: usize,
     options: PatternOptions,
-    visited: &mut Vec<u64>,
+    state: &mut ExtglobMatchState<'_>,
 ) -> bool {
     let steps = &program.steps;
     let mut pattern_index = start;
@@ -2783,17 +3958,30 @@ fn match_extglob_from(
     let mut star_path_index = 0_usize;
     let mut has_star = false;
 
+    // Every recursive branch reaches a program step with no inherited star
+    // backtrack point. It can therefore be shared across sequential groups and
+    // within one repetition: once a suffix has been explored, another
+    // partition cannot make it succeed.
+    if !state
+        .failed
+        .insert(program.memo_state_index(pattern_index), path_index)
+    {
+        return false;
+    }
+
     while path_index < path.len() || pattern_index < steps.len() {
         if pattern_index < steps.len() {
-            // A group refuses a leading period before it looks at its
-            // alternatives, and does so even when its parenthesis never closes
-            // and the bytes end up read as ordinary text.
-            if matches!(
-                steps[pattern_index],
-                ExtglobStep::Group(_) | ExtglobStep::UnclosedGroup { .. }
-            ) && !options.match_hidden
+            let leading_period_is_forbidden = match &steps[pattern_index] {
+                ExtglobStep::Group(group) => {
+                    !extglob_group_allows_literal_leading_period(&program.groups[*group])
+                }
+                ExtglobStep::UnclosedGroup { .. } => true,
+                _ => false,
+            };
+            if leading_period_is_forbidden
+                && !options.match_hidden
                 && path.get(path_index) == Some(&b'.')
-                && at_component_start(path, path_index)
+                && at_component_start(path, path_index, options)
             {
                 return false;
             }
@@ -2805,7 +3993,7 @@ fn match_extglob_from(
                         path,
                         path_index,
                         options,
-                        visited,
+                        state,
                     ) {
                         return true;
                     }
@@ -2836,7 +4024,7 @@ fn match_extglob_from(
                         (!options.component_wildcards || !is_separator(byte))
                             && (options.match_hidden
                                 || byte != b'.'
-                                || !at_component_start(path, path_index))
+                                || !at_component_start(path, path_index, options))
                     }) {
                         pattern_index += 1;
                         path_index += 1;
@@ -2858,7 +4046,7 @@ fn match_extglob_from(
                         (!options.component_wildcards || !is_separator(byte))
                             && (options.match_hidden
                                 || byte != b'.'
-                                || !at_component_start(path, path_index))
+                                || !at_component_start(path, path_index, options))
                             && class.matches(byte, options.case_insensitive)
                     }) {
                         pattern_index = *next;
@@ -2906,7 +4094,7 @@ fn match_extglob_from(
             }
             if !options.match_hidden
                 && path.get(star_path_index) == Some(&b'.')
-                && at_component_start(path, star_path_index)
+                && at_component_start(path, star_path_index, options)
             {
                 return false;
             }
@@ -2920,34 +4108,61 @@ fn match_extglob_from(
     true
 }
 
+/// Whether a group can explicitly consume the leading period of a component.
+///
+/// Wildcard-led alternatives still observe `match_hidden`; only a literal dot
+/// is an opt-in to matching a hidden path.
+fn extglob_group_allows_literal_leading_period(group: &ExtglobGroup) -> bool {
+    // Negation consumes whatever its alternatives reject, not a literal from
+    // one of them, so it remains wildcard-like at a component boundary.
+    if group.kind == ExtglobKind::Negated {
+        return false;
+    }
+    group.alternatives.iter().any(|alternative| {
+        alternative.compiled.as_ref().is_some_and(|alternatives| {
+            alternatives.iter().any(|alternative| {
+                matches!(
+                    alternative.tokens.first(),
+                    Some(Token::Literal(literal)) if literal.first() == Some(&b'.')
+                )
+            })
+        })
+    })
+}
+
 fn match_extglob_group(
     program: &CompiledExtglob,
     group: &ExtglobGroup,
     path: &[u8],
     path_index: usize,
     options: PatternOptions,
-    visited: &mut Vec<u64>,
+    state: &mut ExtglobMatchState<'_>,
 ) -> bool {
     match group.kind {
         ExtglobKind::ExactlyOne => {
-            match_extglob_alternative(program, group, path, path_index, options, visited)
+            match_extglob_alternative(program, group, path, path_index, options, state)
         }
         ExtglobKind::Optional => {
-            match_extglob_from(program, path, group.rest, path_index, options, visited)
-                || match_extglob_alternative(program, group, path, path_index, options, visited)
+            match_extglob_from(program, path, group.rest, path_index, options, state)
+                || match_extglob_alternative(program, group, path, path_index, options, state)
         }
         ExtglobKind::ZeroOrMore => {
-            match_extglob_from(program, path, group.rest, path_index, options, visited)
-                || match_extglob_repetition(program, group, path, path_index, options, visited)
+            match_extglob_from(program, path, group.rest, path_index, options, state)
+                || match_extglob_repetition(program, group, path, path_index, options, state)
         }
         ExtglobKind::OneOrMore => {
-            match_extglob_repetition(program, group, path, path_index, options, visited)
+            match_extglob_repetition(program, group, path, path_index, options, state)
         }
         ExtglobKind::Negated => {
             for end in path_index..=extglob_component_end(path, path_index, options) {
                 if group.alternatives.iter().all(|alternative| {
-                    !match_extglob_alternative_exact(alternative, &path[path_index..end], options)
-                }) && match_extglob_from(program, path, group.rest, end, options, visited)
+                    !match_extglob_alternative_exact(
+                        alternative,
+                        &path[path_index..end],
+                        at_component_start(path, path_index, options),
+                        options,
+                    )
+                }) && match_extglob_from(program, path, group.rest, end, options, state)
                 {
                     return true;
                 }
@@ -2968,11 +4183,11 @@ fn match_extglob_repetition(
     path: &[u8],
     path_index: usize,
     options: PatternOptions,
-    visited: &mut Vec<u64>,
+    state: &mut ExtglobMatchState<'_>,
 ) -> bool {
-    let base = push_visited(visited, path.len() + 1);
-    let matched = match_extglob_repeated(program, group, path, path_index, options, visited, base);
-    visited.truncate(base);
+    let base = push_visited(state.visited, path.len() + 1);
+    let matched = match_extglob_repeated(program, group, path, path_index, options, state, base);
+    state.visited.truncate(base);
     matched
 }
 
@@ -2982,29 +4197,54 @@ fn match_extglob_repeated(
     path: &[u8],
     path_index: usize,
     options: PatternOptions,
-    visited: &mut Vec<u64>,
+    state: &mut ExtglobMatchState<'_>,
     base: usize,
 ) -> bool {
-    if !visit(visited, base, path_index) {
-        return false;
-    }
-    for alternative in &group.alternatives {
-        for end in extglob_alternative_ends(alternative, path, path_index, options)
-            .into_iter()
-            .flatten()
-        {
-            if match_extglob_alternative_exact(alternative, &path[path_index..end], options)
-                && (match_extglob_from(program, path, group.rest, end, options, visited)
-                    || (end > path_index
-                        && match_extglob_repeated(
-                            program, group, path, end, options, visited, base,
-                        )))
+    let work_base = state.repeated.len();
+    state.repeated.push(path_index);
+    let mut matched = false;
+    while state.repeated.len() > work_base {
+        let path_index = state
+            .repeated
+            .pop()
+            .expect("the non-empty repetition work slice has a position");
+        if !visit(state.visited, base, path_index) {
+            continue;
+        }
+        for alternative in &group.alternatives {
+            for end in extglob_alternative_ends(alternative, path, path_index, options)
+                .into_iter()
+                .flatten()
             {
-                return true;
+                if match_extglob_alternative_exact(
+                    alternative,
+                    &path[path_index..end],
+                    at_component_start(path, path_index, options),
+                    options,
+                ) {
+                    if match_extglob_from(program, path, group.rest, end, options, state) {
+                        matched = true;
+                        break;
+                    }
+                    if end > path_index
+                        && state
+                            .failed
+                            .insert(program.memo_state_index(group.start), end)
+                    {
+                        state.repeated.push(end);
+                    }
+                }
+            }
+            if matched {
+                break;
             }
         }
+        if matched {
+            break;
+        }
     }
-    false
+    state.repeated.truncate(work_base);
+    matched
 }
 
 fn match_extglob_alternative(
@@ -3013,15 +4253,19 @@ fn match_extglob_alternative(
     path: &[u8],
     path_index: usize,
     options: PatternOptions,
-    visited: &mut Vec<u64>,
+    state: &mut ExtglobMatchState<'_>,
 ) -> bool {
     for alternative in &group.alternatives {
         for end in extglob_alternative_ends(alternative, path, path_index, options)
             .into_iter()
             .flatten()
         {
-            if match_extglob_alternative_exact(alternative, &path[path_index..end], options)
-                && match_extglob_from(program, path, group.rest, end, options, visited)
+            if match_extglob_alternative_exact(
+                alternative,
+                &path[path_index..end],
+                at_component_start(path, path_index, options),
+                options,
+            ) && match_extglob_from(program, path, group.rest, end, options, state)
             {
                 return true;
             }
@@ -3038,6 +4282,7 @@ fn match_extglob_alternative(
 fn match_extglob_alternative_exact(
     alternative: &ExtglobAlternative,
     path: &[u8],
+    candidate_starts_component: bool,
     options: PatternOptions,
 ) -> bool {
     if alternative.width.is_some_and(|width| width != path.len()) {
@@ -3049,6 +4294,7 @@ fn match_extglob_alternative_exact(
     let mut options = PatternOptions {
         braces: false,
         extglob: false,
+        candidate_starts_component,
         ..options
     };
     if options.root_component_wildcards {
@@ -3088,10 +4334,23 @@ fn extglob_component_end(path: &[u8], path_index: usize, options: PatternOptions
     }
 }
 
+impl CompiledExtglob {
+    fn memo_state_index(&self, offset: usize) -> usize {
+        let state_index = self.memo_state_indices[offset];
+        debug_assert_ne!(
+            state_index,
+            usize::MAX,
+            "only the entry point and group transitions participate in extglob recursion"
+        );
+        state_index
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        FailedStates, FastPath, Pattern, PatternOptions, Prefilter, Token,
+        FailedStates, FastPath, Pattern, PatternOptions, Prefilter, Token, WalkerPathViability,
+        extglob_failed_len, extglob_failed_stats, extglob_scratch_capacities,
         extglob_visited_capacity, scratch_capacities,
     };
 
@@ -3341,6 +4600,198 @@ mod tests {
     }
 
     #[test]
+    fn walker_path_viability_follows_compiled_alternatives() {
+        let options = PatternOptions::default().braces(true).extglob(true);
+        fn viability(source: &str, options: PatternOptions) -> WalkerPathViability {
+            Pattern::compile(source, options)
+                .expect("review pattern compiles")
+                .walker_path_viability()
+        }
+
+        let posix = Pattern::compile("src/[[:alpha:]/../].rs", options).unwrap();
+        assert!(posix.is_match("src/a.rs"));
+        assert_eq!(
+            viability("src/[[:alpha:]/../].rs", options),
+            WalkerPathViability::Viable
+        );
+
+        let leading_bracket = Pattern::compile("src/[]/../].rs", options).unwrap();
+        assert!(leading_bracket.is_match("src/].rs"));
+        assert_eq!(
+            viability("src/[]/../].rs", options),
+            WalkerPathViability::Viable
+        );
+
+        // Brace expansion and extglob alternatives are already compiled when
+        // viability is calculated. A dead arm cannot invalidate a compiled
+        // sibling that can name a walker candidate.
+        assert_eq!(
+            viability("{dead/../branch,src/main.rs}", options),
+            WalkerPathViability::Viable
+        );
+        assert_eq!(
+            viability("@(dead/../branch|src/main.rs)", options),
+            WalkerPathViability::Viable
+        );
+        assert_eq!(
+            viability("{dead/{nested/../branch},src/main.rs}", options),
+            WalkerPathViability::Viable
+        );
+        assert_eq!(
+            viability("@(dead/@(nested/../branch)|src/main.rs)", options),
+            WalkerPathViability::Viable
+        );
+        assert_eq!(
+            viability(r"dead\/../branch", options),
+            WalkerPathViability::Viable
+        );
+
+        let brace_class = Pattern::compile("src/[{],a}/../].rs", options).unwrap();
+        assert!(brace_class.is_match("src/a.rs"));
+        assert!(brace_class.is_match("src/].rs"));
+        assert_eq!(
+            brace_class.walker_path_viability(),
+            WalkerPathViability::Viable
+        );
+
+        let brace_extglob =
+            Pattern::compile("@(dead/{),x}/../branch|src/main.rs)", options).unwrap();
+        assert!(brace_extglob.is_match("src/main.rs"));
+        assert_eq!(
+            brace_extglob.walker_path_viability(),
+            WalkerPathViability::Viable
+        );
+
+        // A brace or extglob delimiter is processed by its compiler phase
+        // before the later class parse. These compile into an outer `..`.
+        for source in [
+            "{dead/[}]]/../x,src/main.rs}",
+            "@(dead/[)]]/../x|src/main.rs)",
+            "{dead/../branch}",
+            "@(dead/../branch)",
+            "@(dead|src)/../main.rs",
+        ] {
+            assert_eq!(
+                viability(source, options),
+                WalkerPathViability::ParentComponent,
+                "all compiled arms remain unwalkable: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn walker_path_viability_composes_extglob_quantifiers_without_state_products() {
+        let options = PatternOptions::default().braces(true).extglob(true);
+        let mandatory =
+            Pattern::compile("+(dead/../branch)", options).expect("mandatory extglob compiles");
+        assert!(mandatory.is_match("dead/../branch"));
+        assert_eq!(
+            mandatory.walker_path_viability(),
+            WalkerPathViability::ParentComponent,
+            "one required repetition preserves its real parent component"
+        );
+        assert_eq!(
+            Pattern::compile("prefix+(../bar)", options)
+                .expect("prefixed repetition compiles")
+                .walker_path_viability(),
+            WalkerPathViability::Viable,
+            "the compiler composes an arm with its outer component"
+        );
+
+        for source in [
+            "?(dead/../branch)",
+            "*(dead/../branch)",
+            "+(dead/../branch)",
+            "@(dead/../branch)",
+        ] {
+            assert_ne!(
+                Pattern::compile(source, options)
+                    .expect("quantified extglob compiles")
+                    .walker_path_viability(),
+                WalkerPathViability::Viable,
+                "every matching repetition of {source} remains unwalkable"
+            );
+        }
+        assert_eq!(
+            Pattern::compile("!(dead/../branch)", options)
+                .expect("negated extglob compiles")
+                .walker_path_viability(),
+            WalkerPathViability::Viable
+        );
+
+        // Only a raw spelling that starts with `./` is normalized by walker
+        // filters. A compiler-produced leading component is still a real
+        // unmatchable dot component. Nor may a nullable arm use an empty
+        // leading or interior component to escape that invalid positive arm.
+        for source in [
+            "@(./a.rs)",
+            "{./a.rs}",
+            "src/?(./a.rs)",
+            "src/*(./a.rs)",
+            "src/?(./a.rs)/bar",
+            "src/*(./a.rs)/bar",
+        ] {
+            assert_eq!(
+                Pattern::compile(source, options)
+                    .expect("edge-normalization regression compiles")
+                    .walker_path_viability(),
+                WalkerPathViability::DotComponent,
+                "{source} has no selectable walker candidate"
+            );
+        }
+        for source in ["src/?()/bar", "src/*()/bar", "?()/bar", "*()/bar"] {
+            assert_eq!(
+                Pattern::compile(source, options)
+                    .expect("empty extglob arm compiles")
+                    .walker_path_viability(),
+                WalkerPathViability::Root,
+                "{source} has only an empty leading or interior component"
+            );
+        }
+        for source in ["src//bar", "/bar", "src/{}/bar", "src/{,./a.rs}/bar"] {
+            assert_eq!(
+                Pattern::compile(source, options)
+                    .expect("empty plain or brace arm compiles")
+                    .walker_path_viability(),
+                WalkerPathViability::Root,
+                "{source} has no selectable complete walker alternative"
+            );
+        }
+        for source in ["src/?(x)/bar", "src/?()bar", "?(x)/bar"] {
+            assert_eq!(
+                Pattern::compile(source, options)
+                    .expect("selectable nullable control compiles")
+                    .walker_path_viability(),
+                WalkerPathViability::Viable,
+                "{source} retains a selectable compiler arm"
+            );
+        }
+        assert_eq!(
+            Pattern::compile("./a.rs", options)
+                .expect("raw normalized spelling compiles")
+                .walker_path_viability(),
+            WalkerPathViability::Viable
+        );
+
+        // Each group has two compiler arms, but their walker summaries are
+        // equal. This used to construct 2^32 duplicate state vectors; the
+        // canonical state set stays one state per group transition.
+        let sequential = "@(a|b)".repeat(32);
+        let compiled = Pattern::compile(&sequential, options)
+            .expect("sequential equivalent extglobs stay within the IR budget");
+        assert_eq!(
+            compiled.walker_path_viability(),
+            WalkerPathViability::Viable
+        );
+
+        // Nesting must take the same bounded compiler path rather than falling
+        // back to a second source-level grammar.
+        let nested = "@(@(a|b)|@(c|d))".repeat(16);
+        Pattern::compile(&nested, options)
+            .expect("nested equivalent extglobs stay within the IR budget");
+    }
+
+    #[test]
     fn braces_expand_nested_and_empty_alternatives() {
         let options = PatternOptions::default().braces(true);
         let pattern = Pattern::compile("{src,{lib,bin}}/*.{rs,toml}", options).unwrap();
@@ -3371,6 +4822,50 @@ mod tests {
         assert_eq!(
             super::expand_brace_alternatives(b"{x,{y,z}}!", true).unwrap(),
             vec![b"x!".to_vec(), b"y!".to_vec(), b"z!".to_vec()]
+        );
+    }
+
+    #[test]
+    fn brace_provenance_stays_span_bounded_for_large_and_branching_sources() {
+        let mut provenance_budget = super::ProvenanceBudget::new();
+        let literal = vec![b'x'; 1 << 20];
+        let expanded = super::expand_brace_alternatives_with_provenance(
+            &literal,
+            Some(&super::SourceProvenance::Contiguous { source_start: 0 }),
+            true,
+            &mut provenance_budget,
+        )
+        .expect("large literal has no provenance allocation per byte");
+        assert!(matches!(
+            expanded[0].source_provenance,
+            Some(super::SourceProvenance::Contiguous { source_start: 0 })
+        ));
+
+        let branching = "{a,b}".repeat(12);
+        let expanded = super::expand_brace_alternatives_with_provenance(
+            branching.as_bytes(),
+            Some(&super::SourceProvenance::Contiguous { source_start: 0 }),
+            true,
+            &mut provenance_budget,
+        )
+        .expect("bounded brace expansion compiles");
+        assert_eq!(expanded.len(), 1 << 12);
+        let span_count = expanded
+            .iter()
+            .map(|alternative| match &alternative.source_provenance {
+                Some(super::SourceProvenance::Spans(spans)) => spans.len(),
+                Some(super::SourceProvenance::Contiguous { .. }) | None => 0,
+            })
+            .sum::<usize>();
+        assert!(
+            span_count <= 12 * (1 << 12),
+            "one compact source span per selected brace arm, never one usize per output byte"
+        );
+
+        let mut capped = super::ProvenanceBudget::new();
+        assert!(
+            capped.charge(super::MAX_BRACE_EXPANSION_BYTES, 0).is_err(),
+            "provenance rejects before a span vector can exceed its byte bound"
         );
     }
 
@@ -3617,6 +5112,131 @@ mod tests {
     }
 
     #[test]
+    fn sequential_extglob_repetitions_share_failed_suffixes() {
+        let pattern = Pattern::compile("+(a)+(a)+(a)+(a)", PatternOptions::default().extglob(true))
+            .expect("repeating extglobs compile");
+
+        // Every partition of this run reaches one of the same group/path
+        // suffixes. The trailing byte makes all of them fail, exercising the
+        // global extglob state memo without a wall-clock assertion.
+        let mut non_matching = "a".repeat(400);
+        non_matching.push('x');
+        assert!(!pattern.is_match(&non_matching));
+
+        // Adjacent `+()` groups remain independently non-empty.
+        assert!(pattern.is_match("aaaa"));
+        assert!(!pattern.is_match("aaa"));
+
+        // A long single repetition stays within one explicit work frame.
+        let single = Pattern::compile("+(a)", PatternOptions::default().extglob(true))
+            .expect("single repeating extglob compiles");
+        assert!(single.is_match("a".repeat(5_000)));
+    }
+
+    #[test]
+    fn extglob_memo_pages_only_reached_dense_states_and_releases_them() {
+        let pattern = Pattern::compile("+(a)+(a)", PatternOptions::default().extglob(true))
+            .expect("repeating extglobs compile");
+        let program = pattern.alternatives[0]
+            .extglob
+            .as_ref()
+            .expect("the pattern carries an extglob program");
+        assert_eq!(program.memo_state_count, 3);
+        assert_eq!(
+            [
+                program.memo_state_index(0),
+                program.memo_state_index(program.groups[0].rest),
+                program.memo_state_index(program.groups[1].rest),
+            ],
+            [0, 1, 2],
+            "the recurrence rows are stable and dense"
+        );
+
+        let long_early_mismatch =
+            Pattern::compile("a+(b)", PatternOptions::default().extglob(true))
+                .expect("extglob compiles");
+        let long_candidate = "x".repeat(2_000_000);
+        assert!(!long_early_mismatch.is_match(&long_candidate));
+        assert_eq!(
+            extglob_failed_stats(),
+            (1, 1),
+            "a long candidate must not allocate an untouched state-by-candidate table"
+        );
+
+        let many_states = Pattern::compile(
+            "+(a)".repeat(2_000),
+            PatternOptions::default().extglob(true),
+        )
+        .expect("many extglobs compile");
+        let many_program = many_states.alternatives[0]
+            .extglob
+            .as_ref()
+            .expect("the pattern carries an extglob program");
+        assert!(many_program.memo_state_count > 2_000);
+        assert!(!many_states.is_match("x"));
+        assert_eq!(
+            extglob_failed_stats(),
+            (1, 1),
+            "unreached dense rows must remain page-free after an early mismatch"
+        );
+
+        let mut candidate = "a".repeat(2_000_000);
+        candidate.push('x');
+        assert!(!pattern.is_match(&candidate));
+        let (pages, states) = extglob_failed_stats();
+        assert!(
+            pages > 1 && states > 1,
+            "the recurrence should visit several memo bits"
+        );
+        assert!(
+            pages
+                <= program.memo_state_count
+                    * candidate.len().div_ceil(super::EXTGLOB_MEMO_PAGE_BITS),
+            "materialized pages stay within the exact dense-row/page shape"
+        );
+
+        let capacities = extglob_scratch_capacities();
+        assert!(
+            capacities.1 <= super::RETAINED_SCRATCH_WORDS,
+            "the failed-state bitset must not retain the adversarial table: {capacities:?}"
+        );
+        assert_eq!(
+            extglob_failed_len(),
+            0,
+            "the retained failed-state bitset must be logically empty"
+        );
+
+        assert!(pattern.is_match("aa"));
+        assert_eq!(
+            extglob_scratch_capacities(),
+            capacities,
+            "a later small match reuses the capped scratch allocation"
+        );
+    }
+
+    #[test]
+    fn extglob_alternatives_keep_the_enclosing_component_context() {
+        let options = PatternOptions::default().extglob(true);
+        let star = Pattern::compile("a@(*)", options).expect("extglob compiles");
+        let question = Pattern::compile("a@(?b)", options).expect("extglob compiles");
+        assert!(star.is_match("a.b"));
+        assert!(question.is_match("a.b"));
+
+        let path_group = Pattern::compile("dir/a@(*)", options).expect("extglob compiles");
+        assert!(path_group.is_match_path("dir/a.b"));
+        assert!(path_group.is_match_glob_path("dir/a.b"));
+
+        let at_start = Pattern::compile("@(*)", options).expect("extglob compiles");
+        assert!(!at_start.is_match(".b"));
+        assert!(!at_start.is_match_path(".b"));
+        assert!(!at_start.is_match_glob_path(".b"));
+
+        let after_separator = Pattern::compile("dir/@(*)", options).expect("extglob compiles");
+        assert!(!after_separator.is_match_path("dir/.b"));
+        assert!(!after_separator.is_match_glob_path("dir/.b"));
+    }
+
+    #[test]
     fn extglob_zero_width_forms_honor_leading_period_policy() {
         let optional = Pattern::compile("?(a|b).c", PatternOptions::default().extglob(true))
             .expect("optional extglob compiles");
@@ -3634,6 +5254,34 @@ mod tests {
         )
         .expect("period-enabled optional extglob compiles");
         assert!(hidden.is_match(".c"));
+    }
+
+    #[test]
+    fn extglob_literal_dot_alternatives_honor_leading_period_policy() {
+        let options = PatternOptions::default().extglob(true);
+        let matcher =
+            Pattern::compile("@(.gitignore|.npmignore)", options).expect("extglob compiles");
+        assert!(matcher.is_match(".gitignore"));
+        assert!(matcher.is_match(".npmignore"));
+        assert!(!matcher.is_match(".env"));
+
+        // The exemption is for explicit dots only: a wildcard alternative
+        // still cannot select a hidden path with the default options.
+        let wildcard = Pattern::compile("@(*|visible)", options).expect("extglob compiles");
+        assert!(!wildcard.is_match(".hidden"));
+
+        let mixed = Pattern::compile("@(.gitignore|*)", options).expect("extglob compiles");
+        assert!(mixed.is_match(".gitignore"));
+        assert!(!mixed.is_match(".hidden"));
+
+        // A negated group is itself wildcard-like: naming one hidden path as
+        // the exception must not opt every other hidden path into matching.
+        let negated = Pattern::compile("!(.gitignore)", options).expect("extglob compiles");
+        assert!(!negated.is_match(".hidden"));
+        let hidden = Pattern::compile("!(.gitignore)", options.match_hidden(true))
+            .expect("period-enabled extglob compiles");
+        assert!(hidden.is_match(".hidden"));
+        assert!(!hidden.is_match(".gitignore"));
     }
 
     #[test]
@@ -4308,6 +5956,31 @@ mod tests {
         assert_eq!(error.offset(), 0);
         assert_eq!(error.message(), "unclosed character class");
         assert!(compile("foo\\").is_match("foo\\"));
+    }
+
+    #[test]
+    fn deeply_nested_unclosed_posix_openers_are_rejected() {
+        let mut pattern = String::from("[");
+        pattern.push_str("[:".repeat(32_768).as_str());
+        let error = Pattern::compile(&pattern, PatternOptions::default()).unwrap_err();
+        assert_eq!(error.offset(), 0);
+        assert_eq!(error.message(), "unclosed character class");
+    }
+
+    #[test]
+    fn deeply_nested_posix_openers_with_a_final_bracket_compile_linearly() {
+        let mut pattern = String::from("[");
+        pattern.push_str("[:".repeat(32_768).as_str());
+        pattern.push(']');
+        assert!(Pattern::compile(&pattern, PatternOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn invalid_posix_opener_does_not_hide_a_later_valid_class() {
+        let pattern = Pattern::compile("[[:[:alpha:]]", PatternOptions::default())
+            .expect("character class compiles");
+        assert!(pattern.is_match("x"));
+        assert!(!pattern.is_match("1"));
     }
 
     #[test]

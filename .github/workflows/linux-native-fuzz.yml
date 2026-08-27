@@ -27,9 +27,16 @@ jobs:
         with:
           toolchain: nightly-2026-08-04
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
         with:
           tool: cargo-fuzz
+      - name: Restore linux_dirent_parser corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/linux_dirent_parser
+          key: native-fuzz-${{ runner.os }}-linux_dirent_parser-${{ github.run_id }}
+          restore-keys: |
+            native-fuzz-${{ runner.os }}-linux_dirent_parser-
       # cargo-fuzz defaults to the target it was itself built for, and the
       # prebuilt binary is musl, where the sanitizer cannot link against a
       # static libc. Name the host target the sanitizer job already uses.
@@ -49,12 +56,8 @@ jobs:
       - name: Run AddressSanitizer tests
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zsanitizer=address
-        # Loom's generator runtime intentionally retains model state until
-        # process exit, which LeakSanitizer reports outside the native code.
         run: >-
-          cargo test --target x86_64-unknown-linux-gnu -p ferralk --features native-linux --lib --
-          --skip scheduler::loom_models::last_completion_notifies_exactly_once
-          --skip scheduler::loom_models::queued_child_keeps_waiting_workers_alive_until_it_is_observed
+          cargo test --target x86_64-unknown-linux-gnu -p ferralk --features native-linux --lib
 
   miri-parser:
     name: Linux Miri parser
