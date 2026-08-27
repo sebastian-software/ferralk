@@ -27,6 +27,7 @@ pub struct Pattern {
     alternatives: Vec<CompiledAlternative>,
     path_filter_alternatives: Option<Vec<CompiledAlternative>>,
     walker_path_viability: WalkerPathViability,
+    walker_path_problem_offset: Option<usize>,
     options: PatternOptions,
 }
 
@@ -200,8 +201,10 @@ impl Pattern {
         options: PatternOptions,
     ) -> Result<Self, PatternError> {
         let pattern = pattern.as_ref();
-        let mut compiled = Self::compile_within(pattern, options, &mut IrBudget::new())?;
-        compiled.walker_path_viability = walker_path_viability(&compiled.alternatives);
+        let mut compiled = Self::compile_within(pattern, options, &mut IrBudget::new(), Some(0))?;
+        let (viability, offset) = walker_path_analysis(&compiled.alternatives);
+        compiled.walker_path_viability = viability;
+        compiled.walker_path_problem_offset = offset;
         Ok(compiled)
     }
 
@@ -217,6 +220,17 @@ impl Pattern {
         self.walker_path_viability
     }
 
+    /// Byte offset of the determinate component behind walker viability.
+    ///
+    /// Brace expansion can make source locations ambiguous, in which case the
+    /// compiler returns `None` and an embedding may use its conventional
+    /// fallback location.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn walker_path_problem_offset(&self) -> Option<usize> {
+        self.walker_path_problem_offset
+    }
+
     /// The compile every alternative shares, carrying the budget that bounds
     /// their total.
     ///
@@ -228,6 +242,7 @@ impl Pattern {
         pattern: &[u8],
         options: PatternOptions,
         budget: &mut IrBudget,
+        walker_offset_base: Option<usize>,
     ) -> Result<Self, PatternError> {
         if options.braces {
             let parse_options = PatternOptions {
@@ -235,8 +250,18 @@ impl Pattern {
                 ..options
             };
             let mut alternatives = Vec::new();
-            for alternative in expand_brace_alternatives(pattern, options.escape)? {
-                let compiled = Self::compile_within(&alternative, parse_options, budget)?;
+            let expanded = expand_brace_alternatives(pattern, options.escape)?;
+            let preserves_source = expanded.len() == 1 && expanded[0] == pattern;
+            for alternative in expanded {
+                // Brace expansion produces a new byte sequence, so its
+                // branches no longer have one unambiguous source offset. A
+                // pattern without an active brace retains its original bytes.
+                let compiled = Self::compile_within(
+                    &alternative,
+                    parse_options,
+                    budget,
+                    preserves_source.then_some(walker_offset_base).flatten(),
+                )?;
                 alternatives.extend(compiled.alternatives);
             }
             return Self::from_alternatives(alternatives, options, budget);
@@ -261,7 +286,7 @@ impl Pattern {
                 b'/' => {
                     flush_literals(&mut tokens, &mut literals);
                     tokens.push(Token::Separator);
-                    walker_path.separator();
+                    walker_path.separator(index, walker_offset_base);
                     index += 1;
                 }
                 b'*' if options.recursive_double_star && pattern.get(index + 1) == Some(&b'*') => {
@@ -269,7 +294,7 @@ impl Pattern {
                     if pattern.get(index + 2) == Some(&b'/') {
                         tokens.push(Token::RecursivePrefix);
                         walker_path.wildcard();
-                        walker_path.separator();
+                        walker_path.separator(index + 2, walker_offset_base);
                         index += 3;
                     } else {
                         tokens.push(Token::RecursiveStar);
@@ -314,7 +339,7 @@ impl Pattern {
                 }
                 byte => {
                     literals.push(byte);
-                    walker_path.literal(byte);
+                    walker_path.literal(byte, index, walker_offset_base);
                     index += 1;
                 }
             }
@@ -322,11 +347,10 @@ impl Pattern {
         flush_literals(&mut tokens, &mut literals);
         budget.charge(tokens.len() - charged, 0)?;
 
-        let extglob = compile_extglob(pattern, options, budget)?;
+        let extglob = compile_extglob(pattern, options, budget, walker_offset_base)?;
         let fast_path = FastPath::compile(&tokens, options);
         let sweep = compile_sweep(&tokens, &fast_path, extglob.as_ref(), options, budget)?;
-        let walker_path_problem = walker_path.finish();
-        let walker_path_has_separator = walker_path.has_separator();
+        let walker_path_shape = walker_path.finish();
         Self::from_alternatives(
             vec![CompiledAlternative {
                 extglob,
@@ -335,8 +359,7 @@ impl Pattern {
                 prefilter: Prefilter::compile(&tokens),
                 sweep,
                 tokens,
-                walker_path_problem,
-                walker_path_has_separator,
+                walker_path_shape,
             }],
             options,
             budget,
@@ -645,6 +668,7 @@ impl Pattern {
             alternatives,
             path_filter_alternatives,
             walker_path_viability: WalkerPathViability::Viable,
+            walker_path_problem_offset: None,
             options,
         })
     }
@@ -679,7 +703,7 @@ impl Pattern {
             },
         );
         budget.charge(tokens.len(), 0)?;
-        let extglob = compile_extglob(&raw, options, budget)?;
+        let extglob = compile_extglob(&raw, options, budget, None)?;
         let sweep = compile_sweep(&tokens, &fast_path, extglob.as_ref(), options, budget)?;
         Ok(CompiledAlternative {
             extglob,
@@ -688,8 +712,7 @@ impl Pattern {
             prefilter: Prefilter::compile(&tokens),
             sweep,
             tokens,
-            walker_path_problem: alternative.walker_path_problem,
-            walker_path_has_separator: alternative.walker_path_has_separator,
+            walker_path_shape: alternative.walker_path_shape.clone(),
         })
     }
 
@@ -1387,12 +1410,9 @@ struct CompiledAlternative {
     prefilter: Prefilter,
     /// Walker-only path shape recorded while this alternative's tokens were
     /// compiled. It retains distinctions (such as escaped dots) that matcher
-    /// tokens intentionally erase.
-    walker_path_problem: Option<WalkerPathViability>,
-    /// Whether the compiler saw an unescaped separator while recording the
-    /// shape. Extglob alternatives without one remain matcher text (for
-    /// example `@(..)`) rather than a root-relative path spelling.
-    walker_path_has_separator: bool,
+    /// tokens intentionally erase, and can be appended to an extglob's outer
+    /// component without reparsing source syntax.
+    walker_path_shape: WalkerPathShape,
     /// The bit-parallel engine for the general path, present when
     /// [`compile_sweep`] found the tokens suitable. It answers exactly like
     /// the memoized matcher and replaces it in the dispatch, never a fast
@@ -2173,8 +2193,8 @@ fn parse_class(
 }
 
 /// One component's only path-relevant literal shapes.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum WalkerComponent {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum WalkerComponentKind {
     #[default]
     Empty,
     Dot,
@@ -2182,14 +2202,48 @@ enum WalkerComponent {
     Other,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WalkerComponent {
+    kind: WalkerComponentKind,
+    /// The first literal dot in this component, when it still has a
+    /// determinate location in the caller's unexpanded source bytes.
+    offset: Option<usize>,
+}
+
 impl WalkerComponent {
-    fn push_byte(&mut self, byte: u8) {
-        *self = match (*self, byte) {
-            (Self::Empty, b'.') => Self::Dot,
-            (Self::Dot, b'.') => Self::Parent,
-            (Self::Empty | Self::Dot | Self::Parent, _) => Self::Other,
-            (Self::Other, _) => Self::Other,
-        };
+    fn push_literal(&mut self, byte: u8, offset: Option<usize>) {
+        match (self.kind, byte) {
+            (WalkerComponentKind::Empty, b'.') => {
+                self.kind = WalkerComponentKind::Dot;
+                self.offset = offset;
+            }
+            (WalkerComponentKind::Dot, b'.') => self.kind = WalkerComponentKind::Parent,
+            (
+                WalkerComponentKind::Empty | WalkerComponentKind::Dot | WalkerComponentKind::Parent,
+                _,
+            ) => {
+                self.kind = WalkerComponentKind::Other;
+                self.offset = None;
+            }
+            (WalkerComponentKind::Other, _) => {}
+        }
+    }
+
+    fn wildcard(&mut self) {
+        self.kind = WalkerComponentKind::Other;
+        self.offset = None;
+    }
+
+    fn append(&mut self, other: Self) {
+        match other.kind {
+            WalkerComponentKind::Empty => {}
+            WalkerComponentKind::Dot => self.push_literal(b'.', other.offset),
+            WalkerComponentKind::Parent => {
+                self.push_literal(b'.', other.offset);
+                self.push_literal(b'.', None);
+            }
+            WalkerComponentKind::Other => self.wildcard(),
+        }
     }
 }
 
@@ -2198,44 +2252,70 @@ impl WalkerComponent {
 /// This is deliberately not a second parser: each method is called from the
 /// same match arm that creates a token. It keeps only whether a component is a
 /// real literal dot shape, a wildcard-bearing shape, or a separator.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct WalkerPathState {
     components: Vec<WalkerComponent>,
     current: WalkerComponent,
-    has_separator: bool,
 }
 
 impl WalkerPathState {
-    fn literal(&mut self, byte: u8) {
-        self.current.push_byte(byte);
+    fn literal(&mut self, byte: u8, index: usize, offset_base: Option<usize>) {
+        self.current
+            .push_literal(byte, offset_base.map(|base| base + index));
     }
 
     fn escaped(&mut self) {
         // An escape is matcher text, including for `\.` and `\/`. It may
         // match a punctuation byte but does not request filesystem path
         // normalization.
-        self.current = WalkerComponent::Other;
+        self.current.wildcard();
     }
 
     fn wildcard(&mut self) {
-        self.current = WalkerComponent::Other;
+        self.current.wildcard();
     }
 
-    fn separator(&mut self) {
+    fn separator(&mut self, _index: usize, _offset_base: Option<usize>) {
         self.components.push(self.current);
-        self.current = WalkerComponent::Empty;
-        self.has_separator = true;
+        self.current = WalkerComponent::default();
     }
 
-    fn finish(&self) -> Option<WalkerPathViability> {
-        let mut components = self.components.clone();
-        components.push(self.current);
-        walker_component_problem(&components)
+    fn append_shape(&mut self, shape: &WalkerPathShape) {
+        for (index, component) in shape.components.iter().copied().enumerate() {
+            self.current.append(component);
+            if index + 1 != shape.components.len() {
+                self.separator(0, None);
+            }
+        }
     }
 
-    const fn has_separator(&self) -> bool {
-        self.has_separator
+    fn finish(mut self) -> WalkerPathShape {
+        self.components.push(self.current);
+        WalkerPathShape {
+            components: self.components,
+        }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WalkerPathShape {
+    components: Vec<WalkerComponent>,
+}
+
+impl WalkerPathShape {
+    fn has_separator(&self) -> bool {
+        self.components.len() > 1
+    }
+
+    fn problem(&self) -> Option<WalkerPathProblem> {
+        walker_component_problem(&self.components)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WalkerPathProblem {
+    viability: WalkerPathViability,
+    offset: Option<usize>,
 }
 
 /// The semantic summary of the alternatives the compiler actually built.
@@ -2243,131 +2323,193 @@ impl WalkerPathState {
 /// Brace expansion happens before this sees an alternative, while extglob
 /// alternatives arrive through their compiled branch objects. The walker
 /// policy therefore never needs a second source grammar.
-fn walker_path_viability(alternatives: &[CompiledAlternative]) -> WalkerPathViability {
+fn walker_path_analysis(
+    alternatives: &[CompiledAlternative],
+) -> (WalkerPathViability, Option<usize>) {
     let mut first_problem = None;
     for alternative in alternatives {
         match alternative.walker_path_problem() {
-            None => return WalkerPathViability::Viable,
+            None => return (WalkerPathViability::Viable, None),
             Some(problem) => first_problem.get_or_insert(problem),
         };
     }
-    first_problem.unwrap_or(WalkerPathViability::Viable)
+    match first_problem {
+        Some(problem) => (problem.viability, problem.offset),
+        None => (WalkerPathViability::Viable, None),
+    }
 }
 
 impl CompiledAlternative {
-    fn walker_path_problem(&self) -> Option<WalkerPathViability> {
+    fn walker_path_problem(&self) -> Option<WalkerPathProblem> {
         match &self.extglob {
             Some(program) => program.walker_path_problem(),
-            None => self.walker_path_problem,
+            None => self.walker_path_shape.problem(),
         }
     }
 }
 
 impl CompiledExtglob {
-    fn walker_path_problem(&self) -> Option<WalkerPathViability> {
-        let outer_problem = walker_path_problem_from_steps(self);
-        if outer_problem.is_some() {
-            return outer_problem;
+    fn walker_path_problem(&self) -> Option<WalkerPathProblem> {
+        let mut states = vec![WalkerPathState::default()];
+        let mut index = 0;
+        while let Some(step) = self.steps.get(index) {
+            match step {
+                ExtglobStep::Byte(b'/') => {
+                    for state in &mut states {
+                        state.separator(index, self.walker_offset_base);
+                    }
+                    index += 1;
+                }
+                ExtglobStep::Byte(byte) => {
+                    for state in &mut states {
+                        state.literal(*byte, index, self.walker_offset_base);
+                    }
+                    index += 1;
+                }
+                ExtglobStep::Escape { .. } => {
+                    for state in &mut states {
+                        state.escaped();
+                    }
+                    index += 2;
+                }
+                ExtglobStep::Group(group) => {
+                    states = self.groups[*group].apply_to(states);
+                    index = self.groups[*group].rest;
+                }
+                ExtglobStep::Star { next } | ExtglobStep::Class { next, .. } => {
+                    for state in &mut states {
+                        state.wildcard();
+                    }
+                    index = *next;
+                }
+                ExtglobStep::Any | ExtglobStep::UnclosedGroup { .. } => {
+                    for state in &mut states {
+                        state.wildcard();
+                    }
+                    index += 1;
+                }
+                // A group interior is skipped by its group's `rest` jump.
+                // Outside a group, a no-match step still occupies matcher
+                // text, so keep the compiled program's following top-level
+                // components visible to the walker analysis.
+                ExtglobStep::NoMatch => {
+                    for state in &mut states {
+                        state.wildcard();
+                    }
+                    index += 1;
+                }
+            }
         }
-        self.groups
-            .iter()
-            .find_map(ExtglobGroup::walker_path_problem)
+        let mut first_problem = None;
+        for state in states {
+            match state.finish().problem() {
+                None => return None,
+                Some(problem) => first_problem.get_or_insert(problem),
+            };
+        }
+        first_problem
     }
 }
 
 impl ExtglobGroup {
-    fn walker_path_problem(&self) -> Option<WalkerPathViability> {
+    fn apply_to(&self, states: Vec<WalkerPathState>) -> Vec<WalkerPathState> {
         match self.kind {
-            // These kinds can avoid a bad arm: `?` and `*` may be empty, and
-            // negation has a candidate outside every listed arm.
-            ExtglobKind::Optional | ExtglobKind::ZeroOrMore | ExtglobKind::Negated => None,
-            ExtglobKind::ExactlyOne | ExtglobKind::OneOrMore => {
-                let mut first_problem = None;
-                for alternative in &self.alternatives {
-                    let Some(compiled) = &alternative.compiled else {
-                        continue;
-                    };
-                    // A group without an unescaped separator is matcher text
-                    // at its containing component (`@(..)`, `[.]`-style), not
-                    // a path operation the walker normalizes.
-                    if compiled.iter().any(|arm| !arm.walker_path_has_separator) {
-                        return None;
-                    }
-                    match walker_path_viability(compiled) {
-                        WalkerPathViability::Viable => return None,
-                        problem => first_problem.get_or_insert(problem),
-                    };
+            ExtglobKind::Negated | ExtglobKind::ZeroOrMore | ExtglobKind::OneOrMore => {
+                let mut states = states;
+                for state in &mut states {
+                    // Repetition and negation can generate a non-literal
+                    // component. A later outer `/.` or `/..` is still
+                    // processed after this placeholder.
+                    state.wildcard();
                 }
-                Some(first_problem.unwrap_or(WalkerPathViability::DotComponent))
+                states
+            }
+            ExtglobKind::Optional => {
+                let mut output = states.clone();
+                output.extend(self.exact_states(states));
+                output
+            }
+            ExtglobKind::ExactlyOne => self.exact_states(states),
+        }
+    }
+
+    fn exact_states(&self, states: Vec<WalkerPathState>) -> Vec<WalkerPathState> {
+        let mut output = Vec::new();
+        for alternative in &self.alternatives {
+            let Some(compiled) = &alternative.compiled else {
+                continue;
+            };
+            for arm in compiled {
+                for state in &states {
+                    let mut state = state.clone();
+                    if arm.walker_path_shape.has_separator() {
+                        state.append_shape(&arm.walker_path_shape);
+                    } else {
+                        // A group that remains inside its containing component
+                        // is matcher text (`@(..)`), not a path operation.
+                        state.wildcard();
+                    }
+                    output.push(state);
+                }
             }
         }
+        if output.is_empty() {
+            // An uncompileable arm has no viable matcher branch, but its
+            // surrounding program still carries top-level path components
+            // that must not be hidden by an empty state set.
+            output = states;
+            for state in &mut output {
+                state.wildcard();
+            }
+        }
+        output
     }
 }
 
-fn walker_path_problem_from_steps(program: &CompiledExtglob) -> Option<WalkerPathViability> {
-    let mut path = WalkerPathState::default();
-    let mut index = 0;
-    while let Some(step) = program.steps.get(index) {
-        match step {
-            ExtglobStep::Byte(b'/') => {
-                path.separator();
-                index += 1;
-            }
-            ExtglobStep::Byte(byte) => {
-                path.literal(*byte);
-                index += 1;
-            }
-            ExtglobStep::Escape { .. } => {
-                path.escaped();
-                index += 2;
-            }
-            ExtglobStep::Group(group) => {
-                path.wildcard();
-                index = program.groups[*group].rest;
-            }
-            ExtglobStep::Star { next } | ExtglobStep::Class { next, .. } => {
-                path.wildcard();
-                index = *next;
-            }
-            ExtglobStep::Any | ExtglobStep::UnclosedGroup { .. } => {
-                path.wildcard();
-                index += 1;
-            }
-            // An unreachable group interior or an invalid class cannot lead
-            // to a later compiled path. The interpreter stops here too.
-            ExtglobStep::NoMatch => break,
-        }
-    }
-    path.finish()
-}
-
-fn walker_component_problem(components: &[WalkerComponent]) -> Option<WalkerPathViability> {
+fn walker_component_problem(components: &[WalkerComponent]) -> Option<WalkerPathProblem> {
     // The conventional leading `./` spelling is removed by traversal filters
     // before they match candidates. A second dot component remains a real
     // non-normalized operation.
-    let components = if components.len() > 1 && components[0] == WalkerComponent::Dot {
+    let components = if components.len() > 1 && components[0].kind == WalkerComponentKind::Dot {
         &components[1..]
     } else {
         components
     };
-    if components
-        .iter()
-        .all(|component| matches!(component, WalkerComponent::Empty | WalkerComponent::Dot))
-    {
-        return Some(WalkerPathViability::Root);
+    if components.iter().all(|component| {
+        matches!(
+            component.kind,
+            WalkerComponentKind::Empty | WalkerComponentKind::Dot
+        )
+    }) {
+        return Some(WalkerPathProblem {
+            viability: WalkerPathViability::Root,
+            offset: components.iter().find_map(|component| component.offset),
+        });
     }
-    if components.contains(&WalkerComponent::Parent) {
-        return Some(WalkerPathViability::ParentComponent);
+    if let Some(component) = components
+        .iter()
+        .find(|component| component.kind == WalkerComponentKind::Parent)
+    {
+        return Some(WalkerPathProblem {
+            viability: WalkerPathViability::ParentComponent,
+            offset: component.offset,
+        });
     }
     let last = components
         .iter()
-        .rposition(|component| *component != WalkerComponent::Empty);
-    if last.is_some_and(|index| components[index] == WalkerComponent::Dot) {
-        return Some(WalkerPathViability::TrailingDot);
+        .rposition(|component| component.kind != WalkerComponentKind::Empty);
+    if last.is_some_and(|index| components[index].kind == WalkerComponentKind::Dot) {
+        return Some(WalkerPathProblem {
+            viability: WalkerPathViability::TrailingDot,
+            offset: components[last.expect("checked above")].offset,
+        });
     }
-    components
-        .contains(&WalkerComponent::Dot)
-        .then_some(WalkerPathViability::DotComponent)
+    components.iter().find_map(|component| {
+        (component.kind == WalkerComponentKind::Dot).then_some(WalkerPathProblem {
+            viability: WalkerPathViability::DotComponent,
+            offset: component.offset,
+        })
+    })
 }
 
 fn parse_posix_class(name: &[u8]) -> Option<PosixClass> {
@@ -2718,6 +2860,7 @@ enum ExtglobKind {
 struct CompiledExtglob {
     steps: Vec<ExtglobStep>,
     groups: Vec<ExtglobGroup>,
+    walker_offset_base: Option<usize>,
 }
 
 /// What the walk does at one byte offset.
@@ -2774,6 +2917,7 @@ fn compile_extglob(
     pattern: &[u8],
     options: PatternOptions,
     budget: &mut IrBudget,
+    walker_offset_base: Option<usize>,
 ) -> Result<Option<CompiledExtglob>, PatternError> {
     if !options.extglob || !contains_extglob(pattern, options.escape) {
         return Ok(None);
@@ -2790,7 +2934,14 @@ fn compile_extglob(
             continue;
         }
         compiled[index] = true;
-        let step = compile_extglob_step(pattern, index, options, &mut groups, budget)?;
+        let step = compile_extglob_step(
+            pattern,
+            index,
+            options,
+            &mut groups,
+            budget,
+            walker_offset_base,
+        )?;
         match &step {
             ExtglobStep::Group(group) => pending.push(groups[*group].rest),
             ExtglobStep::Star { next } | ExtglobStep::Class { next, .. } => pending.push(*next),
@@ -2803,11 +2954,18 @@ fn compile_extglob(
             ExtglobStep::Any | ExtglobStep::Byte(_) | ExtglobStep::UnclosedGroup { .. } => {
                 pending.push(index + 1);
             }
-            ExtglobStep::NoMatch => {}
+            // The matcher still stops at this state, but compiling the suffix
+            // records the same outer path structure for embeddings that need
+            // to classify every generated branch.
+            ExtglobStep::NoMatch => pending.push(index + 1),
         }
         steps[index] = step;
     }
-    Ok(Some(CompiledExtglob { steps, groups }))
+    Ok(Some(CompiledExtglob {
+        steps,
+        groups,
+        walker_offset_base,
+    }))
 }
 
 /// Classifies one byte offset the way the interpreter classified it.
@@ -2817,6 +2975,7 @@ fn compile_extglob_step(
     options: PatternOptions,
     groups: &mut Vec<ExtglobGroup>,
     budget: &mut IrBudget,
+    walker_offset_base: Option<usize>,
 ) -> Result<ExtglobStep, PatternError> {
     if let Some(kind) = detect_extglob_at(pattern, index) {
         let open = index + 1;
@@ -2826,8 +2985,14 @@ fn compile_extglob_step(
             });
         };
         let mut alternatives = Vec::new();
-        for alternative in split_extglob_alternatives(&pattern[open + 1..close], options.escape) {
-            alternatives.push(compile_extglob_alternative(alternative, options, budget)?);
+        for range in split_extglob_alternatives(&pattern[open + 1..close], options.escape) {
+            let start = open + 1 + range.start;
+            alternatives.push(compile_extglob_alternative(
+                &pattern[start..open + 1 + range.end],
+                options,
+                budget,
+                walker_offset_base.map(|base| base + start),
+            )?);
         }
         groups.push(ExtglobGroup {
             kind,
@@ -2869,6 +3034,7 @@ fn compile_extglob_alternative(
     alternative: &[u8],
     options: PatternOptions,
     budget: &mut IrBudget,
+    walker_offset_base: Option<usize>,
 ) -> Result<ExtglobAlternative, PatternError> {
     let options = PatternOptions {
         braces: false,
@@ -2880,7 +3046,7 @@ fn compile_extglob_alternative(
     // A syntax error in one alternative is not a compile failure — it is an
     // alternative that matches nothing, as it always was. Running out of budget
     // is a different thing and has to reach the caller.
-    let compiled = match Pattern::compile_within(alternative, options, budget) {
+    let compiled = match Pattern::compile_within(alternative, options, budget, walker_offset_base) {
         Ok(pattern) => Some(pattern.alternatives),
         Err(error) if error.message() == TOO_MUCH_COMPILED_IR => return Err(error),
         Err(_) => None,
@@ -2966,7 +3132,7 @@ fn closing_extglob_parenthesis(pattern: &[u8], open: usize, escapes: bool) -> Op
     None
 }
 
-fn split_extglob_alternatives(content: &[u8], escapes: bool) -> Vec<&[u8]> {
+fn split_extglob_alternatives(content: &[u8], escapes: bool) -> Vec<std::ops::Range<usize>> {
     let mut alternatives = Vec::new();
     let mut start = 0;
     let mut depth = 0_usize;
@@ -2980,14 +3146,14 @@ fn split_extglob_alternatives(content: &[u8], escapes: bool) -> Vec<&[u8]> {
             b'(' => depth += 1,
             b')' if depth > 0 => depth -= 1,
             b'|' if depth == 0 => {
-                alternatives.push(&content[start..index]);
+                alternatives.push(start..index);
                 start = index + 1;
             }
             _ => {}
         }
         index += 1;
     }
-    alternatives.push(&content[start..]);
+    alternatives.push(start..content.len());
     alternatives
 }
 

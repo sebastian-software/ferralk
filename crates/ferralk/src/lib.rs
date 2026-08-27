@@ -1154,13 +1154,19 @@ fn walker_pattern_for_root(
         absolute::Rewrite::Relative => {
             absolute::reject_path_shaped(pattern, syntax)?;
             let parsed = Pattern::compile(pattern, options)?;
-            reject_unwalkable_relative_pattern(parsed.walker_path_viability())?;
+            reject_unwalkable_relative_pattern(
+                parsed.walker_path_viability(),
+                parsed.walker_path_problem_offset(),
+            )?;
             Ok(Some(pattern.to_vec()))
         }
         absolute::Rewrite::Rooted(rooted) => {
             absolute::reject_path_shaped(&rooted, syntax)?;
             let parsed = Pattern::compile(&rooted, options)?;
-            reject_unwalkable_relative_pattern(parsed.walker_path_viability())?;
+            reject_unwalkable_relative_pattern(
+                parsed.walker_path_viability(),
+                parsed.walker_path_problem_offset(),
+            )?;
             Ok(Some(rooted))
         }
         absolute::Rewrite::Outside => Ok(None),
@@ -1175,7 +1181,10 @@ fn walker_pattern_for_root(
 /// a spelling no root-relative candidate uses. The glob compiler summarizes
 /// its actual expanded alternatives and extglob branches, so this policy never
 /// reparses matcher syntax.
-fn reject_unwalkable_relative_pattern(viability: WalkerPathViability) -> Result<(), PatternError> {
+fn reject_unwalkable_relative_pattern(
+    viability: WalkerPathViability,
+    offset: Option<usize>,
+) -> Result<(), PatternError> {
     let message = match viability {
         WalkerPathViability::Viable => return Ok(()),
         WalkerPathViability::ParentComponent => {
@@ -1191,10 +1200,10 @@ fn reject_unwalkable_relative_pattern(viability: WalkerPathViability) -> Result<
             "a walker-relative pattern with a `.` component is not normalized; remove `/.` to name the entry below that directory"
         }
     };
-    // Branch expansion can create several equally valid source locations, so
-    // the compiler deliberately exposes a semantic summary rather than a raw
-    // range that would misleadingly point into one spelling.
-    Err(PatternError::new(0, message))
+    // Brace expansion can create several equally valid source locations. The
+    // compiler carries an offset whenever it is determinate and uses this
+    // established fallback only for genuinely ambiguous expanded branches.
+    Err(PatternError::new(offset.unwrap_or(0), message))
 }
 
 /// The pattern dialect every walker pattern is compiled in. Only
@@ -2781,6 +2790,8 @@ mod tests {
         fixture.write("src/main.rs");
         fixture.write("src/a.rs");
         fixture.write("src/].rs");
+        fixture.write("prefix../bar");
+        fixture.write("foo/..suffix/bar");
 
         for mode in [
             WildcardMode::ComponentScoped,
@@ -2829,6 +2840,8 @@ mod tests {
             "@(dead/../branch|src/main.rs)",
             "src/[{],a}/../].rs",
             "@(dead/{),x}/../branch|src/main.rs)",
+            "prefix@(../bar)",
+            "@(foo/..)suffix/bar",
         ] {
             for mode in [
                 WildcardMode::ComponentScoped,
@@ -2873,6 +2886,8 @@ mod tests {
                 &["src/main.rs"][..],
                 &[][..],
             ),
+            ("prefix@(../bar)", &["prefix../bar"][..], &[][..]),
+            ("@(foo/..)suffix/bar", &["foo/..suffix/bar"][..], &[][..]),
         ] {
             let matcher = Pattern::compile(pattern, traversal_pattern_options(false))
                 .expect("the reviewer regression is valid matcher syntax");
@@ -2942,6 +2957,7 @@ mod tests {
             "{dead/../branch}",
             "@(dead/../branch)",
             "@(dead|src)/../main.rs",
+            "src/@(./a.rs)",
         ] {
             assert!(
                 Walker::new(&fixture.root).include(pattern).is_err(),
@@ -2958,6 +2974,7 @@ mod tests {
                 "{dead/../branch}",
                 "@(dead/../branch)",
                 "@(dead|src)/../main.rs",
+                "src/@(./a.rs)",
             ] {
                 assert!(
                     Walker::new(&fixture.root)
@@ -2974,6 +2991,45 @@ mod tests {
                     "exclude rejects parser-top-level `..` under {mode:?}: {pattern}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn relative_pattern_errors_keep_determinate_component_offsets() {
+        for (pattern, offset) in [
+            ("src/../main.rs", 4),
+            ("src/./main.rs", 4),
+            ("src/.", 4),
+            ("é/../main.rs", 3),
+            ("src/@(./a.rs)", 6),
+        ] {
+            for mode in [
+                WildcardMode::ComponentScoped,
+                WildcardMode::SeparatorCrossing,
+            ] {
+                for error in [
+                    Walker::new(".")
+                        .wildcard_mode(mode)
+                        .include(pattern)
+                        .expect_err("unwalkable include is refused"),
+                    Walker::new(".")
+                        .wildcard_mode(mode)
+                        .exclude(pattern)
+                        .expect_err("unwalkable exclude is refused"),
+                ] {
+                    assert_eq!(
+                        error.offset(),
+                        offset,
+                        "{pattern} keeps its component offset under {mode:?}"
+                    );
+                }
+            }
+        }
+
+        for pattern in [r"src/\./main.rs", r"src/\../main.rs", "src/@(..)suffix"] {
+            Walker::new(".")
+                .include(pattern)
+                .unwrap_or_else(|error| panic!("{pattern} remains matcher text: {error}"));
         }
     }
 
