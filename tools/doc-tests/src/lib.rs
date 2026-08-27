@@ -37,6 +37,213 @@ const DOCUMENTS: &[&str] = &[
     "fuzz/README.md",
 ];
 
+#[cfg(test)]
+const EXPECTED_COMPILED_RUST_FENCES: usize = 14;
+
+#[cfg(test)]
+struct FencePolicy {
+    path: &'static str,
+    compiled_rust_fences: usize,
+    ignored_rust_fences: usize,
+    intentional_text_fragments: &'static [&'static str],
+}
+
+#[cfg(test)]
+const FENCE_POLICIES: &[FencePolicy] = &[
+    FencePolicy {
+        path: "CHANGELOG.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "CONTRIBUTING.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "README.md",
+        compiled_rust_fences: 2,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "RFC-zig-free-zlob-port.md",
+        compiled_rust_fences: 3,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/README.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/benchmark-evidence.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/usage.md",
+        compiled_rust_fences: 4,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/compatibility-guide.md",
+        compiled_rust_fences: 5,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/compatibility-matrix.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/corpus-format.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/external-release-gates.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/fast-glob-reference.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/palamedes-adoption.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &["Walker::new(first)"],
+    },
+    FencePolicy {
+        path: "docs/zlob-1.6.3-reference.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/zlob-fnmatch-test-coverage.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/zlob-test-suite-audit.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/README.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0001-independent-port-under-the-ferralk-name.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0002-hybrid-port-strategy.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0003-two-published-crates-no-c-abi.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0004-msrv-stable-minus-two.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0005-byte-matching-wtf8-on-windows.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0006-git-normative-ignore-semantics.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0007-differential-corpus-and-dev-time-oracle.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0008-simd-via-memchr-primitives.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0009-own-work-stealing-scheduler.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0010-portable-1.0-native-backends-macos-then-linux.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0011-posix-conservative-walker-defaults.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0012-ferroni-repository-blueprint.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0013-no-glob-to-regex-translation.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0014-own-gitignore-rule-matching.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "fuzz/README.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+];
+
 #[doc = include_str!("../../../CHANGELOG.md")]
 pub mod changelog {}
 
@@ -137,11 +344,17 @@ pub mod fuzzing {}
 mod tests {
     use std::{collections::BTreeSet, fs, path::Path};
 
-    use super::DOCUMENTS;
+    use super::{DOCUMENTS, EXPECTED_COMPILED_RUST_FENCES, FENCE_POLICIES, FencePolicy};
+
+    #[derive(Debug)]
+    struct MarkdownFence {
+        info: String,
+        first_content_line: Option<String>,
+    }
 
     #[test]
     fn every_markdown_document_is_included() {
-        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let repository_root = repository_root();
         let mut discovered = BTreeSet::new();
         collect_markdown_files(&repository_root, &repository_root, &mut discovered);
 
@@ -153,6 +366,203 @@ mod tests {
             included, discovered,
             "add each new Markdown document to this doctest harness"
         );
+    }
+
+    #[test]
+    fn every_document_has_the_expected_doctest_fence_policy() {
+        let documented_paths = DOCUMENTS
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect::<BTreeSet<_>>();
+        let policy_paths = FENCE_POLICIES
+            .iter()
+            .map(|policy| policy.path.to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            policy_paths, documented_paths,
+            "each harness document needs an explicit Rust-fence policy"
+        );
+
+        let repository_root = repository_root();
+        let actual_compiled_fences = FENCE_POLICIES
+            .iter()
+            .map(|policy| {
+                let markdown = fs::read_to_string(repository_root.join(policy.path))
+                    .expect("inventory Markdown document is readable");
+                let fences = scan_fenced_code_blocks(&markdown);
+                assert_fence_policy(policy, &fences);
+                fences
+                    .iter()
+                    .filter(|fence| {
+                        is_rust_fence(&fence.info) && !is_ignored_rust_fence(&fence.info)
+                    })
+                    .count()
+            })
+            .sum::<usize>();
+
+        assert_eq!(
+            actual_compiled_fences, EXPECTED_COMPILED_RUST_FENCES,
+            "the doctest harness must retain the deliberately compiled Rust-fence total"
+        );
+    }
+
+    #[test]
+    fn fence_scanner_recognizes_rustdoc_attributes_and_real_closers() {
+        let fences = scan_fenced_code_blocks(
+            "```rust,no_run\nlet value = 1;\n```\n\
+             ```rust,should_panic\npanic!();\n```\n\
+             ```rust,compile_fail,edition2024\nnot rust\n```\n\
+             ```rust,ignore-x86_64\nlet skipped = true;\n```\n\
+             ```rust\n// ```text is content, not a nested fence\n```\n\
+             ```text\nWalker::new(first)\n```\n",
+        );
+
+        assert_eq!(
+            fences
+                .iter()
+                .filter(|fence| is_rust_fence(&fence.info) && !is_ignored_rust_fence(&fence.info))
+                .count(),
+            4
+        );
+        assert_eq!(
+            fences
+                .iter()
+                .filter(|fence| is_rust_fence(&fence.info) && is_ignored_rust_fence(&fence.info))
+                .count(),
+            1
+        );
+        assert_eq!(
+            fences[4].first_content_line.as_deref(),
+            Some("// ```text is content, not a nested fence")
+        );
+    }
+
+    fn repository_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    fn assert_fence_policy(policy: &FencePolicy, fences: &[MarkdownFence]) {
+        let compiled_rust_fences = fences
+            .iter()
+            .filter(|fence| is_rust_fence(&fence.info) && !is_ignored_rust_fence(&fence.info))
+            .count();
+        let ignored_rust_fences = fences
+            .iter()
+            .filter(|fence| is_rust_fence(&fence.info) && is_ignored_rust_fence(&fence.info))
+            .count();
+        let text_fences = fences
+            .iter()
+            .filter(|fence| fence_language(&fence.info) == Some("text"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            compiled_rust_fences, policy.compiled_rust_fences,
+            "Rust-fence policy changed for {}: update this inventory only when the changed fence is intentionally compiled by rustdoc",
+            policy.path
+        );
+        assert_eq!(
+            ignored_rust_fences, policy.ignored_rust_fences,
+            "ignored Rust-fence policy changed for {}: `rust,ignore` needs an explicit, narrow justification in this inventory",
+            policy.path
+        );
+        assert_eq!(
+            text_fences.len(),
+            policy.intentional_text_fragments.len(),
+            "text-fence policy changed for {}: intentionally non-Rust fragments must be explicitly inventoried",
+            policy.path
+        );
+
+        for expected_first_line in policy.intentional_text_fragments {
+            let matching_fragments = text_fences
+                .iter()
+                .filter(|fence| fence.first_content_line.as_deref() == Some(*expected_first_line))
+                .count();
+            assert_eq!(
+                matching_fragments, 1,
+                "intentional text fragment changed for {}: expected first content line `{expected_first_line}`",
+                policy.path
+            );
+        }
+    }
+
+    fn scan_fenced_code_blocks(markdown: &str) -> Vec<MarkdownFence> {
+        let mut fences: Vec<MarkdownFence> = Vec::new();
+        let mut open_fence = None;
+
+        for line in markdown.lines() {
+            if let Some((marker, marker_len)) = open_fence {
+                if is_closing_fence(line, marker, marker_len) {
+                    open_fence = None;
+                } else if let Some(fence) = fences.last_mut()
+                    && fence.first_content_line.is_none()
+                    && !line.trim().is_empty()
+                {
+                    fence.first_content_line = Some(line.trim().to_owned());
+                }
+                continue;
+            }
+
+            if let Some((marker, marker_len, info)) = opening_fence(line) {
+                fences.push(MarkdownFence {
+                    info: info.to_owned(),
+                    first_content_line: None,
+                });
+                open_fence = Some((marker, marker_len));
+            }
+        }
+
+        fences
+    }
+
+    fn opening_fence(line: &str) -> Option<(u8, usize, &str)> {
+        let (indent, rest) = leading_spaces(line);
+        if indent > 3 {
+            return None;
+        }
+
+        let marker = *rest.as_bytes().first()?;
+        if marker != b'`' && marker != b'~' {
+            return None;
+        }
+        let marker_len = rest.bytes().take_while(|byte| *byte == marker).count();
+        if marker_len < 3 {
+            return None;
+        }
+
+        let info = rest[marker_len..].trim();
+        if marker == b'`' && info.contains('`') {
+            return None;
+        }
+        Some((marker, marker_len, info))
+    }
+
+    fn is_closing_fence(line: &str, marker: u8, marker_len: usize) -> bool {
+        let (indent, rest) = leading_spaces(line);
+        if indent > 3 {
+            return false;
+        }
+        let closing_len = rest.bytes().take_while(|byte| *byte == marker).count();
+        closing_len >= marker_len && rest[closing_len..].trim().is_empty()
+    }
+
+    fn leading_spaces(line: &str) -> (usize, &str) {
+        let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+        (indent, &line[indent..])
+    }
+
+    fn is_rust_fence(info: &str) -> bool {
+        fence_language(info) == Some("rust")
+    }
+
+    fn is_ignored_rust_fence(info: &str) -> bool {
+        info.split(|character: char| character == ',' || character.is_ascii_whitespace())
+            .skip(1)
+            .any(|attribute| attribute == "ignore" || attribute.starts_with("ignore-"))
+    }
+
+    fn fence_language(info: &str) -> Option<&str> {
+        info.split(|character: char| character == ',' || character.is_ascii_whitespace())
+            .find(|part| !part.is_empty())
     }
 
     fn collect_markdown_files(root: &Path, directory: &Path, discovered: &mut BTreeSet<String>) {
