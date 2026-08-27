@@ -77,7 +77,7 @@ if result.was_cancelled() {
 
 ### Keep a configured walker when input patterns are invalid
 
-The chaining [`Walker::include`] and [`Walker::exclude`] methods intentionally
+The chaining `Walker::include` and `Walker::exclude` methods intentionally
 consume and return the builder, which keeps ordinary configuration concise. For
 a caller-supplied pattern list, use their borrowed `try_` counterparts instead.
 Each rejected pattern leaves the complete `Walker` unchanged, so valid entries
