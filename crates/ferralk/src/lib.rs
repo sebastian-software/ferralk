@@ -1917,23 +1917,21 @@ fn read_portable_directory(
                 continue;
             }
         };
-        let entry_path = reported_path.join(entry.file_name());
+        // `DirEntry` only exposes its name by value. Retain that one
+        // allocation for the listing and do not construct a full path unless
+        // the uncommon `file_type` failure needs it for error reporting.
+        let name = entry.file_name();
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(error) => {
-                defer_entry_stat_error(listing, entry_path, error)?;
+                defer_entry_stat_error(listing, reported_path.join(&name), error)?;
                 continue;
             }
         };
-        // `DirEntry` hands its name out by value and nothing else out at
-        // all, so this one allocation is the standard library's and is the
-        // floor for the portable backend. The native backends read names
-        // out of a buffer they own and reach zero.
-        listing.push(
-            &entry.file_name(),
-            file_type.is_dir(),
-            file_type.is_symlink(),
-        );
+        // The standard library's one `file_name` allocation is the portable
+        // backend's floor. The native backends read names out of a buffer they
+        // own and reach zero.
+        listing.push(&name, file_type.is_dir(), file_type.is_symlink());
     }
     Ok(())
 }
@@ -2517,6 +2515,8 @@ mod tests {
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    const HOSTILE_GIT_CONFIG_FIXTURE: &str = "FERRALK_HOSTILE_GIT_CONFIG_FIXTURE";
 
     #[test]
     fn walk_stream_keeps_its_unwind_auto_traits() {
@@ -3995,8 +3995,19 @@ mod tests {
         assert!(!streamed_paths.contains(&PathBuf::from("build")));
     }
 
+    /// Starts a Git oracle process that is independent of the developer's
+    /// global and system configuration, just like the corpus harness.
+    fn git_command() -> Command {
+        let mut command = Command::new("git");
+        command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        command
+    }
+
     fn git_check_ignore(root: &Path, candidate: &str) -> bool {
-        let status = Command::new("git")
+        let status = git_command()
             .args(["check-ignore", "--no-index", "--quiet", "--", candidate])
             .current_dir(root)
             .status()
@@ -4009,7 +4020,7 @@ mod tests {
     }
 
     fn git_config_bool(root: &Path, key: &str) -> bool {
-        let output = Command::new("git")
+        let output = git_command()
             .args(["config", "--type=bool", "--get", key])
             .current_dir(root)
             .output()
@@ -4030,7 +4041,7 @@ mod tests {
     }
 
     fn git_config_file_bool(config: &Path, key: &str) -> bool {
-        let output = Command::new("git")
+        let output = git_command()
             .args(["config", "--file"])
             .arg(config)
             .args(["--type=bool", "--get", key])
@@ -4049,6 +4060,55 @@ mod tests {
             "false" => false,
             value => panic!("unexpected Git config boolean output: {value:?}"),
         }
+    }
+
+    #[test]
+    fn git_oracle_ignores_an_inherited_global_excludes_file() {
+        if let Some(root) = std::env::var_os(HOSTILE_GIT_CONFIG_FIXTURE) {
+            let root = PathBuf::from(root);
+            assert!(
+                !git_check_ignore(&root, "unignored.log"),
+                "the oracle must not read the hostile inherited excludes file"
+            );
+            return;
+        }
+
+        let fixture = Fixture::new();
+        fixture.write("unignored.log");
+        let initialized = git_command()
+            .args(["init", "--quiet"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("initialize hostile-config Git fixture");
+        assert!(initialized.success());
+        let excludes = fixture.root.join("hostile-excludes");
+        fs::write(&excludes, b"*.log\n").expect("write hostile global excludes file");
+        let config = fixture.root.join("hostile-gitconfig");
+        let excludes = excludes.display().to_string();
+        let excludes = excludes.replace('\\', "\\\\").replace('"', "\\\"");
+        fs::write(
+            &config,
+            format!("[core]\n\texcludesFile = \"{excludes}\"\n"),
+        )
+        .expect("write hostile global Git config");
+
+        // Environment mutation is process-global, so run a second copy of
+        // this one test instead. It inherits the hostile config just as a
+        // developer's test process would, while Git itself is still spawned
+        // exclusively through `git_command`.
+        let status = Command::new(std::env::current_exe().expect("locate test binary"))
+            .args([
+                "tests::git_oracle_ignores_an_inherited_global_excludes_file",
+                "--exact",
+            ])
+            .env(HOSTILE_GIT_CONFIG_FIXTURE, &fixture.root)
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .status()
+            .expect("run isolated Git oracle regression test");
+        assert!(
+            status.success(),
+            "hostile-config child test failed: {status}"
+        );
     }
 
     #[test]
@@ -4077,13 +4137,13 @@ mod tests {
 
         // The Git oracle is configured exactly as the repository is. This
         // catches the rule compilation, not merely a hand-written expectation.
-        let initialized = Command::new("git")
+        let initialized = git_command()
             .args(["init", "--quiet"])
             .current_dir(&fixture.root)
             .status()
             .expect("initialize Git oracle");
         assert!(initialized.success());
-        let configured = Command::new("git")
+        let configured = git_command()
             .args(["config", "core.ignoreCase", "true"])
             .current_dir(&fixture.root)
             .status()
@@ -4164,7 +4224,7 @@ mod tests {
     fn numeric_and_empty_ignorecase_values_match_the_git_oracle() {
         let fixture = Fixture::new();
         fixture.write("BUILD.log");
-        let initialized = Command::new("git")
+        let initialized = git_command()
             .args(["init", "--quiet"])
             .current_dir(&fixture.root)
             .status()
@@ -4299,7 +4359,7 @@ mod tests {
         let decomposed = "cafe\u{301}.txt";
         fs::write(fixture.root.join(".gitignore"), "caf\u{e9}.txt\n").expect("write NFC rule");
         fixture.write(decomposed);
-        let initialized = Command::new("git")
+        let initialized = git_command()
             .args(["init", "--quiet"])
             .current_dir(&fixture.root)
             .status()
