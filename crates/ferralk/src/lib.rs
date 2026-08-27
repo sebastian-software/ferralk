@@ -1415,7 +1415,13 @@ trait DirectoryBackend {
     /// The listing is the caller's, and the caller reuses it for every
     /// directory it reads, so a backend that can name an entry without
     /// allocating leaves the walk allocating nothing per entry at all.
-    fn read_directory(&self, path: &Path, listing: &mut Listing) -> std::io::Result<()>;
+    fn read_directory(
+        &self,
+        path: &Path,
+        follow_symlinks: bool,
+        refuse_final_symlink: bool,
+        listing: &mut Listing,
+    ) -> std::io::Result<()>;
 
     /// Follows symlinks; decides whether a link points at a directory.
     fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
@@ -1541,6 +1547,42 @@ pub(crate) struct Listing {
     /// Entries in use. `entries` may be longer: the tail is buffers kept for
     /// the next directory.
     len: usize,
+    /// Per-entry failures discovered while a backend was completing an
+    /// otherwise usable listing. They are delivered after its siblings, so a
+    /// persistent stat failure cannot make those siblings disappear.
+    deferred_errors: Vec<DeferredListingError>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DeferredListingError {
+    path: PathBuf,
+    source: DeferredIoError,
+}
+
+/// An `io::Error` representation that can live in the public stream without
+/// changing its auto-trait contract. `std::io::Error` may carry an arbitrary
+/// error object, which is not necessarily unwind-safe; a deferred listing
+/// error needs only the externally observable kind and message until it is
+/// delivered as a fresh `io::Error`.
+#[derive(Debug)]
+struct DeferredIoError {
+    kind: std::io::ErrorKind,
+    message: String,
+}
+
+impl From<std::io::Error> for DeferredIoError {
+    fn from(source: std::io::Error) -> Self {
+        Self {
+            kind: source.kind(),
+            message: source.to_string(),
+        }
+    }
+}
+
+impl DeferredIoError {
+    fn into_io_error(self) -> std::io::Error {
+        std::io::Error::new(self.kind, self.message)
+    }
 }
 
 /// One entry of a [`Listing`].
@@ -1569,6 +1611,7 @@ impl Listing {
     /// Drops the previous directory's entries, keeping their buffers.
     pub(crate) fn clear(&mut self) {
         self.len = 0;
+        self.deferred_errors.clear();
     }
 
     /// Adds one entry, reusing the buffer left by the directory before.
@@ -1588,6 +1631,19 @@ impl Listing {
         &self.entries[..self.len]
     }
 
+    /// Records a failure for one entry without throwing away the successfully
+    /// read siblings. Consumers report these after the listing is consumed.
+    pub(crate) fn defer_error(&mut self, path: PathBuf, source: std::io::Error) {
+        self.deferred_errors.push(DeferredListingError {
+            path,
+            source: source.into(),
+        });
+    }
+
+    pub(crate) fn take_deferred_error(&mut self) -> Option<DeferredListingError> {
+        (!self.deferred_errors.is_empty()).then(|| self.deferred_errors.remove(0))
+    }
+
     /// Whether the directory holds an entry of this name, which is how the
     /// ignore chain recognizes its own files without probing for them.
     pub(crate) fn contains(&self, name: &str) -> bool {
@@ -1595,25 +1651,80 @@ impl Listing {
     }
 }
 
+#[cfg_attr(all(feature = "native-macos", target_os = "macos"), allow(dead_code))]
 struct StdBackend;
 
 impl DirectoryBackend for StdBackend {
-    fn read_directory(&self, path: &Path, listing: &mut Listing) -> std::io::Result<()> {
-        listing.clear();
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            // `DirEntry` hands its name out by value and nothing else out at
-            // all, so this one allocation is the standard library's and is the
-            // floor for the portable backend. The native backends read names
-            // out of a buffer they own and reach zero.
-            listing.push(
-                &entry.file_name(),
-                file_type.is_dir(),
-                file_type.is_symlink(),
-            );
+    fn read_directory(
+        &self,
+        path: &Path,
+        _follow_symlinks: bool,
+        _refuse_final_symlink: bool,
+        listing: &mut Listing,
+    ) -> std::io::Result<()> {
+        read_portable_directory(path, path, listing)
+    }
+}
+
+/// Reads a directory through the portable `std::fs` backend. `directory` is
+/// the path opened by the operating system; `reported_path` keeps deferred
+/// per-entry errors anchored at the caller's path when a native no-follow
+/// descriptor is exposed through `/dev/fd` for a safe fallback.
+#[cfg_attr(all(feature = "native-macos", target_os = "macos"), allow(dead_code))]
+fn read_portable_directory(
+    directory: &Path,
+    reported_path: &Path,
+    listing: &mut Listing,
+) -> std::io::Result<()> {
+    listing.clear();
+    for entry in fs::read_dir(directory)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                defer_entry_stat_error(listing, reported_path.to_path_buf(), error)?;
+                continue;
+            }
+        };
+        let entry_path = reported_path.join(entry.file_name());
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                defer_entry_stat_error(listing, entry_path, error)?;
+                continue;
+            }
+        };
+        // `DirEntry` hands its name out by value and nothing else out at
+        // all, so this one allocation is the standard library's and is the
+        // floor for the portable backend. The native backends read names
+        // out of a buffer they own and reach zero.
+        listing.push(
+            &entry.file_name(),
+            file_type.is_dir(),
+            file_type.is_symlink(),
+        );
+    }
+    Ok(())
+}
+
+/// Keeps the three directory readers on the same `DT_UNKNOWN` contract.
+///
+/// `NotFound` and `NotADirectory` describe a path that changed after its
+/// directory record was read, so that one entry is dropped. `PermissionDenied`
+/// is persistent often enough that silently treating it as a race loses data;
+/// it is delayed until the usable listing has been delivered. Other failures
+/// make the directory read fail normally.
+pub(crate) fn defer_entry_stat_error(
+    listing: &mut Listing,
+    path: PathBuf,
+    error: std::io::Error,
+) -> std::io::Result<()> {
+    match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => Ok(()),
+        std::io::ErrorKind::PermissionDenied => {
+            listing.defer_error(path, error);
+            Ok(())
         }
-        Ok(())
+        _ => Err(error),
     }
 }
 
@@ -1621,17 +1732,41 @@ impl DirectoryBackend for StdBackend {
 /// portable backend everywhere else.
 struct SystemBackend;
 
+#[cfg(any(
+    all(feature = "native-macos", target_os = "macos"),
+    all(feature = "native-linux", target_os = "linux")
+))]
+#[cfg_attr(all(feature = "native-macos", target_os = "macos"), allow(dead_code))]
+fn read_native_or_portable(
+    listing: &mut Listing,
+    native: impl FnOnce(&mut Listing) -> std::io::Result<()>,
+    fallback: impl FnOnce(&mut Listing) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match native(listing) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => fallback(listing),
+        Err(error) => Err(error),
+    }
+}
+
 impl DirectoryBackend for SystemBackend {
-    fn read_directory(&self, path: &Path, listing: &mut Listing) -> std::io::Result<()> {
+    fn read_directory(
+        &self,
+        path: &Path,
+        follow_symlinks: bool,
+        refuse_final_symlink: bool,
+        listing: &mut Listing,
+    ) -> std::io::Result<()> {
         #[cfg(all(feature = "native-macos", target_os = "macos"))]
         {
-            match macos_native::read_directory(path, listing) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                    StdBackend.read_directory(path, listing)
-                }
-                Err(error) => Err(error),
-            }
+            // macOS performs its capability fallback inside the native module,
+            // where it still owns the protected directory descriptor. Keeping
+            // ordinary `Unsupported` I/O errors out of the generic adapter is
+            // essential: a DT_UNKNOWN stat may report that kind after a batch,
+            // and a path fallback would discard the usable siblings.
+            let _ = follow_symlinks;
+            macos_native::read_directory(path, refuse_final_symlink, listing)
+                .map_err(macos_native::NativeDirectoryReadError::into_io_error)
         }
         #[cfg(all(
             feature = "native-linux",
@@ -1639,19 +1774,26 @@ impl DirectoryBackend for SystemBackend {
             not(all(feature = "native-macos", target_os = "macos"))
         ))]
         {
-            match linux_native::read_directory(path, listing) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                    StdBackend.read_directory(path, listing)
-                }
-                Err(error) => Err(error),
-            }
+            read_native_or_portable(
+                listing,
+                |listing| linux_native::read_directory(path, refuse_final_symlink, listing),
+                |listing| {
+                    if refuse_final_symlink {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "native directory reader is unavailable and the portable fallback cannot preserve no-follow traversal",
+                        ))
+                    } else {
+                        StdBackend.read_directory(path, follow_symlinks, false, listing)
+                    }
+                },
+            )
         }
         #[cfg(not(any(
             all(feature = "native-macos", target_os = "macos"),
             all(feature = "native-linux", target_os = "linux")
         )))]
-        StdBackend.read_directory(path, listing)
+        StdBackend.read_directory(path, follow_symlinks, refuse_final_symlink, listing)
     }
 }
 
@@ -1729,7 +1871,12 @@ impl WalkStream {
                 Err(source) => return self.error(CYCLE_KEY_OPERATION, path, source),
             }
         }
-        match SystemBackend.read_directory(&path, &mut self.listing) {
+        match SystemBackend.read_directory(
+            &path,
+            self.walker.options.follow_symlinks,
+            !self.walker.options.follow_symlinks && depth > 0,
+            &mut self.listing,
+        ) {
             Ok(()) => {
                 // The directory's own ignore files join the chain here, once,
                 // recognized in the listing that was just read.
@@ -1806,6 +1953,14 @@ impl Iterator for WalkStream {
                 let index = self.next_entry;
                 self.next_entry += 1;
                 if let Some(result) = self.process_entry(index) {
+                    return Some(result);
+                }
+                continue;
+            }
+            if let Some(error) = self.listing.take_deferred_error() {
+                if let Some(result) =
+                    self.error("read_dir", error.path, error.source.into_io_error())
+                {
                     return Some(result);
                 }
                 continue;
@@ -1951,7 +2106,12 @@ impl<'walker> WalkState<'walker> {
         ignores: IgnoreScope,
         scratch: &mut DirectoryScratch,
     ) -> Result<(), WalkError> {
-        if let Err(source) = backend.read_directory(path, &mut scratch.listing) {
+        if let Err(source) = backend.read_directory(
+            path,
+            self.walker.options.follow_symlinks,
+            !self.walker.options.follow_symlinks && depth > 0,
+            &mut scratch.listing,
+        ) {
             return self.handle_error("read_dir", path.to_path_buf(), source);
         }
         // The directory's own ignore files join the chain here, once,
@@ -1984,6 +2144,9 @@ impl<'walker> WalkState<'walker> {
             let outcome = self.act(backend, action, &scratch.path);
             reset_to_directory(&mut scratch.path, path);
             outcome?;
+        }
+        while let Some(error) = scratch.listing.take_deferred_error() {
+            self.handle_error("read_dir", error.path, error.source.into_io_error())?;
         }
         Ok(())
     }
@@ -2088,11 +2251,18 @@ mod tests {
 
     use super::{
         CancellationToken, ErrorPolicy, TraversalPattern, Verdict, WalkEntry, WalkEntryKind,
-        WalkOptions, Walker, WildcardMode, glob_path_bytes, literal_extension,
+        WalkOptions, WalkStream, Walker, WildcardMode, glob_path_bytes, literal_extension,
         literal_pattern_root, traversal_pattern_options,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn walk_stream_keeps_its_unwind_auto_traits() {
+        fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+
+        assert_unwind_safe::<WalkStream>();
+    }
 
     /// Compiles one walker pattern the way `include` and `exclude` do, in the
     /// default dialect where a wildcard does not cover a leading period.
@@ -2393,8 +2563,14 @@ mod tests {
     }
 
     impl super::DirectoryBackend for CountingBackend {
-        fn read_directory(&self, path: &Path, listing: &mut super::Listing) -> std::io::Result<()> {
-            super::StdBackend.read_directory(path, listing)
+        fn read_directory(
+            &self,
+            path: &Path,
+            follow_symlinks: bool,
+            refuse_final_symlink: bool,
+            listing: &mut super::Listing,
+        ) -> std::io::Result<()> {
+            super::StdBackend.read_directory(path, follow_symlinks, refuse_final_symlink, listing)
         }
 
         fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
@@ -5091,13 +5267,20 @@ mod tests {
             fn read_directory(
                 &self,
                 path: &Path,
+                follow_symlinks: bool,
+                refuse_final_symlink: bool,
                 listing: &mut super::Listing,
             ) -> std::io::Result<()> {
                 self.reads
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push(path.to_path_buf());
-                super::StdBackend.read_directory(path, listing)
+                super::StdBackend.read_directory(
+                    path,
+                    follow_symlinks,
+                    refuse_final_symlink,
+                    listing,
+                )
             }
 
             fn symlink_metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
@@ -5173,6 +5356,105 @@ mod tests {
         );
     }
 
+    /// Native directory records on DT_UNKNOWN filesystems and portable
+    /// `DirEntry::file_type` both use this channel. Keeping the test at the
+    /// backend boundary pins the policy independently of the local filesystem
+    /// (whose dirents normally already carry a type).
+    #[test]
+    fn deferred_entry_stat_failures_keep_siblings_and_report_permissions() {
+        struct UnknownTypeBackend {
+            root: PathBuf,
+            failure: std::io::ErrorKind,
+        }
+
+        impl super::DirectoryBackend for UnknownTypeBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                listing.clear();
+                if path == self.root {
+                    listing.push("before".as_ref(), false, false);
+                    super::defer_entry_stat_error(
+                        listing,
+                        self.root.join("unknown"),
+                        std::io::Error::from(self.failure),
+                    )?;
+                    listing.push("after".as_ref(), false, false);
+                }
+                Ok(())
+            }
+        }
+
+        let fixture = Fixture::new();
+        let permission = UnknownTypeBackend {
+            root: fixture.root.clone(),
+            failure: std::io::ErrorKind::PermissionDenied,
+        };
+        let walker = Walker::new(&fixture.root)
+            .threads(1)
+            .error_policy(ErrorPolicy::Collect);
+        let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
+        state
+            .walk_directory(
+                &permission,
+                directory_task(&walker, &permission, fixture.root.clone()),
+            )
+            .expect("collect keeps the usable listing");
+        assert_eq!(
+            relative_paths(&state.entries, &fixture.root),
+            [PathBuf::from("before"), PathBuf::from("after")]
+        );
+        assert_eq!(state.errors.len(), 1);
+        assert_eq!(state.errors[0].operation(), "read_dir");
+        assert_eq!(state.errors[0].path(), fixture.root.join("unknown"));
+        assert_eq!(
+            state.errors[0].source.kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let parallel = UnknownTypeBackend {
+            root: fixture.root.clone(),
+            failure: std::io::ErrorKind::PermissionDenied,
+        };
+        let result = Walker::new(&fixture.root)
+            .threads(4)
+            .error_policy(ErrorPolicy::Collect)
+            .collect_with(&parallel)
+            .expect("parallel collect keeps the usable listing");
+        assert_eq!(
+            relative_paths(result.entries(), &fixture.root),
+            [PathBuf::from("before"), PathBuf::from("after")]
+        );
+        assert_eq!(result.errors().len(), 1);
+        assert_eq!(result.errors()[0].path(), fixture.root.join("unknown"));
+
+        for race in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::NotADirectory,
+        ] {
+            let backend = UnknownTypeBackend {
+                root: fixture.root.clone(),
+                failure: race,
+            };
+            let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
+            state
+                .walk_directory(
+                    &backend,
+                    directory_task(&walker, &backend, fixture.root.clone()),
+                )
+                .expect("a changed entry costs only that entry");
+            assert_eq!(
+                relative_paths(&state.entries, &fixture.root),
+                [PathBuf::from("before"), PathBuf::from("after")]
+            );
+            assert!(state.errors.is_empty(), "{race:?} is a replacement race");
+        }
+    }
+
     #[test]
     fn literal_include_roots_prune_unrelated_sibling_directories() {
         /// One directory of the mock tree: entry names and whether each is a
@@ -5188,6 +5470,8 @@ mod tests {
             fn read_directory(
                 &self,
                 path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
                 listing: &mut super::Listing,
             ) -> std::io::Result<()> {
                 self.reads.borrow_mut().push(path.to_path_buf());
@@ -5233,6 +5517,8 @@ mod tests {
             fn read_directory(
                 &self,
                 path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
                 listing: &mut super::Listing,
             ) -> std::io::Result<()> {
                 listing.clear();
@@ -5288,6 +5574,8 @@ mod tests {
             fn read_directory(
                 &self,
                 path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
                 listing: &mut super::Listing,
             ) -> std::io::Result<()> {
                 listing.clear();
@@ -5357,6 +5645,8 @@ mod tests {
             fn read_directory(
                 &self,
                 path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
                 listing: &mut super::Listing,
             ) -> std::io::Result<()> {
                 listing.clear();

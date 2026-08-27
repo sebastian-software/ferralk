@@ -21,6 +21,10 @@ jobs:
   fuzz:
     name: macOS native fuzz
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [macos_dirent_parser, macos_bulk_record_parser]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master branch
@@ -30,11 +34,18 @@ jobs:
       - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
         with:
           tool: cargo-fuzz
+      - name: Restore ${{ matrix.target }} corpus
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: native-fuzz-${{ runner.os }}-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            native-fuzz-${{ runner.os }}-${{ matrix.target }}-
       # cargo-fuzz defaults to the target it was itself built for, and the
       # prebuilt binary is x86_64 while this runner is aarch64. Name the host
       # target the sanitizer job already uses.
       - run: >-
-          cargo fuzz run --target aarch64-apple-darwin macos_dirent_parser
+          cargo fuzz run --target aarch64-apple-darwin ${{ matrix.target }}
           -- -max_total_time=$MAX_TOTAL_TIME
 
   address-sanitizer:

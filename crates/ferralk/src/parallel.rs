@@ -600,7 +600,12 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
     if shared.walker.options.follow_symlinks && !mark_directory(shared, &path) {
         return;
     }
-    if let Err(source) = shared.backend.read_directory(&path, &mut worker.listing) {
+    if let Err(source) = shared.backend.read_directory(
+        &path,
+        shared.walker.options.follow_symlinks,
+        !shared.walker.options.follow_symlinks && depth > 0,
+        &mut worker.listing,
+    ) {
         shared.record_error("read_dir", path, source);
         return;
     }
@@ -639,6 +644,9 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
         );
         act(shared, worker, action);
         reset_to_directory(&mut worker.path, &path);
+    }
+    while let Some(error) = worker.listing.take_deferred_error() {
+        shared.record_error("read_dir", error.path, error.source.into_io_error());
     }
 }
 
