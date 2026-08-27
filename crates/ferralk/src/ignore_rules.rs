@@ -23,7 +23,7 @@
 //! - Asterisks that do not form a whole component are ordinary stars in Git and
 //!   must not cross a separator, so `a**b` collapses to `a*b`.
 
-use std::path::Path;
+use std::{borrow::Cow, path::Path};
 
 use ferralk_glob::{Pattern, PatternOptions};
 use memchr::memmem;
@@ -37,12 +37,15 @@ use super::glob_path_bytes;
 /// rule is expected to see dotfiles. Recursive stars are off because a `**`
 /// component never reaches the compiler - it becomes [`Component::AnyDirs`] -
 /// and any other run has already collapsed to a single star.
-fn component_options() -> PatternOptions {
+fn component_options(case_insensitive: bool) -> PatternOptions {
     PatternOptions::default()
         .braces(false)
         .extglob(false)
         .recursive_double_star(false)
         .match_hidden(true)
+        // Git's WM_CASEFOLD is ASCII-only. `PatternOptions` has exactly that
+        // contract, including in literals and bracket classes.
+        .case_insensitive(case_insensitive)
 }
 
 /// The rules of one ignore file, in file order.
@@ -63,6 +66,7 @@ pub(crate) struct RuleSet {
     /// chain, so each set slices off its own prefix instead of walking the
     /// components again.
     root_len: usize,
+    precompose_unicode: bool,
     rules: Vec<Rule>,
 }
 
@@ -75,10 +79,22 @@ impl RuleSet {
     ///
     /// `path` is the candidate's whole path in glob bytes; the part below this
     /// set's directory is what the rules see. Last-match-wins is Git's rule, so
-    /// the scan runs backwards and stops at the first hit. Nothing here
-    /// allocates.
+    /// the scan runs backwards and stops at the first hit. The ordinary
+    /// byte-exact path is allocation-free; enabled precomposition allocates
+    /// only when a valid UTF-8 component actually changes under NFC.
     pub(crate) fn matched(&self, path: &[u8], is_dir: bool) -> Option<bool> {
         let candidate = path.get(self.root_len..).unwrap_or(path);
+        if self.precompose_unicode {
+            let candidate = normalize_candidate(candidate);
+            self.matched_candidate(&candidate, is_dir)
+        } else {
+            // The ordinary byte-exact path neither allocates nor constructs a
+            // normalization iterator.
+            self.matched_candidate(candidate, is_dir)
+        }
+    }
+
+    fn matched_candidate(&self, candidate: &[u8], is_dir: bool) -> Option<bool> {
         self.rules
             .iter()
             .rev()
@@ -192,11 +208,13 @@ fn split_component(candidate: &[u8]) -> (&[u8], &[u8]) {
 /// Collects the rules of one or more ignore files for the same directory.
 pub(crate) struct RuleSetBuilder {
     root_len: usize,
+    case_insensitive: bool,
+    precompose_unicode: bool,
     rules: Vec<Rule>,
 }
 
 impl RuleSetBuilder {
-    pub(crate) fn new(root: &Path) -> Self {
+    pub(crate) fn new(root: &Path, case_insensitive: bool, precompose_unicode: bool) -> Self {
         let root = glob_path_bytes(root);
         // The separator between the directory and what follows it belongs to
         // the prefix, unless the directory already ends in one. The empty
@@ -209,6 +227,8 @@ impl RuleSetBuilder {
         };
         Self {
             root_len,
+            case_insensitive,
+            precompose_unicode,
             rules: Vec::new(),
         }
     }
@@ -216,7 +236,7 @@ impl RuleSetBuilder {
     /// Adds one line. A line that is blank, a comment, or malformed adds
     /// nothing, which is what Git does with it.
     pub(crate) fn add_line(&mut self, line: impl AsRef<[u8]>) {
-        if let Some(rule) = parse_rule(line) {
+        if let Some(rule) = parse_rule_with_options(line, self.case_insensitive) {
             self.rules.push(rule);
         }
     }
@@ -224,6 +244,7 @@ impl RuleSetBuilder {
     pub(crate) fn build(self) -> RuleSet {
         RuleSet {
             root_len: self.root_len,
+            precompose_unicode: self.precompose_unicode,
             rules: self.rules,
         }
     }
@@ -244,13 +265,18 @@ pub fn fuzz_rule(line: &str, candidate: &[u8], is_dir: bool) -> Option<bool> {
 /// UTF-8. It shares the same empty-root setup as [`fuzz_rule`].
 #[doc(hidden)]
 pub fn fuzz_rule_bytes(line: &[u8], candidate: &[u8], is_dir: bool) -> Option<bool> {
-    let mut builder = RuleSetBuilder::new(Path::new(""));
+    let mut builder = RuleSetBuilder::new(Path::new(""), false, false);
     builder.add_line(line);
     builder.build().matched(candidate, is_dir)
 }
 
 /// Reads one `gitignore(5)` line into a rule, or nothing.
+#[cfg(test)]
 fn parse_rule(line: impl AsRef<[u8]>) -> Option<Rule> {
+    parse_rule_with_options(line, false)
+}
+
+fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Option<Rule> {
     let line = line.as_ref();
     if line.is_empty() || line.starts_with(b"#") {
         return None;
@@ -298,7 +324,7 @@ fn parse_rule(line: impl AsRef<[u8]>) -> Option<Rule> {
         {
             gate = Some(literal);
         }
-        let component = compile_component(part)?;
+        let component = compile_component(part, case_insensitive)?;
         // Two runs in a row are one run, and collapsing them keeps the matcher
         // from backtracking between them for nothing.
         if matches!(component, Component::AnyDirs)
@@ -310,7 +336,7 @@ fn parse_rule(line: impl AsRef<[u8]>) -> Option<Rule> {
     }
     if matches!(components.last(), Some(Component::AnyDirs)) {
         // `abc/**` is what is inside `abc`, so one component has to follow.
-        components.push(compile_component(b"*")?);
+        components.push(compile_component(b"*", case_insensitive)?);
     }
     // A body of nothing but separators is not a rule.
     if components.len() == usize::from(!anchored) {
@@ -319,19 +345,64 @@ fn parse_rule(line: impl AsRef<[u8]>) -> Option<Rule> {
 
     Some(Rule {
         components,
-        gate: gate.map(|literal| memmem::Finder::new(&literal).into_owned()),
+        // This prefilter is byte-exact, so it would reject a case-folded
+        // candidate before the rule matcher can evaluate it.
+        gate: (!case_insensitive)
+            .then(|| gate.map(|literal| memmem::Finder::new(&literal).into_owned()))
+            .flatten(),
         negated,
         directory_only,
     })
 }
 
-fn compile_component(part: &[u8]) -> Option<Component> {
+fn compile_component(part: &[u8], case_insensitive: bool) -> Option<Component> {
     if part == b"**" {
         return Some(Component::AnyDirs);
     }
-    Pattern::compile(collapse_partial_stars(part), component_options())
-        .ok()
-        .map(Component::Pattern)
+    Pattern::compile(
+        collapse_partial_stars(part),
+        component_options(case_insensitive),
+    )
+    .ok()
+    .map(Component::Pattern)
+}
+
+/// Adapts the candidate that one ignore file sees, not its raw pattern. Mac
+/// Git precomposes filesystem names this way before matching; each path
+/// component is independent so an invalid UTF-8 component cannot make a valid
+/// sibling component lose its NFC conversion.
+#[cfg(target_os = "macos")]
+fn normalize_candidate(candidate: &[u8]) -> Cow<'_, [u8]> {
+    use unicode_normalization::{UnicodeNormalization, is_nfc};
+
+    if candidate
+        .split(|byte| *byte == b'/')
+        .all(|component| std::str::from_utf8(component).map_or(true, is_nfc))
+    {
+        return Cow::Borrowed(candidate);
+    }
+
+    let mut normalized = Vec::with_capacity(candidate.len());
+    for (index, component) in candidate.split(|byte| *byte == b'/').enumerate() {
+        if index != 0 {
+            normalized.push(b'/');
+        }
+        match std::str::from_utf8(component) {
+            Ok(component) => {
+                for character in component.nfc() {
+                    let mut encoded = [0; 4];
+                    normalized.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+                }
+            }
+            Err(_) => normalized.extend_from_slice(component),
+        }
+    }
+    Cow::Owned(normalized)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn normalize_candidate(candidate: &[u8]) -> Cow<'_, [u8]> {
+    Cow::Borrowed(candidate)
 }
 
 /// Drops the trailing spaces Git drops: those that are not escaped.
@@ -563,7 +634,7 @@ mod tests {
 
     fn ours(rule: &str, path: &str, is_dir: bool) -> Option<bool> {
         let root = PathBuf::from("/fixture");
-        let mut builder = RuleSetBuilder::new(&root);
+        let mut builder = RuleSetBuilder::new(&root, false, false);
         builder.add_line(rule);
         builder.build().matched(&candidate(&root, path), is_dir)
     }
@@ -666,14 +737,14 @@ mod tests {
     #[test]
     fn trailing_spaces_are_dropped_unless_escaped() {
         let root = Path::new("/fixture");
-        let mut builder = RuleSetBuilder::new(root);
+        let mut builder = RuleSetBuilder::new(root, false, false);
         builder.add_line("trailing ");
         assert_eq!(
             builder.build().matched(&candidate(root, "trailing"), false),
             Some(true)
         );
 
-        let mut builder = RuleSetBuilder::new(root);
+        let mut builder = RuleSetBuilder::new(root, false, false);
         builder.add_line("trailing\\ ");
         let rules = builder.build();
         assert_eq!(
@@ -686,7 +757,7 @@ mod tests {
     #[test]
     fn the_last_matching_rule_decides() {
         let root = Path::new("/fixture");
-        let mut builder = RuleSetBuilder::new(root);
+        let mut builder = RuleSetBuilder::new(root, false, false);
         builder.add_line("*.log");
         builder.add_line("!keep.log");
         builder.add_line("keep.log");
@@ -708,7 +779,7 @@ mod tests {
     #[test]
     fn many_runs_do_not_explode() {
         let root = PathBuf::from("/fixture");
-        let mut builder = RuleSetBuilder::new(&root);
+        let mut builder = RuleSetBuilder::new(&root, false, false);
         builder.add_line("**/a/**/a/**/a/**/a/**/a/**/a/**/a/**/x");
         let rules = builder.build();
         let deep = "a/".repeat(24) + "b";
@@ -720,6 +791,29 @@ mod tests {
             "matching took {:?}",
             start.elapsed()
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn precomposeunicode_normalizes_only_valid_candidate_components() {
+        let root = PathBuf::from("/fixture");
+        let mut enabled = RuleSetBuilder::new(&root, false, true);
+        enabled.add_line("caf\u{e9}.txt");
+        let enabled = enabled.build();
+
+        let decomposed = b"/fixture/cafe\xCC\x81.txt";
+        assert_eq!(enabled.matched(decomposed, false), Some(true));
+
+        // An invalid component remains byte-exact without preventing a later
+        // valid component from receiving the NFC adaptation.
+        assert_eq!(
+            enabled.matched(b"/fixture/bad\xFF/cafe\xCC\x81.txt", false),
+            Some(true)
+        );
+
+        let mut disabled = RuleSetBuilder::new(&root, false, false);
+        disabled.add_line("caf\u{e9}.txt");
+        assert_eq!(disabled.build().matched(decomposed, false), None);
     }
 
     /// What one verdict costs, both engines, in one process.
@@ -751,7 +845,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
-            let mut ours = RuleSetBuilder::new(&root);
+            let mut ours = RuleSetBuilder::new(&root, false, false);
             for line in &lines {
                 ours.add_line(line);
             }

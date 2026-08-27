@@ -84,6 +84,26 @@ let result = Walker::new(".")
 selected. `stream()` is intentionally single-threaded and unsorted so it can
 deliver entries incrementally.
 
+### Git filesystem adaptations
+
+When Git ignore support is enabled, Ferralk reads `core.ignoreCase` and
+`core.precomposeUnicode` from repository-local config. A linked worktree reads
+the common `config` first and private `config.worktree` last when
+`extensions.worktreeConfig=true`. This makes Git's normal per-repository
+filesystem probe observable without a runtime Git subprocess: `ignoreCase`
+uses ASCII-only rule/candidate folding, and macOS-only `precomposeUnicode`
+converts valid UTF-8 candidate components to NFC before matching. Raw invalid
+bytes stay raw.
+
+Git's system/global configuration, conditional includes, and environment
+overrides are deliberately not inherited by a library walk. If one of those
+sources changes Git's effective value, pass it explicitly with
+`Walker::git_ignore_case` or (on macOS) `Walker::git_precompose_unicode`; an
+explicit Walker setting wins over repository-local config. Ferralk identifies a
+case variant of `.gitignore`/`.ignore` in a listing only to attempt Git's
+canonical open, so a case-sensitive filesystem continues to expose that
+variant as an ordinary file.
+
 `Walker::match_hidden` and `WalkOptions::skip_hidden` are separate mechanisms
 and not each other's inverse: `match_hidden` is matcher semantics, deciding
 whether a wildcard may cover a leading period, while `skip_hidden` is a

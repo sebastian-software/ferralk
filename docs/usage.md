@@ -120,6 +120,22 @@ Important defaults:
   decides, as in Git. In-tree `.gitignore` and `.ignore` symlinks are ignored
   rather than followed; `.git/info/exclude` keeps Git's link-following behavior.
 
+  Ferralk reads `core.ignoreCase` and `core.precomposeUnicode` from the
+  repository-local `.git/config`; a linked worktree also reads its private
+  `config.worktree` after the common config when
+  `extensions.worktreeConfig=true`. `core.ignoreCase=true` uses Git-compatible
+  ASCII folding for rules and candidates. A differently cased `.Gitignore` is
+  loaded only when opening the canonical `.gitignore` name resolves on the
+  filesystem, so a case-sensitive filesystem never treats it as a magic file.
+  On macOS only, `core.precomposeUnicode=true` NFC-normalizes valid UTF-8
+  candidate components before matching and leaves invalid bytes untouched.
+
+  System/global config, conditional includes, and environment overrides are
+  intentionally not consulted: they are process-wide state outside a library
+  walk. Use `Walker::git_ignore_case(value)` and
+  `Walker::git_precompose_unicode(value)` to supply Git's effective values;
+  each explicit Walker value takes precedence over repository-local config.
+
   Ferralk deliberately continues into nested repositories, as ripgrep does:
   outer ignore rules remain active inside them and their own ignore files are
   loaded too. This differs from Git's repository-boundary behavior.

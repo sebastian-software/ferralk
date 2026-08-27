@@ -23,6 +23,9 @@ memchr = "=2.8.3"
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.189"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+unicode-normalization = "=0.1.25"
+
 [dev-dependencies]
 corpus = { path = "../../tools/corpus" }
 # The engine ADR-0014 replaced, kept for the test that compares the two rule
