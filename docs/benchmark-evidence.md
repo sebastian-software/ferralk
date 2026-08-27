@@ -191,8 +191,8 @@ once outside their match loop.
 | --- | --- |
 | Host | Mac Studio (Mac13,2), Apple M1 Ultra, 20 cores (16 performance, 4 efficiency), 64 GB RAM |
 | OS | macOS 26.5.2, build 25F84; Darwin 25.5.0, arm64 |
-| Base revision | `f2e5139` plus the benchmark extension in this working tree |
-| Toolchain | rustc/cargo 1.95.0-nightly, LLVM 22.1.0 |
+| Benchmark revision | `0ac2adc` (source tree used for this run) |
+| Toolchain | rustc/cargo 1.96.0, LLVM 22.1.0 |
 | Benchmark stack | Criterion 0.8.2, release profile; exact dependency versions are locked in `Cargo.lock` |
 | Threads | 4 for every parallel ferralk, `ignore`, and `jwalk` arm |
 | Cache | Warm: the fixture is written immediately before the measurement and then reused by all arms in that invocation |
@@ -200,55 +200,53 @@ once outside their match loop.
 | Commands | `cargo bench -p bench --bench matcher -- --output-format bencher --noplot`; `cargo bench -p bench --bench walker_palamedes -- --output-format bencher --noplot`; the same walker command with `--features native-macos` |
 
 The tables report Criterion's point estimates in milliseconds. They are
-indicative wall times, not a performance gate. Lower is better. The native run
-emitted one Criterion target-time warning for one of the unscoped `jwalk`
-arms; those rows have correspondingly high spread and should not be read as a
-precise ranking.
+indicative wall times, not a performance gate. Lower is better. The native
+unscoped `ferralk` parallel arm had unusually high spread in this run
+(`190.92 +/- 103.64 ms`), so it should not be read as a precise ranking.
 
 ### Portable backend
 
 | Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
 | --- | ---: | ---: |
-| ferralk, serial | 63.71 ms | 13.70 ms |
-| **ferralk, 4 threads** | 45.38 ms | **8.78 ms** |
-| `ignore` serial + `globset` | 104.96 ms | 98.93 ms |
-| `walkdir` serial + `globset` | 81.16 ms | 103.97 ms |
-| `jwalk` serial + `globset` | 86.39 ms | 99.84 ms |
-| `jwalk`, 4 threads + `globset` | **44.70 ms** | 45.17 ms |
-| `globwalk` serial | 81.62 ms | 86.13 ms |
-| `wax` serial | 107.13 ms | 20.95 ms |
-| `ignore` parallel + overrides | 58.92 ms | 49.11 ms |
-| `ignore` parallel + hand-pruned subtree | — | 10.87 ms |
+| ferralk, serial | 79.28 ms | 13.92 ms |
+| **ferralk, 4 threads** | 51.42 ms | **8.50 ms** |
+| `ignore` serial + `globset` | 116.32 ms | 101.06 ms |
+| `walkdir` serial + `globset` | 113.51 ms | 97.42 ms |
+| `jwalk` serial + `globset` | 100.14 ms | 102.29 ms |
+| `jwalk`, 4 threads + `globset` | **50.72 ms** | 50.12 ms |
+| `globwalk` serial | 99.45 ms | 99.02 ms |
+| `wax` serial | 120.71 ms | 18.41 ms |
+| `ignore` parallel + overrides | 51.32 ms | 46.40 ms |
+| `ignore` parallel + hand-pruned subtree | — | 10.91 ms |
 
-On the unscoped query, `jwalk` plus caller-side `globset` is 1.5% faster than
-Ferralk's four-thread arm in this run (44.70 ms versus 45.38 ms). On the
+On the unscoped query, `jwalk` plus caller-side `globset` is 1.4% faster than
+Ferralk's four-thread arm in this run (50.72 ms versus 51.42 ms). On the
 scoped query, Ferralk is faster because it prunes `node_modules` from the
-pattern itself: 8.78 ms versus 20.95 ms for `wax`, 45.17 ms for `jwalk`, and
-49.11 ms for `ignore` overrides. The hand-pruned `ignore` arm remains the
-closest comparison at 10.87 ms, but it needs an extra caller policy that the
+pattern itself: 8.50 ms versus 18.41 ms for `wax`, 50.12 ms for `jwalk`, and
+46.40 ms for `ignore` overrides. The hand-pruned `ignore` arm remains the
+closest comparison at 10.91 ms, but it needs an extra caller policy that the
 Ferralk pattern already expresses.
 
 ### macOS-native backend
 
 | Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
 | --- | ---: | ---: |
-| ferralk, serial | 62.34 ms | 21.61 ms |
-| **ferralk, 4 threads** | **45.20 ms** | **8.14 ms** |
-| `ignore` serial + `globset` | 90.16 ms | 92.03 ms |
-| `walkdir` serial + `globset` | 83.90 ms | 83.69 ms |
-| `jwalk` serial + `globset` | 94.85 ms | 88.62 ms |
-| `jwalk`, 4 threads + `globset` | 49.79 ms | 47.86 ms |
-| `globwalk` serial | 92.48 ms | 87.96 ms |
-| `wax` serial | 111.93 ms | 18.18 ms |
-| `ignore` parallel + overrides | 74.34 ms | 49.54 ms |
-| `ignore` parallel + hand-pruned subtree | — | 11.03 ms |
+| ferralk, serial | 61.36 ms | 11.42 ms |
+| `ferralk, 4 threads` | 190.92 ms | **8.04 ms** |
+| `ignore` serial + `globset` | 85.89 ms | 88.91 ms |
+| `walkdir` serial + `globset` | 84.35 ms | 84.57 ms |
+| `jwalk` serial + `globset` | 88.28 ms | 94.96 ms |
+| `jwalk`, 4 threads + `globset` | **44.92 ms** | 47.49 ms |
+| `globwalk` serial | 86.91 ms | 89.06 ms |
+| `wax` serial | 107.90 ms | 18.10 ms |
+| `ignore` parallel + overrides | 49.57 ms | 53.21 ms |
+| `ignore` parallel + hand-pruned subtree | — | 10.82 ms |
 
-The native reader changes Ferralk's serial unscoped result from 63.71 ms to
-62.34 ms in this expanded run. The parallel result is effectively level with
-the portable path, 45.20 ms versus 45.38 ms; this fixture is then limited more
-by scheduling and matching than by the directory reader. The scoped native
-Ferralk result is the best measured arm at 8.14 ms, while `wax` is the only
-other integrated walker close at 18.18 ms.
+The native reader changes Ferralk's serial unscoped result from 79.28 ms to
+61.36 ms in this final run, and the scoped result from 13.92 ms to 11.42 ms.
+The unscoped native parallel point estimate is an outlier with high spread;
+the scoped native Ferralk result is the best measured arm at 8.04 ms, while
+`wax` is the only other integrated walker close at 18.10 ms.
 
 The new references answer a comparison question, not an adoption question.
 `jwalk` is deprecated, `walkdir` has no matching or pruning policy, `globwalk`
@@ -266,11 +264,11 @@ point estimates and add `wax` to the existing compiled baselines:
 
 | Case | ferralk | `globset` | `fast-glob` | `wax` |
 | --- | ---: | ---: | ---: | ---: |
-| `common` matching | **12 ns** | 39 ns | 100 ns | 32 ns |
-| `common` non-matching | **3 ns** | 38 ns | 109 ns | 31 ns |
-| `long_path` matching | **12 ns** | 197 ns | 549 ns | 184 ns |
-| `long_path` non-matching | **3 ns** | 199 ns | 570 ns | 185 ns |
-| `backtracking` non-matching | **4 ns** | 98 ns | 253 ns | 80 ns |
+| `common` matching | **11 ns** | 40 ns | 98 ns | 31 ns |
+| `common` non-matching | **3 ns** | 40 ns | 107 ns | 31 ns |
+| `long_path` matching | **13 ns** | 205 ns | 545 ns | 180 ns |
+| `long_path` non-matching | **3 ns** | 201 ns | 545 ns | 189 ns |
+| `backtracking` non-matching | **4 ns** | 102 ns | 249 ns | 81 ns |
 
 `wax` is faster than `globset` on the long-path and adversarial rows here, but
 that does not erase the API and byte-semantics differences. The complete
