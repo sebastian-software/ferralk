@@ -2402,10 +2402,8 @@ impl CompiledExtglob {
         }
         let mut first_problem = None;
         for state in states {
-            match state.finish().problem() {
-                None => return None,
-                Some(problem) => first_problem.get_or_insert(problem),
-            };
+            let problem = state.finish().problem()?;
+            first_problem.get_or_insert(problem);
         }
         first_problem
     }

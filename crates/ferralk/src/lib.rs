@@ -2790,8 +2790,13 @@ mod tests {
         fixture.write("src/main.rs");
         fixture.write("src/a.rs");
         fixture.write("src/].rs");
-        fixture.write("prefix../bar");
-        fixture.write("foo/..suffix/bar");
+        // Windows normalizes a path component ending in dots, so these two
+        // valid matcher strings cannot be represented as fixture paths there.
+        #[cfg(not(windows))]
+        {
+            fixture.write("prefix../bar");
+            fixture.write("foo/..suffix/bar");
+        }
 
         for mode in [
             WildcardMode::ComponentScoped,
@@ -2894,6 +2899,12 @@ mod tests {
             for matching_path in matching_paths {
                 assert!(matcher.is_match(matching_path));
             }
+            let matching_paths_on_disk =
+                if cfg!(windows) && matches!(pattern, "prefix@(../bar)" | "@(foo/..)suffix/bar") {
+                    &[][..]
+                } else {
+                    matching_paths
+                };
             for mode in [
                 WildcardMode::ComponentScoped,
                 WildcardMode::SeparatorCrossing,
@@ -2914,7 +2925,7 @@ mod tests {
                     let mut expected = if mode == WildcardMode::ComponentScoped {
                         component_scoped_paths
                     } else {
-                        matching_paths
+                        matching_paths_on_disk
                     }
                     .iter()
                     .map(PathBuf::from)
@@ -2939,7 +2950,7 @@ mod tests {
                 let mut expected = if mode == WildcardMode::ComponentScoped {
                     component_scoped_paths
                 } else {
-                    matching_paths
+                    matching_paths_on_disk
                 }
                 .iter()
                 .map(PathBuf::from)
