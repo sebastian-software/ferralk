@@ -148,20 +148,48 @@ fn read_directory_from_open_directory(
     buffer: &mut [u8],
     listing: &mut Listing,
 ) -> Result<(), NativeDirectoryReadError> {
+    read_directory_from_open_directory_with_read_batch(directory, path, buffer, listing, read_batch)
+}
+
+/// Reads one already-open directory through an injected batch source.
+///
+/// The production reader supplies the raw syscall. Keeping the source as an
+/// argument makes the distinction between an unavailable syscall and an
+/// ordinary `Unsupported` error testable without changing production state.
+fn read_directory_from_open_directory_with_read_batch(
+    directory: &File,
+    path: &Path,
+    buffer: &mut [u8],
+    listing: &mut Listing,
+    mut next_batch: impl FnMut(&File, &mut [u8]) -> Result<usize, ReadBatchError>,
+) -> Result<(), NativeDirectoryReadError> {
+    let mut primed = false;
     listing.clear();
     loop {
-        let byte_count = read_batch(directory, buffer).map_err(|error| {
-            if error.kind() == io::ErrorKind::Unsupported {
-                let _ = error;
-                NativeDirectoryReadError::CapabilityUnavailable
-            } else {
-                NativeDirectoryReadError::Io(error)
+        let byte_count = match next_batch(directory, buffer) {
+            Ok(byte_count) => byte_count,
+            // A reviewed architecture without a syscall number can only be
+            // known before any read. It is a capability result rather than an
+            // ordinary directory error.
+            Err(ReadBatchError::CapabilityUnavailable) => {
+                return Err(NativeDirectoryReadError::CapabilityUnavailable);
             }
-        })?;
+            // Only an actual ENOSYS before the first accepted batch proves
+            // that `getdents64` is unavailable. `ErrorKind::Unsupported`
+            // also covers ordinary errors such as EOPNOTSUPP, and any error
+            // after a batch must retain the advanced descriptor and listing.
+            Err(ReadBatchError::Io(error))
+                if !primed && error.raw_os_error() == Some(libc::ENOSYS) =>
+            {
+                return Err(NativeDirectoryReadError::CapabilityUnavailable);
+            }
+            Err(ReadBatchError::Io(error)) => return Err(NativeDirectoryReadError::Io(error)),
+        };
         if byte_count == 0 {
             return Ok(());
         }
         parse_records(path, &buffer[..byte_count], listing)?;
+        primed = true;
     }
 }
 
@@ -176,6 +204,24 @@ impl From<io::Error> for NativeDirectoryReadError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
     }
+}
+
+/// The raw batch source distinguishes a compile-time unavailable syscall from
+/// a runtime I/O failure. Runtime ENOSYS is deliberately preserved as an I/O
+/// error here so the caller can apply its pre-first-batch capability rule.
+#[cfg_attr(
+    any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86",
+        target_arch = "arm"
+    ),
+    allow(dead_code)
+)]
+enum ReadBatchError {
+    CapabilityUnavailable,
+    Io(io::Error),
 }
 
 /// Opens a directory once with the native walk's flags, then enumerates that
@@ -291,7 +337,7 @@ fn descriptor_entry_kind(
     }
 }
 
-fn read_batch(directory: &File, buffer: &mut [u8]) -> io::Result<usize> {
+fn read_batch(directory: &File, buffer: &mut [u8]) -> Result<usize, ReadBatchError> {
     #[cfg(any(
         all(target_arch = "x86_64", target_pointer_width = "64"),
         target_arch = "aarch64",
@@ -320,9 +366,9 @@ fn read_batch(directory: &File, buffer: &mut [u8]) -> io::Result<usize> {
             continue;
         }
         if error.raw_os_error() == Some(38) {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, error));
+            return Err(ReadBatchError::Io(error));
         }
-        return Err(error);
+        return Err(ReadBatchError::Io(error));
     }
 
     #[cfg(not(any(
@@ -334,10 +380,7 @@ fn read_batch(directory: &File, buffer: &mut [u8]) -> io::Result<usize> {
     )))]
     {
         let _ = (directory, buffer);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "getdents64 has no reviewed syscall number for this architecture",
-        ))
+        Err(ReadBatchError::CapabilityUnavailable)
     }
 }
 
@@ -456,7 +499,10 @@ mod tests {
             io::{AsRawFd, FromRawFd},
         },
         path::{Path, PathBuf},
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Mutex, MutexGuard,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -464,25 +510,37 @@ mod tests {
 
     use super::{
         BUFFER_SIZE, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG, DT_SOCK, GETDENTS_UNSUPPORTED,
-        Listing, NAME_OFFSET, NativeDirectoryReadError, TYPE_OFFSET, entry_kind, open_directory,
-        parse_records, read_directory, read_open_directory_with_portable_fallback,
-        read_portable_directory_from_open_file,
+        Listing, NAME_OFFSET, NativeDirectoryReadError, ReadBatchError, TYPE_OFFSET, entry_kind,
+        open_directory, parse_records, read_directory,
+        read_directory_from_open_directory_with_read_batch,
+        read_open_directory_with_portable_fallback, read_portable_directory_from_open_file,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+    static GETDENTS_LATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Restores the process-wide capability latch even if an assertion fails.
-    struct GetdentsLatch(bool);
+    /// Serializes every test that mutates the process-wide capability latch and
+    /// restores its exact prior value even when the test panics.
+    struct GetdentsLatch<'a> {
+        previous: bool,
+        _lock: MutexGuard<'a, ()>,
+    }
 
-    impl GetdentsLatch {
+    impl<'a> GetdentsLatch<'a> {
         fn unsupported() -> Self {
-            Self(GETDENTS_UNSUPPORTED.swap(true, Ordering::SeqCst))
+            let lock = GETDENTS_LATCH_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self {
+                previous: GETDENTS_UNSUPPORTED.swap(true, Ordering::SeqCst),
+                _lock: lock,
+            }
         }
     }
 
-    impl Drop for GetdentsLatch {
+    impl Drop for GetdentsLatch<'_> {
         fn drop(&mut self) {
-            GETDENTS_UNSUPPORTED.store(self.0, Ordering::SeqCst);
+            GETDENTS_UNSUPPORTED.store(self.previous, Ordering::SeqCst);
         }
     }
 
@@ -633,6 +691,104 @@ mod tests {
     }
 
     #[test]
+    fn only_pre_batch_enosys_uses_the_portable_descriptor_fallback() {
+        let root = fixture_root("capability-classification");
+        fs::create_dir_all(&root).expect("create fixture directory");
+        fs::write(root.join("portable-entry"), b"fixture").expect("write portable marker");
+        let mut buffer = vec![0_u8; BUFFER_SIZE];
+
+        let mut listing = Listing::default();
+        let used_portable_fallback = read_open_directory_with_portable_fallback(
+            &root,
+            true,
+            &mut buffer,
+            &mut listing,
+            |directory, path, buffer, listing| {
+                read_directory_from_open_directory_with_read_batch(
+                    directory,
+                    path,
+                    buffer,
+                    listing,
+                    |_, _| {
+                        Err(ReadBatchError::Io(std::io::Error::from_raw_os_error(
+                            libc::ENOSYS,
+                        )))
+                    },
+                )
+            },
+        )
+        .expect("pre-first-batch ENOSYS is a capability fallback");
+        assert!(used_portable_fallback);
+        assert!(listing.contains("portable-entry"));
+
+        let mut listing = Listing::default();
+        let error = read_open_directory_with_portable_fallback(
+            &root,
+            true,
+            &mut buffer,
+            &mut listing,
+            |directory, path, buffer, listing| {
+                read_directory_from_open_directory_with_read_batch(
+                    directory,
+                    path,
+                    buffer,
+                    listing,
+                    |_, _| {
+                        Err(ReadBatchError::Io(std::io::Error::from_raw_os_error(
+                            libc::EOPNOTSUPP,
+                        )))
+                    },
+                )
+            },
+        )
+        .expect_err("EOPNOTSUPP is an ordinary directory error, not a capability latch");
+        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+        assert!(
+            listing.entries().is_empty(),
+            "the portable reader never restarted"
+        );
+
+        let records = record(b"already-read", DT_REG);
+        let mut calls = 0;
+        let error = read_open_directory_with_portable_fallback(
+            &root,
+            true,
+            &mut buffer,
+            &mut listing,
+            |directory, path, buffer, listing| {
+                read_directory_from_open_directory_with_read_batch(
+                    directory,
+                    path,
+                    buffer,
+                    listing,
+                    |_, buffer| {
+                        calls += 1;
+                        if calls == 1 {
+                            buffer[..records.len()].copy_from_slice(&records);
+                            Ok(records.len())
+                        } else {
+                            Err(ReadBatchError::Io(std::io::Error::from_raw_os_error(
+                                libc::ENOSYS,
+                            )))
+                        }
+                    },
+                )
+            },
+        )
+        .expect_err("ENOSYS after an accepted batch does not restart the descriptor");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSYS));
+        assert!(
+            listing.contains("already-read"),
+            "the accepted batch is retained"
+        );
+        assert!(
+            !listing.contains("portable-entry"),
+            "an advanced descriptor never resumes through the portable reader"
+        );
+        fs::remove_dir_all(root).expect("remove capability-classification fixture");
+    }
+
+    #[test]
     fn portable_descriptor_fallback_closes_the_transferred_descriptor() {
         let root = fixture_root("descriptor-close");
         fs::create_dir_all(&root).expect("create fixture directory");
@@ -722,6 +878,22 @@ mod tests {
             "a failed open has no partial listing"
         );
         fs::remove_dir_all(root).expect("remove latched-failure fixture");
+    }
+
+    #[test]
+    fn capability_latch_guard_restores_after_a_panic() {
+        let mut before = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let latch = GetdentsLatch::unsupported();
+            before = Some(latch.previous);
+            assert!(GETDENTS_UNSUPPORTED.load(Ordering::SeqCst));
+            panic!("exercise guard unwinding");
+        }));
+        assert!(result.is_err(), "the injected panic was caught");
+        assert_eq!(
+            GETDENTS_UNSUPPORTED.load(Ordering::SeqCst),
+            before.expect("guard recorded the prior latch state")
+        );
     }
 
     #[test]
