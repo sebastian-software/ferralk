@@ -201,8 +201,14 @@ impl Pattern {
         options: PatternOptions,
     ) -> Result<Self, PatternError> {
         let pattern = pattern.as_ref();
-        let mut compiled = Self::compile_within(pattern, options, &mut IrBudget::new(), Some(0))?;
-        let (viability, offset) = walker_path_analysis(&compiled.alternatives);
+        // Every expanded byte keeps the offset from this original source. The
+        // compiler later owns any map needed by an extglob program, so this
+        // short-lived identity map does not enlarge `Pattern`'s public shape.
+        let source_offsets = (0..pattern.len()).collect::<Vec<_>>();
+        let mut budget = IrBudget::new();
+        let mut compiled =
+            Self::compile_within(pattern, options, &mut budget, Some(&source_offsets))?;
+        let (viability, offset) = walker_path_analysis(&compiled.alternatives, &mut budget)?;
         compiled.walker_path_viability = viability;
         compiled.walker_path_problem_offset = offset;
         Ok(compiled)
@@ -222,9 +228,10 @@ impl Pattern {
 
     /// Byte offset of the determinate component behind walker viability.
     ///
-    /// Brace expansion can make source locations ambiguous, in which case the
-    /// compiler returns `None` and an embedding may use its conventional
-    /// fallback location.
+    /// The compiler retains original source provenance through brace expansion
+    /// whenever an offending byte survives in an expanded arm. It returns
+    /// `None` only when no one source location is available and an embedding
+    /// must use its conventional fallback location.
     #[doc(hidden)]
     #[must_use]
     pub const fn walker_path_problem_offset(&self) -> Option<usize> {
@@ -242,7 +249,7 @@ impl Pattern {
         pattern: &[u8],
         options: PatternOptions,
         budget: &mut IrBudget,
-        walker_offset_base: Option<usize>,
+        walker_source_offsets: Option<&[usize]>,
     ) -> Result<Self, PatternError> {
         if options.braces {
             let parse_options = PatternOptions {
@@ -250,17 +257,17 @@ impl Pattern {
                 ..options
             };
             let mut alternatives = Vec::new();
-            let expanded = expand_brace_alternatives(pattern, options.escape)?;
-            let preserves_source = expanded.len() == 1 && expanded[0] == pattern;
+            let expanded = expand_brace_alternatives_with_provenance(
+                pattern,
+                walker_source_offsets,
+                options.escape,
+            )?;
             for alternative in expanded {
-                // Brace expansion produces a new byte sequence, so its
-                // branches no longer have one unambiguous source offset. A
-                // pattern without an active brace retains its original bytes.
                 let compiled = Self::compile_within(
-                    &alternative,
+                    &alternative.bytes,
                     parse_options,
                     budget,
-                    preserves_source.then_some(walker_offset_base).flatten(),
+                    alternative.source_offsets.as_deref(),
                 )?;
                 alternatives.extend(compiled.alternatives);
             }
@@ -272,7 +279,7 @@ impl Pattern {
         // particular an escaped dot and an ordinary dot both become a literal
         // matcher token, but only the latter is a path operation a walker
         // must reject.
-        let mut walker_path = WalkerPathState::default();
+        let mut walker_path = WalkerPathShapeBuilder::default();
         let mut index = 0;
         // Charged as the tokens appear rather than per byte: a literal run is
         // one token however long it is, so billing bytes would reject patterns
@@ -286,7 +293,7 @@ impl Pattern {
                 b'/' => {
                     flush_literals(&mut tokens, &mut literals);
                     tokens.push(Token::Separator);
-                    walker_path.separator(index, walker_offset_base);
+                    walker_path.separator();
                     index += 1;
                 }
                 b'*' if options.recursive_double_star && pattern.get(index + 1) == Some(&b'*') => {
@@ -294,7 +301,7 @@ impl Pattern {
                     if pattern.get(index + 2) == Some(&b'/') {
                         tokens.push(Token::RecursivePrefix);
                         walker_path.wildcard();
-                        walker_path.separator(index + 2, walker_offset_base);
+                        walker_path.separator();
                         index += 3;
                     } else {
                         tokens.push(Token::RecursiveStar);
@@ -339,7 +346,10 @@ impl Pattern {
                 }
                 byte => {
                     literals.push(byte);
-                    walker_path.literal(byte, index, walker_offset_base);
+                    walker_path.literal(
+                        byte,
+                        walker_source_offsets.and_then(|offsets| offsets.get(index).copied()),
+                    );
                     index += 1;
                 }
             }
@@ -347,7 +357,7 @@ impl Pattern {
         flush_literals(&mut tokens, &mut literals);
         budget.charge(tokens.len() - charged, 0)?;
 
-        let extglob = compile_extglob(pattern, options, budget, walker_offset_base)?;
+        let extglob = compile_extglob(pattern, options, budget, walker_source_offsets)?;
         let fast_path = FastPath::compile(&tokens, options);
         let sweep = compile_sweep(&tokens, &fast_path, extglob.as_ref(), options, budget)?;
         let walker_path_shape = walker_path.finish();
@@ -2193,7 +2203,7 @@ fn parse_class(
 }
 
 /// One component's only path-relevant literal shapes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 enum WalkerComponentKind {
     #[default]
     Empty,
@@ -2202,7 +2212,7 @@ enum WalkerComponentKind {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 struct WalkerComponent {
     kind: WalkerComponentKind,
     /// The first literal dot in this component, when it still has a
@@ -2252,16 +2262,65 @@ impl WalkerComponent {
 /// This is deliberately not a second parser: each method is called from the
 /// same match arm that creates a token. It keeps only whether a component is a
 /// real literal dot shape, a wildcard-bearing shape, or a separator.
-#[derive(Clone, Default)]
-struct WalkerPathState {
+#[derive(Default)]
+struct WalkerPathShapeBuilder {
     components: Vec<WalkerComponent>,
     current: WalkerComponent,
 }
 
+impl WalkerPathShapeBuilder {
+    fn literal(&mut self, byte: u8, offset: Option<usize>) {
+        self.current.push_literal(byte, offset);
+    }
+
+    fn escaped(&mut self) {
+        self.current.wildcard();
+    }
+
+    fn wildcard(&mut self) {
+        self.current.wildcard();
+    }
+
+    fn separator(&mut self) {
+        self.components.push(std::mem::take(&mut self.current));
+    }
+
+    fn finish(mut self) -> WalkerPathShape {
+        self.components.push(self.current);
+        WalkerPathShape {
+            components: self.components,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WalkerPathState {
+    /// The number of components already closed by a separator, saturated once
+    /// the first-component distinction no longer matters.
+    completed_components: u8,
+    all_empty_or_dot: bool,
+    first_parent: Option<WalkerComponent>,
+    first_dot: Option<WalkerComponent>,
+    last_nonempty: Option<WalkerComponent>,
+    current: WalkerComponent,
+}
+
+impl Default for WalkerPathState {
+    fn default() -> Self {
+        Self {
+            completed_components: 0,
+            all_empty_or_dot: true,
+            first_parent: None,
+            first_dot: None,
+            last_nonempty: None,
+            current: WalkerComponent::default(),
+        }
+    }
+}
+
 impl WalkerPathState {
-    fn literal(&mut self, byte: u8, index: usize, offset_base: Option<usize>) {
-        self.current
-            .push_literal(byte, offset_base.map(|base| base + index));
+    fn literal(&mut self, byte: u8, offset: Option<usize>) {
+        self.current.push_literal(byte, offset);
     }
 
     fn escaped(&mut self) {
@@ -2275,25 +2334,87 @@ impl WalkerPathState {
         self.current.wildcard();
     }
 
-    fn separator(&mut self, _index: usize, _offset_base: Option<usize>) {
-        self.components.push(self.current);
-        self.current = WalkerComponent::default();
+    fn separator(&mut self) {
+        let component = std::mem::take(&mut self.current);
+        self.record_component(component);
     }
 
     fn append_shape(&mut self, shape: &WalkerPathShape) {
         for (index, component) in shape.components.iter().copied().enumerate() {
             self.current.append(component);
             if index + 1 != shape.components.len() {
-                self.separator(0, None);
+                self.separator();
             }
         }
     }
 
-    fn finish(mut self) -> WalkerPathShape {
-        self.components.push(self.current);
-        WalkerPathShape {
-            components: self.components,
+    fn record_component(&mut self, component: WalkerComponent) {
+        let first = self.completed_components == 0;
+        if !matches!(
+            component.kind,
+            WalkerComponentKind::Empty | WalkerComponentKind::Dot
+        ) {
+            self.all_empty_or_dot = false;
         }
+        if component.kind == WalkerComponentKind::Parent && self.first_parent.is_none() {
+            self.first_parent = Some(component);
+        }
+        if component.kind == WalkerComponentKind::Dot && !first && self.first_dot.is_none() {
+            self.first_dot = Some(component);
+        }
+        if component.kind != WalkerComponentKind::Empty {
+            self.last_nonempty = Some(component);
+        }
+        self.completed_components = self.completed_components.saturating_add(1).min(2);
+    }
+
+    fn finish(mut self) -> WalkerPathSummary {
+        let component = std::mem::take(&mut self.current);
+        self.record_component(component);
+        WalkerPathSummary {
+            all_empty_or_dot: self.all_empty_or_dot,
+            first_parent: self.first_parent,
+            first_dot: self.first_dot,
+            last_nonempty: self.last_nonempty,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WalkerPathSummary {
+    all_empty_or_dot: bool,
+    first_parent: Option<WalkerComponent>,
+    first_dot: Option<WalkerComponent>,
+    last_nonempty: Option<WalkerComponent>,
+}
+
+impl WalkerPathSummary {
+    fn problem(self) -> Option<WalkerPathProblem> {
+        if self.all_empty_or_dot {
+            return Some(WalkerPathProblem {
+                viability: WalkerPathViability::Root,
+                offset: self.last_nonempty.and_then(|component| component.offset),
+            });
+        }
+        if let Some(component) = self.first_parent {
+            return Some(WalkerPathProblem {
+                viability: WalkerPathViability::ParentComponent,
+                offset: component.offset,
+            });
+        }
+        if self
+            .last_nonempty
+            .is_some_and(|component| component.kind == WalkerComponentKind::Dot)
+        {
+            return Some(WalkerPathProblem {
+                viability: WalkerPathViability::TrailingDot,
+                offset: self.last_nonempty.and_then(|component| component.offset),
+            });
+        }
+        self.first_dot.map(|component| WalkerPathProblem {
+            viability: WalkerPathViability::DotComponent,
+            offset: component.offset,
+        })
     }
 }
 
@@ -2308,7 +2429,9 @@ impl WalkerPathShape {
     }
 
     fn problem(&self) -> Option<WalkerPathProblem> {
-        walker_component_problem(&self.components)
+        let mut state = WalkerPathState::default();
+        state.append_shape(self);
+        state.finish().problem()
     }
 }
 
@@ -2325,44 +2448,56 @@ struct WalkerPathProblem {
 /// policy therefore never needs a second source grammar.
 fn walker_path_analysis(
     alternatives: &[CompiledAlternative],
-) -> (WalkerPathViability, Option<usize>) {
+    budget: &mut IrBudget,
+) -> Result<(WalkerPathViability, Option<usize>), PatternError> {
     let mut first_problem = None;
     for alternative in alternatives {
-        match alternative.walker_path_problem() {
-            None => return (WalkerPathViability::Viable, None),
+        match alternative.walker_path_problem(budget)? {
+            None => return Ok((WalkerPathViability::Viable, None)),
             Some(problem) => first_problem.get_or_insert(problem),
         };
     }
     match first_problem {
-        Some(problem) => (problem.viability, problem.offset),
-        None => (WalkerPathViability::Viable, None),
+        Some(problem) => Ok((problem.viability, problem.offset)),
+        None => Ok((WalkerPathViability::Viable, None)),
     }
 }
 
 impl CompiledAlternative {
-    fn walker_path_problem(&self) -> Option<WalkerPathProblem> {
+    fn walker_path_problem(
+        &self,
+        budget: &mut IrBudget,
+    ) -> Result<Option<WalkerPathProblem>, PatternError> {
         match &self.extglob {
-            Some(program) => program.walker_path_problem(),
-            None => self.walker_path_shape.problem(),
+            Some(program) => program.walker_path_problem(budget),
+            None => Ok(self.walker_path_shape.problem()),
         }
     }
 }
 
 impl CompiledExtglob {
-    fn walker_path_problem(&self) -> Option<WalkerPathProblem> {
+    fn walker_path_problem(
+        &self,
+        budget: &mut IrBudget,
+    ) -> Result<Option<WalkerPathProblem>, PatternError> {
         let mut states = vec![WalkerPathState::default()];
         let mut index = 0;
         while let Some(step) = self.steps.get(index) {
             match step {
                 ExtglobStep::Byte(b'/') => {
                     for state in &mut states {
-                        state.separator(index, self.walker_offset_base);
+                        state.separator();
                     }
                     index += 1;
                 }
                 ExtglobStep::Byte(byte) => {
                     for state in &mut states {
-                        state.literal(*byte, index, self.walker_offset_base);
+                        state.literal(
+                            *byte,
+                            self.walker_source_offsets
+                                .as_ref()
+                                .and_then(|offsets| offsets.get(index).copied()),
+                        );
                     }
                     index += 1;
                 }
@@ -2373,7 +2508,7 @@ impl CompiledExtglob {
                     index += 2;
                 }
                 ExtglobStep::Group(group) => {
-                    states = self.groups[*group].apply_to(states);
+                    states = self.groups[*group].apply_to(states, budget)?;
                     index = self.groups[*group].rest;
                 }
                 ExtglobStep::Star { next } | ExtglobStep::Class { next, .. } => {
@@ -2402,43 +2537,87 @@ impl CompiledExtglob {
         }
         let mut first_problem = None;
         for state in states {
-            let problem = state.finish().problem()?;
+            let Some(problem) = state.finish().problem() else {
+                return Ok(None);
+            };
             first_problem.get_or_insert(problem);
         }
-        first_problem
+        Ok(first_problem)
     }
 }
 
 impl ExtglobGroup {
-    fn apply_to(&self, states: Vec<WalkerPathState>) -> Vec<WalkerPathState> {
+    fn apply_to(
+        &self,
+        states: Vec<WalkerPathState>,
+        budget: &mut IrBudget,
+    ) -> Result<Vec<WalkerPathState>, PatternError> {
         match self.kind {
-            ExtglobKind::Negated | ExtglobKind::ZeroOrMore | ExtglobKind::OneOrMore => {
+            ExtglobKind::Negated => {
                 let mut states = states;
                 for state in &mut states {
-                    // Repetition and negation can generate a non-literal
-                    // component. A later outer `/.` or `/..` is still
-                    // processed after this placeholder.
+                    // A negated arm can generate arbitrary matcher text. A
+                    // later outer `/.` or `/..` remains visible after this
+                    // placeholder.
                     state.wildcard();
                 }
-                states
+                Ok(states)
             }
             ExtglobKind::Optional => {
                 let mut output = states.clone();
-                output.extend(self.exact_states(states));
-                output
+                output.extend(self.exact_states(&states, budget)?);
+                Ok(deduplicate_walker_states(output))
             }
-            ExtglobKind::ExactlyOne => self.exact_states(states),
+            ExtglobKind::ZeroOrMore => self.fixed_point(states, false, budget),
+            ExtglobKind::OneOrMore => self.fixed_point(states, true, budget),
+            ExtglobKind::ExactlyOne => self.exact_states(&states, budget),
         }
     }
 
-    fn exact_states(&self, states: Vec<WalkerPathState>) -> Vec<WalkerPathState> {
+    fn fixed_point(
+        &self,
+        states: Vec<WalkerPathState>,
+        require_one: bool,
+        budget: &mut IrBudget,
+    ) -> Result<Vec<WalkerPathState>, PatternError> {
+        let mut seen = HashSet::new();
+        let mut all = Vec::new();
+        let mut frontier = if require_one {
+            self.exact_states(&states, budget)?
+        } else {
+            states
+        };
+        frontier.retain(|state| seen.insert(state.clone()));
+        all.extend(frontier.iter().cloned());
+        while !frontier.is_empty() {
+            let next = self.exact_states(&frontier, budget)?;
+            frontier = next
+                .into_iter()
+                .filter(|state| seen.insert(state.clone()))
+                .collect();
+            all.extend(frontier.iter().cloned());
+        }
+        Ok(all)
+    }
+
+    fn exact_states(
+        &self,
+        states: &[WalkerPathState],
+        budget: &mut IrBudget,
+    ) -> Result<Vec<WalkerPathState>, PatternError> {
+        let mut seen = HashSet::new();
         let mut output = Vec::new();
         for alternative in &self.alternatives {
             let Some(compiled) = &alternative.compiled else {
                 continue;
             };
             for arm in compiled {
-                for state in &states {
+                for state in states {
+                    // The state product is compiler-owned semantic IR. Charge
+                    // every attempted transition before it can allocate, so
+                    // an adversarial sequence of distinct groups is bounded
+                    // by the same limit as the matcher IR.
+                    budget.charge(1, self.start)?;
                     let mut state = state.clone();
                     if arm.walker_path_shape.has_separator() {
                         state.append_shape(&arm.walker_path_shape);
@@ -2447,7 +2626,9 @@ impl ExtglobGroup {
                         // is matcher text (`@(..)`), not a path operation.
                         state.wildcard();
                     }
-                    output.push(state);
+                    if seen.insert(state.clone()) {
+                        output.push(state);
+                    }
                 }
             }
         }
@@ -2455,59 +2636,22 @@ impl ExtglobGroup {
             // An uncompileable arm has no viable matcher branch, but its
             // surrounding program still carries top-level path components
             // that must not be hidden by an empty state set.
-            output = states;
-            for state in &mut output {
+            let mut fallback = states.to_vec();
+            for state in &mut fallback {
                 state.wildcard();
             }
+            output = deduplicate_walker_states(fallback);
         }
-        output
+        Ok(output)
     }
 }
 
-fn walker_component_problem(components: &[WalkerComponent]) -> Option<WalkerPathProblem> {
-    // The conventional leading `./` spelling is removed by traversal filters
-    // before they match candidates. A second dot component remains a real
-    // non-normalized operation.
-    let components = if components.len() > 1 && components[0].kind == WalkerComponentKind::Dot {
-        &components[1..]
-    } else {
-        components
-    };
-    if components.iter().all(|component| {
-        matches!(
-            component.kind,
-            WalkerComponentKind::Empty | WalkerComponentKind::Dot
-        )
-    }) {
-        return Some(WalkerPathProblem {
-            viability: WalkerPathViability::Root,
-            offset: components.iter().find_map(|component| component.offset),
-        });
-    }
-    if let Some(component) = components
-        .iter()
-        .find(|component| component.kind == WalkerComponentKind::Parent)
-    {
-        return Some(WalkerPathProblem {
-            viability: WalkerPathViability::ParentComponent,
-            offset: component.offset,
-        });
-    }
-    let last = components
-        .iter()
-        .rposition(|component| component.kind != WalkerComponentKind::Empty);
-    if last.is_some_and(|index| components[index].kind == WalkerComponentKind::Dot) {
-        return Some(WalkerPathProblem {
-            viability: WalkerPathViability::TrailingDot,
-            offset: components[last.expect("checked above")].offset,
-        });
-    }
-    components.iter().find_map(|component| {
-        (component.kind == WalkerComponentKind::Dot).then_some(WalkerPathProblem {
-            viability: WalkerPathViability::DotComponent,
-            offset: component.offset,
-        })
-    })
+fn deduplicate_walker_states(states: Vec<WalkerPathState>) -> Vec<WalkerPathState> {
+    let mut seen = HashSet::new();
+    states
+        .into_iter()
+        .filter(|state| seen.insert(state.clone()))
+        .collect()
 }
 
 fn parse_posix_class(name: &[u8]) -> Option<PosixClass> {
@@ -2599,12 +2743,15 @@ const MAX_BRACE_EXPANSION_BYTES: usize = 1 << 26;
 /// budget cannot express: 20 MB of expanded text became 1.9 GB of compiled
 /// program, from a 5 KB pattern that sat inside both other budgets.
 ///
-/// A unit is one token, one program step, or one class member — a class token
-/// owns its member list, so it is charged for both. [`Token`] is 32 bytes and
-/// [`ExtglobStep`] is 40, pinned by a test so this arithmetic cannot go stale,
-/// which puts the ceiling around 40 MB of compiled program and tens of
-/// milliseconds of work. That is orders of magnitude past any real pattern: a
-/// language's extension list against a path glob is a few hundred units.
+/// A unit is one token, one program step, one class member, or one attempted
+/// compiler-derived walker-state transition — a class token owns its member
+/// list, so it is charged for both. The transition charge bounds the product
+/// of exact extglob arms without adding a separate viability limit. [`Token`]
+/// is 32 bytes and [`ExtglobStep`] is 40, pinned by a test so this arithmetic
+/// cannot go stale, which puts the ceiling around 40 MB of compiled program
+/// and tens of milliseconds of work. That is orders of magnitude past any
+/// real pattern: a language's extension list against a path glob is a few
+/// hundred units.
 const MAX_COMPILED_IR_UNITS: usize = 1 << 20;
 
 /// Tracks compiled units across every alternative of one [`Pattern::compile`].
@@ -2681,7 +2828,19 @@ pub fn expand_braces(
     if !options.braces {
         return Ok(vec![pattern.to_vec()]);
     }
-    expand_brace_alternatives(pattern, options.escape)
+    Ok(
+        expand_brace_alternatives_with_provenance(pattern, None, options.escape)?
+            .into_iter()
+            .map(|alternative| alternative.bytes)
+            .collect(),
+    )
+}
+
+/// One brace-expanded byte sequence and, when compilation requested it, the
+/// original byte position of every surviving byte.
+struct BraceExpansion {
+    bytes: Vec<u8>,
+    source_offsets: Option<Vec<usize>>,
 }
 
 /// Expands brace groups into one pattern per combination.
@@ -2702,27 +2861,38 @@ pub fn expand_braces(
 /// is quadratic in its length even where it expands to one alternative. The
 /// running total only grows too, so stopping at the first write that passes the
 /// limit rejects exactly the patterns whose finished expansion would.
-fn expand_brace_alternatives(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8>>, PatternError> {
+fn expand_brace_alternatives_with_provenance(
+    pattern: &[u8],
+    source_offsets: Option<&[usize]>,
+    escapes: bool,
+) -> Result<Vec<BraceExpansion>, PatternError> {
     let Some(first_open) = first_unescaped_brace(pattern, escapes) else {
-        return Ok(vec![pattern.to_vec()]);
+        return Ok(vec![BraceExpansion {
+            bytes: pattern.to_vec(),
+            source_offsets: source_offsets.map(ToOwned::to_owned),
+        }]);
     };
 
-    let mut expanded: Vec<Vec<u8>> = Vec::new();
-    let mut pending: Vec<Vec<u8>> = vec![pattern.to_vec()];
+    let mut expanded = Vec::new();
+    let mut pending = vec![BraceExpansion {
+        bytes: pattern.to_vec(),
+        source_offsets: source_offsets.map(ToOwned::to_owned),
+    }];
     let mut written = pattern.len();
     while let Some(current) = pending.pop() {
-        let Some(open) = first_unescaped_brace(&current, escapes) else {
+        let Some(open) = first_unescaped_brace(&current.bytes, escapes) else {
             expanded.push(current);
             continue;
         };
-        let Some(close) = matching_brace(&current, open, escapes) else {
+        let Some(close) = matching_brace(&current.bytes, open, escapes) else {
             // zlob treats an unmatched brace as ordinary text.
             expanded.push(current);
             continue;
         };
 
-        let alternatives = split_brace_alternatives(&current[open + 1..close], escapes);
-        for alternative in alternatives.iter().rev() {
+        let alternatives = split_brace_alternatives(&current.bytes[open + 1..close], escapes);
+        for range in alternatives.iter().rev() {
+            let alternative = &current.bytes[open + 1 + range.start..open + 1 + range.end];
             if expanded.len() + pending.len() >= MAX_BRACE_ALTERNATIVES {
                 return Err(PatternError {
                     // Offsets into a partly expanded pattern would not point
@@ -2731,7 +2901,7 @@ fn expand_brace_alternatives(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8
                     message: "too many brace alternatives",
                 });
             }
-            let length = open + alternative.len() + current.len() - close - 1;
+            let length = open + alternative.len() + current.bytes.len() - close - 1;
             written = written.saturating_add(length);
             if written > MAX_BRACE_EXPANSION_BYTES {
                 return Err(PatternError {
@@ -2739,14 +2909,37 @@ fn expand_brace_alternatives(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8
                     message: "brace expansion is too large",
                 });
             }
-            let mut combined = Vec::with_capacity(length);
-            combined.extend_from_slice(&current[..open]);
-            combined.extend_from_slice(alternative);
-            combined.extend_from_slice(&current[close + 1..]);
-            pending.push(combined);
+            let mut bytes = Vec::with_capacity(length);
+            bytes.extend_from_slice(&current.bytes[..open]);
+            bytes.extend_from_slice(alternative);
+            bytes.extend_from_slice(&current.bytes[close + 1..]);
+            let source_offsets = current.source_offsets.as_ref().map(|offsets| {
+                let mut combined = Vec::with_capacity(length);
+                combined.extend_from_slice(&offsets[..open]);
+                let alternative_start = open + 1 + range.start;
+                combined.extend_from_slice(
+                    &offsets[alternative_start..alternative_start + alternative.len()],
+                );
+                combined.extend_from_slice(&offsets[close + 1..]);
+                combined
+            });
+            pending.push(BraceExpansion {
+                bytes,
+                source_offsets,
+            });
         }
     }
     Ok(expanded)
+}
+
+#[cfg(test)]
+fn expand_brace_alternatives(pattern: &[u8], escapes: bool) -> Result<Vec<Vec<u8>>, PatternError> {
+    Ok(
+        expand_brace_alternatives_with_provenance(pattern, None, escapes)?
+            .into_iter()
+            .map(|alternative| alternative.bytes)
+            .collect(),
+    )
 }
 
 fn first_unescaped_brace(pattern: &[u8], escapes: bool) -> Option<usize> {
@@ -2789,7 +2982,7 @@ fn matching_brace(pattern: &[u8], open: usize, escapes: bool) -> Option<usize> {
     None
 }
 
-fn split_brace_alternatives(content: &[u8], escapes: bool) -> Vec<&[u8]> {
+fn split_brace_alternatives(content: &[u8], escapes: bool) -> Vec<std::ops::Range<usize>> {
     let mut alternatives = Vec::new();
     let mut start = 0;
     let mut depth = 0_usize;
@@ -2803,14 +2996,14 @@ fn split_brace_alternatives(content: &[u8], escapes: bool) -> Vec<&[u8]> {
             b'{' => depth += 1,
             b'}' => depth -= 1,
             b',' if depth == 0 => {
-                alternatives.push(&content[start..index]);
+                alternatives.push(start..index);
                 start = index + 1;
             }
             _ => {}
         }
         index += 1;
     }
-    alternatives.push(&content[start..]);
+    alternatives.push(start..content.len());
     alternatives
 }
 
@@ -2858,7 +3051,9 @@ enum ExtglobKind {
 struct CompiledExtglob {
     steps: Vec<ExtglobStep>,
     groups: Vec<ExtglobGroup>,
-    walker_offset_base: Option<usize>,
+    /// Original-source byte offsets for `steps`, retained after brace
+    /// expansion so walker diagnostics preserve `PatternError` provenance.
+    walker_source_offsets: Option<Vec<usize>>,
 }
 
 /// What the walk does at one byte offset.
@@ -2915,7 +3110,7 @@ fn compile_extglob(
     pattern: &[u8],
     options: PatternOptions,
     budget: &mut IrBudget,
-    walker_offset_base: Option<usize>,
+    walker_source_offsets: Option<&[usize]>,
 ) -> Result<Option<CompiledExtglob>, PatternError> {
     if !options.extglob || !contains_extglob(pattern, options.escape) {
         return Ok(None);
@@ -2938,7 +3133,7 @@ fn compile_extglob(
             options,
             &mut groups,
             budget,
-            walker_offset_base,
+            walker_source_offsets,
         )?;
         match &step {
             ExtglobStep::Group(group) => pending.push(groups[*group].rest),
@@ -2962,7 +3157,7 @@ fn compile_extglob(
     Ok(Some(CompiledExtglob {
         steps,
         groups,
-        walker_offset_base,
+        walker_source_offsets: walker_source_offsets.map(ToOwned::to_owned),
     }))
 }
 
@@ -2973,7 +3168,7 @@ fn compile_extglob_step(
     options: PatternOptions,
     groups: &mut Vec<ExtglobGroup>,
     budget: &mut IrBudget,
-    walker_offset_base: Option<usize>,
+    walker_source_offsets: Option<&[usize]>,
 ) -> Result<ExtglobStep, PatternError> {
     if let Some(kind) = detect_extglob_at(pattern, index) {
         let open = index + 1;
@@ -2989,7 +3184,7 @@ fn compile_extglob_step(
                 &pattern[start..open + 1 + range.end],
                 options,
                 budget,
-                walker_offset_base.map(|base| base + start),
+                walker_source_offsets.map(|offsets| &offsets[start..open + 1 + range.end]),
             )?);
         }
         groups.push(ExtglobGroup {
@@ -3032,7 +3227,7 @@ fn compile_extglob_alternative(
     alternative: &[u8],
     options: PatternOptions,
     budget: &mut IrBudget,
-    walker_offset_base: Option<usize>,
+    walker_source_offsets: Option<&[usize]>,
 ) -> Result<ExtglobAlternative, PatternError> {
     let options = PatternOptions {
         braces: false,
@@ -3044,11 +3239,12 @@ fn compile_extglob_alternative(
     // A syntax error in one alternative is not a compile failure — it is an
     // alternative that matches nothing, as it always was. Running out of budget
     // is a different thing and has to reach the caller.
-    let compiled = match Pattern::compile_within(alternative, options, budget, walker_offset_base) {
-        Ok(pattern) => Some(pattern.alternatives),
-        Err(error) if error.message() == TOO_MUCH_COMPILED_IR => return Err(error),
-        Err(_) => None,
-    };
+    let compiled =
+        match Pattern::compile_within(alternative, options, budget, walker_source_offsets) {
+            Ok(pattern) => Some(pattern.alternatives),
+            Err(error) if error.message() == TOO_MUCH_COMPILED_IR => return Err(error),
+            Err(_) => None,
+        };
     let width = compiled.as_deref().and_then(fixed_token_width);
     Ok(ExtglobAlternative { compiled, width })
 }
@@ -3957,6 +4153,64 @@ mod tests {
                 "all compiled arms remain unwalkable: {source}"
             );
         }
+    }
+
+    #[test]
+    fn walker_path_viability_composes_extglob_quantifiers_without_state_products() {
+        let options = PatternOptions::default().braces(true).extglob(true);
+        let mandatory =
+            Pattern::compile("+(dead/../branch)", options).expect("mandatory extglob compiles");
+        assert!(mandatory.is_match("dead/../branch"));
+        assert_eq!(
+            mandatory.walker_path_viability(),
+            WalkerPathViability::ParentComponent,
+            "one required repetition preserves its real parent component"
+        );
+        assert_eq!(
+            Pattern::compile("prefix+(../bar)", options)
+                .expect("prefixed repetition compiles")
+                .walker_path_viability(),
+            WalkerPathViability::Viable,
+            "the compiler composes an arm with its outer component"
+        );
+
+        for source in [
+            "?(dead/../branch)",
+            "*(dead/../branch)",
+            "+(dead/../branch)",
+            "@(dead/../branch)",
+        ] {
+            assert_ne!(
+                Pattern::compile(source, options)
+                    .expect("quantified extglob compiles")
+                    .walker_path_viability(),
+                WalkerPathViability::Viable,
+                "every matching repetition of {source} remains unwalkable"
+            );
+        }
+        assert_eq!(
+            Pattern::compile("!(dead/../branch)", options)
+                .expect("negated extglob compiles")
+                .walker_path_viability(),
+            WalkerPathViability::Viable
+        );
+
+        // Each group has two compiler arms, but their walker summaries are
+        // equal. This used to construct 2^32 duplicate state vectors; the
+        // canonical state set stays one state per group transition.
+        let sequential = "@(a|b)".repeat(32);
+        let compiled = Pattern::compile(&sequential, options)
+            .expect("sequential equivalent extglobs stay within the IR budget");
+        assert_eq!(
+            compiled.walker_path_viability(),
+            WalkerPathViability::Viable
+        );
+
+        // Nesting must take the same bounded compiler path rather than falling
+        // back to a second source-level grammar.
+        let nested = "@(@(a|b)|@(c|d))".repeat(16);
+        Pattern::compile(&nested, options)
+            .expect("nested equivalent extglobs stay within the IR budget");
     }
 
     #[test]

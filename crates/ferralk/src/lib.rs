@@ -2809,12 +2809,14 @@ mod tests {
                 |walker: Walker| walker.include("src/./main.rs"),
                 |walker: Walker| walker.include("././src/**"),
                 |walker: Walker| walker.include("src/../main.rs"),
+                |walker: Walker| walker.include("+(dead/../branch)"),
                 |walker: Walker| walker.exclude("."),
                 |walker: Walker| walker.exclude("./"),
                 |walker: Walker| walker.exclude("src/."),
                 |walker: Walker| walker.exclude("src/./main.rs"),
                 |walker: Walker| walker.exclude("././src/**"),
                 |walker: Walker| walker.exclude("src/../main.rs"),
+                |walker: Walker| walker.exclude("+(dead/../branch)"),
             ] {
                 let error = add(Walker::new(&fixture.root).wildcard_mode(mode))
                     .expect_err("unwalkable relative pattern is refused");
@@ -3013,6 +3015,9 @@ mod tests {
             ("src/.", 4),
             ("é/../main.rs", 3),
             ("src/@(./a.rs)", 6),
+            ("{src}/../main.rs", 6),
+            ("{a,b}/../main.rs", 6),
+            ("src/{x}/.", 8),
         ] {
             for mode in [
                 WildcardMode::ComponentScoped,
