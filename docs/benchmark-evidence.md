@@ -353,8 +353,11 @@ is cheap next to reading a few hundred directory entries.
 What one walker actually buys is structural rather than measurable here: one
 helper-spawn decision taken over the whole walk instead of per tree, so three
 small roots stay serial where three separate walkers would each weigh
-themselves; one visited-directory set; and one place for the caller's patterns
-instead of a loop that rebuilds them per root. Criterion's sequential arms
+themselves; one visited-directory guard per root traversal, shared only with
+that root's descendants; and one place for the caller's patterns instead of a
+loop that rebuilds them per root. The independent guards preserve overlapping,
+duplicate and alias roots as the concatenation of their single-root walks while
+still ending genuine cycles within each root. Criterion's sequential arms
 disagreed with the paired measurement on the smallest shape — it reported the
 one-walker arm slower — which is drift between arms measured minutes apart, and
 the reason the table above is paired.
