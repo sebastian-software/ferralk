@@ -2,7 +2,7 @@
 
 use std::hint::black_box;
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ferralk_glob::{Pattern, PatternOptions};
 use globset::GlobBuilder;
 use wax::{Glob as WaxGlob, Program as _};
@@ -407,6 +407,7 @@ fn matcher(c: &mut Criterion) {
     long_paths(c);
     adversarial(c);
     large_path_filter(c);
+    node_pattern_sets(c);
 }
 
 /// Pendants for the scenarios that previously ran against no comparator.
@@ -577,6 +578,186 @@ fn large_path_filter(c: &mut Criterion) {
     c.bench_function("path_filter/large_list", |benchmark| {
         benchmark.iter(|| black_box(filter.filter_paths(black_box(paths.as_slice())).len()))
     });
+}
+
+/// Common Node/TypeScript catalogs, with the best and worst positions kept
+/// separate so a faster first alternative cannot hide a linear tail.
+fn node_pattern_sets(c: &mut Criterion) {
+    const EXTENSIONS: [&str; 6] = ["ts", "tsx", "js", "jsx", "mjs", "cjs"];
+    const BRACE_SOURCE: &str = "**/*.{ts,tsx,js,jsx,mjs,cjs}";
+    const SCOPED_SOURCE: &str = "{src,packages,apps}/**/*.{ts,tsx,js,jsx,mjs,cjs}";
+    let options = PatternOptions::default()
+        .braces(true)
+        .recursive_double_star(true)
+        .extglob(true);
+    let brace = Pattern::compile(BRACE_SOURCE, options).expect("Node brace pattern is valid");
+    let scoped =
+        Pattern::compile(SCOPED_SOURCE, options).expect("scoped Node brace pattern is valid");
+    let catalog = EXTENSIONS
+        .iter()
+        .map(|extension| {
+            Pattern::compile(format!("**/*.{extension}"), options)
+                .expect("Node catalog pattern is valid")
+        })
+        .collect::<Vec<_>>();
+    let first = "packages/frontend/src/components/navigation/header.ts";
+    let last = "packages/server/dist/runtime/worker.cjs";
+    let rejected = "packages/frontend/src/components/navigation/header.vue";
+    let scoped_first = "src/components/navigation/header.ts";
+    let scoped_last = "apps/server/src/runtime/worker.cjs";
+    let scoped_wrong_root = "vendor/frontend/src/components/header.ts";
+
+    let mut compile = c.benchmark_group("node_pattern_set/compile");
+    compile.bench_function("brace", |benchmark| {
+        benchmark.iter(|| {
+            black_box(
+                Pattern::compile(black_box(BRACE_SOURCE), black_box(options))
+                    .expect("Node brace pattern is valid"),
+            )
+        })
+    });
+    compile.bench_function("scoped_brace", |benchmark| {
+        benchmark.iter(|| {
+            black_box(
+                Pattern::compile(black_box(SCOPED_SOURCE), black_box(options))
+                    .expect("scoped Node brace pattern is valid"),
+            )
+        })
+    });
+    compile.finish();
+
+    assert!(brace.is_match_glob_path(first));
+    assert!(brace.is_match_glob_path(last));
+    assert!(!brace.is_match_glob_path(rejected));
+    assert!(scoped.is_match_glob_path(scoped_first));
+    assert!(scoped.is_match_glob_path(scoped_last));
+    assert!(!scoped.is_match_glob_path(scoped_wrong_root));
+    for candidate in [first, last, rejected] {
+        assert_eq!(
+            brace.is_match_glob_path(candidate),
+            catalog
+                .iter()
+                .any(|pattern| pattern.is_match_glob_path(candidate)),
+            "brace and catalog forms must select the same benchmark candidate"
+        );
+    }
+
+    let mut point = c.benchmark_group("node_pattern_set/point");
+    point.bench_function("brace/first_extension", |benchmark| {
+        benchmark.iter(|| black_box(brace.is_match_glob_path(black_box(first))))
+    });
+    point.bench_function("brace/last_extension", |benchmark| {
+        benchmark.iter(|| black_box(brace.is_match_glob_path(black_box(last))))
+    });
+    point.bench_function("brace/rejected_extension", |benchmark| {
+        benchmark.iter(|| black_box(brace.is_match_glob_path(black_box(rejected))))
+    });
+    point.bench_function("scoped_brace/first_alternative", |benchmark| {
+        benchmark.iter(|| black_box(scoped.is_match_glob_path(black_box(scoped_first))))
+    });
+    point.bench_function("scoped_brace/last_alternative", |benchmark| {
+        benchmark.iter(|| black_box(scoped.is_match_glob_path(black_box(scoped_last))))
+    });
+    point.bench_function("scoped_brace/rejected_root", |benchmark| {
+        benchmark.iter(|| black_box(scoped.is_match_glob_path(black_box(scoped_wrong_root))))
+    });
+    point.bench_function("catalog/first_extension", |benchmark| {
+        benchmark.iter(|| {
+            black_box(
+                catalog
+                    .iter()
+                    .any(|pattern| pattern.is_match_glob_path(black_box(first))),
+            )
+        })
+    });
+    point.bench_function("catalog/last_extension", |benchmark| {
+        benchmark.iter(|| {
+            black_box(
+                catalog
+                    .iter()
+                    .any(|pattern| pattern.is_match_glob_path(black_box(last))),
+            )
+        })
+    });
+    point.bench_function("catalog/rejected_extension", |benchmark| {
+        benchmark.iter(|| {
+            black_box(
+                catalog
+                    .iter()
+                    .any(|pattern| pattern.is_match_glob_path(black_box(rejected))),
+            )
+        })
+    });
+    point.finish();
+
+    let paths = (0..1024)
+        .map(|index| {
+            let extension = match index % 4 {
+                0 => "ts",
+                1 => "tsx",
+                2 => "cjs",
+                _ => "vue",
+            };
+            format!("packages/package-{index}/src/components/widget-{index}.{extension}")
+        })
+        .collect::<Vec<_>>();
+    let brace_count = paths
+        .iter()
+        .filter(|path| brace.is_match_glob_path(path.as_bytes()))
+        .count();
+    let catalog_count = paths
+        .iter()
+        .filter(|path| {
+            catalog
+                .iter()
+                .any(|pattern| pattern.is_match_glob_path(path.as_bytes()))
+        })
+        .count();
+    let scoped_count = paths
+        .iter()
+        .filter(|path| scoped.is_match_glob_path(path.as_bytes()))
+        .count();
+    assert_eq!(brace_count, 768);
+    assert_eq!(catalog_count, brace_count);
+    assert_eq!(scoped_count, brace_count);
+
+    let mut list = c.benchmark_group("node_pattern_set/list");
+    list.throughput(Throughput::Elements(paths.len() as u64));
+    list.bench_function("brace/1024_paths", |benchmark| {
+        benchmark.iter(|| {
+            black_box(
+                paths
+                    .iter()
+                    .filter(|path| brace.is_match_glob_path(black_box(path.as_bytes())))
+                    .count(),
+            )
+        })
+    });
+    list.bench_function("scoped_brace/1024_paths", |benchmark| {
+        benchmark.iter(|| {
+            black_box(
+                paths
+                    .iter()
+                    .filter(|path| scoped.is_match_glob_path(black_box(path.as_bytes())))
+                    .count(),
+            )
+        })
+    });
+    list.bench_function("catalog/1024_paths", |benchmark| {
+        benchmark.iter(|| {
+            black_box(
+                paths
+                    .iter()
+                    .filter(|path| {
+                        catalog
+                            .iter()
+                            .any(|pattern| pattern.is_match_glob_path(black_box(path.as_bytes())))
+                    })
+                    .count(),
+            )
+        })
+    });
+    list.finish();
 }
 
 fn long_path(file: &str) -> String {

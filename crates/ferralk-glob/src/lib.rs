@@ -33,6 +33,7 @@ use sweep::{SweepEngine, SweepState};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern {
     alternatives: Vec<CompiledAlternative>,
+    alternative_fast_path: Option<Box<AlternativeFastPath>>,
     path_filter_alternatives: Option<Vec<CompiledAlternative>>,
     walker_path_viability: WalkerPathViability,
     walker_path_problem_offset: Option<usize>,
@@ -437,11 +438,14 @@ impl Pattern {
     #[must_use]
     pub fn is_match(&self, path: impl AsRef<[u8]>) -> bool {
         let path = path.as_ref();
-        if !self.options.extglob
-            && let [alternative] = self.alternatives.as_slice()
+        if let [alternative] = self.alternatives.as_slice()
+            && (!self.options.extglob || alternative.extglob.is_none())
             && let Some(fast_path) = &alternative.fast_path
         {
             return fast_path.is_match(path, self.options);
+        }
+        if let Some(fast_path) = &self.alternative_fast_path {
+            return fast_path.is_match(path, self.options, &self.alternatives);
         }
         Self::match_alternatives(&self.alternatives, self.options, path)
     }
@@ -478,6 +482,9 @@ impl Pattern {
     /// the stripped pattern into the bare memoized engine — the oracle the
     /// prefilter and the sweep are both held against.
     fn strip_engines(&mut self, fast_paths: bool, sweeps: bool, prefilters: bool) {
+        if fast_paths {
+            self.alternative_fast_path = None;
+        }
         for alternative in self
             .alternatives
             .iter_mut()
@@ -614,12 +621,23 @@ impl Pattern {
     /// at the root component and is suitable for traversal filters.
     #[must_use]
     pub fn is_match_glob_path(&self, path: impl AsRef<[u8]>) -> bool {
+        let path = path.as_ref();
         let options = PatternOptions {
             component_wildcards: true,
             root_component_wildcards: true,
             ..self.options
         };
-        Self::match_alternatives(&self.alternatives, options, path.as_ref())
+        if let [alternative] = self.alternatives.as_slice()
+            && (!options.extglob || alternative.extglob.is_none())
+            && let Some(fast_path) = &alternative.fast_path
+            && fast_path.supports_component_wildcards()
+        {
+            return fast_path.is_match(path, options);
+        }
+        if let Some(fast_path) = &self.alternative_fast_path {
+            return fast_path.is_match(path, options, &self.alternatives);
+        }
+        Self::match_alternatives(&self.alternatives, options, path)
     }
 
     /// Returns the input paths accepted relative to `base_path`, preserving
@@ -697,6 +715,8 @@ impl Pattern {
         options: PatternOptions,
         budget: &mut IrBudget,
     ) -> Result<Self, PatternError> {
+        let alternative_fast_path =
+            AlternativeFastPath::compile(&alternatives, options, budget)?.map(Box::new);
         let path_filter_alternatives = alternatives
             .iter()
             .any(|alternative| {
@@ -721,6 +741,7 @@ impl Pattern {
             .transpose()?;
         Ok(Self {
             alternatives,
+            alternative_fast_path,
             path_filter_alternatives,
             walker_path_viability: WalkerPathViability::Viable,
             walker_path_problem_offset: None,
@@ -1687,6 +1708,373 @@ impl LiteralSuffix {
                 strip_literal_suffix(path, &bytes[16 - suffix.len()..], case_insensitive)
             }
         }
+    }
+}
+
+/// One matcher for a brace-expanded set that differs only in its literal
+/// suffix. The trie reads a candidate from the end once, so the cost does not
+/// depend on where a matching extension appeared in the source brace list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AlternativeFastPath {
+    SuffixSet(SuffixSet),
+    ScopedSuffixSet(ScopedSuffixSet),
+}
+
+impl AlternativeFastPath {
+    fn compile(
+        alternatives: &[CompiledAlternative],
+        options: PatternOptions,
+        budget: &mut IrBudget,
+    ) -> Result<Option<Self>, PatternError> {
+        if alternatives.len() < 2 || alternatives.iter().any(|item| item.extglob.is_some()) {
+            return Ok(None);
+        }
+        if let Some(set) = SuffixSet::compile(alternatives, options.case_insensitive, budget)? {
+            return Ok(Some(Self::SuffixSet(set)));
+        }
+        Ok(
+            ScopedSuffixSet::compile(alternatives, options.case_insensitive, budget)?
+                .map(Self::ScopedSuffixSet),
+        )
+    }
+
+    fn is_match(
+        &self,
+        path: &[u8],
+        options: PatternOptions,
+        alternatives: &[CompiledAlternative],
+    ) -> bool {
+        match self {
+            Self::SuffixSet(set) => set.is_match(path, options),
+            Self::ScopedSuffixSet(set) => {
+                alternatives
+                    .first()
+                    .and_then(|alternative| alternative.fast_path.as_ref())
+                    .is_some_and(|fast_path| fast_path.is_match(path, options))
+                    || set.is_match(path, options)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuffixSetKind {
+    Star,
+    Recursive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SuffixSet {
+    kind: SuffixSetKind,
+    trie: AffixTrie,
+}
+
+/// Two independent tries are sound only for a complete prefix/suffix cross
+/// product. Compilation proves that shape before this matcher is installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopedSuffixSet {
+    prefixes: AffixTrie,
+    suffixes: AffixTrie,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AffixTrie {
+    nodes: Vec<AffixNode>,
+    edges: Vec<AffixEdge>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AffixNode {
+    first_edge: usize,
+    edge_count: usize,
+    terminal: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AffixEdge {
+    byte: u8,
+    next: usize,
+}
+
+#[derive(Default)]
+struct BuildingAffixNode {
+    edges: Vec<(u8, usize)>,
+    terminal: bool,
+}
+
+impl SuffixSet {
+    fn compile(
+        alternatives: &[CompiledAlternative],
+        case_insensitive: bool,
+        budget: &mut IrBudget,
+    ) -> Result<Option<Self>, PatternError> {
+        let mut suffixes = Vec::with_capacity(alternatives.len());
+        let mut common_kind = None;
+        for alternative in alternatives {
+            let Some(fast_path) = alternative.fast_path.as_ref() else {
+                return Ok(None);
+            };
+            let (kind, suffix) = match (fast_path, alternative.tokens.as_slice()) {
+                (FastPath::StarSuffix { .. }, [Token::Star, Token::Literal(suffix)]) => {
+                    (SuffixSetKind::Star, suffix)
+                }
+                (
+                    FastPath::RecursiveSuffix { .. },
+                    [Token::RecursivePrefix, Token::Star, Token::Literal(suffix)],
+                ) => (SuffixSetKind::Recursive, suffix),
+                _ => return Ok(None),
+            };
+            if common_kind.is_some_and(|common| common != kind) {
+                return Ok(None);
+            }
+            suffixes.push(suffix.as_slice());
+            common_kind = Some(kind);
+        }
+        Ok(Some(Self {
+            kind: common_kind.expect("two suffix alternatives establish a kind"),
+            trie: AffixTrie::new(&suffixes, true, case_insensitive, budget)?,
+        }))
+    }
+
+    fn is_match(&self, path: &[u8], options: PatternOptions) -> bool {
+        let mut node = 0;
+        for (offset, &byte) in path.iter().rev().enumerate() {
+            let Some(next) = self
+                .trie
+                .next(node, fold_ascii(byte, options.case_insensitive))
+            else {
+                return false;
+            };
+            node = next;
+            if !self.trie.nodes[node].terminal {
+                continue;
+            }
+
+            let variable_end = path.len() - offset - 1;
+            if self.kind == SuffixSetKind::Star
+                && options.component_wildcards
+                && next_separator(&path[..variable_end]).is_some()
+            {
+                continue;
+            }
+            if options.match_hidden
+                || !contains_hidden_component_in(
+                    path,
+                    0,
+                    variable_end,
+                    options.candidate_starts_component,
+                )
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl ScopedSuffixSet {
+    fn compile(
+        alternatives: &[CompiledAlternative],
+        case_insensitive: bool,
+        budget: &mut IrBudget,
+    ) -> Result<Option<Self>, PatternError> {
+        let mut prefixes = Vec::new();
+        let mut suffixes = Vec::new();
+        let mut pairs = Vec::with_capacity(alternatives.len());
+        for alternative in alternatives {
+            let Some(fast_path) = alternative.fast_path.as_ref() else {
+                return Ok(None);
+            };
+            let (
+                FastPath::RecursivePrefixSuffix { .. },
+                [
+                    Token::Literal(prefix),
+                    Token::Separator,
+                    Token::RecursivePrefix,
+                    Token::Star,
+                    Token::Literal(suffix),
+                ],
+            ) = (fast_path, alternative.tokens.as_slice())
+            else {
+                return Ok(None);
+            };
+            let prefix = literal_index(&mut prefixes, prefix, case_insensitive);
+            let suffix = literal_index(&mut suffixes, suffix, case_insensitive);
+            if !pairs.contains(&(prefix, suffix)) {
+                pairs.push((prefix, suffix));
+            }
+        }
+
+        // Independent tries would otherwise accept a combination the source
+        // never named, such as `lib/**/*.ts` from
+        // `{src/**/*.ts,lib/**/*.js}`.
+        if prefixes
+            .len()
+            .checked_mul(suffixes.len())
+            .is_none_or(|product| pairs.len() != product)
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            prefixes: AffixTrie::new(&prefixes, false, case_insensitive, budget)?,
+            suffixes: AffixTrie::new(&suffixes, true, case_insensitive, budget)?,
+        }))
+    }
+
+    fn is_match(&self, path: &[u8], options: PatternOptions) -> bool {
+        let mut prefix_node = 0;
+        let mut prefix_len = None;
+        for (offset, &byte) in path.iter().enumerate() {
+            let Some(next) = self
+                .prefixes
+                .next(prefix_node, fold_ascii(byte, options.case_insensitive))
+            else {
+                return false;
+            };
+            prefix_node = next;
+            if self.prefixes.nodes[prefix_node].terminal
+                && path.get(offset + 1).is_some_and(|byte| is_separator(*byte))
+            {
+                prefix_len = Some(offset + 1);
+                break;
+            }
+        }
+        let Some(prefix_len) = prefix_len else {
+            return false;
+        };
+        let variable_start = prefix_len + 1;
+
+        let mut suffix_node = 0;
+        for (offset, &byte) in path.iter().rev().enumerate() {
+            let Some(next) = self
+                .suffixes
+                .next(suffix_node, fold_ascii(byte, options.case_insensitive))
+            else {
+                return false;
+            };
+            suffix_node = next;
+            if !self.suffixes.nodes[suffix_node].terminal {
+                continue;
+            }
+            let variable_end = path.len() - offset - 1;
+            if variable_start > variable_end {
+                continue;
+            }
+            if options.match_hidden
+                || !contains_hidden_component_in(
+                    path,
+                    variable_start,
+                    variable_end,
+                    options.candidate_starts_component,
+                )
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn literal_index<'a>(
+    literals: &mut Vec<&'a [u8]>,
+    literal: &'a [u8],
+    case_insensitive: bool,
+) -> usize {
+    if let Some(index) = literals.iter().position(|existing| {
+        existing.len() == literal.len()
+            && existing
+                .iter()
+                .zip(literal)
+                .all(|(&left, &right)| bytes_equal(left, right, case_insensitive))
+    }) {
+        return index;
+    }
+    literals.push(literal);
+    literals.len() - 1
+}
+
+impl AffixTrie {
+    fn new(
+        words: &[&[u8]],
+        reverse: bool,
+        case_insensitive: bool,
+        budget: &mut IrBudget,
+    ) -> Result<Self, PatternError> {
+        // The root exists in the temporary builder and the flattened trie at
+        // the same time while the latter is assembled.
+        budget.charge(2, 0)?;
+        let mut building = vec![BuildingAffixNode::default()];
+        for word in words {
+            if reverse {
+                Self::insert(
+                    &mut building,
+                    word.iter()
+                        .rev()
+                        .map(|&byte| fold_ascii(byte, case_insensitive)),
+                    budget,
+                )?;
+            } else {
+                Self::insert(
+                    &mut building,
+                    word.iter().map(|&byte| fold_ascii(byte, case_insensitive)),
+                    budget,
+                )?;
+            }
+        }
+
+        let edge_count = building.iter().map(|node| node.edges.len()).sum();
+        let mut nodes = Vec::with_capacity(building.len());
+        let mut edges = Vec::with_capacity(edge_count);
+        for node in building {
+            let first_edge = edges.len();
+            edges.extend(
+                node.edges
+                    .into_iter()
+                    .map(|(byte, next)| AffixEdge { byte, next }),
+            );
+            nodes.push(AffixNode {
+                first_edge,
+                edge_count: edges.len() - first_edge,
+                terminal: node.terminal,
+            });
+        }
+        Ok(Self { nodes, edges })
+    }
+
+    fn insert(
+        building: &mut Vec<BuildingAffixNode>,
+        bytes: impl Iterator<Item = u8>,
+        budget: &mut IrBudget,
+    ) -> Result<(), PatternError> {
+        let mut node = 0;
+        for byte in bytes {
+            let existing = building[node]
+                .edges
+                .iter()
+                .find_map(|&(edge, next)| (edge == byte).then_some(next));
+            node = if let Some(existing) = existing {
+                existing
+            } else {
+                // Construction temporarily owns the builder node and edge as
+                // well as their flattened counterparts. Three token-sized IR
+                // units conservatively cover that peak, not merely the final
+                // node/edge pair.
+                budget.charge(3, 0)?;
+                let next = building.len();
+                building.push(BuildingAffixNode::default());
+                building[node].edges.push((byte, next));
+                next
+            };
+        }
+        building[node].terminal = true;
+        Ok(())
+    }
+
+    fn next(&self, node: usize, byte: u8) -> Option<usize> {
+        let node = self.nodes[node];
+        self.edges[node.first_edge..node.first_edge + node.edge_count]
+            .iter()
+            .find_map(|edge| (edge.byte == byte).then_some(edge.next))
     }
 }
 
@@ -2976,13 +3364,14 @@ const MAX_BRACE_EXPANSION_BYTES: usize = 1 << 26;
 ///
 /// A unit is one token, one program step, one class member, or one attempted
 /// compiler-derived walker-state transition — a class token owns its member
-/// list, so it is charged for both. The transition charge bounds the product
-/// of exact extglob arms without adding a separate viability limit. [`Token`]
-/// is 32 bytes and [`ExtglobStep`] is 40, pinned by a test so this arithmetic
-/// cannot go stale, which puts the ceiling around 40 MB of compiled program
-/// and tens of milliseconds of work. That is orders of magnitude past any
-/// real pattern: a language's extension list against a path glob is a few
-/// hundred units.
+/// list, so it is charged for both. Affix tries charge their temporary builder
+/// and flattened node/edge representation together at the construction peak.
+/// The transition charge bounds the product of exact extglob arms without
+/// adding a separate viability limit. [`Token`] is 32 bytes and
+/// [`ExtglobStep`] is 40, pinned by a test so this arithmetic cannot go stale,
+/// which puts the ceiling around 40 MB of compiled program and tens of
+/// milliseconds of work. That is orders of magnitude past any real pattern:
+/// a language's extension list against a path glob is a few hundred units.
 const MAX_COMPILED_IR_UNITS: usize = 1 << 20;
 
 /// Tracks compiled units across every alternative of one [`Pattern::compile`].
@@ -5035,8 +5424,8 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     use super::LiteralSuffix;
     use super::{
-        FailedStates, FastPath, Pattern, PatternOptions, Prefilter, Token, WalkerPathViability,
-        extglob_failed_len, extglob_failed_stats, extglob_scratch_capacities,
+        AlternativeFastPath, FailedStates, FastPath, Pattern, PatternOptions, Prefilter, Token,
+        WalkerPathViability, extglob_failed_len, extglob_failed_stats, extglob_scratch_capacities,
         positive_extglob_scratch_capacities, scratch_capacities,
     };
 
@@ -5747,6 +6136,14 @@ mod tests {
             40,
             "ExtglobStep grew; the budget doc is stale"
         );
+        assert!(
+            size_of::<super::BuildingAffixNode>()
+                + size_of::<(u8, usize)>()
+                + size_of::<super::AffixNode>()
+                + size_of::<super::AffixEdge>()
+                <= 3 * size_of::<Token>(),
+            "affix-trie construction outgrew its three-unit charge"
+        );
     }
 
     #[test]
@@ -6335,6 +6732,132 @@ mod tests {
     }
 
     #[test]
+    fn suffix_set_fast_path_matches_linear_alternatives() {
+        for options in [
+            PatternOptions::default()
+                .braces(true)
+                .recursive_double_star(true),
+            PatternOptions::default()
+                .braces(true)
+                .recursive_double_star(true)
+                .case_insensitive(true),
+            PatternOptions::default()
+                .braces(true)
+                .recursive_double_star(true)
+                .match_hidden(true),
+        ] {
+            for source in ["*.{ts,tsx,js,jsx,mjs,cjs}", "**/*.{ts,tsx,js,jsx,mjs,cjs}"] {
+                let fast = Pattern::compile(source, options).expect("suffix set compiles");
+                assert!(matches!(
+                    fast.alternative_fast_path.as_deref(),
+                    Some(AlternativeFastPath::SuffixSet(_))
+                ));
+                let mut linear = fast.clone();
+                linear.alternative_fast_path = None;
+
+                let mut candidates = vec![
+                    b"".to_vec(),
+                    b".ts".to_vec(),
+                    b"index.ts".to_vec(),
+                    b"INDEX.TSX".to_vec(),
+                    b"index.cjs".to_vec(),
+                    b"index.vue".to_vec(),
+                    b"src/index.ts".to_vec(),
+                    b"src/.hidden.ts".to_vec(),
+                    b".hidden/index.jsx".to_vec(),
+                    b"src/deep/index.mjs".to_vec(),
+                ];
+                candidates.extend(byte_words(b"ab./tTsSxjc", 4));
+                for candidate in candidates {
+                    assert_eq!(
+                        fast.is_match(&candidate),
+                        linear.is_match(&candidate),
+                        "crossing match differs for {source:?}, {options:?}, {candidate:?}"
+                    );
+                    assert_eq!(
+                        fast.is_match_glob_path(&candidate),
+                        linear.is_match_glob_path(&candidate),
+                        "component match differs for {source:?}, {options:?}, {candidate:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_suffix_set_fast_path_matches_only_complete_cross_products() {
+        for options in [
+            PatternOptions::default()
+                .braces(true)
+                .recursive_double_star(true),
+            PatternOptions::default()
+                .braces(true)
+                .recursive_double_star(true)
+                .case_insensitive(true),
+            PatternOptions::default()
+                .braces(true)
+                .recursive_double_star(true)
+                .match_hidden(true),
+        ] {
+            let fast = Pattern::compile("{src,packages}/**/*.{ts,tsx,js,jsx,mjs,cjs}", options)
+                .expect("scoped suffix set compiles");
+            assert!(matches!(
+                fast.alternative_fast_path.as_deref(),
+                Some(AlternativeFastPath::ScopedSuffixSet(_))
+            ));
+            let mut linear = fast.clone();
+            linear.alternative_fast_path = None;
+
+            let mut candidates = vec![
+                b"".to_vec(),
+                b"src/.ts".to_vec(),
+                b"src/index.ts".to_vec(),
+                b"SRC/INDEX.TSX".to_vec(),
+                b"packages/.js".to_vec(),
+                b"packages/index.cjs".to_vec(),
+                b"packages/deep/index.vue".to_vec(),
+                b"vendor/index.ts".to_vec(),
+                b"src/.hidden/index.ts".to_vec(),
+                b"src/deep/.hidden.mjs".to_vec(),
+                b"packages/deep/index.jsx".to_vec(),
+            ];
+            candidates.extend(
+                byte_words(b"ab./tTsSxjc", 4)
+                    .into_iter()
+                    .map(|suffix| [b"src/".as_slice(), suffix.as_slice()].concat()),
+            );
+            // The recursive prefix and star may both consume nothing. Use a
+            // non-first prefix/suffix pair so the first-alternative shortcut
+            // cannot conceal a boundary error in the aggregate matcher.
+            assert!(fast.is_match("packages/.js"));
+            assert!(fast.is_match_glob_path("packages/.js"));
+            for candidate in candidates {
+                assert_eq!(
+                    fast.is_match(&candidate),
+                    linear.is_match(&candidate),
+                    "crossing match differs for {options:?}, {candidate:?}"
+                );
+                assert_eq!(
+                    fast.is_match_glob_path(&candidate),
+                    linear.is_match_glob_path(&candidate),
+                    "component match differs for {options:?}, {candidate:?}"
+                );
+            }
+        }
+
+        let coupled = Pattern::compile(
+            "{src/**/*.ts,lib/**/*.js}",
+            PatternOptions::default()
+                .braces(true)
+                .recursive_double_star(true),
+        )
+        .expect("coupled alternatives compile");
+        assert!(coupled.alternative_fast_path.is_none());
+        assert!(!coupled.is_match_glob_path("src/index.js"));
+        assert!(!coupled.is_match_glob_path("lib/index.ts"));
+    }
+
+    #[test]
     fn recursive_terminal_fast_path_matches_the_general_matcher() {
         let options = PatternOptions::default()
             .recursive_double_star(true)
@@ -6893,6 +7416,7 @@ mod tests {
     /// Strips every route around the general engine, leaving the prefilter as
     /// the only thing between a candidate and the state walk.
     fn only_the_general_engine(pattern: &mut Pattern) {
+        pattern.alternative_fast_path = None;
         let alternatives = pattern
             .alternatives
             .iter_mut()
