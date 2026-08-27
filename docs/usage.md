@@ -96,7 +96,10 @@ Important defaults:
   both trees with one thread pool, and `WalkEntry::root` says which root an
   entry came from. Patterns apply under every root, `depth` is counted from the
   entry's own root, and roots that contain one another deliver their overlap
-  once per root. See the
+  once per root. A root must be a directory: a file root reports `read_dir`
+  with a not-a-directory error and emits no entry for the file. A directory
+  symlink supplied as a root is always traversed; `follow_symlinks` only
+  affects symlinks found below a root. See the
   [compatibility guide](compatibility-guide.md#several-roots-in-one-walk).
 
 - Include and exclude patterns may be absolute. `Walker::new("/repo")
@@ -104,7 +107,10 @@ Important defaults:
   caller holding absolute patterns does not have to strip the root itself. A
   pattern about a different tree selects nothing rather than erroring; a
   wildcard at or above the root, a `..`, and a pattern naming the root itself
-  are rejected. See the
+  are rejected. Relative patterns receive the same guardrails: `.` and `./`
+  name the root, and a `.` component after the conventional leading `./`
+  (such as `src/./main.rs`) or a real `..` component is rejected with guidance
+  instead of silently selecting nothing. See the
   [compatibility guide](compatibility-guide.md#absolute-patterns-and-the-caller-side-rewrite-they-replace).
 
 - `.gitignore` and `.ignore` files are considered only after
@@ -117,8 +123,10 @@ Important defaults:
   Ferralk deliberately continues into nested repositories, as ripgrep does:
   outer ignore rules remain active inside them and their own ignore files are
   loaded too. This differs from Git's repository-boundary behavior.
-- Symlinks are not followed unless `WalkOptions::follow_symlinks(true)` is
-  selected; a canonical-path guard prevents directory cycles.
+- Symlinks discovered below a root are not followed unless
+  `WalkOptions::follow_symlinks(true)` is selected; a canonical-path guard
+  prevents directory cycles. A root that is itself a directory symlink is
+  opened regardless, because the caller supplied it as the tree to walk.
 - `files_only(true)` and `directories_only(true)` filter on the kind a
   directory listing reports, and a listing reports a symlink as a symlink and
   nothing about its target. So by default `files_only` keeps every symlink -
@@ -143,7 +151,13 @@ Important defaults:
   `Symlink` either way: the switch answers what the link points at, not what
   the entry is.
 - `ErrorPolicy::Collect` is the default. It returns accepted entries and
-  recoverable filesystem errors in one `WalkResult`.
+  recoverable filesystem errors in one `WalkResult`. `Skip` still drops
+  recoverable failures discovered below a root, but it always reports a root
+  open/read failure: a missing, unreadable, or non-directory caller-supplied
+  root must not look like an empty tree. Other roots continue, so a multi-root
+  walk can return their entries alongside the failed root's error. `stream()`
+  yields that root error as an item under both `Collect` and `Skip`; `Abort`
+  returns it immediately.
 - Results are unsorted unless `WalkOptions::sort(true)` is set.
 - Metadata is not fetched unless `WalkOptions::metadata(true)` is set.
 - `stream()` yields entries and recoverable errors incrementally. It is

@@ -20,7 +20,7 @@ use std::{
     },
 };
 
-use ferralk_glob::{Pattern, PatternError, PatternOptions};
+use ferralk_glob::{Pattern, PatternError, PatternOptions, WalkerPathViability};
 
 pub use ferralk_glob;
 
@@ -53,8 +53,10 @@ mod absolute;
 /// Walker-pattern entry point for the corpus harness, exported the way the
 /// fuzz entry points are: for `tools/`, not for consumers.
 ///
-/// Returns the pattern the walker would compile, or `None` when the pattern
-/// names paths outside `root` and so can select nothing. `windows_paths`
+/// Returns the pattern after the walker's absolute-root rewrite, or `None`
+/// when the pattern names paths outside `root` and so can select nothing. The
+/// walker additionally compiles and validates this spelling before using it.
+/// `windows_paths`
 /// chooses which spelling of a path the rules read instead of the host's, so
 /// one corpus case describes one rule on every platform - including the rules
 /// that only apply to Windows, which would otherwise be recorded where nothing
@@ -70,7 +72,7 @@ pub fn corpus_rewrite_absolute_pattern(
     } else {
         absolute::Syntax::Posix
     };
-    walker_pattern_for_root(pattern, root, syntax)
+    rewrite_pattern_for_root(pattern, root, syntax)
 }
 mod classify;
 mod gitignore;
@@ -93,7 +95,10 @@ use gitignore::IgnoreScope;
 pub enum ErrorPolicy {
     /// Stop immediately and return the first error.
     Abort,
-    /// Continue walking and do not retain recoverable errors.
+    /// Continue walking and do not retain recoverable errors discovered below
+    /// a root. A caller-supplied root that cannot be opened is still retained
+    /// (or yielded by [`Walker::stream`]), so it cannot look like an empty
+    /// tree.
     Skip,
     /// Continue walking and return accumulated recoverable errors.
     #[default]
@@ -169,7 +174,13 @@ pub struct WalkOptions {
 }
 
 impl WalkOptions {
-    /// Follows directory symlinks while retaining a canonical-path cycle guard.
+    /// Follows directory symlinks discovered below a walk root while retaining
+    /// a canonical-path cycle guard.
+    ///
+    /// A root supplied to [`Walker::new`] or [`Walker::add_root`] is always
+    /// opened as a directory, so a root that is a symlink to a directory is
+    /// traversed even when this option is `false`. This option controls only
+    /// symlink entries discovered while walking that root.
     #[must_use]
     pub const fn follow_symlinks(mut self, enabled: bool) -> Self {
         self.follow_symlinks = enabled;
@@ -597,7 +608,11 @@ impl RootPlan {
 impl Walker {
     /// Starts a walk rooted at root.
     ///
-    /// Further roots may be added with [`Walker::add_root`].
+    /// Further roots may be added with [`Walker::add_root`]. `root` must name
+    /// a readable directory: a plain file produces a `read_dir` not-a-directory
+    /// error and no entry for the file. A directory symlink supplied as the
+    /// root is traversed regardless of [`WalkOptions::follow_symlinks`], which
+    /// only controls symlinks discovered below the root.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
@@ -625,11 +640,15 @@ impl Walker {
     /// ```
     /// use ferralk::Walker;
     ///
-    /// // On a Unix host these two select the same entries of a walk rooted at
-    /// // `/repo`. The Windows spelling of the second is `C:/repo/src/**/*.ts`
-    /// // for a walk rooted at `C:/repo`.
-    /// let written_relative = Walker::new("/repo").include("src/**/*.ts")?;
-    /// let held_absolute = Walker::new("/repo").include("/repo/src/**/*.ts")?;
+    /// // These select the same entries. The absolute spelling follows the
+    /// // host's path syntax: `/repo` on Unix and `C:/repo` on Windows.
+    /// let (root, absolute) = if cfg!(windows) {
+    ///     ("C:/repo", "C:/repo/src/**/*.ts")
+    /// } else {
+    ///     ("/repo", "/repo/src/**/*.ts")
+    /// };
+    /// let written_relative = Walker::new(root).include("src/**/*.ts")?;
+    /// let held_absolute = Walker::new(root).include(absolute)?;
     /// # Ok::<(), ferralk::ferralk_glob::PatternError>(())
     /// ```
     pub fn include(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
@@ -655,8 +674,8 @@ impl Walker {
     /// would otherwise have to sort them itself - which is the arithmetic this
     /// exists to remove. What counts as absolute is the platform's own rule:
     /// a leading `/` on Unix, a drive letter or a UNC share on Windows, where a
-    /// single leading separator is drive-relative and so stays a walker
-    /// pattern.
+    /// single leading separator is drive-relative and so is compiled as a
+    /// walker pattern rather than treated as absolute.
     ///
     /// A pattern that names paths outside the walk root selects nothing, which
     /// is what it would have selected had it been matched against absolute
@@ -744,7 +763,9 @@ impl Walker {
     ///   wants each path once passes roots that do not contain one another.
     /// - **A root that cannot be read is an ordinary walk error** for that
     ///   root's path, and the other roots are still walked, subject to
-    ///   [`ErrorPolicy`].
+    ///   [`ErrorPolicy`]. Even [`ErrorPolicy::Skip`] reports that root error,
+    ///   because a caller-supplied root must not be indistinguishable from an
+    ///   empty tree.
     ///
     /// The order roots are visited in is not part of the contract, any more
     /// than the order of entries within one root is: the scheduler hands the
@@ -1108,7 +1129,7 @@ fn compile_for_root(
     root: &[u8],
     options: PatternOptions,
 ) -> Result<TraversalPattern, PatternError> {
-    match walker_pattern_for_root(pattern, root, absolute::Syntax::NATIVE)? {
+    match walker_pattern_for_root(pattern, root, absolute::Syntax::NATIVE, options)? {
         Some(usable) => TraversalPattern::compile(&usable, options),
         // Compiled even though it can never match, so that a pattern the caller
         // wrote badly is still reported, and kept rather than dropped, because
@@ -1133,6 +1154,27 @@ fn walker_pattern_for_root(
     pattern: &[u8],
     root: &[u8],
     syntax: absolute::Syntax,
+    options: PatternOptions,
+) -> Result<Option<Vec<u8>>, PatternError> {
+    let Some(rewritten) = rewrite_pattern_for_root(pattern, root, syntax)? else {
+        return Ok(None);
+    };
+    let parsed = Pattern::compile(pattern_without_directory_marker(&rewritten), options)?;
+    reject_unwalkable_relative_pattern(
+        parsed.walker_path_viability(),
+        parsed.walker_path_problem_offset(),
+    )?;
+    Ok(Some(rewritten))
+}
+
+/// Applies only the root-to-pattern relation shared by the walk and corpus
+/// harness. Walker construction adds the compiled root-relative candidate
+/// validation afterwards; the corpus records absolute rewrite semantics even
+/// for synthetic platform spellings that do not describe this host's walker.
+fn rewrite_pattern_for_root(
+    pattern: &[u8],
+    root: &[u8],
+    syntax: absolute::Syntax,
 ) -> Result<Option<Vec<u8>>, PatternError> {
     match absolute::rewrite_in(pattern, root, syntax)? {
         absolute::Rewrite::Relative => {
@@ -1145,6 +1187,51 @@ fn walker_pattern_for_root(
         }
         absolute::Rewrite::Outside => Ok(None),
     }
+}
+
+/// The one trailing slash [`TraversalPattern`] treats as a directory-only
+/// marker is not part of the root-relative candidate spelling. Validation uses
+/// the same marker-free bytes so `aaa/` remains valid while `src//bar` and
+/// other leading or interior empty components stay unselectable.
+fn pattern_without_directory_marker(pattern: &[u8]) -> &[u8] {
+    if pattern.len() > 1 {
+        pattern.strip_suffix(b"/").unwrap_or(pattern)
+    } else {
+        pattern
+    }
+}
+
+/// Rejects root-relative path spellings that name no walk candidate.
+///
+/// A leading `./` remains the conventional harmless spelling for a pattern
+/// below the root, but `.` and `./` name the root itself, which a walk never
+/// emits. Any other real `.` component (`src/./x` or `src/.`) likewise names
+/// a spelling no root-relative candidate uses. The glob compiler summarizes
+/// its actual expanded alternatives and extglob branches, so this policy never
+/// reparses matcher syntax.
+fn reject_unwalkable_relative_pattern(
+    viability: WalkerPathViability,
+    offset: Option<usize>,
+) -> Result<(), PatternError> {
+    let message = match viability {
+        WalkerPathViability::Viable => return Ok(()),
+        WalkerPathViability::ParentComponent => {
+            "`..` in a walker-relative pattern is not resolved, because resolving it lexically would be wrong across a symlink"
+        }
+        WalkerPathViability::Root => {
+            "a walker-relative pattern that names the walk root itself selects nothing; add `/**` to select what is inside it"
+        }
+        WalkerPathViability::TrailingDot => {
+            "a walker-relative pattern ending in `/.` selects that directory itself; add `/**` to select what is inside it"
+        }
+        WalkerPathViability::DotComponent => {
+            "a walker-relative pattern with a `.` component is not normalized; remove `/.` to name the entry below that directory"
+        }
+    };
+    // Brace expansion can create several equally valid source locations. The
+    // compiler carries an offset whenever it is determinate and uses this
+    // established fallback only for genuinely ambiguous expanded branches.
+    Err(PatternError::new(offset.unwrap_or(0), message))
 }
 
 /// The pattern dialect every walker pattern is compiled in. Only
@@ -1865,6 +1952,7 @@ impl WalkStream {
         operation: &'static str,
         path: PathBuf,
         source: std::io::Error,
+        is_root: bool,
     ) -> Option<Result<WalkEntry, WalkError>> {
         let error = WalkError::new(operation, path, source);
         match self.walker.error_policy {
@@ -1872,8 +1960,8 @@ impl WalkStream {
                 self.stopped = true;
                 Some(Err(error))
             }
-            ErrorPolicy::Skip => None,
-            ErrorPolicy::Collect => Some(Err(error)),
+            ErrorPolicy::Skip if !is_root => None,
+            ErrorPolicy::Skip | ErrorPolicy::Collect => Some(Err(error)),
         }
     }
 
@@ -1891,7 +1979,7 @@ impl WalkStream {
                         return None;
                     }
                 }
-                Err(source) => return self.error(CYCLE_KEY_OPERATION, path, source),
+                Err(source) => return self.error(CYCLE_KEY_OPERATION, path, source, depth == 0),
             }
         }
         match SystemBackend.read_directory(
@@ -1917,7 +2005,7 @@ impl WalkStream {
                 // the directory the stream delivered previously.
                 self.listing.clear();
                 self.next_entry = 0;
-                self.error("read_dir", path, source)
+                self.error("read_dir", path, source, depth == 0)
             }
         }
     }
@@ -1955,7 +2043,7 @@ impl WalkStream {
                 if let Some(task) = descend {
                     self.pending_directories.push(task);
                 }
-                self.error(failure.operation, failure.path, failure.source)
+                self.error(failure.operation, failure.path, failure.source, false)
             }
         };
         reset_to_directory(&mut self.path, &self.directory);
@@ -1982,7 +2070,7 @@ impl Iterator for WalkStream {
             }
             if let Some(error) = self.listing.take_deferred_error() {
                 if let Some(result) =
-                    self.error("read_dir", error.path, error.source.into_io_error())
+                    self.error("read_dir", error.path, error.source.into_io_error(), false)
                 {
                     return Some(result);
                 }
@@ -2108,7 +2196,8 @@ impl<'walker> WalkState<'walker> {
             root,
             ignores,
         } = task;
-        if self.walker.options.follow_symlinks && !self.mark_directory(backend, &path)? {
+        let is_root = depth == 0;
+        if self.walker.options.follow_symlinks && !self.mark_directory(backend, &path, is_root)? {
             return Ok(());
         }
         let mut scratch = self.scratch.pop().unwrap_or_default();
@@ -2129,13 +2218,14 @@ impl<'walker> WalkState<'walker> {
         ignores: IgnoreScope,
         scratch: &mut DirectoryScratch,
     ) -> Result<(), WalkError> {
+        let is_root = depth == 0;
         if let Err(source) = backend.read_directory(
             path,
             self.walker.options.follow_symlinks,
             !self.walker.options.follow_symlinks && depth > 0,
             &mut scratch.listing,
         ) {
-            return self.handle_error("read_dir", path.to_path_buf(), source);
+            return self.handle_error("read_dir", path.to_path_buf(), source, is_root);
         }
         // The directory's own ignore files join the chain here, once,
         // recognized in the listing that was just read.
@@ -2169,7 +2259,7 @@ impl<'walker> WalkState<'walker> {
             outcome?;
         }
         while let Some(error) = scratch.listing.take_deferred_error() {
-            self.handle_error("read_dir", error.path, error.source.into_io_error())?;
+            self.handle_error("read_dir", error.path, error.source.into_io_error(), false)?;
         }
         Ok(())
     }
@@ -2178,11 +2268,17 @@ impl<'walker> WalkState<'walker> {
         &mut self,
         backend: &impl DirectoryBackend,
         directory: &Path,
+        is_root: bool,
     ) -> Result<bool, WalkError> {
         match backend.cycle_key(directory) {
             Ok(key) => Ok(self.visited_directories.insert(key)),
             Err(source) => {
-                self.handle_error(CYCLE_KEY_OPERATION, directory.to_path_buf(), source)?;
+                self.handle_error(
+                    CYCLE_KEY_OPERATION,
+                    directory.to_path_buf(),
+                    source,
+                    is_root,
+                )?;
                 Ok(false)
             }
         }
@@ -2215,7 +2311,7 @@ impl<'walker> WalkState<'walker> {
                 Ok(())
             }
             EntryAction::Failed { failure, descend } => {
-                self.handle_error(failure.operation, failure.path, failure.source)?;
+                self.handle_error(failure.operation, failure.path, failure.source, false)?;
                 if let Some(task) = descend {
                     self.walk_directory(backend, task)?;
                 }
@@ -2229,12 +2325,13 @@ impl<'walker> WalkState<'walker> {
         operation: &'static str,
         path: PathBuf,
         source: std::io::Error,
+        is_root: bool,
     ) -> Result<(), WalkError> {
         let error = WalkError::new(operation, path, source);
         match self.walker.error_policy {
             ErrorPolicy::Abort => Err(error),
-            ErrorPolicy::Skip => Ok(()),
-            ErrorPolicy::Collect => {
+            ErrorPolicy::Skip if !is_root => Ok(()),
+            ErrorPolicy::Skip | ErrorPolicy::Collect => {
                 self.errors.push(error);
                 Ok(())
             }
@@ -2713,6 +2810,320 @@ mod tests {
             relative_paths(brace.entries(), &fixture.root),
             vec![PathBuf::from("docs/d.md"), PathBuf::from("src/b.txt")]
         );
+    }
+
+    #[test]
+    fn relative_patterns_that_name_no_candidate_are_rejected_with_guidance() {
+        let fixture = Fixture::new();
+        fixture.write("src/main.rs");
+        fixture.write("src/a.rs");
+        fixture.write("src/].rs");
+        // Windows normalizes a path component ending in dots, so these two
+        // valid matcher strings cannot be represented as fixture paths there.
+        #[cfg(not(windows))]
+        {
+            fixture.write("prefix../bar");
+            fixture.write("foo/..suffix/bar");
+        }
+
+        for mode in [
+            WildcardMode::ComponentScoped,
+            WildcardMode::SeparatorCrossing,
+        ] {
+            for add in [
+                |walker: Walker| walker.include("."),
+                |walker: Walker| walker.include("./"),
+                |walker: Walker| walker.include("src/."),
+                |walker: Walker| walker.include("src/./main.rs"),
+                |walker: Walker| walker.include("././src/**"),
+                |walker: Walker| walker.include("src/../main.rs"),
+                |walker: Walker| walker.include("+(dead/../branch)"),
+                |walker: Walker| walker.exclude("."),
+                |walker: Walker| walker.exclude("./"),
+                |walker: Walker| walker.exclude("src/."),
+                |walker: Walker| walker.exclude("src/./main.rs"),
+                |walker: Walker| walker.exclude("././src/**"),
+                |walker: Walker| walker.exclude("src/../main.rs"),
+                |walker: Walker| walker.exclude("+(dead/../branch)"),
+            ] {
+                let error = add(Walker::new(&fixture.root).wildcard_mode(mode))
+                    .expect_err("unwalkable relative pattern is refused");
+                assert!(
+                    error.message().contains("select")
+                        || error.message().contains("not normalized")
+                        || error.message().starts_with("`..`"),
+                    "the rejection explains why the pattern cannot select: {error}"
+                );
+            }
+        }
+
+        // On a relative walk root `/bar` cannot be rewritten as an absolute
+        // pattern; on Windows it remains a root-relative empty-leading
+        // spelling. Either path must refuse it at pattern-add time.
+        for mode in [
+            WildcardMode::ComponentScoped,
+            WildcardMode::SeparatorCrossing,
+        ] {
+            assert!(
+                Walker::new(".")
+                    .wildcard_mode(mode)
+                    .include("/bar")
+                    .is_err(),
+                "include rejects an unselectable leading empty component under {mode:?}"
+            );
+            assert!(
+                Walker::new(".")
+                    .wildcard_mode(mode)
+                    .exclude("/bar")
+                    .is_err(),
+                "exclude rejects an unselectable leading empty component under {mode:?}"
+            );
+        }
+
+        // Dots that are matcher text, rather than slash-delimited path
+        // components, remain valid in every mode. In particular this keeps
+        // escaped, class, brace and extglob literals out of the path check.
+        for pattern in [
+            "./src/**",
+            "...",
+            ".hidden",
+            r"\.\.",
+            r"src\..\main.rs",
+            "[.]",
+            "{..,src}",
+            "@(..)",
+            "src/[[:alpha:]/../].rs",
+            "src/[]/../].rs",
+            "{dead/../branch,src/main.rs}",
+            "@(dead/../branch|src/main.rs)",
+            "src/[{],a}/../].rs",
+            "@(dead/{),x}/../branch|src/main.rs)",
+            "prefix@(../bar)",
+            "@(foo/..)suffix/bar",
+        ] {
+            for mode in [
+                WildcardMode::ComponentScoped,
+                WildcardMode::SeparatorCrossing,
+            ] {
+                Walker::new(&fixture.root)
+                    .wildcard_mode(mode)
+                    .include(pattern)
+                    .unwrap_or_else(|error| panic!("{pattern} must stay matcher text: {error}"));
+            }
+        }
+
+        // A dead brace or extglob arm must not reject a viable one. Character
+        // classes use the glob parser's POSIX and leading-`]` grammar, so a
+        // slash or `..` text inside either class stays matcher syntax too.
+        // Extglobs retain their component-scoped matching rule, so only the
+        // separator-crossing walk reads its slash-containing arm as one path.
+        for (pattern, matching_paths, component_scoped_paths) in [
+            (
+                "{dead/../branch,src/main.rs}",
+                &["src/main.rs"][..],
+                &["src/main.rs"][..],
+            ),
+            (
+                "@(dead/../branch|src/main.rs)",
+                &["src/main.rs"][..],
+                &[][..],
+            ),
+            (
+                "src/[[:alpha:]/../].rs",
+                &["src/a.rs"][..],
+                &["src/a.rs"][..],
+            ),
+            ("src/[]/../].rs", &["src/].rs"][..], &["src/].rs"][..]),
+            (
+                "src/[{],a}/../].rs",
+                &["src/a.rs", "src/].rs"][..],
+                &["src/a.rs", "src/].rs"][..],
+            ),
+            (
+                "@(dead/{),x}/../branch|src/main.rs)",
+                &["src/main.rs"][..],
+                &[][..],
+            ),
+            ("prefix@(../bar)", &["prefix../bar"][..], &[][..]),
+            ("@(foo/..)suffix/bar", &["foo/..suffix/bar"][..], &[][..]),
+        ] {
+            let matcher = Pattern::compile(pattern, traversal_pattern_options(false))
+                .expect("the reviewer regression is valid matcher syntax");
+            for matching_path in matching_paths {
+                assert!(matcher.is_match(matching_path));
+            }
+            let matching_paths_on_disk =
+                if cfg!(windows) && matches!(pattern, "prefix@(../bar)" | "@(foo/..)suffix/bar") {
+                    &[][..]
+                } else {
+                    matching_paths
+                };
+            for mode in [
+                WildcardMode::ComponentScoped,
+                WildcardMode::SeparatorCrossing,
+            ] {
+                Walker::new(&fixture.root)
+                    .wildcard_mode(mode)
+                    .exclude(pattern)
+                    .expect("the viable group arm is accepted for excludes");
+                for threads in [1, 4] {
+                    let result = Walker::new(&fixture.root)
+                        .wildcard_mode(mode)
+                        .threads(threads)
+                        .include(pattern)
+                        .expect("the viable group arm is accepted")
+                        .options(WalkOptions::default().sort(true).files_only(true))
+                        .collect()
+                        .expect("walk succeeds");
+                    let mut expected = if mode == WildcardMode::ComponentScoped {
+                        component_scoped_paths
+                    } else {
+                        matching_paths_on_disk
+                    }
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                    expected.sort();
+                    assert_eq!(
+                        relative_paths(result.entries(), &fixture.root),
+                        expected,
+                        "{pattern} must keep its viable arm under {mode:?} on {threads} threads"
+                    );
+                }
+                let streamed = Walker::new(&fixture.root)
+                    .wildcard_mode(mode)
+                    .include(pattern)
+                    .expect("the viable group arm is accepted")
+                    .options(WalkOptions::default().files_only(true))
+                    .stream()
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("stream succeeds");
+                let mut actual = relative_paths(&streamed, &fixture.root);
+                actual.sort();
+                let mut expected = if mode == WildcardMode::ComponentScoped {
+                    component_scoped_paths
+                } else {
+                    matching_paths_on_disk
+                }
+                .iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+                expected.sort();
+                assert_eq!(actual, expected);
+            }
+        }
+
+        for pattern in [
+            "src/../main.rs",
+            "src/{live,dead}/../main.rs",
+            "{dead/[}]]/../x,src/main.rs}",
+            "@(dead/[)]]/../x|src/main.rs)",
+            "{dead/../branch}",
+            "@(dead/../branch)",
+            "@(dead|src)/../main.rs",
+            "src/@(./a.rs)",
+            "@(./a.rs)",
+            "{./a.rs}",
+            "src/?(./a.rs)",
+            "src/*(./a.rs)",
+            "src/?(./a.rs)/bar",
+            "src/*(./a.rs)/bar",
+            "src/?()/bar",
+            "src/*()/bar",
+            "?()/bar",
+            "*()/bar",
+            "src//bar",
+            "src/{}/bar",
+            "src/{,./a.rs}/bar",
+        ] {
+            assert!(
+                Walker::new(&fixture.root).include(pattern).is_err(),
+                "a parser-top-level `..` component stays invalid: {pattern}"
+            );
+        }
+        for mode in [
+            WildcardMode::ComponentScoped,
+            WildcardMode::SeparatorCrossing,
+        ] {
+            for pattern in [
+                "{dead/[}]]/../x,src/main.rs}",
+                "@(dead/[)]]/../x|src/main.rs)",
+                "{dead/../branch}",
+                "@(dead/../branch)",
+                "@(dead|src)/../main.rs",
+                "src/@(./a.rs)",
+                "@(./a.rs)",
+                "{./a.rs}",
+                "src/?(./a.rs)",
+                "src/*(./a.rs)",
+                "src/?(./a.rs)/bar",
+                "src/*(./a.rs)/bar",
+                "src/?()/bar",
+                "src/*()/bar",
+                "?()/bar",
+                "*()/bar",
+                "src//bar",
+                "src/{}/bar",
+                "src/{,./a.rs}/bar",
+            ] {
+                assert!(
+                    Walker::new(&fixture.root)
+                        .wildcard_mode(mode)
+                        .include(pattern)
+                        .is_err(),
+                    "include rejects parser-top-level `..` under {mode:?}: {pattern}"
+                );
+                assert!(
+                    Walker::new(&fixture.root)
+                        .wildcard_mode(mode)
+                        .exclude(pattern)
+                        .is_err(),
+                    "exclude rejects parser-top-level `..` under {mode:?}: {pattern}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn relative_pattern_errors_keep_determinate_component_offsets() {
+        for (pattern, offset) in [
+            ("src/../main.rs", 4),
+            ("src/./main.rs", 4),
+            ("src/.", 4),
+            ("é/../main.rs", 3),
+            ("src/@(./a.rs)", 6),
+            ("{src}/../main.rs", 6),
+            ("{a,b}/../main.rs", 6),
+            ("src/{x}/.", 8),
+        ] {
+            for mode in [
+                WildcardMode::ComponentScoped,
+                WildcardMode::SeparatorCrossing,
+            ] {
+                for error in [
+                    Walker::new(".")
+                        .wildcard_mode(mode)
+                        .include(pattern)
+                        .expect_err("unwalkable include is refused"),
+                    Walker::new(".")
+                        .wildcard_mode(mode)
+                        .exclude(pattern)
+                        .expect_err("unwalkable exclude is refused"),
+                ] {
+                    assert_eq!(
+                        error.offset(),
+                        offset,
+                        "{pattern} keeps its component offset under {mode:?}"
+                    );
+                }
+            }
+        }
+
+        for pattern in [r"src/\./main.rs", r"src/\../main.rs", "src/@(..)suffix"] {
+            Walker::new(".")
+                .include(pattern)
+                .unwrap_or_else(|error| panic!("{pattern} remains matcher text: {error}"));
+        }
     }
 
     #[test]
@@ -4808,6 +5219,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn skip_reports_a_failed_root_while_walking_the_other_roots() {
+        let fixture = Fixture::new();
+        fixture.write("alpha/one.rs");
+        fixture.write("gamma/two.rs");
+        let missing = fixture.root.join("beta");
+        let build = || {
+            Walker::new(fixture.root.join("alpha"))
+                .add_root(&missing)
+                .expect("root")
+                .add_root(fixture.root.join("gamma"))
+                .expect("root")
+                .error_policy(ErrorPolicy::Skip)
+                .options(WalkOptions::default().sort(true).files_only(true))
+        };
+
+        for threads in [1, 4] {
+            let result = build()
+                .threads(threads)
+                .collect()
+                .expect("Skip preserves the other roots");
+            assert_eq!(
+                relative_paths(result.entries(), &fixture.root),
+                vec![PathBuf::from("alpha/one.rs"), PathBuf::from("gamma/two.rs")]
+            );
+            assert_eq!(result.errors().len(), 1);
+            assert_eq!(result.errors()[0].path(), missing);
+        }
+
+        let mut stream = build().stream();
+        let mut entries = Vec::new();
+        let mut errors = Vec::new();
+        for item in &mut stream {
+            match item {
+                Ok(entry) => entries.push(entry),
+                Err(error) => errors.push(error),
+            }
+        }
+        entries.sort_by(|left, right| left.path().cmp(right.path()));
+        assert_eq!(
+            relative_paths(&entries, &fixture.root),
+            vec![PathBuf::from("alpha/one.rs"), PathBuf::from("gamma/two.rs")]
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path(), missing);
+    }
+
     /// `*.tmp/**` used to close `a/b.tmp` in both modes, because the subtree
     /// root was always read as separator-crossing. In the default mode the
     /// exclude does not reach that directory at all - `*.tmp` cannot match the
@@ -5936,7 +6394,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_and_skip_distinguish_recoverable_root_errors() {
+    fn a_failed_root_is_reported_under_every_error_policy() {
         let missing = std::env::temp_dir().join(format!(
             "ferralk-missing-{}",
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
@@ -5946,20 +6404,73 @@ mod tests {
             .collect()
             .expect("collect policy retains the error");
         assert_eq!(collected.errors().len(), 1);
-        assert!(
-            Walker::new(&missing)
+        for threads in [1, 4] {
+            let skipped = Walker::new(&missing)
+                .threads(threads)
                 .error_policy(ErrorPolicy::Skip)
                 .collect()
-                .expect("skip policy ignores the error")
-                .errors()
-                .is_empty()
-        );
+                .expect("Skip keeps walking after a caller-supplied root failure");
+            assert_eq!(skipped.errors().len(), 1);
+            assert_eq!(skipped.errors()[0].operation(), "read_dir");
+            assert_eq!(skipped.errors()[0].path(), missing);
+        }
+        let streamed = Walker::new(&missing)
+            .error_policy(ErrorPolicy::Skip)
+            .stream()
+            .collect::<Result<Vec<_>, _>>()
+            .expect_err("stream reports a failed caller-supplied root under Skip");
+        assert_eq!(streamed.operation(), "read_dir");
+        assert_eq!(streamed.path(), missing);
         assert!(
             Walker::new(&missing)
                 .error_policy(ErrorPolicy::Abort)
                 .collect()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_plain_file_root_reports_not_a_directory_without_emitting_it() {
+        let fixture = Fixture::new();
+        let file = fixture.root.join("not-a-directory.txt");
+        fs::write(&file, b"fixture").expect("write file root");
+
+        for threads in [1, 4] {
+            let result = Walker::new(&file)
+                .threads(threads)
+                .error_policy(ErrorPolicy::Skip)
+                .collect()
+                .expect("root error is collected while the walk completes");
+            assert!(result.entries().is_empty());
+            assert_eq!(result.errors().len(), 1);
+            assert_eq!(result.errors()[0].operation(), "read_dir");
+            assert_eq!(result.errors()[0].path(), file);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_symlink_root_is_traversed_even_without_following_descendants() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        fixture.write("real/inside.txt");
+        let link = fixture.root.join("linked-root");
+        symlink("real", &link).expect("create directory symlink root");
+
+        for threads in [1, 4] {
+            for follow_symlinks in [false, true] {
+                let result = Walker::new(&link)
+                    .threads(threads)
+                    .options(WalkOptions::default().follow_symlinks(follow_symlinks))
+                    .collect()
+                    .expect("directory symlink root is opened");
+                assert_eq!(
+                    relative_paths(result.entries(), &link),
+                    vec![PathBuf::from("inside.txt")]
+                );
+            }
+        }
     }
 
     #[test]
