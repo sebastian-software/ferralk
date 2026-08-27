@@ -1168,11 +1168,11 @@ fn walker_pattern_for_root(
 /// A leading `./` remains the conventional harmless spelling for a pattern
 /// below the root, but `.` and `./` name the root itself, which a walk never
 /// emits. Any other real `.` component (`src/./x` or `src/.`) likewise names
-/// a spelling no root-relative candidate uses. Backslashes stay escapes and
-/// groups stay matcher syntax, so only a slash-delimited component whose raw
-/// bytes are exactly `.` or `..` is a path operation here.
+/// a spelling no root-relative candidate uses. Backslashes, classes, braces,
+/// and extglobs are matcher syntax, so the check sees only slash-delimited
+/// components outside a complete top-level group.
 fn reject_unwalkable_relative_pattern(pattern: &[u8]) -> Result<(), PatternError> {
-    let components = relative_pattern_components(pattern).collect::<Vec<_>>();
+    let components = top_level_pattern_components(pattern);
     let last = components
         .iter()
         .rev()
@@ -1211,15 +1211,111 @@ fn reject_unwalkable_relative_pattern(pattern: &[u8]) -> Result<(), PatternError
     Ok(())
 }
 
-/// Slash-delimited components in the pattern language, paired with their byte
-/// offsets. `/` is the only separator even on Windows; `\\` is an escape.
-fn relative_pattern_components(pattern: &[u8]) -> impl Iterator<Item = (&[u8], usize)> {
-    let mut offset = 0;
-    pattern.split(|byte| *byte == b'/').map(move |component| {
-        let component_offset = offset;
-        offset += component.len() + 1;
-        (component, component_offset)
-    })
+/// Slash-delimited path components outside matcher groups, paired with their
+/// byte offsets.
+///
+/// `/` is the only separator even on Windows; `\\` is an escape. A complete
+/// brace or extglob group, and a character class, are skipped as one matcher
+/// token so a slash in one alternative cannot make that alternative a global
+/// path operation. An unclosed construct is left as ordinary input for
+/// [`Pattern::compile`], which remains the authority for syntax errors.
+fn top_level_pattern_components(pattern: &[u8]) -> Vec<(&[u8], usize)> {
+    let mut components = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < pattern.len() {
+        if pattern[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        let end = match pattern[index] {
+            b'[' => closing_class(pattern, index),
+            b'{' => closing_brace(pattern, index),
+            b'@' | b'+' | b'!' | b'*' | b'?' if pattern.get(index + 1) == Some(&b'(') => {
+                closing_parenthesis(pattern, index + 1)
+            }
+            _ => None,
+        };
+        if let Some(end) = end {
+            index = end + 1;
+            continue;
+        }
+        if pattern[index] == b'/' {
+            components.push((&pattern[start..index], start));
+            start = index + 1;
+        }
+        index += 1;
+    }
+    components.push((&pattern[start..], start));
+    components
+}
+
+/// End of a complete character class, including its closing bracket.
+fn closing_class(pattern: &[u8], open: usize) -> Option<usize> {
+    let mut index = open + 1;
+    while index < pattern.len() {
+        if pattern[index] == b'\\' {
+            index += 2;
+        } else if pattern[index] == b']' {
+            return Some(index);
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+/// End of a complete nested brace group, including its closing brace.
+fn closing_brace(pattern: &[u8], open: usize) -> Option<usize> {
+    closing_nested(pattern, open, b'{', b'}')
+}
+
+/// End of a complete nested extglob group, including its closing parenthesis.
+fn closing_parenthesis(pattern: &[u8], open: usize) -> Option<usize> {
+    closing_nested(pattern, open, b'(', b')')
+}
+
+/// Finds the matching delimiter while respecting escapes and nested matcher
+/// constructs.
+///
+/// This deliberately recognizes only enough syntax to decide whether a slash
+/// is outside a matcher construct. `Pattern::compile` remains responsible for
+/// deciding whether the complete expression is valid. In particular, a
+/// closing delimiter in a character class or a nested brace/extglob cannot
+/// terminate its surrounding group early.
+fn closing_nested(pattern: &[u8], open: usize, opening: u8, closing: u8) -> Option<usize> {
+    let mut depth = 1_usize;
+    let mut index = open + 1;
+    while index < pattern.len() {
+        if pattern[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        let nested_end = match pattern[index] {
+            b'[' => closing_class(pattern, index),
+            b'{' => closing_brace(pattern, index),
+            b'@' | b'+' | b'!' | b'*' | b'?' if pattern.get(index + 1) == Some(&b'(') => {
+                closing_parenthesis(pattern, index + 1)
+            }
+            _ => None,
+        };
+        if let Some(end) = nested_end {
+            index = end + 1;
+            continue;
+        }
+        match pattern[index] {
+            byte if byte == opening => depth += 1,
+            byte if byte == closing => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
 }
 
 /// The pattern dialect every walker pattern is compiled in. Only
@@ -2360,7 +2456,8 @@ mod tests {
     use super::{
         CancellationToken, ErrorPolicy, Pattern, PatternOptions, TraversalPattern, Verdict,
         WalkEntry, WalkEntryKind, WalkOptions, WalkStream, Walker, WildcardMode, glob_path_bytes,
-        literal_extension, literal_pattern_root, traversal_pattern_options,
+        literal_extension, literal_pattern_root, top_level_pattern_components,
+        traversal_pattern_options,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -2846,6 +2943,8 @@ mod tests {
             "[.]",
             "{..,src}",
             "@(..)",
+            "{dead/../branch,src/main.rs}",
+            "@(dead/../branch|src/main.rs)",
         ] {
             for mode in [
                 WildcardMode::ComponentScoped,
@@ -2856,6 +2955,94 @@ mod tests {
                     .include(pattern)
                     .expect("matcher text is not a path operation");
             }
+        }
+
+        // A slash inside one brace or extglob alternative belongs to that
+        // matcher alternative. It is not a top-level path component and must
+        // not let a dead arm reject another arm that really matches. Extglobs
+        // retain their component-scoped matching rule, so only the
+        // separator-crossing walk reads its slash-containing arm as one path.
+        for pattern in [
+            "{dead/../branch,src/main.rs}",
+            "@(dead/../branch|src/main.rs)",
+        ] {
+            let matcher = Pattern::compile(pattern, traversal_pattern_options(false))
+                .expect("the reviewer regression is valid matcher syntax");
+            assert!(matcher.is_match("src/main.rs"));
+            for mode in [
+                WildcardMode::ComponentScoped,
+                WildcardMode::SeparatorCrossing,
+            ] {
+                for threads in [1, 4] {
+                    let result = Walker::new(&fixture.root)
+                        .wildcard_mode(mode)
+                        .threads(threads)
+                        .include(pattern)
+                        .expect("the viable group arm is accepted")
+                        .options(WalkOptions::default().sort(true).files_only(true))
+                        .collect()
+                        .expect("walk succeeds");
+                    let expected =
+                        if mode == WildcardMode::SeparatorCrossing || pattern.starts_with('{') {
+                            vec![PathBuf::from("src/main.rs")]
+                        } else {
+                            Vec::new()
+                        };
+                    assert_eq!(
+                        relative_paths(result.entries(), &fixture.root),
+                        expected,
+                        "{pattern} must keep its viable arm under {mode:?} on {threads} threads"
+                    );
+                }
+                let streamed = Walker::new(&fixture.root)
+                    .wildcard_mode(mode)
+                    .include(pattern)
+                    .expect("the viable group arm is accepted")
+                    .options(WalkOptions::default().files_only(true))
+                    .stream()
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("stream succeeds");
+                let expected =
+                    if mode == WildcardMode::SeparatorCrossing || pattern.starts_with('{') {
+                        vec![PathBuf::from("src/main.rs")]
+                    } else {
+                        Vec::new()
+                    };
+                assert_eq!(relative_paths(&streamed, &fixture.root), expected);
+            }
+        }
+
+        for pattern in ["src/../main.rs", "src/{live,dead}/../main.rs"] {
+            assert!(
+                Walker::new(&fixture.root).include(pattern).is_err(),
+                "a top-level `..` component stays invalid: {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_pattern_component_scan_only_splits_top_level_slashes() {
+        for (pattern, expected) in [
+            (
+                "{dead/{nested/../branch},src/main.rs}",
+                vec!["{dead/{nested/../branch},src/main.rs}"],
+            ),
+            (
+                "@(dead/@(nested/../branch)|src/main.rs)",
+                vec!["@(dead/@(nested/../branch)|src/main.rs)"],
+            ),
+            ("[dead/../branch]", vec!["[dead/../branch]"]),
+            (r"dead\/../branch", vec![r"dead\/..", "branch"]),
+            (
+                "src/{live,dead}/../main.rs",
+                vec!["src", "{live,dead}", "..", "main.rs"],
+            ),
+        ] {
+            let components = top_level_pattern_components(pattern.as_bytes())
+                .into_iter()
+                .map(|(component, _)| std::str::from_utf8(component).expect("test ASCII"))
+                .collect::<Vec<_>>();
+            assert_eq!(components, expected, "top-level components for {pattern}");
         }
     }
 
