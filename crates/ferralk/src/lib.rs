@@ -53,8 +53,10 @@ mod absolute;
 /// Walker-pattern entry point for the corpus harness, exported the way the
 /// fuzz entry points are: for `tools/`, not for consumers.
 ///
-/// Returns the pattern the walker would compile, or `None` when the pattern
-/// names paths outside `root` and so can select nothing. `windows_paths`
+/// Returns the pattern after the walker's absolute-root rewrite, or `None`
+/// when the pattern names paths outside `root` and so can select nothing. The
+/// walker additionally compiles and validates this spelling before using it.
+/// `windows_paths`
 /// chooses which spelling of a path the rules read instead of the host's, so
 /// one corpus case describes one rule on every platform - including the rules
 /// that only apply to Windows, which would otherwise be recorded where nothing
@@ -70,7 +72,7 @@ pub fn corpus_rewrite_absolute_pattern(
     } else {
         absolute::Syntax::Posix
     };
-    walker_pattern_for_root(pattern, root, syntax, traversal_pattern_options(false))
+    rewrite_pattern_for_root(pattern, root, syntax)
 }
 mod classify;
 mod gitignore;
@@ -668,8 +670,8 @@ impl Walker {
     /// would otherwise have to sort them itself - which is the arithmetic this
     /// exists to remove. What counts as absolute is the platform's own rule:
     /// a leading `/` on Unix, a drive letter or a UNC share on Windows, where a
-    /// single leading separator is drive-relative and so stays a walker
-    /// pattern.
+    /// single leading separator is drive-relative and so is compiled as a
+    /// walker pattern rather than treated as absolute.
     ///
     /// A pattern that names paths outside the walk root selects nothing, which
     /// is what it would have selected had it been matched against absolute
@@ -1150,26 +1152,48 @@ fn walker_pattern_for_root(
     syntax: absolute::Syntax,
     options: PatternOptions,
 ) -> Result<Option<Vec<u8>>, PatternError> {
+    let Some(rewritten) = rewrite_pattern_for_root(pattern, root, syntax)? else {
+        return Ok(None);
+    };
+    let parsed = Pattern::compile(pattern_without_directory_marker(&rewritten), options)?;
+    reject_unwalkable_relative_pattern(
+        parsed.walker_path_viability(),
+        parsed.walker_path_problem_offset(),
+    )?;
+    Ok(Some(rewritten))
+}
+
+/// Applies only the root-to-pattern relation shared by the walk and corpus
+/// harness. Walker construction adds the compiled root-relative candidate
+/// validation afterwards; the corpus records absolute rewrite semantics even
+/// for synthetic platform spellings that do not describe this host's walker.
+fn rewrite_pattern_for_root(
+    pattern: &[u8],
+    root: &[u8],
+    syntax: absolute::Syntax,
+) -> Result<Option<Vec<u8>>, PatternError> {
     match absolute::rewrite_in(pattern, root, syntax)? {
         absolute::Rewrite::Relative => {
             absolute::reject_path_shaped(pattern, syntax)?;
-            let parsed = Pattern::compile(pattern, options)?;
-            reject_unwalkable_relative_pattern(
-                parsed.walker_path_viability(),
-                parsed.walker_path_problem_offset(),
-            )?;
             Ok(Some(pattern.to_vec()))
         }
         absolute::Rewrite::Rooted(rooted) => {
             absolute::reject_path_shaped(&rooted, syntax)?;
-            let parsed = Pattern::compile(&rooted, options)?;
-            reject_unwalkable_relative_pattern(
-                parsed.walker_path_viability(),
-                parsed.walker_path_problem_offset(),
-            )?;
             Ok(Some(rooted))
         }
         absolute::Rewrite::Outside => Ok(None),
+    }
+}
+
+/// The one trailing slash [`TraversalPattern`] treats as a directory-only
+/// marker is not part of the root-relative candidate spelling. Validation uses
+/// the same marker-free bytes so `aaa/` remains valid while `src//bar` and
+/// other leading or interior empty components stay unselectable.
+fn pattern_without_directory_marker(pattern: &[u8]) -> &[u8] {
+    if pattern.len() > 1 {
+        pattern.strip_suffix(b"/").unwrap_or(pattern)
+    } else {
+        pattern
     }
 }
 
@@ -2829,6 +2853,29 @@ mod tests {
             }
         }
 
+        // On a relative walk root `/bar` cannot be rewritten as an absolute
+        // pattern; on Windows it remains a root-relative empty-leading
+        // spelling. Either path must refuse it at pattern-add time.
+        for mode in [
+            WildcardMode::ComponentScoped,
+            WildcardMode::SeparatorCrossing,
+        ] {
+            assert!(
+                Walker::new(".")
+                    .wildcard_mode(mode)
+                    .include("/bar")
+                    .is_err(),
+                "include rejects an unselectable leading empty component under {mode:?}"
+            );
+            assert!(
+                Walker::new(".")
+                    .wildcard_mode(mode)
+                    .exclude("/bar")
+                    .is_err(),
+                "exclude rejects an unselectable leading empty component under {mode:?}"
+            );
+        }
+
         // Dots that are matcher text, rather than slash-delimited path
         // components, remain valid in every mode. In particular this keeps
         // escaped, class, brace and extglob literals out of the path check.
@@ -2981,6 +3028,9 @@ mod tests {
             "src/*()/bar",
             "?()/bar",
             "*()/bar",
+            "src//bar",
+            "src/{}/bar",
+            "src/{,./a.rs}/bar",
         ] {
             assert!(
                 Walker::new(&fixture.root).include(pattern).is_err(),
@@ -3008,6 +3058,9 @@ mod tests {
                 "src/*()/bar",
                 "?()/bar",
                 "*()/bar",
+                "src//bar",
+                "src/{}/bar",
+                "src/{,./a.rs}/bar",
             ] {
                 assert!(
                     Walker::new(&fixture.root)

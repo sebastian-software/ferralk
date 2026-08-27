@@ -2433,6 +2433,17 @@ struct WalkerPathEvaluation {
     problem: Option<WalkerPathProblem>,
 }
 
+impl WalkerPathEvaluation {
+    fn complete_problem(self) -> Option<WalkerPathProblem> {
+        self.problem.or_else(|| {
+            (!self.selects_candidate).then_some(WalkerPathProblem {
+                viability: WalkerPathViability::Root,
+                offset: None,
+            })
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct WalkerPathSummary {
     all_empty_or_dot: bool,
@@ -2495,7 +2506,7 @@ impl WalkerPathShape {
     fn problem(&self) -> Option<WalkerPathProblem> {
         let mut state = WalkerPathState::new(self.leading_dot_is_normalized);
         state.append_shape(self);
-        state.finish().problem
+        state.finish().complete_problem()
     }
 }
 
@@ -4473,6 +4484,15 @@ mod tests {
                     .walker_path_viability(),
                 WalkerPathViability::Root,
                 "{source} has only an empty leading or interior component"
+            );
+        }
+        for source in ["src//bar", "/bar", "src/{}/bar", "src/{,./a.rs}/bar"] {
+            assert_eq!(
+                Pattern::compile(source, options)
+                    .expect("empty plain or brace arm compiles")
+                    .walker_path_viability(),
+                WalkerPathViability::Root,
+                "{source} has no selectable complete walker alternative"
             );
         }
         for source in ["src/?(x)/bar", "src/?()bar", "?(x)/bar"] {
