@@ -22,8 +22,8 @@ use std::{
 };
 
 use super::{
-    DirectoryBackend, ListedEntry, WalkEntry, Walker, gitignore::IgnoreScope, glob_bytes,
-    has_hidden_component, should_skip_git_directory,
+    CycleGuard, DirectoryBackend, ListedEntry, WalkEntry, Walker, gitignore::IgnoreScope,
+    glob_bytes, has_hidden_component, should_skip_git_directory,
 };
 
 /// What a frontend has to do with one directory entry.
@@ -89,11 +89,20 @@ pub(crate) struct DirectoryTask {
     /// tree rather than rediscovered, because it selects the patterns and the
     /// root-relative offset that apply here.
     pub(crate) root: usize,
+    /// Shared only by this root and its descendants while following symlinks.
+    pub(crate) cycle_guard: Arc<CycleGuard>,
     /// Components between the walk root and this directory. The walk counts
     /// them once, on the way down, instead of recounting the components of
     /// every entry's path.
     pub(crate) depth: usize,
     pub(crate) ignores: IgnoreScope,
+}
+
+/// Root-specific state carried by a directory while it is classified.
+#[derive(Clone, Copy)]
+pub(crate) struct TraversalContext<'a> {
+    pub(crate) root: usize,
+    pub(crate) cycle_guard: &'a Arc<CycleGuard>,
 }
 
 /// A filesystem call that failed while classifying one entry.
@@ -148,9 +157,9 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     entry: &ListedEntry,
     ignores: &IgnoreScope,
     directory_depth: usize,
-    root: usize,
+    context: TraversalContext<'_>,
 ) -> EntryAction {
-    let plan = &walker.roots[root];
+    let plan = &walker.roots[context.root];
     let mut is_dir = entry.is_dir();
     let path_bytes = path.as_os_str().as_encoded_bytes();
     // Every walked path is its root with names pushed onto it, so the
@@ -200,7 +209,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
             }
         }
     }
-    if !is_dir && !walker.may_include_file(root, bytes.as_ref()) {
+    if !is_dir && !walker.may_include_file(context.root, bytes.as_ref()) {
         return EntryAction::Skip;
     }
 
@@ -212,7 +221,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
             .excludes
             .iter()
             .any(|pattern| pattern.covers_subtree(bytes.as_ref(), walker.wildcard_mode))
-        && walker.may_descend_at(root, depth, bytes.as_ref());
+        && walker.may_descend_at(context.root, depth, bytes.as_ref());
     // What the kind filters count this entry as. A listing reports a symlink as
     // a symlink and nothing about its target, so left alone the filters read
     // every unfollowed symlink as a non-directory. Resolving costs one stat and
@@ -251,7 +260,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     }
     let emit = should_emit(
         walker,
-        root,
+        context.root,
         is_dir,
         kind_is_dir,
         bytes.as_ref(),
@@ -264,7 +273,8 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     let task = || DirectoryTask {
         path: path.to_path_buf(),
         depth,
-        root,
+        root: context.root,
+        cycle_guard: Arc::clone(context.cycle_guard),
         ignores: ignores.clone(),
     };
     if !emit {
