@@ -407,14 +407,18 @@ mod tests {
     }
 
     #[test]
-    fn fence_scanner_recognizes_rustdoc_attributes_and_real_closers() {
+    fn fence_scanner_matches_rustdoc_fence_classification_and_real_closers() {
         let fences = scan_fenced_code_blocks(
-            "```rust,no_run\nlet value = 1;\n```\n\
-             ```rust,should_panic\npanic!();\n```\n\
-             ```rust,compile_fail,edition2024\nnot rust\n```\n\
-             ```rust,ignore-x86_64\nlet skipped = true;\n```\n\
-             ```rust\n// ```text is content, not a nested fence\n```\n\
-             ```text\nWalker::new(first)\n```\n",
+            "```\nlet bare: u8 = 1;\n```\n\
+             ```no_run,rust\nlet explicit: u8 = 2;\n```\n\
+             ```should_panic\npanic!(\"expected\");\n```\n\
+             ```edition2024,compile_fail\nlet _: u8 = \"not a byte\";\n```\n\
+             ```ignore-x86_64\nlet skipped = true;\n```\n\
+             ```text\nWalker::new(first)\n```\n\
+             ```sh\necho not-rust\n```\n\
+             ```json\n{\"not\": \"rust\"}\n```\n\
+             ~~~rust\nlet tilde_fence = true;\n~~~~\n\
+             ````rust\n// ```text is content, not a nested fence\n````\n",
         );
 
         assert_eq!(
@@ -422,7 +426,7 @@ mod tests {
                 .iter()
                 .filter(|fence| is_rust_fence(&fence.info) && !is_ignored_rust_fence(&fence.info))
                 .count(),
-            4
+            6
         );
         assert_eq!(
             fences
@@ -432,9 +436,17 @@ mod tests {
             1
         );
         assert_eq!(
-            fences[4].first_content_line.as_deref(),
+            fences[9].first_content_line.as_deref(),
             Some("// ```text is content, not a nested fence")
         );
+        assert!(is_rust_fence("no_run,sh"));
+        assert!(is_rust_fence("text,rust"));
+        assert!(is_rust_fence("compile_fail,E0308"));
+        assert!(is_rust_fence("test_harness"));
+        assert!(is_rust_fence("standalone_crate"));
+        assert!(!is_rust_fence("text,no_run"));
+        assert!(!is_rust_fence("allow_fail"));
+        assert!(!is_rust_fence("unknown-language"));
     }
 
     fn repository_root() -> std::path::PathBuf {
@@ -551,18 +563,62 @@ mod tests {
     }
 
     fn is_rust_fence(info: &str) -> bool {
-        fence_language(info) == Some("rust")
+        let tokens = fence_tokens(info).collect::<Vec<_>>();
+        if tokens.is_empty() {
+            return true;
+        }
+        if tokens.contains(&"rust") {
+            return true;
+        }
+        if tokens
+            .iter()
+            .any(|token| is_explicit_non_rust_marker(token))
+        {
+            return false;
+        }
+        tokens.iter().any(|token| is_rustdoc_rust_attribute(token))
     }
 
     fn is_ignored_rust_fence(info: &str) -> bool {
-        info.split(|character: char| character == ',' || character.is_ascii_whitespace())
-            .skip(1)
-            .any(|attribute| attribute == "ignore" || attribute.starts_with("ignore-"))
+        fence_tokens(info).any(is_ignore_attribute)
     }
 
     fn fence_language(info: &str) -> Option<&str> {
+        fence_tokens(info).next()
+    }
+
+    fn fence_tokens(info: &str) -> impl Iterator<Item = &str> {
         info.split(|character: char| character == ',' || character.is_ascii_whitespace())
-            .find(|part| !part.is_empty())
+            .filter(|part| !part.is_empty())
+    }
+
+    fn is_explicit_non_rust_marker(token: &str) -> bool {
+        matches!(token, "text" | "notrust" | "custom")
+    }
+
+    fn is_rustdoc_rust_attribute(token: &str) -> bool {
+        matches!(
+            token,
+            "no_run"
+                | "should_panic"
+                | "compile_fail"
+                | "test_harness"
+                | "standalone_crate"
+                | "edition2015"
+                | "edition2018"
+                | "edition2021"
+                | "edition2024"
+        ) || is_ignore_attribute(token)
+            || is_error_code(token)
+    }
+
+    fn is_ignore_attribute(token: &str) -> bool {
+        token == "ignore" || token.starts_with("ignore-")
+    }
+
+    fn is_error_code(token: &str) -> bool {
+        let bytes = token.as_bytes();
+        bytes.len() == 5 && bytes[0] == b'E' && bytes[1..].iter().all(|byte| byte.is_ascii_digit())
     }
 
     fn collect_markdown_files(root: &Path, directory: &Path, discovered: &mut BTreeSet<String>) {
