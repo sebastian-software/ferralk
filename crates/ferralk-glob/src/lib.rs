@@ -23,6 +23,8 @@ use std::{
 
 use memchr::{memchr, memchr2, memchr3, memmem};
 
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+mod suffix_word;
 mod sweep;
 
 use sweep::{SweepEngine, SweepState};
@@ -1652,6 +1654,42 @@ fn run_byte_matches(expected: u8, actual: u8, case_insensitive: bool) -> bool {
     }
 }
 
+/// The suffix representation selected once while compiling a fast path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiteralSuffix {
+    Plain(Vec<u8>),
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    Packed16(Box<suffix_word::PreparedSuffix16>),
+}
+
+impl LiteralSuffix {
+    fn new(suffix: Vec<u8>, case_insensitive: bool) -> Self {
+        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+        let _ = case_insensitive;
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        if !case_insensitive && let Some(prepared) = suffix_word::PreparedSuffix16::new(&suffix) {
+            return Self::Packed16(Box::new(prepared));
+        }
+
+        Self::Plain(suffix)
+    }
+
+    fn strip_from<'a>(&self, path: &'a [u8], case_insensitive: bool) -> Option<&'a [u8]> {
+        match self {
+            Self::Plain(suffix) => strip_literal_suffix(path, suffix, case_insensitive),
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            Self::Packed16(suffix) => {
+                if !case_insensitive && let Some(matches) = suffix.matches(path) {
+                    return matches.then_some(&path[..path.len() - suffix.len()]);
+                }
+                let bytes = suffix.bytes();
+                strip_literal_suffix(path, &bytes[16 - suffix.len()..], case_insensitive)
+            }
+        }
+    }
+}
+
 /// An allocation-free matcher for a common recursive-prefix/suffix shape.
 ///
 /// It is deliberately narrower than the full token matcher. Keeping it as a
@@ -1666,7 +1704,7 @@ enum FastPath {
         prefix: Vec<u8>,
     },
     StarSuffix {
-        suffix: Vec<u8>,
+        suffix: LiteralSuffix,
     },
     InfixStar {
         prefix: Vec<u8>,
@@ -1680,12 +1718,12 @@ enum FastPath {
         prefix: Vec<u8>,
     },
     RecursiveSuffix {
-        suffix: Vec<u8>,
+        suffix: LiteralSuffix,
         suffix_last: u8,
     },
     RecursivePrefixSuffix {
         prefix: Vec<u8>,
-        suffix: Vec<u8>,
+        suffix: LiteralSuffix,
         suffix_last: u8,
     },
 }
@@ -1718,7 +1756,7 @@ impl FastPath {
             }
             [Token::Star, Token::Literal(suffix)] => {
                 return Some(Self::StarSuffix {
-                    suffix: suffix.clone(),
+                    suffix: LiteralSuffix::new(suffix.clone(), options.case_insensitive),
                 });
             }
             [Token::Literal(prefix), Token::Star, Token::Literal(suffix)] => {
@@ -1752,7 +1790,7 @@ impl FastPath {
         }
         if let [Token::RecursivePrefix, Token::Star, Token::Literal(suffix)] = tokens {
             return Some(Self::RecursiveSuffix {
-                suffix: suffix.clone(),
+                suffix: LiteralSuffix::new(suffix.clone(), options.case_insensitive),
                 suffix_last: *suffix.last().expect("literal token is non-empty"),
             });
         }
@@ -1768,7 +1806,7 @@ impl FastPath {
         };
         Some(Self::RecursivePrefixSuffix {
             prefix: prefix.clone(),
-            suffix: suffix.clone(),
+            suffix: LiteralSuffix::new(suffix.clone(), options.case_insensitive),
             suffix_last: *suffix.last().expect("literal token is non-empty"),
         })
     }
@@ -1898,8 +1936,7 @@ impl FastPath {
                     )
             }
             Self::StarSuffix { suffix } => {
-                let Some(variable) = strip_literal_suffix(path, suffix, options.case_insensitive)
-                else {
+                let Some(variable) = suffix.strip_from(path, options.case_insensitive) else {
                     return false;
                 };
                 if options.component_wildcards && next_separator(variable).is_some() {
@@ -1975,8 +2012,7 @@ impl FastPath {
                 if !bytes_equal(*suffix_last, path_last, options.case_insensitive) {
                     return false;
                 }
-                let Some(variable) = strip_literal_suffix(path, suffix, options.case_insensitive)
-                else {
+                let Some(variable) = suffix.strip_from(path, options.case_insensitive) else {
                     return false;
                 };
                 options.match_hidden
@@ -1998,19 +2034,10 @@ impl FastPath {
                 if !bytes_equal(*suffix_last, path_last, options.case_insensitive) {
                     return false;
                 }
-                let Some(suffix_start) = path.len().checked_sub(suffix.len()) else {
+                let Some(prefix_and_variable) = suffix.strip_from(path, options.case_insensitive)
+                else {
                     return false;
                 };
-                if !suffix
-                    .iter()
-                    .zip(&path[suffix_start..])
-                    .all(|(&expected, &actual)| {
-                        bytes_equal(expected, actual, options.case_insensitive)
-                    })
-                {
-                    return false;
-                }
-                let prefix_and_variable = &path[..suffix_start];
                 let Some(remainder) =
                     strip_literal_prefix(prefix_and_variable, prefix, options.case_insensitive)
                 else {
@@ -5005,6 +5032,8 @@ impl CompiledExtglob {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    use super::LiteralSuffix;
     use super::{
         FailedStates, FastPath, Pattern, PatternOptions, Prefilter, Token, WalkerPathViability,
         extglob_failed_len, extglob_failed_stats, extglob_scratch_capacities,
@@ -5020,6 +5049,23 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Pattern>();
         assert_send_sync::<PatternOptions>();
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn apple_silicon_only_packs_short_case_sensitive_suffixes() {
+        assert!(matches!(
+            LiteralSuffix::new(b".ts".to_vec(), false),
+            LiteralSuffix::Packed16(_)
+        ));
+        assert!(matches!(
+            LiteralSuffix::new(b".ts".to_vec(), true),
+            LiteralSuffix::Plain(_)
+        ));
+        assert!(matches!(
+            LiteralSuffix::new(vec![b'x'; 17], false),
+            LiteralSuffix::Plain(_)
+        ));
     }
 
     #[test]
