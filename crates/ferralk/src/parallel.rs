@@ -388,7 +388,13 @@ impl<'backend> Shared<'backend> {
         }
     }
 
-    fn record_error(&self, operation: &'static str, path: PathBuf, source: std::io::Error) {
+    fn record_error(
+        &self,
+        operation: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+        is_root: bool,
+    ) {
         let error = WalkError::new(operation, path, source);
         match self.walker.error_policy {
             ErrorPolicy::Abort => {
@@ -398,8 +404,8 @@ impl<'backend> Shared<'backend> {
                     self.stop();
                 }
             }
-            ErrorPolicy::Skip => {}
-            ErrorPolicy::Collect => lock(&self.errors).push(error),
+            ErrorPolicy::Skip if !is_root => {}
+            ErrorPolicy::Skip | ErrorPolicy::Collect => lock(&self.errors).push(error),
         }
     }
 
@@ -597,7 +603,8 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
     if shared.should_stop() {
         return;
     }
-    if shared.walker.options.follow_symlinks && !mark_directory(shared, &path) {
+    let is_root = depth == 0;
+    if shared.walker.options.follow_symlinks && !mark_directory(shared, &path, is_root) {
         return;
     }
     if let Err(source) = shared.backend.read_directory(
@@ -606,7 +613,7 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
         !shared.walker.options.follow_symlinks && depth > 0,
         &mut worker.listing,
     ) {
-        shared.record_error("read_dir", path, source);
+        shared.record_error("read_dir", path, source, is_root);
         return;
     }
     // One add for the whole listing: the entries it returned, and the listing
@@ -646,17 +653,22 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
         reset_to_directory(&mut worker.path, &path);
     }
     while let Some(error) = worker.listing.take_deferred_error() {
-        shared.record_error("read_dir", error.path, error.source.into_io_error());
+        shared.record_error("read_dir", error.path, error.source.into_io_error(), false);
     }
 }
 
-fn mark_directory(shared: &Shared, directory: &Path) -> bool {
+fn mark_directory(shared: &Shared, directory: &Path, is_root: bool) -> bool {
     // The key is computed outside the lock, so the critical section holds only
     // the hash and the insert.
     match shared.backend.cycle_key(directory) {
         Ok(key) => lock(&shared.visited_directories).insert(key),
         Err(source) => {
-            shared.record_error(CYCLE_KEY_OPERATION, directory.to_path_buf(), source);
+            shared.record_error(
+                CYCLE_KEY_OPERATION,
+                directory.to_path_buf(),
+                source,
+                is_root,
+            );
             false
         }
     }
@@ -677,7 +689,7 @@ fn act(shared: &Shared, worker: &mut WorkerScratch, action: EntryAction) {
             if let Some(task) = descend {
                 shared.schedule(&worker.queue, task);
             }
-            shared.record_error(failure.operation, failure.path, failure.source);
+            shared.record_error(failure.operation, failure.path, failure.source, false);
         }
     }
 }
