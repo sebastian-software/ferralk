@@ -40,7 +40,7 @@ const DOCUMENTS: &[&str] = &[
 ];
 
 #[cfg(test)]
-const EXPECTED_COMPILED_RUST_FENCES: usize = 16;
+const EXPECTED_COMPILED_RUST_FENCES: usize = 17;
 
 #[cfg(test)]
 struct FencePolicy {
@@ -102,7 +102,7 @@ const FENCE_POLICIES: &[FencePolicy] = &[
     },
     FencePolicy {
         path: "docs/usage.md",
-        compiled_rust_fences: 4,
+        compiled_rust_fences: 5,
         ignored_rust_fences: 0,
         intentional_text_fragments: &[],
     },
