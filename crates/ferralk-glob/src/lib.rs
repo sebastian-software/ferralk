@@ -2332,6 +2332,10 @@ struct WalkerPathState {
     first_parent: Option<WalkerComponent>,
     first_dot: Option<WalkerComponent>,
     last_nonempty: Option<WalkerComponent>,
+    /// A separator closed an empty component. Such a leading or interior
+    /// component is not a spelling the walker can select, even when later
+    /// matcher text makes the final component nonempty.
+    has_empty_leading_or_interior_component: bool,
     current: WalkerComponent,
 }
 
@@ -2344,6 +2348,7 @@ impl WalkerPathState {
             first_parent: None,
             first_dot: None,
             last_nonempty: None,
+            has_empty_leading_or_interior_component: false,
             current: WalkerComponent::default(),
         }
     }
@@ -2364,6 +2369,8 @@ impl WalkerPathState {
 
     fn separator(&mut self) {
         let component = std::mem::take(&mut self.current);
+        self.has_empty_leading_or_interior_component |=
+            component.kind == WalkerComponentKind::Empty;
         self.record_component(component);
     }
 
@@ -2401,7 +2408,8 @@ impl WalkerPathState {
 
     fn finish(mut self) -> WalkerPathEvaluation {
         let component = std::mem::take(&mut self.current);
-        let selects_candidate = component.kind != WalkerComponentKind::Empty;
+        let selects_candidate = component.kind != WalkerComponentKind::Empty
+            && !self.has_empty_leading_or_interior_component;
         self.record_component(component);
         WalkerPathEvaluation {
             selects_candidate,
@@ -2418,9 +2426,9 @@ impl WalkerPathState {
 
 #[derive(Clone, Copy)]
 struct WalkerPathEvaluation {
-    /// A trailing empty component is a directory spelling (`src/`), not an
-    /// emitted root-relative candidate. Nullable groups must not use it as a
-    /// viable escape from their real invalid arms.
+    /// A walker candidate ends in a nonempty component and contains no empty
+    /// leading or interior component. Nullable groups must not use an empty
+    /// arm as a viable escape from their real invalid arms.
     selects_candidate: bool,
     problem: Option<WalkerPathProblem>,
 }
@@ -2472,6 +2480,16 @@ struct WalkerPathShape {
 impl WalkerPathShape {
     fn has_separator(&self) -> bool {
         self.components.len() > 1
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(
+            self.components.as_slice(),
+            [WalkerComponent {
+                kind: WalkerComponentKind::Empty,
+                ..
+            }]
+        )
     }
 
     fn problem(&self) -> Option<WalkerPathProblem> {
@@ -2678,6 +2696,10 @@ impl ExtglobGroup {
                     let mut state = state.clone();
                     if arm.walker_path_shape.has_separator() {
                         state.append_shape(&arm.walker_path_shape);
+                    } else if arm.walker_path_shape.is_empty() {
+                        // A syntactically empty arm (`?()`/`*()`) matches no
+                        // matcher text and therefore leaves this canonical
+                        // path state unchanged.
                     } else {
                         // A group that remains inside its containing component
                         // is matcher text (`@(..)`), not a path operation.
@@ -4426,15 +4448,40 @@ mod tests {
 
         // Only a raw spelling that starts with `./` is normalized by walker
         // filters. A compiler-produced leading component is still a real
-        // unmatchable dot component, and a nullable empty arm ending in `/`
-        // cannot rescue an otherwise invalid positive arm.
-        for source in ["@(./a.rs)", "{./a.rs}", "src/?(./a.rs)", "src/*(./a.rs)"] {
+        // unmatchable dot component. Nor may a nullable arm use an empty
+        // leading or interior component to escape that invalid positive arm.
+        for source in [
+            "@(./a.rs)",
+            "{./a.rs}",
+            "src/?(./a.rs)",
+            "src/*(./a.rs)",
+            "src/?(./a.rs)/bar",
+            "src/*(./a.rs)/bar",
+        ] {
             assert_eq!(
                 Pattern::compile(source, options)
                     .expect("edge-normalization regression compiles")
                     .walker_path_viability(),
                 WalkerPathViability::DotComponent,
                 "{source} has no selectable walker candidate"
+            );
+        }
+        for source in ["src/?()/bar", "src/*()/bar", "?()/bar", "*()/bar"] {
+            assert_eq!(
+                Pattern::compile(source, options)
+                    .expect("empty extglob arm compiles")
+                    .walker_path_viability(),
+                WalkerPathViability::Root,
+                "{source} has only an empty leading or interior component"
+            );
+        }
+        for source in ["src/?(x)/bar", "src/?()bar", "?(x)/bar"] {
+            assert_eq!(
+                Pattern::compile(source, options)
+                    .expect("selectable nullable control compiles")
+                    .walker_path_viability(),
+                WalkerPathViability::Viable,
+                "{source} retains a selectable compiler arm"
             );
         }
         assert_eq!(

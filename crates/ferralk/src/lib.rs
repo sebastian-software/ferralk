@@ -2975,6 +2975,12 @@ mod tests {
             "{./a.rs}",
             "src/?(./a.rs)",
             "src/*(./a.rs)",
+            "src/?(./a.rs)/bar",
+            "src/*(./a.rs)/bar",
+            "src/?()/bar",
+            "src/*()/bar",
+            "?()/bar",
+            "*()/bar",
         ] {
             assert!(
                 Walker::new(&fixture.root).include(pattern).is_err(),
@@ -2996,6 +3002,12 @@ mod tests {
                 "{./a.rs}",
                 "src/?(./a.rs)",
                 "src/*(./a.rs)",
+                "src/?(./a.rs)/bar",
+                "src/*(./a.rs)/bar",
+                "src/?()/bar",
+                "src/*()/bar",
+                "?()/bar",
+                "*()/bar",
             ] {
                 assert!(
                     Walker::new(&fixture.root)
