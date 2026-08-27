@@ -30,7 +30,7 @@ For an unreleased Git dependency, pin a revision for repeatable builds.
 ## Local benchmark snapshot
 
 The matcher snapshot below was refreshed on 2026-08-27 on a Mac Studio with an
-Apple M1 Ultra, 20 cores, 64 GB RAM, macOS 26.5.2, Rust 1.95.0-nightly, and
+Apple M1 Ultra, 20 cores, 64 GB RAM, macOS 26.5.2, Rust 1.96.0, and
 Criterion 0.8.2. It is a local comparison, not a portable promise. The zlob
 row is the last separately dated context measurement because Zig is not
 installed on this host. The expanded multi-library walker comparison is in
@@ -40,11 +40,11 @@ lanes, limitations, and reproduction commands. Matcher values use the common
 
 | Matcher | Match | Non-match |
 | --- | ---: | ---: |
-| Ferralk (compiled, 2026-08-27) | 12 ns | 3 ns |
+| Ferralk (compiled, 2026-08-27) | 11 ns | 3 ns |
 | zlob 1.6.3 (compiled, 2026-08-19) | 34.74 ns | 2.36 ns |
-| globset (compiled, 2026-08-27) | 39 ns | 38 ns |
-| fast-glob (interpreted, 2026-08-27) | 100 ns | 109 ns |
-| wax (compiled, 2026-08-27) | 32 ns | 31 ns |
+| globset (compiled, 2026-08-27) | 40 ns | 40 ns |
+| fast-glob (interpreted, 2026-08-27) | 98 ns | 107 ns |
+| wax (compiled, 2026-08-27) | 31 ns | 31 ns |
 
 On this common syntax Ferralk is faster than both `globset` and `fast-glob` in
 the current refresh. The complete current matcher table, including long-path
