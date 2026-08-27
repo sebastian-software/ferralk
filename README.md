@@ -32,8 +32,8 @@ For an unreleased Git dependency, pin a revision for repeatable builds.
 The matcher snapshot below was refreshed on 2026-08-27 on a Mac Studio with an
 Apple M1 Ultra, 20 cores, 64 GB RAM, macOS 26.5.2, Rust 1.96.0, and
 Criterion 0.8.2. It is a local comparison, not a portable promise. The zlob
-row is the last separately dated context measurement because Zig is not
-installed on this host. The expanded multi-library walker comparison is in
+row was refreshed on the same host with zlob 1.6.3, Zig 0.16.0, and libclang
+22.1.8. The expanded multi-library walker comparison is in
 [benchmark evidence](docs/benchmark-evidence.md), which also describes the
 lanes, limitations, and reproduction commands. Matcher values use the common
 `src/**/*.rs` syntax; lower is better.
@@ -41,7 +41,7 @@ lanes, limitations, and reproduction commands. Matcher values use the common
 | Matcher | Match | Non-match |
 | --- | ---: | ---: |
 | Ferralk (compiled, 2026-08-27) | 11 ns | 3 ns |
-| zlob 1.6.3 (compiled, 2026-08-19) | 34.74 ns | 2.36 ns |
+| zlob 1.6.3 (compiled, 2026-08-27) | 37 ns | 2 ns |
 | globset (compiled, 2026-08-27) | 40 ns | 40 ns |
 | fast-glob (interpreted, 2026-08-27) | 98 ns | 107 ns |
 | wax (compiled, 2026-08-27) | 31 ns | 31 ns |
