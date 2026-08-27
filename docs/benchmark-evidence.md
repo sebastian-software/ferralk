@@ -12,10 +12,11 @@ records the same for releases.
 
 | Lane | What it measures | Where | Gating |
 | --- | --- | --- | --- |
-| Matcher, wall time | Compiled-pattern matching and compilation, against `globset` and `fast-glob` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
+| Matcher, wall time | Compiled-pattern matching and compilation, against `globset`, `fast-glob`, and `wax` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
 | Walker, wall time | Warm-cache traversal of a synthetic tree, ferralk serial and parallel against `ignore` parallel, one job per backend that ships | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request, medians in the job summary and as an artifact | No |
 | Engine comparison | One repository shape, every engine on the same query and the same file set | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), run on demand | No |
 | zlob context | The same matcher and walker shapes against zlob 1.6.3 | [`zlob-benchmark.yml`](../.github/workflows/zlob-benchmark.yml), manual dispatch only | No |
+| Node.js ecosystem context | The same matcher cases and repository-shaped walker fixture against current locked Node libraries | [`tools/bench/node`](../tools/bench/node), run on demand | No |
 
 **Why every lane measures wall time.** An earlier revision ran the matcher
 under CodSpeed's simulation instrument, which counts instructions in a virtual
@@ -54,6 +55,15 @@ cargo bench -p bench --bench walker -- --warm-up-time 1 --measurement-time 5 --s
 # Engine comparison on a repository-shaped 53k-file tree. This includes
 # walkdir, jwalk, globwalk, and wax in addition to the existing arms.
 cargo bench -p bench --bench walker_palamedes -- --output-format bencher --noplot
+```
+
+Node.js ecosystem context requires Node 24 or later. Install the exact locked
+dependencies once, then run the self-validating harness:
+
+```sh
+cd tools/bench/node
+npm ci
+npm run bench
 ```
 
 **Both walker benches measure the portable backend unless a feature says
@@ -169,10 +179,11 @@ The portable one. `cargo bench -p bench --bench walker_palamedes` compiles
 `ferralk` without a native feature, so both `ferralk` arms above read
 directories through `std::fs`, on macOS as everywhere else.
 
-## Expanded library comparison on this machine, 2026-08-27
+## Expanded library comparison on this machine, 2026-08-28
 
-The comparison was refreshed on the current checkout and extended with four
-popular Rust libraries plus zlob as the optional cross-language reference:
+The comparison was refreshed on the current checkout. It covers four popular
+Rust libraries plus zlob as the optional cross-language reference, and now
+includes a separate Node.js ecosystem harness on the same fixture shape:
 
 | Library | Locked version | Role in the comparison | Important scope note |
 | --- | ---: | --- | --- |
@@ -197,67 +208,83 @@ once outside their match loop.
 | --- | --- |
 | Host | Mac Studio (Mac13,2), Apple M1 Ultra, 20 cores (16 performance, 4 efficiency), 64 GB RAM |
 | OS | macOS 26.5.2, build 25F84; Darwin 25.5.0, arm64 |
-| Benchmark revision | `0ac2adc` (source tree used for this run) |
-| Toolchain | rustc/cargo 1.96.0, LLVM 22.1.0 |
+| Benchmark revision | `c9727b8` (source tree used for this run) |
+| Toolchain | rustc/cargo 1.96.0, LLVM 22.1.2 |
 | Benchmark stack | Criterion 0.8.2, release profile; exact dependency versions are locked in `Cargo.lock` |
 | zlob toolchain | Zig 0.16.0, libclang 22.1.8 from Homebrew |
+| Node toolchain | Node.js 24.19.0, npm 11.17.0; exact dependency versions are locked in `tools/bench/node/package-lock.json` |
 | Threads | 4 for every parallel ferralk, `ignore`, and `jwalk` arm |
 | Cache | Warm: the fixture is written immediately before the measurement and then reused by all arms in that invocation |
 | Fixture | 53,600 files, 2,600 TypeScript sources under `src/` and `packages/`, and 400 dependency packages under `node_modules/` |
-| Commands | `cargo bench -p bench --bench matcher -- --output-format bencher --noplot`; `cargo bench -p bench --bench matcher_zlob --features zlob-oracle -- --output-format bencher --noplot`; `cargo bench -p bench --bench walker_palamedes -- --output-format bencher --noplot`; the same walker command with `--features native-macos` and with `--features zlob-oracle` |
+
+The complete refresh used these commands. `+stable` selects the installed 1.96.0
+toolchain explicitly because this host's default nightly predates the workspace
+MSRV:
+
+```sh
+cargo +stable bench -p bench --bench matcher -- --output-format bencher --noplot
+LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib cargo +stable bench -p bench --bench matcher_zlob --features zlob-oracle -- --output-format bencher --noplot
+LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib cargo +stable bench -p bench --bench walker_palamedes --features zlob-oracle -- --output-format bencher --noplot
+LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib cargo +stable bench -p bench --bench walker_palamedes --features native-macos,zlob-oracle -- --output-format bencher --noplot
+cd tools/bench/node && npm run bench
+```
 
 The tables report Criterion's point estimates in milliseconds. They are
-indicative wall times, not a performance gate. Lower is better. The native
-unscoped `ferralk` parallel arm had unusually high spread in this run
-(`190.92 +/- 103.64 ms`), so it should not be read as a precise ranking.
+indicative wall times, not a performance gate. Lower is better. The zlob arm is
+inside both walker invocations, so each table's Rust and zlob rows share the
+same fixture and host load.
 
 ### Portable backend
 
 | Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
 | --- | ---: | ---: |
-| ferralk, serial | 79.28 ms | 13.92 ms |
-| ferralk, 4 threads | 51.42 ms | **8.50 ms** |
-| `ignore` serial + `globset` | 116.32 ms | 101.06 ms |
-| `walkdir` serial + `globset` | 113.51 ms | 97.42 ms |
-| `jwalk` serial + `globset` | 100.14 ms | 102.29 ms |
-| `jwalk`, 4 threads + `globset` | **50.72 ms** | 50.12 ms |
-| `globwalk` serial | 99.45 ms | 99.02 ms |
-| `wax` serial | 120.71 ms | 18.41 ms |
-| `ignore` parallel + overrides | 51.32 ms | 46.40 ms |
-| `ignore` parallel + hand-pruned subtree | — | 10.91 ms |
-| zlob, 4 threads | **35.99 ms** | 38.24 ms |
+| ferralk, serial | 60.84 ms | 10.95 ms |
+| ferralk, 4 threads | 37.91 ms | **6.46 ms** |
+| `ignore` serial + `globset` | 86.42 ms | 85.24 ms |
+| `walkdir` serial + `globset` | 74.39 ms | 73.58 ms |
+| `jwalk` serial + `globset` | 80.12 ms | 79.79 ms |
+| `jwalk`, 4 threads + `globset` | 39.72 ms | 36.54 ms |
+| `globwalk` serial | 77.03 ms | 79.53 ms |
+| `wax` serial | 98.07 ms | 15.93 ms |
+| `ignore` parallel + overrides | 39.35 ms | 38.57 ms |
+| `ignore` parallel + hand-pruned subtree | — | 9.52 ms |
+| zlob, 4 threads | **29.68 ms** | 31.66 ms |
 
-On the unscoped query, zlob is the fastest arm in this run at 35.99 ms; Ferralk
-and `jwalk` plus caller-side `globset` follow at 51.42 ms and 50.72 ms. On the
-scoped query, Ferralk is fastest because it prunes `node_modules` from the
-pattern itself: 8.50 ms versus 18.41 ms for `wax`, 38.24 ms for zlob, and
-50.12 ms for `jwalk`. The hand-pruned `ignore` arm remains the closest
-selection-policy comparison at 10.91 ms, but it needs an extra caller policy
-that the Ferralk pattern already expresses.
+On the unscoped query, zlob is the fastest arm at 29.68 ms. Ferralk follows at
+37.91 ms, alongside parallel `ignore` at 39.35 ms and `jwalk` plus caller-side
+`globset` at 39.72 ms. On the scoped query, Ferralk is fastest because it prunes
+`node_modules` from the pattern itself: 6.46 ms versus 9.52 ms for hand-pruned
+`ignore`, 15.93 ms for `wax`, and 31.66 ms for zlob. The `ignore` arm needs an
+extra caller policy that the Ferralk pattern already expresses.
 
 ### macOS-native backend
 
 | Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
 | --- | ---: | ---: |
-| ferralk, serial | 61.36 ms | 11.42 ms |
-| `ferralk, 4 threads` | 190.92 ms | **8.04 ms** |
-| `ignore` serial + `globset` | 85.89 ms | 88.91 ms |
-| `walkdir` serial + `globset` | 84.35 ms | 84.57 ms |
-| `jwalk` serial + `globset` | 88.28 ms | 94.96 ms |
-| `jwalk`, 4 threads + `globset` | 44.92 ms | 47.49 ms |
-| `globwalk` serial | 86.91 ms | 89.06 ms |
-| `wax` serial | 107.90 ms | 18.10 ms |
-| `ignore` parallel + overrides | 49.57 ms | 53.21 ms |
-| `ignore` parallel + hand-pruned subtree | — | 10.82 ms |
-| zlob, 4 threads | **37.00 ms** | 39.26 ms |
+| ferralk, serial | 52.46 ms | 10.02 ms |
+| ferralk, 4 threads | 37.54 ms | **6.31 ms** |
+| `ignore` serial + `globset` | 87.52 ms | 86.62 ms |
+| `walkdir` serial + `globset` | 74.92 ms | 74.05 ms |
+| `jwalk` serial + `globset` | 78.84 ms | 79.81 ms |
+| `jwalk`, 4 threads + `globset` | 40.76 ms | 31.38 ms |
+| `globwalk` serial | 77.82 ms | 80.83 ms |
+| `wax` serial | 97.98 ms | 15.62 ms |
+| `ignore` parallel + overrides | 33.46 ms | 40.58 ms |
+| `ignore` parallel + hand-pruned subtree | — | 8.37 ms |
+| zlob, 4 threads | **26.64 ms** | 29.19 ms |
 
-The native reader changes Ferralk's serial unscoped result from 79.28 ms to
-61.36 ms in this final run, and the scoped result from 13.92 ms to 11.42 ms.
-The unscoped native parallel point estimate is an outlier with high spread;
-the scoped native Ferralk result is the best measured arm at 8.04 ms, while
-zlob is the fastest unscoped cross-language reference at 37.00 ms and `wax` is
-the only other integrated walker close to Ferralk on the scoped query at
-18.10 ms.
+The native reader changes Ferralk's serial unscoped result from 60.84 ms to
+52.46 ms in these two adjacent runs, while the parallel result stays level at
+37.91 and 37.54 ms. The scoped native Ferralk result is the best measured arm
+at 6.31 ms, ahead of hand-pruned `ignore` at 8.37 ms and `wax` at 15.62 ms.
+zlob remains the fastest unscoped cross-language reference at 26.64 ms.
+
+Relative to the previous 2026-08-27 refresh, the new brace-suffix-set path
+lowers Ferralk's scoped point estimates from 13.92/8.50 ms to 10.95/6.46 ms on
+the portable backend and from 11.42/8.04 ms to 10.02/6.31 ms on the native
+backend (serial/parallel). Those are 12–24% lower point estimates, not a claim
+that the code change alone accounts for every difference between separate
+wall-time runs.
 
 The new references answer a comparison question, not an adoption question.
 `jwalk` is deprecated, `walkdir` has no matching or pruning policy, `globwalk`
@@ -265,8 +292,8 @@ uses a different override contract, and `wax` accepts UTF-8 expressions rather
 than Ferralk's arbitrary-byte matcher. Exact semantic compatibility still
 comes from the checked-in corpus and caller parity tests, not from these
 wall-time rows. zlob was run in the same fixture and invocation as the other
-walker arms after installing Zig 0.16.0 and libclang 22.1.8 locally. It remains
-an optional context lane rather than an automated baseline.
+walker arms with Zig 0.16.0 and libclang 22.1.8 installed locally. It remains an
+optional context lane rather than an automated baseline.
 
 ### Matcher refresh
 
@@ -275,11 +302,11 @@ point estimates and add `wax` and zlob to the existing compiled baselines:
 
 | Case | ferralk | zlob | `globset` | `fast-glob` | `wax` |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `common` matching | **11 ns** | 37 ns | 40 ns | 98 ns | 31 ns |
-| `common` non-matching | **3 ns** | **2 ns** | 40 ns | 107 ns | 31 ns |
-| `long_path` matching | **13 ns** | 74 ns | 205 ns | 545 ns | 180 ns |
-| `long_path` non-matching | **3 ns** | **2 ns** | 201 ns | 545 ns | 189 ns |
-| `backtracking` non-matching | **4 ns** | 30 ns | 102 ns | 249 ns | 81 ns |
+| `common` matching | **10 ns** | 37 ns | 39 ns | 97 ns | 31 ns |
+| `common` non-matching | 3 ns | **2 ns** | 39 ns | 106 ns | 31 ns |
+| `long_path` matching | **10 ns** | 74 ns | 201 ns | 533 ns | 182 ns |
+| `long_path` non-matching | 3 ns | **2 ns** | 200 ns | 544 ns | 180 ns |
+| `backtracking` non-matching | **3 ns** | 29 ns | 104 ns | 250 ns | 79 ns |
 
 `wax` is faster than `globset` on the long-path and adversarial rows here, but
 that does not erase the API and byte-semantics differences. zlob is competitive
@@ -287,6 +314,82 @@ on short non-matches and the adversarial case, while Ferralk remains faster on
 the matching and long-path cases. The Ferralk/baseline output is produced by
 [`matcher.rs`](../tools/bench/benches/matcher.rs), and the optional zlob rows by
 [`matcher_zlob.rs`](../tools/bench/benches/matcher_zlob.rs).
+
+### Node/TypeScript brace catalogs
+
+The matcher refresh now includes the pattern shape that motivated the latest
+optimization. One compiled brace expression covers the six common
+Node/TypeScript extensions; the catalog arm compiles six independent patterns
+and asks them in order. The scoped expression additionally proves the cross
+product of three roots and six extensions. All three forms select 768 of the
+same 1,024 generated paths.
+
+| Operation | One brace expression | Six-pattern catalog | Scoped brace expression |
+| --- | ---: | ---: | ---: |
+| Compile | 4.12 µs | — | 15.94 µs |
+| First extension/root | 11 ns | **8 ns** | 12 ns |
+| Last extension/root | **13 ns** | 32 ns | 25 ns |
+| Rejected extension/root | **6 ns** | 23 ns | 10 ns |
+| Filter 1,024 paths | **10.74 µs** | 19.86 µs | 36.36 µs |
+
+The catalog can win when its first pattern matches, but its cost depends on
+where a suffix appears. The brace trie keeps first and last extensions close
+and filters the full list 46% faster than the six-pattern catalog. The scoped
+row is not a pure suffix comparison: it also checks the allowed-root set.
+
+### Node.js ecosystem context
+
+[`tools/bench/node`](../tools/bench/node) recreates the same fixture and queries
+through Node's built-in glob plus current locked ecosystem packages:
+
+| Package | Locked version | Measured role |
+| --- | ---: | --- |
+| Node.js `node:fs` glob | 24.19.0 runtime | Sync and async walking |
+| `glob` | 13.0.6 | Sync and async walking |
+| `fast-glob` | 3.3.3 | Sync and async walking |
+| `tinyglobby` | 0.2.17 | Sync and async walking |
+| `fdir` + `picomatch` | 6.5.0 + 4.0.7 | Sync and async traversal with caller-side matching |
+| `picomatch` | 4.0.7 | Compiled matching |
+| `micromatch` | 4.0.8 | Compiled matching |
+| `minimatch` | 10.2.6 | Compiled matching |
+
+The walker harness takes two warmups and ten order-rotated samples, and reports
+the median. Every candidate must return 7,400 files for the unscoped query and
+2,600 for the scoped query before it is timed.
+
+| Node.js walker | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
+| --- | ---: | ---: |
+| `node:fs` sync | 286.49 ms | 31.51 ms |
+| `node:fs` async | 359.11 ms | 43.83 ms |
+| `glob` sync | 89.36 ms | 16.14 ms |
+| `glob` async | 48.56 ms | **8.08 ms** |
+| `fast-glob` sync | 94.41 ms | 13.95 ms |
+| `fast-glob` async | 50.73 ms | 8.29 ms |
+| `tinyglobby` sync | 90.06 ms | 14.02 ms |
+| `tinyglobby` async | 47.34 ms | 8.21 ms |
+| `fdir` + `picomatch` sync | 87.31 ms | 80.60 ms |
+| `fdir` + `picomatch` async | **47.08 ms** | 42.09 ms |
+
+The fastest Node medians are 47.08 ms unscoped and 8.08 ms scoped. The adjacent
+Criterion runs put portable Ferralk at 37.91 and 6.46 ms and native Ferralk at
+37.54 and 6.31 ms. That is useful same-host context, not a formal ranking: the
+Rust table uses Criterion point estimates while the Node harness reports a
+median of ten samples, and the APIs do not offer identical semantics.
+
+The matcher harness takes five warmups and fifteen order-rotated samples of
+100,000 matches per case. The adversarial case uses 100 matches per sample so a
+backtracking engine cannot make the run unbounded.
+
+| Node.js matcher | Common match | Common reject | Long match | Long reject | Adversarial reject |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `picomatch` | 80.9 ns | 90.9 ns | 290.8 ns | **299.7 ns** | 393.1 µs |
+| `micromatch` | **80.6 ns** | 91.0 ns | **286.9 ns** | **299.7 ns** | 392.2 µs |
+| `minimatch` | 238.3 ns | 219.0 ns | 573.8 ns | 498.8 ns | **388.8 µs** |
+
+Ferralk's corresponding rows are 10/3 ns for the common case, 10/3 ns for the
+long case, and 3 ns for the adversarial rejection. This is compiled native Rust
+against JavaScript libraries, not a Node binding comparison; it isolates
+matcher work and says nothing about interop or application-level throughput.
 
 ## The macOS native backend, 2026-08-20
 
