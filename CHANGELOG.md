@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.9.0](https://github.com/sebastian-software/ferralk/compare/v0.8.1...v0.9.0) (2026-08-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* harden matcher and walker resource limits ([#178](https://github.com/sebastian-software/ferralk/issues/178))
+
+### Features
+
+* **walker:** finish post-0.8 polish ([#175](https://github.com/sebastian-software/ferralk/issues/175)) ([a01a3a0](https://github.com/sebastian-software/ferralk/commit/a01a3a04be8b11fb167250368995a9b0f7440e10))
+
+
+### Bug Fixes
+
+* harden matcher and walker resource limits ([#178](https://github.com/sebastian-software/ferralk/issues/178)) ([494abc9](https://github.com/sebastian-software/ferralk/commit/494abc9727c87136c67b453f3e1771bcb77a8f80))
+
+
+### Performance Improvements
+
+* **glob:** accelerate common suffix patterns ([#180](https://github.com/sebastian-software/ferralk/issues/180)) ([a83ccf4](https://github.com/sebastian-software/ferralk/commit/a83ccf4eccda09c04d977eb5017d5c43b95b84ec))
+* **glob:** reuse positive extglob scratch ([#179](https://github.com/sebastian-software/ferralk/issues/179)) ([f0f60e3](https://github.com/sebastian-software/ferralk/commit/f0f60e3649d65511266e871380308fdbe74aebaa))
+* **glob:** vectorize short suffix checks on Apple Silicon ([#181](https://github.com/sebastian-software/ferralk/issues/181)) ([af84e55](https://github.com/sebastian-software/ferralk/commit/af84e5543a8c47a34dca27574b5eba3b431c94e1))
+
 ## [0.8.1](https://github.com/sebastian-software/ferralk/compare/v0.8.0...v0.8.1) (2026-08-27)
 
 
