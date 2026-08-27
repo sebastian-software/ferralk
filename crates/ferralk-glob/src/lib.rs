@@ -14,7 +14,13 @@
 //! `test/test_fnmatch.zig`. Deliberate differences live in
 //! the checked-in corpus and compatibility matrix.
 
-use std::{cell::RefCell, collections::HashSet, error::Error, fmt, ops::RangeInclusive};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashSet},
+    error::Error,
+    fmt,
+    ops::RangeInclusive,
+};
 
 use memchr::{memchr, memchr2, memchr3, memmem};
 
@@ -3702,10 +3708,17 @@ fn split_extglob_alternatives(content: &[u8], escapes: bool) -> Vec<std::ops::Ra
 struct ExtglobScratch {
     /// One visited-position frame per repetition in flight.
     visited: Vec<u64>,
-    /// Program/path states explored by this match, one bit each. Only the
-    /// interpreter offsets reachable through extglob recursion receive a
-    /// dense row, so this is O(groups x candidate length) bits.
-    failed: Vec<u64>,
+    /// Dense rows for extglob-recursive interpreter offsets. Each row lazily
+    /// allocates fixed-size candidate pages as states are explored.
+    failed: Vec<ExtglobFailedRow>,
+    #[cfg(test)]
+    /// The previous match's materialized failure pages, retained only as
+    /// deterministic test instrumentation.
+    failed_page_count: usize,
+    #[cfg(test)]
+    /// The previous match's distinct failed states, retained only as
+    /// deterministic test instrumentation.
+    failed_state_count: usize,
     /// Deferred continuation positions, partitioned by active repetition
     /// calls so sequential groups reuse one allocation without sharing work.
     repeated: Vec<usize>,
@@ -3735,14 +3748,30 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                 let ExtglobScratch {
                     visited,
                     failed,
+                    #[cfg(test)]
+                    failed_page_count,
+                    #[cfg(test)]
+                    failed_state_count,
                     repeated,
                 } = &mut *scratch;
                 visited.clear();
                 failed.clear();
                 repeated.clear();
+                #[cfg(test)]
+                {
+                    *failed_page_count = 0;
+                    *failed_state_count = 0;
+                }
                 let mut state = ExtglobMatchState {
                     visited,
-                    failed: ExtglobFailedStates::new(program, path, failed),
+                    failed: ExtglobFailedStates::new(
+                        program,
+                        failed,
+                        #[cfg(test)]
+                        failed_page_count,
+                        #[cfg(test)]
+                        failed_state_count,
+                    ),
                     repeated,
                 };
                 match_extglob_from(program, path, 0, 0, options, &mut state)
@@ -3752,8 +3781,10 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                 scratch.visited.shrink_to(RETAINED_SCRATCH_WORDS);
             }
             scratch.failed.clear();
-            if scratch.failed.capacity() > RETAINED_SCRATCH_WORDS {
-                scratch.failed.shrink_to(RETAINED_SCRATCH_WORDS);
+            let retained_rows = RETAINED_SCRATCH_WORDS * std::mem::size_of::<u64>()
+                / std::mem::size_of::<ExtglobFailedRow>();
+            if scratch.failed.capacity() > retained_rows {
+                scratch.failed.shrink_to(retained_rows);
             }
             scratch.repeated.clear();
             if scratch.repeated.capacity() > RETAINED_SCRATCH_WORDS {
@@ -3766,11 +3797,22 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
             let ExtglobScratch {
                 visited,
                 failed,
+                #[cfg(test)]
+                failed_page_count,
+                #[cfg(test)]
+                failed_state_count,
                 repeated,
             } = &mut scratch;
             let mut state = ExtglobMatchState {
                 visited,
-                failed: ExtglobFailedStates::new(program, path, failed),
+                failed: ExtglobFailedStates::new(
+                    program,
+                    failed,
+                    #[cfg(test)]
+                    failed_page_count,
+                    #[cfg(test)]
+                    failed_state_count,
+                ),
                 repeated,
             };
             match_extglob_from(program, path, 0, 0, options, &mut state)
@@ -3792,7 +3834,8 @@ fn extglob_scratch_capacities() -> (usize, usize, usize) {
         let scratch = cell.borrow();
         (
             scratch.visited.capacity(),
-            scratch.failed.capacity(),
+            scratch.failed.capacity() * std::mem::size_of::<ExtglobFailedRow>()
+                / std::mem::size_of::<u64>(),
             scratch.repeated.capacity(),
         )
     })
@@ -3803,39 +3846,78 @@ fn extglob_failed_len() -> usize {
     EXTGLOB_SCRATCH.with(|cell| cell.borrow().failed.len())
 }
 
-/// A dense bitset over the extglob interpreter states and candidate offsets.
+#[cfg(test)]
+fn extglob_failed_stats() -> (usize, usize) {
+    EXTGLOB_SCRATCH.with(|cell| {
+        let scratch = cell.borrow();
+        (scratch.failed_page_count, scratch.failed_state_count)
+    })
+}
+
+/// Failure memoization for a single dense interpreter row.
+#[derive(Default)]
+struct ExtglobFailedRow {
+    pages: BTreeMap<usize, Box<[u64; EXTGLOB_MEMO_PAGE_WORDS]>>,
+}
+
+/// A page holds 4,096 candidate offsets. This keeps a sparse failed-state
+/// search compact without allocating the full state-by-candidate product.
+const EXTGLOB_MEMO_PAGE_WORDS: usize = 64;
+const EXTGLOB_MEMO_PAGE_BITS: usize = EXTGLOB_MEMO_PAGE_WORDS * u64::BITS as usize;
+
+/// A sparse paged bitset over dense extglob interpreter rows and candidate
+/// offsets. Its boolean semantics are identical to a flat matrix, while only
+/// recurrence states actually reached by the match materialize storage.
 struct ExtglobFailedStates<'scratch> {
-    width: usize,
-    states: &'scratch mut [u64],
+    rows: &'scratch mut [ExtglobFailedRow],
+    #[cfg(test)]
+    page_count: &'scratch mut usize,
+    #[cfg(test)]
+    state_count: &'scratch mut usize,
 }
 
 impl<'scratch> ExtglobFailedStates<'scratch> {
-    fn new(program: &CompiledExtglob, path: &[u8], scratch: &'scratch mut Vec<u64>) -> Self {
-        let width = path.len() + 1;
-        let words = Self::required_words(program, path.len());
-        if scratch.len() < words {
-            scratch.resize(words, 0);
+    fn new(
+        program: &CompiledExtglob,
+        scratch: &'scratch mut Vec<ExtglobFailedRow>,
+        #[cfg(test)] page_count: &'scratch mut usize,
+        #[cfg(test)] state_count: &'scratch mut usize,
+    ) -> Self {
+        scratch.resize_with(program.memo_state_count, ExtglobFailedRow::default);
+        Self {
+            rows: scratch,
+            #[cfg(test)]
+            page_count,
+            #[cfg(test)]
+            state_count,
         }
-        let states = &mut scratch[..words];
-        states.fill(0);
-        Self { width, states }
-    }
-
-    fn required_words(program: &CompiledExtglob, path_len: usize) -> usize {
-        program
-            .memo_state_count
-            .saturating_mul(path_len + 1)
-            .div_ceil(u64::BITS as usize)
     }
 
     fn insert(&mut self, state_index: usize, path_index: usize) -> bool {
-        let state = state_index * self.width + path_index;
-        let word = &mut self.states[state / u64::BITS as usize];
-        let mask = 1_u64 << (state % u64::BITS as usize);
+        let candidate_page = path_index / EXTGLOB_MEMO_PAGE_BITS;
+        let page_bit = path_index % EXTGLOB_MEMO_PAGE_BITS;
+        let row = &mut self.rows[state_index];
+        let words = match row.pages.entry(candidate_page) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let words = entry.insert(Box::new([0; EXTGLOB_MEMO_PAGE_WORDS]));
+                #[cfg(test)]
+                {
+                    *self.page_count += 1;
+                }
+                words
+            }
+        };
+        let word = &mut words[page_bit / u64::BITS as usize];
+        let mask = 1_u64 << (page_bit % u64::BITS as usize);
         if *word & mask != 0 {
             false
         } else {
             *word |= mask;
+            #[cfg(test)]
+            {
+                *self.state_count += 1;
+            }
             true
         }
     }
@@ -4268,8 +4350,8 @@ impl CompiledExtglob {
 mod tests {
     use super::{
         FailedStates, FastPath, Pattern, PatternOptions, Prefilter, Token, WalkerPathViability,
-        extglob_failed_len, extglob_scratch_capacities, extglob_visited_capacity,
-        scratch_capacities,
+        extglob_failed_len, extglob_failed_stats, extglob_scratch_capacities,
+        extglob_visited_capacity, scratch_capacities,
     };
 
     fn compile(pattern: &str) -> Pattern {
@@ -5052,7 +5134,7 @@ mod tests {
     }
 
     #[test]
-    fn extglob_memo_is_dense_and_releases_large_candidates() {
+    fn extglob_memo_pages_only_reached_dense_states_and_releases_them() {
         let pattern = Pattern::compile("+(a)+(a)", PatternOptions::default().extglob(true))
             .expect("repeating extglobs compile");
         let program = pattern.alternatives[0]
@@ -5070,14 +5152,48 @@ mod tests {
             "the recurrence rows are stable and dense"
         );
 
+        let long_early_mismatch =
+            Pattern::compile("a+(b)", PatternOptions::default().extglob(true))
+                .expect("extglob compiles");
+        let long_candidate = "x".repeat(2_000_000);
+        assert!(!long_early_mismatch.is_match(&long_candidate));
+        assert_eq!(
+            extglob_failed_stats(),
+            (1, 1),
+            "a long candidate must not allocate an untouched state-by-candidate table"
+        );
+
+        let many_states = Pattern::compile(
+            "+(a)".repeat(2_000),
+            PatternOptions::default().extglob(true),
+        )
+        .expect("many extglobs compile");
+        let many_program = many_states.alternatives[0]
+            .extglob
+            .as_ref()
+            .expect("the pattern carries an extglob program");
+        assert!(many_program.memo_state_count > 2_000);
+        assert!(!many_states.is_match("x"));
+        assert_eq!(
+            extglob_failed_stats(),
+            (1, 1),
+            "unreached dense rows must remain page-free after an early mismatch"
+        );
+
         let mut candidate = "a".repeat(2_000_000);
         candidate.push('x');
-        assert_eq!(
-            super::ExtglobFailedStates::required_words(program, candidate.len()),
-            93_751,
-            "three dense state rows need one bit per candidate offset"
-        );
         assert!(!pattern.is_match(&candidate));
+        let (pages, states) = extglob_failed_stats();
+        assert!(
+            pages > 1 && states > 1,
+            "the recurrence should visit several memo bits"
+        );
+        assert!(
+            pages
+                <= program.memo_state_count
+                    * candidate.len().div_ceil(super::EXTGLOB_MEMO_PAGE_BITS),
+            "materialized pages stay within the exact dense-row/page shape"
+        );
 
         let capacities = extglob_scratch_capacities();
         assert!(
