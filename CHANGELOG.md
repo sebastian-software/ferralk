@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.8.1](https://github.com/sebastian-software/ferralk/compare/v0.8.0...v0.8.1) (2026-08-27)
+
+
+### Bug Fixes
+
+* bound extglob memo memory and dot context ([#170](https://github.com/sebastian-software/ferralk/issues/170)) ([832642f](https://github.com/sebastian-software/ferralk/commit/832642faadeffcde933d3c96909058182de1c3ea))
+* harden native walker fallbacks ([#169](https://github.com/sebastian-software/ferralk/issues/169)) ([feedb48](https://github.com/sebastian-software/ferralk/commit/feedb48200898cebeb64299a23d3446519d64249))
+* parse repository config without UTF-8 gate ([#168](https://github.com/sebastian-software/ferralk/issues/168)) ([7867c48](https://github.com/sebastian-software/ferralk/commit/7867c4861a915344c104d7d5a453b689c1f0f7a3))
+* restore portable walker hot path and isolate Git tests ([#166](https://github.com/sebastian-software/ferralk/issues/166)) ([c95e5dc](https://github.com/sebastian-software/ferralk/commit/c95e5dca1490cea5734f1984cd1c2a3308b01162))
+
 ## [0.8.0](https://github.com/sebastian-software/ferralk/compare/v0.7.0...v0.8.0) (2026-08-27)
 
 
