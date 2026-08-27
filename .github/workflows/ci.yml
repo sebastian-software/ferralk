@@ -5,9 +5,10 @@ on:
   push:
     branches: [main]
   schedule:
-    # Surface new RustSec advisories in quiet phases. Only the audit job runs
-    # on this trigger; every other job is guarded below.
+    # Surface RustSec advisories and Rust stable-release drift in quiet phases.
+    # Only security-audit and msrv-policy run on this trigger.
     - cron: "0 6 * * 1"
+  # Runs only the MSRV policy check, without the ordinary CI matrix.
   workflow_dispatch:
 
 permissions:
@@ -19,7 +20,7 @@ env:
 jobs:
   lint:
     name: format and lints
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -45,7 +46,7 @@ jobs:
 
   test:
     name: test (${{ matrix.os }})
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -62,7 +63,7 @@ jobs:
 
   macos-native:
     name: macOS native backend
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -75,7 +76,7 @@ jobs:
 
   linux-native:
     name: Linux native backend
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -86,19 +87,21 @@ jobs:
 
   msrv:
     name: msrv (workspace rust-version)
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # ADR-0004 keeps the MSRV at current stable minus two releases. The
-      # workspace manifest is the single place it is written down.
-      - name: Read the MSRV from the workspace manifest
+      # fuzz crate is a separate workspace, but shares this same floor.
+      - name: Read and align the declared MSRVs
         id: msrv
         run: |
-          version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
-          test -n "$version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Workspace MSRV is $version"
+          workspace_version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          fuzz_version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' fuzz/Cargo.toml)
+          test -n "$workspace_version"
+          test "$fuzz_version" = "$workspace_version"
+          echo "version=$workspace_version" >> "$GITHUB_OUTPUT"
+          echo "Workspace and fuzz MSRV is $workspace_version"
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master branch
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
@@ -112,6 +115,11 @@ jobs:
           cargo check -p ferralk -p bench
           --features ferralk/native-linux,bench/native-linux
           --all-targets --locked
+      - name: Check the platform-neutral fuzz targets
+        run: >-
+          cargo check --manifest-path fuzz/Cargo.toml
+          --bin pattern_parser --bin pattern_matcher --bin ferralk_vs_fast_glob
+          --locked
 
   msrv-policy:
     name: MSRV stable-minus-two policy
@@ -167,6 +175,7 @@ jobs:
 
   security-audit:
     name: dependency and unsafe audit
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -182,7 +191,7 @@ jobs:
 
   coverage:
     name: coverage
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
