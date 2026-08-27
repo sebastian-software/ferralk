@@ -324,6 +324,29 @@ impl WalkEntry {
         &self.path
     }
 
+    /// Encoded bytes of [`Self::path`], ready for byte-first matchers.
+    ///
+    /// This is exactly [`OsStr::as_encoded_bytes`] on the path's native
+    /// representation: raw filesystem bytes on Unix and lossless WTF-8 on
+    /// Windows. It performs no allocation or Unicode conversion, so it is the
+    /// bridge to [`ferralk_glob::Pattern`] when a visitor needs to match the
+    /// entry itself.
+    ///
+    /// ```no_run
+    /// use ferralk::{Verdict, Walker, ferralk_glob::{Pattern, PatternOptions}};
+    ///
+    /// let matcher = Pattern::compile("**/*.rs", PatternOptions::default().recursive_double_star(true))?;
+    /// let result = Walker::new("src").visit(|entry| {
+    ///     matcher.is_match(entry.path_bytes()).then_some(Verdict::Keep).unwrap_or(Verdict::Skip)
+    /// })?;
+    /// # let _ = result;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn path_bytes(&self) -> &[u8] {
+        self.path.as_os_str().as_encoded_bytes()
+    }
+
     /// The walk root this entry was found under, exactly as it was given to
     /// [`Walker::new`] or [`Walker::add_root`].
     ///
@@ -2250,9 +2273,9 @@ mod tests {
     };
 
     use super::{
-        CancellationToken, ErrorPolicy, TraversalPattern, Verdict, WalkEntry, WalkEntryKind,
-        WalkOptions, WalkStream, Walker, WildcardMode, glob_path_bytes, literal_extension,
-        literal_pattern_root, traversal_pattern_options,
+        CancellationToken, ErrorPolicy, Pattern, PatternOptions, TraversalPattern, Verdict,
+        WalkEntry, WalkEntryKind, WalkOptions, WalkStream, Walker, WildcardMode, glob_path_bytes,
+        literal_extension, literal_pattern_root, traversal_pattern_options,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -5982,6 +6005,32 @@ mod tests {
             .stream();
         assert!(cancelled.next().is_none());
         assert!(cancelled.was_cancelled());
+    }
+
+    #[test]
+    fn path_bytes_bridge_entries_to_byte_first_matchers() {
+        let fixture = Fixture::new();
+        fixture.write("src/main.rs");
+
+        let result = Walker::new(&fixture.root)
+            .collect()
+            .expect("fixture has no I/O errors");
+        let entry = result
+            .entries()
+            .iter()
+            .find(|entry| entry.path().ends_with("src/main.rs"))
+            .expect("walk reports the fixture file");
+        let matcher = Pattern::compile(
+            "**/main.rs",
+            PatternOptions::default().recursive_double_star(true),
+        )
+        .expect("valid pattern");
+
+        assert_eq!(
+            entry.path_bytes(),
+            entry.path().as_os_str().as_encoded_bytes()
+        );
+        assert!(matcher.is_match(entry.path_bytes()));
     }
 
     #[cfg(unix)]

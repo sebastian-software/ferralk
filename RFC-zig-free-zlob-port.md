@@ -149,7 +149,7 @@ document and covered by a test.
 The public API should use builders and typed options instead of carrying C ABI
 constraints into the rewrite.
 
-```rust
+```rust,no_run
 use ferralk_glob::{Pattern, PatternOptions};
 
 let pattern = Pattern::compile(
@@ -161,9 +161,10 @@ let pattern = Pattern::compile(
 )?;
 
 assert!(pattern.is_match("src/main.ts"));
+# Ok::<(), ferralk_glob::PatternError>(())
 ```
 
-```rust
+```rust,no_run
 use ferralk::{ErrorPolicy, WalkOptions, Walker};
 
 let entries = Walker::new(".")
@@ -174,6 +175,8 @@ let entries = Walker::new(".")
     .error_policy(ErrorPolicy::Collect)
     .options(WalkOptions::default().follow_symlinks(false))
     .collect()?;
+# let _ = entries;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The iterator form SHOULD support streaming and cancellation. `collect()` MAY use

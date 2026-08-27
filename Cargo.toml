@@ -6,6 +6,7 @@ members = [
     "tools/harness",
     "tools/oracle",
     "tools/bench",
+    "tools/doc-tests",
 ]
 default-members = ["crates/ferralk-glob", "crates/ferralk"]
 resolver = "3"
