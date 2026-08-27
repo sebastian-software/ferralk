@@ -20,8 +20,12 @@ criterion = { version = "=0.8.2", default-features = false, features = ["cargo_b
 ferralk = { path = "../../crates/ferralk" }
 ferralk-glob = { path = "../../crates/ferralk-glob" }
 fast-glob = "=1.1.0"
+globwalk = "=0.9.1"
 globset = "=0.4.20"
 ignore = "=0.4.33"
+jwalk = "=0.9.0"
+walkdir = "=2.5.0"
+wax = "=0.7.0"
 
 [[bench]]
 name = "matcher"
