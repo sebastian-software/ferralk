@@ -21,8 +21,9 @@
 * **Breaking:** pattern compilation now rejects `.` and `..` path components
   instead of accepting them. Correct the pattern before constructing a matcher
   or walker.
-* `ErrorPolicy::Skip` now reports an open or read failure for a caller-supplied
-  root. It still skips recoverable failures discovered below a root.
+* `ErrorPolicy::Skip` now reports every failure for a caller-supplied root,
+  including read, metadata, and canonicalize failures in follow-symlink walks.
+  It still skips recoverable failures discovered below a root.
 
 ## [0.7.0](https://github.com/sebastian-software/ferralk/compare/v0.6.1...v0.7.0) (2026-08-27)
 
