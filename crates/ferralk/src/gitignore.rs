@@ -314,38 +314,39 @@ fn read_repository_config(layout: &RepositoryLayout) -> GitConfig {
 /// are joined before comments, quoting, escapes, or boolean decoding. Unsupported
 /// config forms leave the repository-local default intact rather than guessing.
 fn apply_config(config: &mut GitConfig, contents: &[u8]) {
-    let Ok(contents) = std::str::from_utf8(contents) else {
-        return;
-    };
     let mut section = None;
     for line in logical_config_lines(contents) {
-        let line = strip_config_comment(&line).trim();
+        let line = trim_ascii(strip_config_comment(&line));
         if line.is_empty() {
             continue;
         }
-        if line.starts_with('[') {
+        if line.starts_with(b"[") {
             section = parse_top_level_section(line);
             continue;
         }
         let Some(section) = section else {
             continue;
         };
-        let (key, value) = line
-            .split_once('=')
-            .map_or((line.trim(), None), |(key, value)| {
-                (key.trim(), Some(value.trim()))
-            });
-        let Some(value) = parse_git_bool(value.unwrap_or("true")) else {
+        let (key, value) =
+            line.iter()
+                .position(|byte| *byte == b'=')
+                .map_or((trim_ascii(line), None), |index| {
+                    (
+                        trim_ascii(&line[..index]),
+                        Some(trim_ascii(&line[index + 1..])),
+                    )
+                });
+        let Some(value) = parse_git_bool(value.unwrap_or(b"true")) else {
             continue;
         };
         match section {
-            GitConfigSection::Core if key.eq_ignore_ascii_case("ignorecase") => {
+            GitConfigSection::Core if key.eq_ignore_ascii_case(b"ignorecase") => {
                 config.ignore_case = Some(value);
             }
-            GitConfigSection::Core if key.eq_ignore_ascii_case("precomposeunicode") => {
+            GitConfigSection::Core if key.eq_ignore_ascii_case(b"precomposeunicode") => {
                 config.precompose_unicode = Some(value);
             }
-            GitConfigSection::Extensions if key.eq_ignore_ascii_case("worktreeconfig") => {
+            GitConfigSection::Extensions if key.eq_ignore_ascii_case(b"worktreeconfig") => {
                 config.worktree_config = Some(value);
             }
             _ => {}
@@ -359,20 +360,20 @@ fn apply_config(config: &mut GitConfig, contents: &[u8]) {
 /// It works inside and outside quotes, but a backslash in a comment is ignored.
 /// A terminal backslash at EOF is consumed with Git's synthetic final newline.
 /// Every other quote and escape is retained for `parse_git_bool`.
-fn logical_config_lines(contents: &str) -> Vec<String> {
-    let mut physical = contents.split_inclusive('\n').map(|line| {
-        let line = line.strip_suffix('\n').unwrap_or(line);
-        line.strip_suffix('\r').unwrap_or(line)
+fn logical_config_lines(contents: &[u8]) -> Vec<Vec<u8>> {
+    let mut physical = contents.split_inclusive(|byte| *byte == b'\n').map(|line| {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        line.strip_suffix(b"\r").unwrap_or(line)
     });
     let mut logical = Vec::new();
     while let Some(line) = physical.next() {
-        let mut line = line.to_owned();
+        let mut line = line.to_vec();
         while config_value_continues(&line) {
             line.pop();
             let Some(next) = physical.next() else {
                 break;
             };
-            line.push_str(next);
+            line.extend_from_slice(next);
         }
         logical.push(line);
     }
@@ -383,34 +384,31 @@ fn logical_config_lines(contents: &str) -> Vec<String> {
 /// Only a valid-looking assignment can start a value parser; any following
 /// physical line, including one that looks like a section header, is then part
 /// of that continued value.
-fn config_value_continues(line: &str) -> bool {
-    let line = line.trim_start();
-    let Some(first) = line.as_bytes().first() else {
+fn config_value_continues(line: &[u8]) -> bool {
+    let line = trim_ascii_start(line);
+    let Some(first) = line.first() else {
         return false;
     };
     if matches!(first, b'#' | b';' | b'[') || !first.is_ascii_alphabetic() {
         return false;
     }
     let key_end = line
-        .bytes()
-        .position(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-'))
+        .iter()
+        .position(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'-'))
         .unwrap_or(line.len());
-    let Some(value) = line[key_end..].trim_start().strip_prefix('=') else {
+    let Some(value) = trim_ascii_start(&line[key_end..]).strip_prefix(b"=") else {
         return false;
     };
     let mut quoted = false;
-    let mut characters = value.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\\' {
-            let Some(next) = characters.next() else {
-                return true;
-            };
-            if next == '\n' {
+    let mut bytes = value.iter();
+    while let Some(byte) = bytes.next() {
+        if *byte == b'\\' {
+            if bytes.next().is_none() {
                 return true;
             }
-        } else if character == '"' {
+        } else if *byte == b'"' {
             quoted = !quoted;
-        } else if !quoted && matches!(character, '#' | ';') {
+        } else if !quoted && matches!(*byte, b'#' | b';') {
             return false;
         }
     }
@@ -420,35 +418,36 @@ fn config_value_continues(line: &str) -> bool {
 /// Returns only the top-level sections whose variables this adapter consumes.
 /// Git gives a quoted subsection a dotted key prefix, so it must never alias
 /// that subsection with its parent section.
-fn parse_top_level_section(line: &str) -> Option<GitConfigSection> {
-    let name = line.strip_prefix('[')?.strip_suffix(']')?;
-    if name.eq_ignore_ascii_case("core") {
+fn parse_top_level_section(line: &[u8]) -> Option<GitConfigSection> {
+    let name = line.strip_prefix(b"[")?.strip_suffix(b"]")?;
+    if name.eq_ignore_ascii_case(b"core") {
         Some(GitConfigSection::Core)
-    } else if name.eq_ignore_ascii_case("extensions") {
+    } else if name.eq_ignore_ascii_case(b"extensions") {
         Some(GitConfigSection::Extensions)
     } else {
         None
     }
 }
 
-fn strip_config_comment(line: &str) -> &str {
+fn strip_config_comment(line: &[u8]) -> &[u8] {
     let mut quoted = false;
     let mut escaped = false;
-    for (index, character) in line.char_indices() {
+    for (index, byte) in line.iter().enumerate() {
         if escaped {
             escaped = false;
-        } else if character == '\\' {
+        } else if *byte == b'\\' {
             escaped = true;
-        } else if character == '"' {
+        } else if *byte == b'"' {
             quoted = !quoted;
-        } else if !quoted && matches!(character, '#' | ';') {
+        } else if !quoted && matches!(*byte, b'#' | b';') {
             return &line[..index];
         }
     }
     line
 }
 
-fn parse_git_bool(value: &str) -> Option<bool> {
+fn parse_git_bool(value: &[u8]) -> Option<bool> {
+    let value = std::str::from_utf8(value).ok()?;
     let value = decode_git_config_value(value.trim())?;
     if value.is_empty() {
         Some(false)
@@ -465,6 +464,23 @@ fn parse_git_bool(value: &str) -> Option<bool> {
     } else {
         parse_git_config_int(&value).map(|value| value != 0)
     }
+}
+
+fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    &bytes[start..]
+}
+
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let bytes = trim_ascii_start(bytes);
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(0, |index| index + 1);
+    &bytes[..end]
 }
 
 /// Decodes the quoted escapes that Git's config parser resolves before it
@@ -659,7 +675,7 @@ mod tests {
             ("1.0", None),
             ("invalid", None),
         ] {
-            assert_eq!(parse_git_bool(value), expected, "{value:?}");
+            assert_eq!(parse_git_bool(value.as_bytes()), expected, "{value:?}");
         }
     }
 
@@ -710,5 +726,32 @@ mod tests {
         // boolean cannot replace `true` and the following key remains in core.
         assert_eq!(continued_header.ignore_case, Some(true));
         assert_eq!(continued_header.worktree_config, None);
+    }
+
+    #[test]
+    fn config_parser_keeps_core_values_across_non_utf8_irrelevant_lines() {
+        let mut config = GitConfig::default();
+        apply_config(
+            &mut config,
+            b"# comment before \xff\n[user]\nname = Jos\xe9\nemail = user\\\n\xff@example.test\n\
+              [core]\nignorecase = true\nprecomposeunicode = false\n\
+              [remote]\nurl = ssh://\xff@example.test\n# comment after \xff\n",
+        );
+
+        assert_eq!(config.ignore_case, Some(true));
+        assert_eq!(config.precompose_unicode, Some(false));
+    }
+
+    #[test]
+    fn config_parser_rejects_non_utf8_relevant_boolean_values() {
+        let mut config = GitConfig::default();
+        apply_config(
+            &mut config,
+            b"[core]\nignorecase = false\nignorecase = tr\xffue\n\
+              precomposeunicode = true\nprecomposeunicode = fa\xfflse\n",
+        );
+
+        assert_eq!(config.ignore_case, Some(false));
+        assert_eq!(config.precompose_unicode, Some(true));
     }
 }

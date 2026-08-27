@@ -4189,6 +4189,35 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_unrelated_config_value_does_not_hide_repository_ignorecase() {
+        let fixture = Fixture::new();
+        fixture.write("BUILD.log");
+        fs::write(fixture.root.join(".gitignore"), b"build.log\n").expect("write rule");
+        let initialized = git_command()
+            .args(["init", "--quiet"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("initialize Git oracle");
+        assert!(initialized.success());
+        fs::write(
+            fixture.root.join(".git/config"),
+            b"[user]\nname = Jos\xe9\n[core]\nignorecase = true\n",
+        )
+        .expect("write Latin-1 local config");
+
+        assert!(git_config_bool(&fixture.root, "core.ignoreCase"));
+        assert!(git_check_ignore(&fixture.root, "BUILD.log"));
+        let walked = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk with non-UTF-8 config");
+        assert!(
+            !relative_paths(walked.entries(), &fixture.root).contains(&PathBuf::from("BUILD.log")),
+            "Ferralk must retain core.ignoreCase and agree with Git"
+        );
+    }
+
+    #[test]
     fn explicit_ignorecase_false_and_walker_override_take_precedence() {
         let fixture = Fixture::new();
         fixture.write("BUILD.log");
