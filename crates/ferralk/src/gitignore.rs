@@ -261,6 +261,12 @@ struct GitConfig {
     worktree_config: Option<bool>,
 }
 
+#[derive(Clone, Copy)]
+enum GitConfigSection {
+    Core,
+    Extensions,
+}
+
 impl GitIgnoreAdaptation {
     /// Repository-local config is deliberately the whole implicit surface.
     /// Git also reads system/global files, conditional includes and environment
@@ -303,23 +309,22 @@ fn read_repository_config(layout: &RepositoryLayout) -> GitConfig {
 
 /// Reads the tiny, stable config surface this adapter needs. Git config names
 /// are case-insensitive; values follow Git's boolean grammar, including empty
-/// and base-zero integer values. Unsupported config forms leave the
-/// repository-local default intact rather than guessing.
+/// and base-zero integer values. Quoted subsections deliberately remain
+/// distinct from their top-level section, and backslash-newline continuations
+/// are joined before comments, quoting, escapes, or boolean decoding. Unsupported
+/// config forms leave the repository-local default intact rather than guessing.
 fn apply_config(config: &mut GitConfig, contents: &[u8]) {
     let Ok(contents) = std::str::from_utf8(contents) else {
         return;
     };
     let mut section = None;
-    for line in contents.lines() {
-        let line = strip_config_comment(line).trim();
+    for line in logical_config_lines(contents) {
+        let line = strip_config_comment(&line).trim();
         if line.is_empty() {
             continue;
         }
-        if let Some(name) = line
-            .strip_prefix('[')
-            .and_then(|line| line.strip_suffix(']'))
-        {
-            section = name.split_ascii_whitespace().next();
+        if line.starts_with('[') {
+            section = parse_top_level_section(line);
             continue;
         }
         let Some(section) = section else {
@@ -333,17 +338,96 @@ fn apply_config(config: &mut GitConfig, contents: &[u8]) {
         let Some(value) = parse_git_bool(value.unwrap_or("true")) else {
             continue;
         };
-        if section.eq_ignore_ascii_case("core") && key.eq_ignore_ascii_case("ignorecase") {
-            config.ignore_case = Some(value);
-        } else if section.eq_ignore_ascii_case("core")
-            && key.eq_ignore_ascii_case("precomposeunicode")
-        {
-            config.precompose_unicode = Some(value);
-        } else if section.eq_ignore_ascii_case("extensions")
-            && key.eq_ignore_ascii_case("worktreeconfig")
-        {
-            config.worktree_config = Some(value);
+        match section {
+            GitConfigSection::Core if key.eq_ignore_ascii_case("ignorecase") => {
+                config.ignore_case = Some(value);
+            }
+            GitConfigSection::Core if key.eq_ignore_ascii_case("precomposeunicode") => {
+                config.precompose_unicode = Some(value);
+            }
+            GitConfigSection::Extensions if key.eq_ignore_ascii_case("worktreeconfig") => {
+                config.worktree_config = Some(value);
+            }
+            _ => {}
         }
+    }
+}
+
+/// Produces the logical config lines that Git's value parser sees. A terminal
+/// backslash in an assignment value consumes the following physical newline,
+/// then parsing resumes with the next line's bytes (including indentation).
+/// It works inside and outside quotes, but a backslash in a comment is ignored.
+/// A terminal backslash at EOF is consumed with Git's synthetic final newline.
+/// Every other quote and escape is retained for `parse_git_bool`.
+fn logical_config_lines(contents: &str) -> Vec<String> {
+    let mut physical = contents.split_inclusive('\n').map(|line| {
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        line.strip_suffix('\r').unwrap_or(line)
+    });
+    let mut logical = Vec::new();
+    while let Some(line) = physical.next() {
+        let mut line = line.to_owned();
+        while config_value_continues(&line) {
+            line.pop();
+            let Some(next) = physical.next() else {
+                break;
+            };
+            line.push_str(next);
+        }
+        logical.push(line);
+    }
+    logical
+}
+
+/// Whether the terminal backslash is consumed by Git as a value continuation.
+/// Only a valid-looking assignment can start a value parser; any following
+/// physical line, including one that looks like a section header, is then part
+/// of that continued value.
+fn config_value_continues(line: &str) -> bool {
+    let line = line.trim_start();
+    let Some(first) = line.as_bytes().first() else {
+        return false;
+    };
+    if matches!(first, b'#' | b';' | b'[') || !first.is_ascii_alphabetic() {
+        return false;
+    }
+    let key_end = line
+        .bytes()
+        .position(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-'))
+        .unwrap_or(line.len());
+    let Some(value) = line[key_end..].trim_start().strip_prefix('=') else {
+        return false;
+    };
+    let mut quoted = false;
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            let Some(next) = characters.next() else {
+                return true;
+            };
+            if next == '\n' {
+                return true;
+            }
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if !quoted && matches!(character, '#' | ';') {
+            return false;
+        }
+    }
+    false
+}
+
+/// Returns only the top-level sections whose variables this adapter consumes.
+/// Git gives a quoted subsection a dotted key prefix, so it must never alias
+/// that subsection with its parent section.
+fn parse_top_level_section(line: &str) -> Option<GitConfigSection> {
+    let name = line.strip_prefix('[')?.strip_suffix(']')?;
+    if name.eq_ignore_ascii_case("core") {
+        Some(GitConfigSection::Core)
+    } else if name.eq_ignore_ascii_case("extensions") {
+        Some(GitConfigSection::Extensions)
+    } else {
+        None
     }
 }
 
@@ -587,5 +671,44 @@ mod tests {
             b"[core]\nignorecase = false\nignorecase = not-a-bool\n",
         );
         assert_eq!(config.ignore_case, Some(false));
+    }
+
+    #[test]
+    fn config_subsections_and_continuations_follow_git_value_boundaries() {
+        let mut config = GitConfig::default();
+        apply_config(
+            &mut config,
+            b"[core \"unrelated\"]\nignorecase = false\nprecomposeunicode = false\n\
+              [extensions \"unrelated\"]\nworktreeconfig = false\n  [CoRe] # top-level comment\nignorecase = f\\\nalse\nprecomposeunicode = \"tr\\\nue\" # comment\n\
+              [extensions]\nworktreeconfig = f\\\nalse\nworktreeconfig = t\\\nr\\\nue\n",
+        );
+
+        assert_eq!(config.ignore_case, Some(false));
+        assert_eq!(config.precompose_unicode, Some(true));
+        assert_eq!(config.worktree_config, Some(true));
+
+        apply_config(
+            &mut config,
+            b"[core]\nignorecase = true\nignorecase = f\\\n  alse\n\
+              precomposeunicode = true\nprecomposeunicode = tr\\\n# comment\n\
+              [extensions]\nworktreeconfig = true\nworktreeconfig = tr\\",
+        );
+
+        // Continuation indentation is not trimmed, a continued comment leaves
+        // the preceding invalid fragment, and an EOF backslash is consumed.
+        // None is a valid boolean, so all earlier values remain in force.
+        assert_eq!(config.ignore_case, Some(true));
+        assert_eq!(config.precompose_unicode, Some(true));
+        assert_eq!(config.worktree_config, Some(true));
+
+        let mut continued_header = GitConfig::default();
+        apply_config(
+            &mut continued_header,
+            b"[core]\nignorecase = true\nignorecase = f\\\n[extensions]\nworktreeconfig = true\n",
+        );
+        // The continued value consumes the section-looking line, so its invalid
+        // boolean cannot replace `true` and the following key remains in core.
+        assert_eq!(continued_header.ignore_case, Some(true));
+        assert_eq!(continued_header.worktree_config, None);
     }
 }

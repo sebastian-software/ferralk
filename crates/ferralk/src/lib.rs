@@ -4049,6 +4049,23 @@ mod tests {
                 .contains(&PathBuf::from("BUILD.log")),
             "a bare key must retain Git's true behavior"
         );
+
+        fs::write(
+            &config,
+            b"[core]\nignoreCase = false\nIGNORECASE = t\\\nr\\\nue\n\
+              [core \"unrelated\"]\nignoreCase = false\n",
+        )
+        .expect("write continued and subsection config");
+        assert!(git_config_bool(&fixture.root, "core.ignoreCase"));
+        let continued_true = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk with continued boolean config");
+        assert!(
+            !relative_paths(continued_true.entries(), &fixture.root)
+                .contains(&PathBuf::from("BUILD.log")),
+            "a later subsection must not override the top-level continued true value"
+        );
     }
 
     #[test]
@@ -4124,9 +4141,10 @@ mod tests {
         let config = fixture.root.join(".git/config");
         fs::write(
             &config,
-            b"[core]\nprecomposeUnicode = false\nPRECOMPOSEUNICODE = -7\n",
+            b"[core]\nprecomposeUnicode = false\nPRECOMPOSEUNICODE = t\\\nr\\\nue\n\
+              [core \"unrelated\"]\nprecomposeUnicode = false\n",
         )
-        .expect("write numeric precompose Unicode config");
+        .expect("write continued precompose Unicode config");
         assert!(git_config_bool(&fixture.root, "core.precomposeUnicode"));
 
         assert!(git_check_ignore(&fixture.root, decomposed));
@@ -4150,7 +4168,8 @@ mod tests {
 
         fs::write(
             &config,
-            b"[core]\nprecomposeUnicode = true\nPRECOMPOSEUNICODE = \"\"\n",
+            b"[core]\nprecomposeUnicode = \"\"\n\
+              [core \"unrelated\"]\nprecomposeUnicode = true\n",
         )
         .expect("write empty precompose Unicode config");
         assert!(!git_config_bool(&fixture.root, "core.precomposeUnicode"));
@@ -4458,14 +4477,17 @@ mod tests {
         fs::create_dir_all(&common_git).expect("create common Git directory");
         fs::write(
             common_git.join("config"),
-            b"[extensions]\nworktreeConfig = false\nWORKTREECONFIG = +2\n[core]\nignorecase = false\n",
+            b"[extensions]\nworktreeConfig = f\\\nalse\nWORKTREECONFIG = t\\\nr\\\nue\n\
+              [extensions \"unrelated\"]\nworktreeConfig = false\n\
+              [core]\nignorecase = false\n",
         )
-        .expect("write common config");
+        .expect("write continued common config");
         fs::write(
             private_git.join("config.worktree"),
-            b"[CORE]\nignoreCASE = -7\n",
+            b"[CORE]\nignoreCASE = t\\\nr\\\nue\n\
+              [core \"unrelated\"]\nignoreCASE = false\n",
         )
-        .expect("write worktree config");
+        .expect("write continued private worktree config");
         fs::write(
             checkout.join(".git"),
             b"gitdir: ../main/.git/worktrees/linked-worktree\n",

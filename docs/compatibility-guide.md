@@ -96,7 +96,10 @@ converts valid UTF-8 candidate components to NFC before matching. Raw invalid
 bytes stay raw. The supported local boolean parser follows Git for named forms,
 bare keys, empty assignments, and signed base-zero integers with `K`/`M`/`G`
 scaling; a malformed value is ignored and therefore cannot override an earlier
-valid local value.
+valid local value. It consumes only exact top-level `[core]` and `[extensions]`
+sections (never a quoted subsection) and applies Git's backslash-newline value
+continuations before comment, quote, escape, and boolean processing; indentation
+on the continued physical line remains meaningful.
 
 Git's system/global configuration, conditional includes, and environment
 overrides are deliberately not inherited by a library walk. If one of those

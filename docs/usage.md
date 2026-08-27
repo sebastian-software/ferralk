@@ -131,7 +131,11 @@ Important defaults:
   candidate components before matching and leaves invalid bytes untouched.
   These local booleans accept Git's named forms, bare keys, empty assignments,
   and signed base-zero integer forms (including `K`/`M`/`G` scaling); malformed
-  values do not override an earlier valid repository-local value.
+  values do not override an earlier valid repository-local value. Only the
+  exact top-level `[core]` and `[extensions]` sections apply: quoted
+  subsections are distinct. Git backslash-newline continuations are decoded
+  before comments, quotes, escapes, and boolean parsing, preserving the next
+  line's indentation.
 
   System/global config, conditional includes, and environment overrides are
   intentionally not consulted: they are process-wide state outside a library
