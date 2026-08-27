@@ -643,8 +643,11 @@ impl Walker {
     /// // On a Unix host these two select the same entries of a walk rooted at
     /// // `/repo`. The Windows spelling of the second is `C:/repo/src/**/*.ts`
     /// // for a walk rooted at `C:/repo`.
+    /// # #[cfg(not(windows))]
+    /// # {
     /// let written_relative = Walker::new("/repo").include("src/**/*.ts")?;
     /// let held_absolute = Walker::new("/repo").include("/repo/src/**/*.ts")?;
+    /// # }
     /// # Ok::<(), ferralk::ferralk_glob::PatternError>(())
     /// ```
     pub fn include(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
