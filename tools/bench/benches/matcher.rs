@@ -5,6 +5,7 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use ferralk_glob::{Pattern, PatternOptions};
 use globset::GlobBuilder;
+use wax::{Glob as WaxGlob, Program as _};
 
 fn matcher(c: &mut Criterion) {
     let pattern = Pattern::compile(
@@ -59,6 +60,7 @@ fn matcher(c: &mut Criterion) {
         .build()
         .expect("common benchmark globset pattern is valid")
         .compile_matcher();
+    let wax = WaxGlob::new(common_pattern).expect("common benchmark wax pattern is valid");
     let common_matching = "src/deep/nested/main.rs";
     let common_non_matching = "src/deep/nested/main.txt";
 
@@ -299,6 +301,12 @@ fn matcher(c: &mut Criterion) {
     c.bench_function("common/globset_compiled/non_matching", |benchmark| {
         benchmark.iter(|| black_box(globset.is_match(black_box(common_non_matching))))
     });
+    c.bench_function("common/wax_compiled/matching", |benchmark| {
+        benchmark.iter(|| black_box(wax.is_match(black_box(common_matching))))
+    });
+    c.bench_function("common/wax_compiled/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(wax.is_match(black_box(common_non_matching))))
+    });
     // Every comparator input is black-boxed, including the pattern. These two
     // benches used to pass compile-time constants, which let the optimizer
     // fold work the ferralk and globset benches still had to do.
@@ -391,6 +399,7 @@ fn long_paths(c: &mut Criterion) {
         .build()
         .expect("long-path comparator pattern is valid")
         .compile_matcher();
+    let wax = WaxGlob::new(pattern).expect("long-path wax pattern is valid");
 
     c.bench_function("long_path/ferralk_compiled/matching", |benchmark| {
         benchmark.iter(|| black_box(ferralk.is_match(black_box(matching.as_str()))))
@@ -403,6 +412,12 @@ fn long_paths(c: &mut Criterion) {
     });
     c.bench_function("long_path/globset_compiled/non_matching", |benchmark| {
         benchmark.iter(|| black_box(globset.is_match(black_box(non_matching.as_str()))))
+    });
+    c.bench_function("long_path/wax_compiled/matching", |benchmark| {
+        benchmark.iter(|| black_box(wax.is_match(black_box(matching.as_str()))))
+    });
+    c.bench_function("long_path/wax_compiled/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(wax.is_match(black_box(non_matching.as_str()))))
     });
     c.bench_function("long_path/fast_glob_interpreted/matching", |benchmark| {
         benchmark.iter(|| {
@@ -439,12 +454,16 @@ fn adversarial(c: &mut Criterion) {
         .build()
         .expect("adversarial comparator pattern is valid")
         .compile_matcher();
+    let wax = WaxGlob::new(pattern).expect("adversarial wax pattern is valid");
 
     c.bench_function("backtracking/ferralk_compiled/non_matching", |benchmark| {
         benchmark.iter(|| black_box(ferralk.is_match(black_box(candidate.as_str()))))
     });
     c.bench_function("backtracking/globset_compiled/non_matching", |benchmark| {
         benchmark.iter(|| black_box(globset.is_match(black_box(candidate.as_str()))))
+    });
+    c.bench_function("backtracking/wax_compiled/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(wax.is_match(black_box(candidate.as_str()))))
     });
     c.bench_function(
         "backtracking/fast_glob_interpreted/non_matching",

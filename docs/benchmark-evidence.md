@@ -51,8 +51,9 @@ cargo bench -p bench --bench matcher
 # Walker wall time, the shape the pull-request lane measures.
 cargo bench -p bench --bench walker -- --warm-up-time 1 --measurement-time 5 --sample-size 20
 
-# Engine comparison on a repository-shaped 53k-file tree.
-cargo bench -p bench --bench walker_palamedes
+# Engine comparison on a repository-shaped 53k-file tree. This includes
+# walkdir, jwalk, globwalk, and wax in addition to the existing arms.
+cargo bench -p bench --bench walker_palamedes -- --output-format bencher --noplot
 ```
 
 **Both walker benches measure the portable backend unless a feature says
@@ -162,6 +163,119 @@ arm can be fast by finding less. Unscoped finds 7,400 files, scoped 2,600.
 The portable one. `cargo bench -p bench --bench walker_palamedes` compiles
 `ferralk` without a native feature, so both `ferralk` arms above read
 directories through `std::fs`, on macOS as everywhere else.
+
+## Expanded library comparison on this machine, 2026-08-27
+
+The comparison was refreshed on the current checkout and extended with four
+popular Rust libraries:
+
+| Library | Locked version | Role in the comparison | Important scope note |
+| --- | ---: | --- | --- |
+| [`walkdir`](https://crates.io/crates/walkdir/2.5.0) | 2.5.0 | Serial traversal plus a caller-side `globset` | Traversal only; it does not select paths itself. |
+| [`jwalk`](https://crates.io/crates/jwalk/0.9.0) | 0.9.0 | Serial and four-thread traversal plus a caller-side `globset` | The current release is marked deprecated by its package metadata. |
+| [`globwalk`](https://crates.io/crates/globwalk/0.9.1) | 0.9.1 | Integrated serial glob walking | Built on `walkdir` and `ignore` overrides. |
+| [`wax`](https://crates.io/crates/wax/0.7.0) | 0.7.0 | Integrated serial glob walking and compiled matching | UTF-8/regex-based API; the comparison is valid only for this ASCII fixture. |
+
+`ignore` + `globset`, `globset`, `fast-glob`, ferralk, and zlob remain in the
+existing lanes. Every walker arm was checked for the exact same result count
+before it was timed: **7,400** files for the unscoped query and **2,600** for
+the scoped query. The new caller-side arms compile their `globset` inside the
+timed operation, as the existing ferralk and `ignore` arms compile their
+selection inside the operation. `globwalk` and `wax` likewise include their
+builder work in their timed operation. Matcher-only baselines are compiled
+once outside their match loop.
+
+### Host and method
+
+| | |
+| --- | --- |
+| Host | Mac Studio (Mac13,2), Apple M1 Ultra, 20 cores (16 performance, 4 efficiency), 64 GB RAM |
+| OS | macOS 26.5.2, build 25F84; Darwin 25.5.0, arm64 |
+| Base revision | `f2e5139` plus the benchmark extension in this working tree |
+| Toolchain | rustc/cargo 1.95.0-nightly, LLVM 22.1.0 |
+| Benchmark stack | Criterion 0.8.2, release profile; exact dependency versions are locked in `Cargo.lock` |
+| Threads | 4 for every parallel ferralk, `ignore`, and `jwalk` arm |
+| Cache | Warm: the fixture is written immediately before the measurement and then reused by all arms in that invocation |
+| Fixture | 53,600 files, 2,600 TypeScript sources under `src/` and `packages/`, and 400 dependency packages under `node_modules/` |
+| Commands | `cargo bench -p bench --bench matcher -- --output-format bencher --noplot`; `cargo bench -p bench --bench walker_palamedes -- --output-format bencher --noplot`; the same walker command with `--features native-macos` |
+
+The tables report Criterion's point estimates in milliseconds. They are
+indicative wall times, not a performance gate. Lower is better. The native run
+emitted one Criterion target-time warning for one of the unscoped `jwalk`
+arms; those rows have correspondingly high spread and should not be read as a
+precise ranking.
+
+### Portable backend
+
+| Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
+| --- | ---: | ---: |
+| ferralk, serial | 63.71 ms | 13.70 ms |
+| **ferralk, 4 threads** | 45.38 ms | **8.78 ms** |
+| `ignore` serial + `globset` | 104.96 ms | 98.93 ms |
+| `walkdir` serial + `globset` | 81.16 ms | 103.97 ms |
+| `jwalk` serial + `globset` | 86.39 ms | 99.84 ms |
+| `jwalk`, 4 threads + `globset` | **44.70 ms** | 45.17 ms |
+| `globwalk` serial | 81.62 ms | 86.13 ms |
+| `wax` serial | 107.13 ms | 20.95 ms |
+| `ignore` parallel + overrides | 58.92 ms | 49.11 ms |
+| `ignore` parallel + hand-pruned subtree | — | 10.87 ms |
+
+On the unscoped query, `jwalk` plus caller-side `globset` is 1.5% faster than
+Ferralk's four-thread arm in this run (44.70 ms versus 45.38 ms). On the
+scoped query, Ferralk is faster because it prunes `node_modules` from the
+pattern itself: 8.78 ms versus 20.95 ms for `wax`, 45.17 ms for `jwalk`, and
+49.11 ms for `ignore` overrides. The hand-pruned `ignore` arm remains the
+closest comparison at 10.87 ms, but it needs an extra caller policy that the
+Ferralk pattern already expresses.
+
+### macOS-native backend
+
+| Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
+| --- | ---: | ---: |
+| ferralk, serial | 62.34 ms | 21.61 ms |
+| **ferralk, 4 threads** | **45.20 ms** | **8.14 ms** |
+| `ignore` serial + `globset` | 90.16 ms | 92.03 ms |
+| `walkdir` serial + `globset` | 83.90 ms | 83.69 ms |
+| `jwalk` serial + `globset` | 94.85 ms | 88.62 ms |
+| `jwalk`, 4 threads + `globset` | 49.79 ms | 47.86 ms |
+| `globwalk` serial | 92.48 ms | 87.96 ms |
+| `wax` serial | 111.93 ms | 18.18 ms |
+| `ignore` parallel + overrides | 74.34 ms | 49.54 ms |
+| `ignore` parallel + hand-pruned subtree | — | 11.03 ms |
+
+The native reader changes Ferralk's serial unscoped result from 63.71 ms to
+62.34 ms in this expanded run. The parallel result is effectively level with
+the portable path, 45.20 ms versus 45.38 ms; this fixture is then limited more
+by scheduling and matching than by the directory reader. The scoped native
+Ferralk result is the best measured arm at 8.14 ms, while `wax` is the only
+other integrated walker close at 18.18 ms.
+
+The new references answer a comparison question, not an adoption question.
+`jwalk` is deprecated, `walkdir` has no matching or pruning policy, `globwalk`
+uses a different override contract, and `wax` accepts UTF-8 expressions rather
+than Ferralk's arbitrary-byte matcher. Exact semantic compatibility still
+comes from the checked-in corpus and caller parity tests, not from these
+wall-time rows. zlob was not included in this refresh because Zig is not
+installed on the host; its last separately dated context measurements remain
+in the existing zlob context and macOS-native sections.
+
+### Matcher refresh
+
+The matcher lane was run in the same environment. These rows use the current
+point estimates and add `wax` to the existing compiled baselines:
+
+| Case | ferralk | `globset` | `fast-glob` | `wax` |
+| --- | ---: | ---: | ---: | ---: |
+| `common` matching | **12 ns** | 39 ns | 100 ns | 32 ns |
+| `common` non-matching | **3 ns** | 38 ns | 109 ns | 31 ns |
+| `long_path` matching | **12 ns** | 197 ns | 549 ns | 184 ns |
+| `long_path` non-matching | **3 ns** | 199 ns | 570 ns | 185 ns |
+| `backtracking` non-matching | **4 ns** | 98 ns | 253 ns | 80 ns |
+
+`wax` is faster than `globset` on the long-path and adversarial rows here, but
+that does not erase the API and byte-semantics differences. The complete
+matcher output, including compilation and path-filter shapes, is produced by
+[`matcher.rs`](../tools/bench/benches/matcher.rs).
 
 ## The macOS native backend, 2026-08-20
 
@@ -414,8 +528,10 @@ is not compared against the baselines, whose builders accept different syntax.
   CI run on shared runners and move with them; that is why nothing gates on
   them.
 - **Scope differs between engines.** `globset` and `fast-glob` are matchers,
-  `ignore` is a walker with gitignore support, zlob is a Zig library behind a C
-  ABI with its own semantics. They are compared here on the one axis they share,
-  the shape and speed of a query, and the corpus is where behaviour is compared.
+  `walkdir` is traversal only, `jwalk` is deprecated, `globwalk` is a serial
+  wrapper around `walkdir` and `ignore`, `wax` is UTF-8/regex-based, `ignore` is
+  a walker with gitignore support, and zlob is a Zig library behind a C ABI with
+  its own semantics. They are compared here on the one axis they share, the
+  shape and speed of a query, and the corpus is where behaviour is compared.
 - **Thread count is fixed at four.** A different count changes the parallel arms
   and would change the ordering on a machine with a different core count.

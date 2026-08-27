@@ -29,26 +29,30 @@ For an unreleased Git dependency, pin a revision for repeatable builds.
 
 ## Local benchmark snapshot
 
-The following macOS measurements use Rust 1.95.0 and Criterion's default
-100-sample configuration, taken on 2026-08-19 against the checked-in fixtures.
-They are a local comparison, not a portable promise.
-[Benchmark evidence](docs/benchmark-evidence.md) describes the lanes, what each
-does not establish, and how to reproduce them. Matcher values use the common
+The matcher snapshot below was refreshed on 2026-08-27 on a Mac Studio with an
+Apple M1 Ultra, 20 cores, 64 GB RAM, macOS 26.5.2, Rust 1.95.0-nightly, and
+Criterion 0.8.2. It is a local comparison, not a portable promise. The zlob
+row is the last separately dated context measurement because Zig is not
+installed on this host. The expanded multi-library walker comparison is in
+[benchmark evidence](docs/benchmark-evidence.md), which also describes the
+lanes, limitations, and reproduction commands. Matcher values use the common
 `src/**/*.rs` syntax; lower is better.
 
 | Matcher | Match | Non-match |
 | --- | ---: | ---: |
-| Ferralk (compiled) | 11.59 ns | 2.88 ns |
-| zlob 1.6.3 (compiled) | 34.74 ns | 2.36 ns |
-| globset (compiled) | 38.43 ns | 37.48 ns |
-| fast-glob (interpreted) | 98.75 ns | 108.18 ns |
+| Ferralk (compiled, 2026-08-27) | 12 ns | 3 ns |
+| zlob 1.6.3 (compiled, 2026-08-19) | 34.74 ns | 2.36 ns |
+| globset (compiled, 2026-08-27) | 39 ns | 38 ns |
+| fast-glob (interpreted, 2026-08-27) | 100 ns | 109 ns |
+| wax (compiled, 2026-08-27) | 32 ns | 31 ns |
 
-On this common syntax Ferralk is 0.33× zlob for matches and 1.22× zlob for
-non-matches, within the local 1.5× zlob target. It is faster than both globset
-and fast-glob in both cases.
+On this common syntax Ferralk is faster than both `globset` and `fast-glob` in
+the current refresh. The complete current matcher table, including long-path
+and adversarial cases, is in the benchmark evidence document.
 
-The Walker comparison uses the checked-in walker fixture — sixteen branches
-nested four levels deep, filtered — and lower is better.
+The following small-fixture Walker snapshot is retained from 2026-08-19 for
+continuity. The current 53,600-file, multi-library Walker comparison is in the
+benchmark evidence document; lower is better.
 
 | Walker | Time |
 | --- | ---: |

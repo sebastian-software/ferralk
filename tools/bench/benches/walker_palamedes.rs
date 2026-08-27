@@ -38,7 +38,12 @@ use std::{
 use criterion::{Criterion, criterion_group, criterion_main};
 use ferralk::{WalkOptions, Walker};
 use globset::{Glob, GlobSetBuilder};
+use globwalk::{FileType as GlobwalkFileType, GlobWalkerBuilder};
 use ignore::{WalkBuilder, WalkState, overrides::OverrideBuilder};
+use jwalk::{Parallelism as JwalkParallelism, WalkDir as JwalkWalkDir};
+use walkdir::WalkDir;
+use wax::Glob as WaxGlob;
+use wax::walk::Entry as _;
 
 /// Threads for every parallel arm, so the comparison is like for like rather
 /// than a reading of whatever `available_parallelism` reports on the host.
@@ -214,6 +219,35 @@ fn palamedes(c: &mut Criterion) {
         );
         assert_eq!(
             found,
+            walkdir_serial_globset(&fixture.root, &override_globs),
+            "{query}: walkdir + globset disagrees with ferralk"
+        );
+        assert_eq!(
+            found,
+            jwalk_globset(&fixture.root, &override_globs, JwalkParallelism::Serial,),
+            "{query}: jwalk serial + globset disagrees with ferralk"
+        );
+        assert_eq!(
+            found,
+            jwalk_globset(
+                &fixture.root,
+                &override_globs,
+                JwalkParallelism::RayonNewPool(THREADS),
+            ),
+            "{query}: jwalk parallel + globset disagrees with ferralk"
+        );
+        assert_eq!(
+            found,
+            globwalk_serial(&fixture.root, &override_globs),
+            "{query}: globwalk disagrees with ferralk"
+        );
+        assert_eq!(
+            found,
+            wax_walk(&fixture.root, ferralk_pattern),
+            "{query}: wax disagrees with ferralk"
+        );
+        assert_eq!(
+            found,
             ignore_parallel_overrides(&fixture.root, &override_globs),
             "{query}: ignore overrides disagree with ferralk"
         );
@@ -242,6 +276,33 @@ fn palamedes(c: &mut Criterion) {
         // every path with globset, without telling the walker what to skip.
         group.bench_function(format!("{query}/ignore_serial_globset"), |benchmark| {
             benchmark.iter(|| black_box(ignore_serial_globset(&fixture.root, &override_globs)))
+        });
+        group.bench_function(format!("{query}/walkdir_serial_globset"), |benchmark| {
+            benchmark.iter(|| black_box(walkdir_serial_globset(&fixture.root, &override_globs)))
+        });
+        group.bench_function(format!("{query}/jwalk_serial_globset"), |benchmark| {
+            benchmark.iter(|| {
+                black_box(jwalk_globset(
+                    &fixture.root,
+                    &override_globs,
+                    JwalkParallelism::Serial,
+                ))
+            })
+        });
+        group.bench_function(format!("{query}/jwalk_parallel_globset"), |benchmark| {
+            benchmark.iter(|| {
+                black_box(jwalk_globset(
+                    &fixture.root,
+                    &override_globs,
+                    JwalkParallelism::RayonNewPool(THREADS),
+                ))
+            })
+        });
+        group.bench_function(format!("{query}/globwalk_serial"), |benchmark| {
+            benchmark.iter(|| black_box(globwalk_serial(&fixture.root, &override_globs)))
+        });
+        group.bench_function(format!("{query}/wax_serial"), |benchmark| {
+            benchmark.iter(|| black_box(wax_walk(&fixture.root, ferralk_pattern)))
         });
         // `ignore` parallel with the same globs as overrides. Overrides decide
         // which entries are yielded, not which directories are opened, so this
@@ -284,12 +345,16 @@ fn ferralk_walk(root: &Path, pattern: &str, threads: usize) -> usize {
         .len()
 }
 
-fn ignore_serial_globset(root: &Path, globs: &[&str; 2]) -> usize {
+fn build_globset(globs: &[&str; 2]) -> globset::GlobSet {
     let mut builder = GlobSetBuilder::new();
     for glob in globs {
         builder.add(Glob::new(glob).expect("benchmark glob is valid"));
     }
-    let set = builder.build().expect("benchmark glob set builds");
+    builder.build().expect("benchmark glob set builds")
+}
+
+fn ignore_serial_globset(root: &Path, globs: &[&str; 2]) -> usize {
+    let set = build_globset(globs);
     let mut matched = 0;
     for entry in WalkBuilder::new(root).standard_filters(false).build() {
         let entry = entry.expect("benchmark walk succeeds");
@@ -302,6 +367,62 @@ fn ignore_serial_globset(root: &Path, globs: &[&str; 2]) -> usize {
         }
     }
     matched
+}
+
+fn walkdir_serial_globset(root: &Path, globs: &[&str; 2]) -> usize {
+    let set = build_globset(globs);
+    let mut matched = 0;
+    for entry in WalkDir::new(root) {
+        let entry = entry.expect("benchmark walk succeeds");
+        if entry.file_type().is_file()
+            && set.is_match(
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .expect("entry belongs to the fixture"),
+            )
+        {
+            matched += 1;
+        }
+    }
+    matched
+}
+
+fn jwalk_globset(root: &Path, globs: &[&str; 2], parallelism: JwalkParallelism) -> usize {
+    let set = build_globset(globs);
+    JwalkWalkDir::new(root)
+        .skip_hidden(false)
+        .parallelism(parallelism)
+        .into_iter()
+        .map(|entry| entry.expect("benchmark walk succeeds"))
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && set.is_match(
+                    entry
+                        .path()
+                        .strip_prefix(root)
+                        .expect("entry belongs to the fixture"),
+                )
+        })
+        .count()
+}
+
+fn globwalk_serial(root: &Path, globs: &[&str; 2]) -> usize {
+    GlobWalkerBuilder::from_patterns(root, globs)
+        .file_type(GlobwalkFileType::FILE)
+        .build()
+        .expect("benchmark globwalk builds")
+        .filter_map(Result::ok)
+        .count()
+}
+
+fn wax_walk(root: &Path, pattern: &str) -> usize {
+    WaxGlob::new(pattern)
+        .expect("benchmark wax pattern is valid")
+        .walk(root)
+        .map(|entry| entry.expect("benchmark walk succeeds"))
+        .filter(|entry| entry.file_type().is_file())
+        .count()
 }
 
 fn ignore_parallel_overrides(root: &Path, globs: &[&str; 2]) -> usize {
