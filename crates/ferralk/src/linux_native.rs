@@ -9,10 +9,14 @@
 
 use std::{
     cell::RefCell,
-    ffi::{OsStr, c_long, c_void},
+    ffi::{CStr, CString, OsStr, c_int, c_long, c_void},
     fs::{self, File, OpenOptions},
     io,
-    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawFd},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::OpenOptionsExt,
+        io::{AsRawFd, FromRawFd, IntoRawFd},
+    },
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -72,23 +76,22 @@ pub(super) fn read_directory(
     listing: &mut Listing,
 ) -> io::Result<()> {
     if GETDENTS_UNSUPPORTED.load(Ordering::Relaxed) {
-        return Err(unsupported("getdents64 is unavailable on this system"));
+        return read_portable_directory_from_path(path, refuse_final_symlink, listing);
     }
-    let result = DIRECTORY_BUFFER.with(|buffer| {
+    let used_portable_fallback = DIRECTORY_BUFFER.with(|buffer| {
         let mut buffer = buffer.borrow_mut();
-        read_directory_with_buffer(path, refuse_final_symlink, &mut buffer[..], listing)
+        read_open_directory_with_portable_fallback(
+            path,
+            refuse_final_symlink,
+            &mut buffer[..],
+            listing,
+            read_directory_from_open_directory,
+        )
     });
-    if result
-        .as_ref()
-        .is_err_and(|error| error.kind() == io::ErrorKind::Unsupported)
-    {
+    if used_portable_fallback? {
         GETDENTS_UNSUPPORTED.store(true, Ordering::Relaxed);
     }
-    result
-}
-
-fn unsupported(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::Unsupported, message)
+    Ok(())
 }
 
 /// Opens a directory for reading, refusing anything that is not one.
@@ -110,24 +113,231 @@ fn open_directory(path: &Path, refuse_final_symlink: bool) -> io::Result<File> {
     OpenOptions::new().read(true).custom_flags(flags).open(path)
 }
 
-fn read_directory_with_buffer(
+/// Reads a protected open directory with `getdents64`, falling back through
+/// that same descriptor only when the syscall itself is unavailable.
+///
+/// Keeping this decision next to the descriptor is essential. The generic
+/// backend adapter only has `path`, which is no longer safe to reopen for a
+/// scheduled no-follow descendant after a replacement race.
+fn read_open_directory_with_portable_fallback(
     path: &Path,
     refuse_final_symlink: bool,
     buffer: &mut [u8],
     listing: &mut Listing,
-) -> io::Result<()> {
+    native: impl FnOnce(&File, &Path, &mut [u8], &mut Listing) -> Result<(), NativeDirectoryReadError>,
+) -> io::Result<bool> {
     let directory = open_directory(path, refuse_final_symlink)?;
+    match native(&directory, path, buffer, listing) {
+        Ok(()) => Ok(false),
+        Err(NativeDirectoryReadError::CapabilityUnavailable) => {
+            read_portable_directory_from_open_file(directory, path, listing)?;
+            Ok(true)
+        }
+        Err(NativeDirectoryReadError::Io(error)) => Err(error),
+    }
+}
+
+/// Reads one already-open directory through the raw syscall.
+///
+/// Only an unavailable syscall is a capability result. In particular, an
+/// `Unsupported` metadata error after a batch is an ordinary error: attempting
+/// to resume its advanced descriptor through `readdir` would lose entries.
+fn read_directory_from_open_directory(
+    directory: &File,
+    path: &Path,
+    buffer: &mut [u8],
+    listing: &mut Listing,
+) -> Result<(), NativeDirectoryReadError> {
+    read_directory_from_open_directory_with_read_batch(directory, path, buffer, listing, read_batch)
+}
+
+/// Reads one already-open directory through an injected batch source.
+///
+/// The production reader supplies the raw syscall. Keeping the source as an
+/// argument makes the distinction between an unavailable syscall and an
+/// ordinary `Unsupported` error testable without changing production state.
+fn read_directory_from_open_directory_with_read_batch(
+    directory: &File,
+    path: &Path,
+    buffer: &mut [u8],
+    listing: &mut Listing,
+    mut next_batch: impl FnMut(&File, &mut [u8]) -> Result<usize, ReadBatchError>,
+) -> Result<(), NativeDirectoryReadError> {
+    let mut primed = false;
     listing.clear();
     loop {
-        let byte_count = read_batch(&directory, buffer)?;
+        let byte_count = match next_batch(directory, buffer) {
+            Ok(byte_count) => byte_count,
+            // A reviewed architecture without a syscall number can only be
+            // known before any read. It is a capability result rather than an
+            // ordinary directory error.
+            Err(ReadBatchError::CapabilityUnavailable) => {
+                return Err(NativeDirectoryReadError::CapabilityUnavailable);
+            }
+            // Only an actual ENOSYS before the first accepted batch proves
+            // that `getdents64` is unavailable. `ErrorKind::Unsupported`
+            // also covers ordinary errors such as EOPNOTSUPP, and any error
+            // after a batch must retain the advanced descriptor and listing.
+            Err(ReadBatchError::Io(error))
+                if !primed && error.raw_os_error() == Some(libc::ENOSYS) =>
+            {
+                return Err(NativeDirectoryReadError::CapabilityUnavailable);
+            }
+            Err(ReadBatchError::Io(error)) => return Err(NativeDirectoryReadError::Io(error)),
+        };
         if byte_count == 0 {
             return Ok(());
         }
         parse_records(path, &buffer[..byte_count], listing)?;
+        primed = true;
     }
 }
 
-fn read_batch(directory: &File, buffer: &mut [u8]) -> io::Result<usize> {
+/// Distinguishes an unavailable syscall from an ordinary error after the
+/// directory stream has started advancing.
+enum NativeDirectoryReadError {
+    CapabilityUnavailable,
+    Io(io::Error),
+}
+
+impl From<io::Error> for NativeDirectoryReadError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// The raw batch source distinguishes a compile-time unavailable syscall from
+/// a runtime I/O failure. Runtime ENOSYS is deliberately preserved as an I/O
+/// error here so the caller can apply its pre-first-batch capability rule.
+#[cfg_attr(
+    any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86",
+        target_arch = "arm"
+    ),
+    allow(dead_code)
+)]
+enum ReadBatchError {
+    CapabilityUnavailable,
+    Io(io::Error),
+}
+
+/// Opens a directory once with the native walk's flags, then enumerates that
+/// exact descriptor through libc's public portable API.
+fn read_portable_directory_from_path(
+    path: &Path,
+    refuse_final_symlink: bool,
+    listing: &mut Listing,
+) -> io::Result<()> {
+    let directory = open_directory(path, refuse_final_symlink)?;
+    read_portable_directory_from_open_file(directory, path, listing)
+}
+
+/// Enumerates exactly the directory an open `File` already refers to.
+///
+/// `fdopendir` takes ownership of the descriptor on success. `readdir` and
+/// the rare `fstatat` fallback are relative to that descriptor, so a no-follow
+/// descendant is never reopened by path.
+fn read_portable_directory_from_open_file(
+    directory: File,
+    reported_path: &Path,
+    listing: &mut Listing,
+) -> io::Result<()> {
+    let descriptor = directory.into_raw_fd();
+    // SAFETY: `descriptor` is a live directory descriptor transferred from
+    // `directory`. On success `fdopendir` owns it; on failure the `File`
+    // reconstruction below remains the sole owner and closes it once.
+    let stream = unsafe { libc::fdopendir(descriptor) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: `fdopendir` did not take ownership on failure.
+        unsafe { drop(File::from_raw_fd(descriptor)) };
+        return Err(error);
+    }
+    let stream = DirectoryStream(stream);
+    listing.clear();
+    loop {
+        // SAFETY: Linux exposes this thread's writable errno slot. Clearing
+        // it distinguishes `readdir` EOF from a failed directory read.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: `stream` owns this valid `DIR` until Drop calls `closedir`;
+        // its returned record is consumed before the next `readdir` call.
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(0) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: a successful `readdir` returns a valid, NUL-terminated
+        // Linux `dirent` name; its storage remains live until the next call.
+        let entry = unsafe { &*entry };
+        let name = unsafe { CStr::from_ptr(entry.d_name.as_ptr()) }.to_bytes();
+        if name.is_empty() || name == b"." || name == b".." {
+            continue;
+        }
+        let name = OsStr::from_bytes(name);
+        match descriptor_entry_kind(descriptor, name, entry.d_type) {
+            Ok(Some((is_dir, is_symlink))) => listing.push(name, is_dir, is_symlink),
+            Ok(None) => {}
+            Err(error) => defer_entry_stat_error(listing, reported_path.join(name), error)?,
+        }
+    }
+}
+
+/// Owns the `DIR` returned by `fdopendir`, including its descriptor.
+struct DirectoryStream(*mut libc::DIR);
+
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: this is the one `closedir` corresponding to successful
+        // `fdopendir`; libc closes the transferred descriptor with the stream.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+/// Resolves a `DT_UNKNOWN` entry relative to the protected descriptor.
+fn descriptor_entry_kind(
+    directory: c_int,
+    name: &OsStr,
+    directory_type: u8,
+) -> io::Result<Option<(bool, bool)>> {
+    match directory_type {
+        DT_DIR => Ok(Some((true, false))),
+        DT_REG | DT_FIFO | DT_CHR | DT_BLK | DT_SOCK => Ok(Some((false, false))),
+        DT_LNK => Ok(Some((false, true))),
+        _ => {
+            let name = CString::new(name.as_bytes()).map_err(|_| malformed_record())?;
+            // SAFETY: output storage is valid, `directory` is held live by
+            // `DirectoryStream`, and `name` is NUL-terminated for this call.
+            let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+            let result = unsafe {
+                libc::fstatat(
+                    directory,
+                    name.as_ptr(),
+                    &mut metadata,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                return if is_vanished_entry(&error) {
+                    Ok(None)
+                } else {
+                    Err(error)
+                };
+            }
+            let kind = metadata.st_mode & libc::S_IFMT;
+            Ok(Some((kind == libc::S_IFDIR, kind == libc::S_IFLNK)))
+        }
+    }
+}
+
+fn read_batch(directory: &File, buffer: &mut [u8]) -> Result<usize, ReadBatchError> {
     #[cfg(any(
         all(target_arch = "x86_64", target_pointer_width = "64"),
         target_arch = "aarch64",
@@ -156,9 +366,9 @@ fn read_batch(directory: &File, buffer: &mut [u8]) -> io::Result<usize> {
             continue;
         }
         if error.raw_os_error() == Some(38) {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, error));
+            return Err(ReadBatchError::Io(error));
         }
-        return Err(error);
+        return Err(ReadBatchError::Io(error));
     }
 
     #[cfg(not(any(
@@ -170,10 +380,7 @@ fn read_batch(directory: &File, buffer: &mut [u8]) -> io::Result<usize> {
     )))]
     {
         let _ = (directory, buffer);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "getdents64 has no reviewed syscall number for this architecture",
-        ))
+        Err(ReadBatchError::CapabilityUnavailable)
     }
 }
 
@@ -287,20 +494,66 @@ fn malformed_record() -> io::Error {
 mod tests {
     use std::{
         fs,
-        os::unix::fs::symlink,
+        os::unix::{
+            fs::symlink,
+            io::{AsRawFd, FromRawFd},
+        },
         path::{Path, PathBuf},
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Mutex, MutexGuard,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use crate::{DirectoryBackend, ErrorPolicy, StdBackend, WalkEntry, WalkOptions, Walker};
 
     use super::{
-        DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG, DT_SOCK, Listing, NAME_OFFSET, TYPE_OFFSET,
-        entry_kind, open_directory, parse_records, read_directory,
+        BUFFER_SIZE, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG, DT_SOCK, GETDENTS_UNSUPPORTED,
+        Listing, NAME_OFFSET, NativeDirectoryReadError, ReadBatchError, TYPE_OFFSET, entry_kind,
+        open_directory, parse_records, read_directory,
+        read_directory_from_open_directory_with_read_batch,
+        read_open_directory_with_portable_fallback, read_portable_directory_from_open_file,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+    static GETDENTS_LATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serializes every test that mutates the process-wide capability latch and
+    /// restores its exact prior value even when the test panics.
+    struct GetdentsLatch<'a> {
+        previous: bool,
+        _lock: MutexGuard<'a, ()>,
+    }
+
+    impl<'a> GetdentsLatch<'a> {
+        fn unsupported() -> Self {
+            let lock = GETDENTS_LATCH_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self {
+                previous: GETDENTS_UNSUPPORTED.swap(true, Ordering::SeqCst),
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for GetdentsLatch<'_> {
+        fn drop(&mut self) {
+            GETDENTS_UNSUPPORTED.store(self.previous, Ordering::SeqCst);
+        }
+    }
+
+    fn getdents_latch_state_for_test() -> bool {
+        // A panic drops `GetdentsLatch` before it releases its guard. Acquire
+        // the same lock again before observing the restored state so another
+        // parallel latch test cannot change it between restoration and this
+        // assertion.
+        let _lock = GETDENTS_LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        GETDENTS_UNSUPPORTED.load(Ordering::SeqCst)
+    }
 
     fn record(name: &[u8], directory_type: u8) -> Vec<u8> {
         let length = (NAME_OFFSET + name.len() + 1 + 7) & !7;
@@ -405,6 +658,253 @@ mod tests {
         read_directory(&link, false, &mut listing).expect("follow mode still opens through a link");
         assert!(listing.contains("inside"));
         fs::remove_dir_all(root).expect("remove no-follow fixture");
+    }
+
+    #[test]
+    fn unsupported_no_follow_descendant_reuses_its_open_descriptor() {
+        let root = fixture_root("descriptor-fallback");
+        let descendant = root.join("scheduled");
+        let moved = root.join("opened-before-swap");
+        let target = root.join("target");
+        fs::create_dir_all(descendant.join("nested")).expect("create scheduled subtree");
+        fs::write(descendant.join("nested/inside"), b"fixture").expect("write nested entry");
+        fs::create_dir_all(&target).expect("create swapped target");
+        fs::write(target.join("escaped"), b"fixture").expect("write target entry");
+
+        let mut buffer = vec![0_u8; BUFFER_SIZE];
+        let mut listing = Listing::default();
+        let used_portable_fallback = read_open_directory_with_portable_fallback(
+            &descendant,
+            true,
+            &mut buffer,
+            &mut listing,
+            |_, _, _, _| {
+                // The native path has already opened `descendant` with
+                // O_NOFOLLOW. A fallback that reopened its name after this
+                // replacement would enumerate `target` instead.
+                fs::rename(&descendant, &moved).expect("move opened directory");
+                symlink(&target, &descendant).expect("replace path with a link");
+                Err(NativeDirectoryReadError::CapabilityUnavailable)
+            },
+        )
+        .expect("unsupported native read degrades through the descriptor");
+
+        assert!(used_portable_fallback);
+        assert!(
+            listing.contains("nested"),
+            "the opened descendant remains visible"
+        );
+        assert!(
+            !listing.contains("escaped"),
+            "the portable fallback never reopens the swapped path"
+        );
+        fs::remove_dir_all(root).expect("remove descriptor fallback fixture");
+    }
+
+    #[test]
+    fn only_pre_batch_enosys_uses_the_portable_descriptor_fallback() {
+        let root = fixture_root("capability-classification");
+        fs::create_dir_all(&root).expect("create fixture directory");
+        fs::write(root.join("portable-entry"), b"fixture").expect("write portable marker");
+        let mut buffer = vec![0_u8; BUFFER_SIZE];
+
+        let mut listing = Listing::default();
+        let used_portable_fallback = read_open_directory_with_portable_fallback(
+            &root,
+            true,
+            &mut buffer,
+            &mut listing,
+            |directory, path, buffer, listing| {
+                read_directory_from_open_directory_with_read_batch(
+                    directory,
+                    path,
+                    buffer,
+                    listing,
+                    |_, _| {
+                        Err(ReadBatchError::Io(std::io::Error::from_raw_os_error(
+                            libc::ENOSYS,
+                        )))
+                    },
+                )
+            },
+        )
+        .expect("pre-first-batch ENOSYS is a capability fallback");
+        assert!(used_portable_fallback);
+        assert!(listing.contains("portable-entry"));
+
+        let mut listing = Listing::default();
+        let error = read_open_directory_with_portable_fallback(
+            &root,
+            true,
+            &mut buffer,
+            &mut listing,
+            |directory, path, buffer, listing| {
+                read_directory_from_open_directory_with_read_batch(
+                    directory,
+                    path,
+                    buffer,
+                    listing,
+                    |_, _| {
+                        Err(ReadBatchError::Io(std::io::Error::from_raw_os_error(
+                            libc::EOPNOTSUPP,
+                        )))
+                    },
+                )
+            },
+        )
+        .expect_err("EOPNOTSUPP is an ordinary directory error, not a capability latch");
+        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+        assert!(
+            listing.entries().is_empty(),
+            "the portable reader never restarted"
+        );
+
+        let records = record(b"already-read", DT_REG);
+        let mut calls = 0;
+        let error = read_open_directory_with_portable_fallback(
+            &root,
+            true,
+            &mut buffer,
+            &mut listing,
+            |directory, path, buffer, listing| {
+                read_directory_from_open_directory_with_read_batch(
+                    directory,
+                    path,
+                    buffer,
+                    listing,
+                    |_, buffer| {
+                        calls += 1;
+                        if calls == 1 {
+                            buffer[..records.len()].copy_from_slice(&records);
+                            Ok(records.len())
+                        } else {
+                            Err(ReadBatchError::Io(std::io::Error::from_raw_os_error(
+                                libc::ENOSYS,
+                            )))
+                        }
+                    },
+                )
+            },
+        )
+        .expect_err("ENOSYS after an accepted batch does not restart the descriptor");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSYS));
+        assert!(
+            listing.contains("already-read"),
+            "the accepted batch is retained"
+        );
+        assert!(
+            !listing.contains("portable-entry"),
+            "an advanced descriptor never resumes through the portable reader"
+        );
+        fs::remove_dir_all(root).expect("remove capability-classification fixture");
+    }
+
+    #[test]
+    fn portable_descriptor_fallback_closes_the_transferred_descriptor() {
+        let root = fixture_root("descriptor-close");
+        fs::create_dir_all(&root).expect("create fixture directory");
+        fs::write(root.join("entry"), b"fixture").expect("write fixture entry");
+        let directory = open_directory(&root, true).expect("open fixture directory");
+        // Use a deliberately high descriptor so other concurrently-running
+        // tests cannot plausibly reuse its number between `closedir` and the
+        // observation below.
+        let descriptor = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 1024) };
+        assert!(descriptor >= 1024, "duplicate directory descriptor");
+        drop(directory);
+        // SAFETY: `fcntl` returned this live, uniquely-owned duplicate; the
+        // portable reader takes it by value and must transfer it to `fdopendir`.
+        let directory = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        let mut listing = Listing::default();
+        read_portable_directory_from_open_file(directory, &root, &mut listing)
+            .expect("read descriptor fallback");
+
+        assert!(listing.contains("entry"));
+        // SAFETY: `F_GETFD` does not modify the descriptor. `fdopendir`'s
+        // successful ownership transfer means `DirectoryStream::drop` closed
+        // it when the reader returned.
+        assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        fs::remove_dir_all(root).expect("remove descriptor-close fixture");
+    }
+
+    #[test]
+    fn latched_unsupported_walks_descendants_in_serial_and_default_parallel_modes() {
+        let root = fixture_root("latched-walker");
+        for branch in 0..16 {
+            let leaf = root.join(format!("branch-{branch}/nested/leaf-{branch}"));
+            fs::create_dir_all(leaf.parent().expect("leaf has parent"))
+                .expect("create descendant directory");
+            fs::write(leaf, b"fixture").expect("write descendant file");
+        }
+
+        // This is the process-wide state after an injected ENOSYS. The native
+        // module must still open every scheduled no-follow descendant once and
+        // enumerate it through that descriptor, in both frontends.
+        let _latch = GetdentsLatch::unsupported();
+        for walker in [
+            Walker::new(&root)
+                .threads(1)
+                .error_policy(ErrorPolicy::Collect)
+                .options(WalkOptions::default().sort(true)),
+            Walker::new(&root)
+                .error_policy(ErrorPolicy::Collect)
+                .options(WalkOptions::default().sort(true)),
+        ] {
+            let result = walker.collect().expect("latched fallback still walks");
+            assert!(
+                result.errors().is_empty(),
+                "fallback reports no descendant errors"
+            );
+            assert_eq!(
+                result.entries().len(),
+                48,
+                "all directory and file descendants remain"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove latched-walker fixture");
+    }
+
+    #[test]
+    fn latched_unsupported_no_follow_failures_reach_the_caller() {
+        let root = fixture_root("latched-failure");
+        let target = root.join("target");
+        let replaced = root.join("scheduled");
+        fs::create_dir_all(&target).expect("create target directory");
+        symlink(&target, &replaced).expect("create replacement link");
+
+        let _latch = GetdentsLatch::unsupported();
+        let mut listing = Listing::default();
+        let error = read_directory(&replaced, true, &mut listing)
+            .expect_err("a protected fallback must still reject a replacement link");
+
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::ELOOP | libc::ENOTDIR)
+        ));
+        assert!(
+            listing.entries().is_empty(),
+            "a failed open has no partial listing"
+        );
+        fs::remove_dir_all(root).expect("remove latched-failure fixture");
+    }
+
+    #[test]
+    fn capability_latch_guard_restores_after_a_panic() {
+        let mut before = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let latch = GetdentsLatch::unsupported();
+            before = Some(latch.previous);
+            assert!(GETDENTS_UNSUPPORTED.load(Ordering::SeqCst));
+            panic!("exercise guard unwinding");
+        }));
+        assert!(result.is_err(), "the injected panic was caught");
+        assert_eq!(
+            getdents_latch_state_for_test(),
+            before.expect("guard recorded the prior latch state")
+        );
     }
 
     #[test]
