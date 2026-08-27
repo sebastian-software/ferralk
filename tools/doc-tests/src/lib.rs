@@ -3,34 +3,51 @@
 
 #[cfg(test)]
 const DOCUMENTS: &[&str] = &[
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
     "README.md",
-    "benchmark-evidence.md",
-    "usage.md",
-    "compatibility-guide.md",
-    "compatibility-matrix.md",
-    "corpus-format.md",
-    "external-release-gates.md",
-    "fast-glob-reference.md",
-    "palamedes-adoption.md",
-    "zlob-1.6.3-reference.md",
-    "zlob-fnmatch-test-coverage.md",
-    "zlob-test-suite-audit.md",
-    "adr/README.md",
-    "adr/0001-independent-port-under-the-ferralk-name.md",
-    "adr/0002-hybrid-port-strategy.md",
-    "adr/0003-two-published-crates-no-c-abi.md",
-    "adr/0004-msrv-stable-minus-two.md",
-    "adr/0005-byte-matching-wtf8-on-windows.md",
-    "adr/0006-git-normative-ignore-semantics.md",
-    "adr/0007-differential-corpus-and-dev-time-oracle.md",
-    "adr/0008-simd-via-memchr-primitives.md",
-    "adr/0009-own-work-stealing-scheduler.md",
-    "adr/0010-portable-1.0-native-backends-macos-then-linux.md",
-    "adr/0011-posix-conservative-walker-defaults.md",
-    "adr/0012-ferroni-repository-blueprint.md",
-    "adr/0013-no-glob-to-regex-translation.md",
-    "adr/0014-own-gitignore-rule-matching.md",
+    "RFC-zig-free-zlob-port.md",
+    "docs/README.md",
+    "docs/benchmark-evidence.md",
+    "docs/usage.md",
+    "docs/compatibility-guide.md",
+    "docs/compatibility-matrix.md",
+    "docs/corpus-format.md",
+    "docs/external-release-gates.md",
+    "docs/fast-glob-reference.md",
+    "docs/palamedes-adoption.md",
+    "docs/zlob-1.6.3-reference.md",
+    "docs/zlob-fnmatch-test-coverage.md",
+    "docs/zlob-test-suite-audit.md",
+    "docs/adr/README.md",
+    "docs/adr/0001-independent-port-under-the-ferralk-name.md",
+    "docs/adr/0002-hybrid-port-strategy.md",
+    "docs/adr/0003-two-published-crates-no-c-abi.md",
+    "docs/adr/0004-msrv-stable-minus-two.md",
+    "docs/adr/0005-byte-matching-wtf8-on-windows.md",
+    "docs/adr/0006-git-normative-ignore-semantics.md",
+    "docs/adr/0007-differential-corpus-and-dev-time-oracle.md",
+    "docs/adr/0008-simd-via-memchr-primitives.md",
+    "docs/adr/0009-own-work-stealing-scheduler.md",
+    "docs/adr/0010-portable-1.0-native-backends-macos-then-linux.md",
+    "docs/adr/0011-posix-conservative-walker-defaults.md",
+    "docs/adr/0012-ferroni-repository-blueprint.md",
+    "docs/adr/0013-no-glob-to-regex-translation.md",
+    "docs/adr/0014-own-gitignore-rule-matching.md",
+    "fuzz/README.md",
 ];
+
+#[doc = include_str!("../../../CHANGELOG.md")]
+pub mod changelog {}
+
+#[doc = include_str!("../../../CONTRIBUTING.md")]
+pub mod contributing {}
+
+#[doc = include_str!("../../../README.md")]
+pub mod repository_readme {}
+
+#[doc = include_str!("../../../RFC-zig-free-zlob-port.md")]
+pub mod rfc {}
 
 #[doc = include_str!("../../../docs/README.md")]
 pub mod index {}
@@ -113,6 +130,9 @@ pub mod adr_0013 {}
 #[doc = include_str!("../../../docs/adr/0014-own-gitignore-rule-matching.md")]
 pub mod adr_0014 {}
 
+#[doc = include_str!("../../../fuzz/README.md")]
+pub mod fuzzing {}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeSet, fs, path::Path};
@@ -121,9 +141,9 @@ mod tests {
 
     #[test]
     fn every_markdown_document_is_included() {
-        let documents_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut discovered = BTreeSet::new();
-        collect_markdown_files(&documents_root, &documents_root, &mut discovered);
+        collect_markdown_files(&repository_root, &repository_root, &mut discovered);
 
         let included = DOCUMENTS
             .iter()
@@ -136,11 +156,13 @@ mod tests {
     }
 
     fn collect_markdown_files(root: &Path, directory: &Path, discovered: &mut BTreeSet<String>) {
-        for entry in fs::read_dir(directory).expect("documentation directory is readable") {
-            let entry = entry.expect("documentation directory entry is readable");
+        for entry in fs::read_dir(directory).expect("repository directory is readable") {
+            let entry = entry.expect("repository directory entry is readable");
             let path = entry.path();
             if path.is_dir() {
-                collect_markdown_files(root, &path, discovered);
+                if !is_excluded_directory(root, &path) {
+                    collect_markdown_files(root, &path, discovered);
+                }
             } else if path.extension().is_some_and(|extension| extension == "md") {
                 discovered.insert(
                     path.strip_prefix(root)
@@ -150,5 +172,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn is_excluded_directory(root: &Path, directory: &Path) -> bool {
+        // Git metadata and generated/build trees are not repository
+        // documentation. Every other Markdown file is inventory-controlled.
+        directory
+            .strip_prefix(root)
+            .expect("repository directory is below the repository root")
+            .components()
+            .any(|component| {
+                matches!(
+                    component.as_os_str().to_str(),
+                    Some(".git" | "target" | "vendor")
+                )
+            })
     }
 }
