@@ -588,6 +588,11 @@ mod tests {
         assert!(parse_records(Path::new("/tmp"), &missing_nul, &mut listing).is_err());
     }
 
+    // Linux's dirent wire fields use host endianness. The reviewed native
+    // syscall targets and checked-in corpus are little-endian; a big-endian
+    // port needs its own reviewed seed corpus rather than silently accepting
+    // byte sequences this parser would not read as records.
+    #[cfg(target_endian = "little")]
     #[test]
     fn checked_in_linux_native_fuzz_seeds_are_valid_and_reproducible() {
         let long_name = [b'x'; 255];
