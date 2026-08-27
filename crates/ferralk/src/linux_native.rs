@@ -297,7 +297,7 @@ mod tests {
 
     use super::{
         DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG, DT_SOCK, Listing, NAME_OFFSET, TYPE_OFFSET,
-        entry_kind, open_directory, parse_records, read_directory,
+        entry_kind, for_each_record, open_directory, parse_records, read_directory,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -333,6 +333,45 @@ mod tests {
             *byte = b'x';
         }
         assert!(parse_records(Path::new("/tmp"), &missing_nul, &mut listing).is_err());
+    }
+
+    #[test]
+    fn checked_in_linux_native_fuzz_seeds_are_valid_and_reproducible() {
+        let long_name = [b'x'; 255];
+        let mut multi = record(b"nested", DT_DIR);
+        multi.extend(record(b"file", DT_REG));
+        let seeds: [(&[u8], Vec<u8>); 4] = [
+            (
+                include_bytes!("../../../fuzz/corpus/linux_dirent_parser/single-regular"),
+                record(b"one", DT_REG),
+            ),
+            (
+                include_bytes!("../../../fuzz/corpus/linux_dirent_parser/minimal-name"),
+                record(b"a", DT_REG),
+            ),
+            (
+                include_bytes!("../../../fuzz/corpus/linux_dirent_parser/multi-directory-regular"),
+                multi,
+            ),
+            (
+                include_bytes!("../../../fuzz/corpus/linux_dirent_parser/long-name"),
+                record(&long_name, DT_REG),
+            ),
+        ];
+        for (seed, expected) in seeds {
+            assert_eq!(
+                seed,
+                expected.as_slice(),
+                "seed matches the generator record"
+            );
+            let mut records = 0;
+            for_each_record(seed, |_, _| {
+                records += 1;
+                Ok(())
+            })
+            .expect("seed reaches the parser visitor");
+            assert!(records > 0);
+        }
     }
 
     #[test]

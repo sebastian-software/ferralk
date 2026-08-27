@@ -71,6 +71,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "generate_linux_native_seeds"
+path = "seed_corpora/generate_linux_native_seeds.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "linux_dirent_parser"
 path = "fuzz_targets/linux_dirent_parser.rs"
 test = false

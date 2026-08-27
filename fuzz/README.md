@@ -9,8 +9,9 @@ paths. Linux has the equivalent `linux_dirent_parser`. The native targets keep
 small structure-aware checked-in records and CI preserves each target's corpus
 between runs, so their bounded budgets start from valid parser shapes.
 `cargo run --manifest-path fuzz/Cargo.toml --bin generate_macos_native_seeds`
-regenerates the macOS records byte-for-byte; macOS-native tests replay and
-validate every checked-in seed before CI fuzzes it.
+and `cargo run --manifest-path fuzz/Cargo.toml --bin generate_linux_native_seeds`
+regenerate the native records byte-for-byte; the matching native tests replay
+and validate every checked-in seed before CI fuzzes it.
 
 `ferralk_vs_fast_glob` is differential: it feeds one pattern and one candidate
 to both ferralk and Oxc fast-glob and asserts the same verdict. It keeps only

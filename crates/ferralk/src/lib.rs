@@ -617,7 +617,8 @@ impl RootPlan {
 impl Walker {
     /// Starts a walk rooted at root.
     ///
-    /// Further roots may be added with [`Walker::add_root`]. `root` must name
+    /// Further roots may be added with [`Walker::add_root`] or
+    /// [`Walker::try_add_root`]. `root` must name
     /// a readable directory: a plain file produces a `read_dir` not-a-directory
     /// error and no entry for the file. A directory symlink supplied as the
     /// root is traversed regardless of [`WalkOptions::follow_symlinks`], which
@@ -849,6 +850,34 @@ impl Walker {
     /// # Ok::<(), ferralk::ferralk_glob::PatternError>(())
     /// ```
     pub fn add_root(mut self, root: impl Into<PathBuf>) -> Result<Self, PatternError> {
+        self.try_add_root(root)?;
+        Ok(self)
+    }
+
+    /// Adds another root without consuming the builder.
+    ///
+    /// This is the borrowed counterpart to [`Walker::add_root`]. It is useful
+    /// when applying a caller-supplied root list: if an already-added absolute
+    /// pattern cannot be rewritten for one root, this method returns its
+    /// [`PatternError`] and leaves the configured walker unchanged, so later
+    /// roots can still be considered. A valid root has the same semantics as
+    /// [`Walker::add_root`].
+    ///
+    /// ```no_run
+    /// use ferralk::Walker;
+    ///
+    /// let mut walker = Walker::new("workspace");
+    /// for root in ["generated", "vendor"] {
+    ///     if let Err(error) = walker.try_add_root(root) {
+    ///         eprintln!("skipping {root:?}: {error}");
+    ///     }
+    /// }
+    ///
+    /// let result = walker.collect()?;
+    /// # let _ = result;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn try_add_root(&mut self, root: impl Into<PathBuf>) -> Result<&mut Self, PatternError> {
         let mut plan = RootPlan::new(root.into());
         let options = traversal_pattern_options(self.match_hidden);
         let root_bytes = glob_path_bytes(&plan.path);
@@ -999,6 +1028,18 @@ impl Walker {
         self
     }
 
+    /// Clears an explicit [`Walker::git_ignore_case`] override.
+    ///
+    /// Subsequent Git-ignore walks resume detection from each repository's
+    /// local config. This is useful for a reusable builder whose caller first
+    /// supplied Git's effective value and then wants its normal local-config
+    /// behaviour back.
+    #[must_use]
+    pub const fn clear_git_ignore_case(mut self) -> Self {
+        self.git_ignore_case = None;
+        self
+    }
+
     /// Overrides the repository-local `core.precomposeUnicode` value used by
     /// [`Walker::respect_git_ignore`].
     ///
@@ -1011,6 +1052,17 @@ impl Walker {
     #[must_use]
     pub const fn git_precompose_unicode(mut self, enabled: bool) -> Self {
         self.git_precompose_unicode = Some(enabled);
+        self
+    }
+
+    /// Clears an explicit [`Walker::git_precompose_unicode`] override.
+    ///
+    /// Subsequent Git-ignore walks resume detection from each repository's
+    /// local config. On non-macOS platforms this retains Git's no-op
+    /// applicability for this setting.
+    #[must_use]
+    pub const fn clear_git_precompose_unicode(mut self) -> Self {
+        self.git_precompose_unicode = None;
         self
     }
 
@@ -1298,9 +1350,12 @@ fn pattern_without_directory_marker(pattern: &[u8]) -> &[u8] {
 /// A leading `./` remains the conventional harmless spelling for a pattern
 /// below the root, but `.` and `./` name the root itself, which a walk never
 /// emits. Any other real `.` component (`src/./x` or `src/.`) likewise names
-/// a spelling no root-relative candidate uses. The glob compiler summarizes
-/// its actual expanded alternatives and extglob branches, so this policy never
-/// reparses matcher syntax.
+/// a spelling no root-relative candidate uses. Brace alternatives are expanded
+/// and therefore reject forms such as `{.,..}`, while an extglob-only
+/// component such as `@(.)` remains deliberately opaque matcher text and
+/// selects nothing. The glob compiler summarizes its actual expanded
+/// alternatives and extglob branches, so this policy never reparses matcher
+/// syntax.
 fn reject_unwalkable_relative_pattern(
     viability: WalkerPathViability,
     offset: Option<usize>,
@@ -3172,6 +3227,23 @@ mod tests {
             }
         }
 
+        // Braces expose literal path components to the viability analysis, so
+        // their dot forms are rejected. An extglob remains one opaque matcher
+        // component; it cannot name `.` or `..` as a walk path component and
+        // therefore stays valid while selecting no entry.
+        let brace_dot_components = "{.,..}";
+        assert!(
+            Walker::new(&fixture.root)
+                .include(brace_dot_components)
+                .is_err(),
+            "brace-expanded {brace_dot_components:?} is an unwalkable path spelling"
+        );
+        for pattern in ["@(.)", "@(..)/x", "?(.)/x"] {
+            Walker::new(&fixture.root)
+                .include(pattern)
+                .unwrap_or_else(|error| panic!("{pattern} remains opaque matcher text: {error}"));
+        }
+
         // A dead brace or extglob arm must not reject a viable one. Character
         // classes use the glob parser's POSIX and leading-`]` grammar, so a
         // slash or `..` text inside either class stays matcher syntax too.
@@ -4218,6 +4290,17 @@ mod tests {
             !relative_paths(override_true.entries(), &fixture.root)
                 .contains(&PathBuf::from("BUILD.log"))
         );
+
+        let cleared = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .git_ignore_case(true)
+            .clear_git_ignore_case()
+            .collect()
+            .expect("cleared override resumes local config");
+        assert!(
+            relative_paths(cleared.entries(), &fixture.root).contains(&PathBuf::from("BUILD.log")),
+            "clearing an override restores the repository-local false value"
+        );
     }
 
     #[test]
@@ -4352,6 +4435,43 @@ mod tests {
         assert_eq!(emitted, 2);
     }
 
+    #[test]
+    fn try_add_root_keeps_the_builder_after_a_rejected_root() {
+        let fixture = Fixture::new();
+        let first_extra = fixture.root.clone();
+        let last_extra = fixture.root.clone();
+        let mut walker = Walker::new(&fixture.root)
+            .include(fixture.absolute("/**"))
+            .expect("absolute pattern applies to the first absolute root");
+
+        walker
+            .try_add_root(&first_extra)
+            .expect("the absolute pattern applies to an equal root");
+        let error = walker
+            .try_add_root("relative-root")
+            .expect_err("an absolute pattern needs an absolute added root");
+        assert_eq!(
+            error.message(),
+            "an absolute pattern needs an absolute walk root"
+        );
+        assert_eq!(
+            walker.roots().collect::<Vec<_>>(),
+            vec![fixture.root.as_path(), first_extra.as_path()],
+            "a rejected borrowed addition cannot partially append a root"
+        );
+        walker
+            .try_add_root(&last_extra)
+            .expect("the retained builder can consider later roots");
+        assert_eq!(
+            walker.roots().collect::<Vec<_>>(),
+            vec![
+                fixture.root.as_path(),
+                first_extra.as_path(),
+                last_extra.as_path(),
+            ]
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn repository_precomposeunicode_matches_the_macos_git_oracle() {
@@ -4418,6 +4538,28 @@ mod tests {
             !relative_paths(forced_true.entries(), &fixture.root)
                 .contains(&PathBuf::from(decomposed))
         );
+
+        let cleared = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .git_precompose_unicode(true)
+            .clear_git_precompose_unicode()
+            .collect()
+            .expect("cleared override resumes local config");
+        assert!(
+            relative_paths(cleared.entries(), &fixture.root).contains(&PathBuf::from(decomposed)),
+            "clearing an override restores the repository-local false value"
+        );
+    }
+
+    #[test]
+    fn clearing_git_adaptation_overrides_restores_the_unset_state() {
+        let walker = Walker::new("workspace")
+            .git_ignore_case(true)
+            .clear_git_ignore_case()
+            .git_precompose_unicode(true)
+            .clear_git_precompose_unicode();
+        assert_eq!(walker.git_ignore_case, None);
+        assert_eq!(walker.git_precompose_unicode, None);
     }
 
     #[cfg(target_os = "linux")]
@@ -6790,6 +6932,56 @@ mod tests {
             );
             assert!(state.errors.is_empty(), "{race:?} is a replacement race");
         }
+    }
+
+    #[test]
+    fn stream_delivers_deferred_entry_errors_after_listing_siblings() {
+        let fixture = Fixture::new();
+        let mut stream = Walker::new(&fixture.root)
+            .error_policy(ErrorPolicy::Collect)
+            .stream();
+        // Feed the stream the same completed listing native and portable
+        // readers create. This isolates delivery order from a host filesystem
+        // that usually supplies a file type without a fallible stat.
+        stream.pending_directories.clear();
+        stream.directory = fixture.root.clone();
+        stream.path = fixture.root.clone();
+        stream.listing.push("before".as_ref(), false, false);
+        super::defer_entry_stat_error(
+            &mut stream.listing,
+            fixture.root.join("unknown"),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )
+        .expect("permission failure is deferred");
+        stream.listing.push("after".as_ref(), false, false);
+
+        let delivered = stream
+            .map(|item| match item {
+                Ok(entry) => Ok(entry
+                    .path()
+                    .strip_prefix(&fixture.root)
+                    .expect("entry belongs to fixture")
+                    .to_path_buf()),
+                Err(error) => Err((
+                    error.operation(),
+                    error.path().to_path_buf(),
+                    error.source.kind(),
+                )),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delivered,
+            vec![
+                Ok(PathBuf::from("before")),
+                Ok(PathBuf::from("after")),
+                Err((
+                    "read_dir",
+                    fixture.root.join("unknown"),
+                    std::io::ErrorKind::PermissionDenied,
+                )),
+            ],
+            "the stream must not let one deferred entry failure hide its siblings"
+        );
     }
 
     #[test]
