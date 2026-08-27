@@ -500,11 +500,7 @@ impl Pattern {
             {
                 match_extglob_program(program, path, options)
             } else if let Some(fast_path) = &alternative.fast_path
-                && (!options.component_wildcards
-                    || matches!(
-                        fast_path,
-                        FastPath::LiteralTokens(_) | FastPath::DeterministicTokens(_)
-                    ))
+                && (!options.component_wildcards || fast_path.supports_component_wildcards())
             {
                 fast_path.is_match(path, options)
             } else {
@@ -1516,9 +1512,9 @@ impl CompiledAlternative {
 /// An extglob program keeps its own interpreter, and the literal and
 /// deterministic fast paths win the dispatch under every option profile, so
 /// building an engine behind either would spend budget on dead tables. Every
-/// other shape may reach the general path — the starred fast paths lose the
-/// dispatch once wildcards are component-local — and gets an engine when its
-/// positions fit one word.
+/// other shape may reach the general path under another option profile, or
+/// retains the engine as a differential oracle behind a starred fast path, and
+/// gets an engine when its positions fit one word.
 fn compile_sweep(
     tokens: &[Token],
     fast_path: &Option<FastPath>,
@@ -1683,6 +1679,10 @@ enum FastPath {
     RecursiveTerminalPrefix {
         prefix: Vec<u8>,
     },
+    RecursiveSuffix {
+        suffix: Vec<u8>,
+        suffix_last: u8,
+    },
     RecursivePrefixSuffix {
         prefix: Vec<u8>,
         suffix: Vec<u8>,
@@ -1750,6 +1750,12 @@ impl FastPath {
                 prefix: prefix.clone(),
             });
         }
+        if let [Token::RecursivePrefix, Token::Star, Token::Literal(suffix)] = tokens {
+            return Some(Self::RecursiveSuffix {
+                suffix: suffix.clone(),
+                suffix_last: *suffix.last().expect("literal token is non-empty"),
+            });
+        }
         let [
             Token::Literal(prefix),
             Token::Separator,
@@ -1760,13 +1766,22 @@ impl FastPath {
         else {
             return None;
         };
-        let mut prefix_with_separator = prefix.clone();
-        prefix_with_separator.push(b'/');
         Some(Self::RecursivePrefixSuffix {
-            prefix: prefix_with_separator,
+            prefix: prefix.clone(),
             suffix: suffix.clone(),
             suffix_last: *suffix.last().expect("literal token is non-empty"),
         })
+    }
+
+    fn supports_component_wildcards(&self) -> bool {
+        matches!(
+            self,
+            Self::LiteralTokens(_)
+                | Self::DeterministicTokens(_)
+                | Self::StarSuffix { .. }
+                | Self::RecursiveSuffix { .. }
+                | Self::RecursivePrefixSuffix { .. }
+        )
     }
 
     fn is_match(&self, path: &[u8], options: PatternOptions) -> bool {
@@ -1887,6 +1902,9 @@ impl FastPath {
                 else {
                     return false;
                 };
+                if options.component_wildcards && next_separator(variable).is_some() {
+                    return false;
+                }
                 options.match_hidden
                     || !contains_hidden_component_in(
                         path,
@@ -1947,6 +1965,28 @@ impl FastPath {
                                 options.candidate_starts_component,
                             ))
             }
+            Self::RecursiveSuffix {
+                suffix,
+                suffix_last,
+            } => {
+                let Some(&path_last) = path.last() else {
+                    return false;
+                };
+                if !bytes_equal(*suffix_last, path_last, options.case_insensitive) {
+                    return false;
+                }
+                let Some(variable) = strip_literal_suffix(path, suffix, options.case_insensitive)
+                else {
+                    return false;
+                };
+                options.match_hidden
+                    || !contains_hidden_component_in(
+                        path,
+                        0,
+                        variable.len(),
+                        options.candidate_starts_component,
+                    )
+            }
             Self::RecursivePrefixSuffix {
                 prefix,
                 suffix,
@@ -1971,12 +2011,18 @@ impl FastPath {
                     return false;
                 }
                 let prefix_and_variable = &path[..suffix_start];
-                let Some(variable) =
+                let Some(remainder) =
                     strip_literal_prefix(prefix_and_variable, prefix, options.case_insensitive)
                 else {
                     return false;
                 };
-                let variable_start = prefix.len();
+                let Some((&separator, variable)) = remainder.split_first() else {
+                    return false;
+                };
+                if !is_separator(separator) {
+                    return false;
+                }
+                let variable_start = prefix.len() + 1;
                 options.match_hidden
                     || !contains_hidden_component_in(
                         path,
@@ -4988,7 +5034,7 @@ mod tests {
         // The scratch belongs to the memoized matcher; pin it, since the
         // sweep engine would otherwise answer for this shape without any
         // buffers at all.
-        pattern.strip_engines(false, true, false);
+        pattern.strip_engines(true, true, false);
         let matching = "src/deep/nested/module/component/widget/main.ts";
         let other = "src/deep/nested/module/component/widget/main.tsx";
 
@@ -6170,6 +6216,7 @@ mod tests {
             b"src/nested/.hidden.rs".to_vec(),
             b"src/nested/visible.rs".to_vec(),
             b"SRC/NESTED/VISIBLE.RS".to_vec(),
+            b"SRC\\NESTED\\VISIBLE.RS".to_vec(),
             b"other/visible.rs".to_vec(),
         ];
         candidates.extend(
@@ -6183,6 +6230,61 @@ mod tests {
                 general.is_match(&candidate),
                 "fast path differs for {candidate:?}"
             );
+            assert_eq!(
+                fast.is_match_glob_path(&candidate),
+                general.is_match_glob_path(&candidate),
+                "component fast path differs for {candidate:?}"
+            );
+        }
+        #[cfg(windows)]
+        assert!(fast.is_match_glob_path(br"SRC\NESTED\VISIBLE.RS"));
+    }
+
+    #[test]
+    fn recursive_suffix_fast_path_matches_the_general_matcher() {
+        for options in [
+            PatternOptions::default().recursive_double_star(true),
+            PatternOptions::default()
+                .recursive_double_star(true)
+                .case_insensitive(true),
+            PatternOptions::default()
+                .recursive_double_star(true)
+                .match_hidden(true),
+        ] {
+            let fast = Pattern::compile("**/*.ts", options).expect("pattern compiles");
+            assert!(matches!(
+                fast.alternatives[0].fast_path,
+                Some(FastPath::RecursiveSuffix { .. })
+            ));
+            let mut general = fast.clone();
+            general.alternatives[0].fast_path = None;
+
+            let mut candidates = vec![
+                b"".to_vec(),
+                b".ts".to_vec(),
+                b"index.ts".to_vec(),
+                b"INDEX.TS".to_vec(),
+                b"index.tsx".to_vec(),
+                b".hidden.ts".to_vec(),
+                b"src/.ts".to_vec(),
+                b"src/index.ts".to_vec(),
+                b"src/.hidden.ts".to_vec(),
+                b".hidden/index.ts".to_vec(),
+                b"src/deep/index.ts".to_vec(),
+            ];
+            candidates.extend(byte_words(b"ab./tsTS", 4));
+            for candidate in candidates {
+                assert_eq!(
+                    fast.is_match(&candidate),
+                    general.is_match(&candidate),
+                    "fast path differs for {options:?} against {candidate:?}"
+                );
+                assert_eq!(
+                    fast.is_match_glob_path(&candidate),
+                    general.is_match_glob_path(&candidate),
+                    "component fast path differs for {options:?} against {candidate:?}"
+                );
+            }
         }
     }
 
@@ -6406,8 +6508,43 @@ mod tests {
                     general.is_match(candidate),
                     "fast path differs for {pattern:?} against {candidate:?}"
                 );
+                assert_eq!(
+                    fast.is_match_glob_path(candidate),
+                    general.is_match_glob_path(candidate),
+                    "component fast path differs for {pattern:?} against {candidate:?}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn component_suffix_fast_paths_preserve_separator_and_hidden_rules() {
+        let star = Pattern::compile("*.ts", PatternOptions::default()).unwrap();
+        assert!(star.is_match_glob_path("index.ts"));
+        assert!(star.is_match_glob_path(".ts"));
+        assert!(!star.is_match_glob_path("src/index.ts"));
+        assert!(!star.is_match_glob_path(".hidden.ts"));
+
+        let recursive = Pattern::compile(
+            "**/*.ts",
+            PatternOptions::default().recursive_double_star(true),
+        )
+        .unwrap();
+        assert!(recursive.is_match_glob_path("index.ts"));
+        assert!(recursive.is_match_glob_path("src/deep/index.ts"));
+        assert!(recursive.is_match_glob_path("src/.ts"));
+        assert!(!recursive.is_match_glob_path("src/.hidden.ts"));
+        assert!(!recursive.is_match_glob_path(".hidden/index.ts"));
+
+        let hidden = Pattern::compile(
+            "**/*.ts",
+            PatternOptions::default()
+                .recursive_double_star(true)
+                .match_hidden(true),
+        )
+        .unwrap();
+        assert!(hidden.is_match_glob_path("src/.hidden.ts"));
+        assert!(hidden.is_match_glob_path(".hidden/index.ts"));
     }
 
     #[test]

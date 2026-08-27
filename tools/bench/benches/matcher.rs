@@ -174,16 +174,49 @@ fn matcher(c: &mut Criterion) {
         benchmark.iter(|| black_box(general.is_match(black_box("src/deep/main.txt"))))
     });
 
-    // The walker routes every starred pattern through the general matcher once
-    // wildcards are component-local, so these two shapes cover the per-entry
-    // cost of a real traversal filter.
+    // These component-local calls mirror the common suffix filters used by the
+    // walker. Keep root, deep, and separator-rejection inputs side by side so a
+    // shortcut cannot look fast by quietly accepting a nested plain-star path.
+    let walker_star = Pattern::compile("*.ts", PatternOptions::default())
+        .expect("walker star-suffix benchmark pattern is valid");
     let walker_recursive = Pattern::compile(
         "**/*.ts",
         PatternOptions::default().recursive_double_star(true),
     )
     .expect("walker recursive benchmark pattern is valid");
+    let walker_scoped_recursive = Pattern::compile(
+        "src/**/*.ts",
+        PatternOptions::default().recursive_double_star(true),
+    )
+    .expect("walker scoped recursive benchmark pattern is valid");
+    let walker_root = "index.ts";
     let walker_path = "src/deep/nested/module/component/widget/main.ts";
     let walker_other = "src/deep/nested/module/component/widget/main.tsx";
+    assert!(walker_star.is_match_glob_path(walker_root));
+    assert!(!walker_star.is_match_glob_path(walker_path));
+    assert!(walker_recursive.is_match_glob_path(walker_root));
+    assert!(walker_recursive.is_match_glob_path(walker_path));
+    assert!(walker_scoped_recursive.is_match_glob_path(walker_path));
+
+    c.bench_function("common_suffix/component_star/basename", |benchmark| {
+        benchmark.iter(|| black_box(walker_star.is_match_glob_path(black_box(walker_root))))
+    });
+    c.bench_function(
+        "common_suffix/component_star/nested_rejection",
+        |benchmark| {
+            benchmark.iter(|| black_box(walker_star.is_match_glob_path(black_box(walker_path))))
+        },
+    );
+    c.bench_function("common_suffix/recursive_suffix/root", |benchmark| {
+        benchmark.iter(|| black_box(walker_recursive.is_match_glob_path(black_box(walker_root))))
+    });
+    c.bench_function("common_suffix/recursive_suffix/deep", |benchmark| {
+        benchmark.iter(|| black_box(walker_recursive.is_match_glob_path(black_box(walker_path))))
+    });
+    c.bench_function("common_suffix/scoped_recursive_suffix/deep", |benchmark| {
+        benchmark
+            .iter(|| black_box(walker_scoped_recursive.is_match_glob_path(black_box(walker_path))))
+    });
     c.bench_function("walker_component/recursive_suffix/matching", |benchmark| {
         benchmark.iter(|| black_box(walker_recursive.is_match_glob_path(black_box(walker_path))))
     });
