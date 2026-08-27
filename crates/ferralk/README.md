@@ -4,7 +4,7 @@
 root-relative glob filtering. It re-exports `ferralk-glob`, so walker patterns
 and standalone matchers use the same component-aware language.
 
-```no_run
+```rust,no_run
 use ferralk::{ErrorPolicy, WalkOptions, Walker};
 
 let result = Walker::new(".")

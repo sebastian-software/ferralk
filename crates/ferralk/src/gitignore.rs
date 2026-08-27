@@ -269,7 +269,7 @@ enum GitConfigSection {
 
 impl GitIgnoreAdaptation {
     /// Repository-local config is deliberately the whole implicit surface.
-    /// Git also reads system/global files, conditional includes and environment
+    /// Git also reads system/global files, includes and environment
     /// overrides; a library cannot safely inherit those process-wide settings,
     /// so callers may provide the final effective values on `Walker`.
     fn effective(walker: &Walker, layout: Option<&RepositoryLayout>) -> Self {

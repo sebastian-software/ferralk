@@ -4,7 +4,7 @@
 
 //! Compiled, byte-first glob patterns with explicit behaviour-changing options.
 //!
-//! The M1 implementation currently covers literals, `*`, `?`, `**`, character
+//! The matcher covers literals, `*`, `?`, `**`, character
 //! classes, escapes, leading-period handling, ASCII case folding, nested brace
 //! expansion, and Bash-style extglobs.
 //!

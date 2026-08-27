@@ -168,11 +168,13 @@ Important defaults:
   before comments, quotes, escapes, and boolean parsing, preserving the next
   line's indentation.
 
-  System/global config, conditional includes, and environment overrides are
+  System/global config, includes, and environment overrides are
   intentionally not consulted: they are process-wide state outside a library
   walk. Use `Walker::git_ignore_case(value)` and
   `Walker::git_precompose_unicode(value)` to supply Git's effective values;
   each explicit Walker value takes precedence over repository-local config.
+  `clear_git_ignore_case` and `clear_git_precompose_unicode` resume
+  repository-local detection on a reused builder.
 
   Ferralk deliberately continues into nested repositories, as ripgrep does:
   outer ignore rules remain active inside them and their own ignore files are

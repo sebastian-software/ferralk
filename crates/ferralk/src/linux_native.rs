@@ -511,7 +511,7 @@ mod tests {
     use super::{
         BUFFER_SIZE, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG, DT_SOCK, GETDENTS_UNSUPPORTED,
         Listing, NAME_OFFSET, NativeDirectoryReadError, ReadBatchError, TYPE_OFFSET, entry_kind,
-        open_directory, parse_records, read_directory,
+        for_each_record, open_directory, parse_records, read_directory,
         read_directory_from_open_directory_with_read_batch,
         read_open_directory_with_portable_fallback, read_portable_directory_from_open_file,
     };
@@ -586,6 +586,45 @@ mod tests {
             *byte = b'x';
         }
         assert!(parse_records(Path::new("/tmp"), &missing_nul, &mut listing).is_err());
+    }
+
+    #[test]
+    fn checked_in_linux_native_fuzz_seeds_are_valid_and_reproducible() {
+        let long_name = [b'x'; 255];
+        let mut multi = record(b"nested", DT_DIR);
+        multi.extend(record(b"file", DT_REG));
+        let seeds: [(&[u8], Vec<u8>); 4] = [
+            (
+                include_bytes!("../../../fuzz/corpus/linux_dirent_parser/single-regular"),
+                record(b"one", DT_REG),
+            ),
+            (
+                include_bytes!("../../../fuzz/corpus/linux_dirent_parser/minimal-name"),
+                record(b"a", DT_REG),
+            ),
+            (
+                include_bytes!("../../../fuzz/corpus/linux_dirent_parser/multi-directory-regular"),
+                multi,
+            ),
+            (
+                include_bytes!("../../../fuzz/corpus/linux_dirent_parser/long-name"),
+                record(&long_name, DT_REG),
+            ),
+        ];
+        for (seed, expected) in seeds {
+            assert_eq!(
+                seed,
+                expected.as_slice(),
+                "seed matches the generator record"
+            );
+            let mut records = 0;
+            for_each_record(seed, |_, _| {
+                records += 1;
+                Ok(())
+            })
+            .expect("seed reaches the parser visitor");
+            assert!(records > 0);
+        }
     }
 
     #[test]

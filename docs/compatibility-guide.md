@@ -101,11 +101,13 @@ sections (never a quoted subsection) and applies Git's backslash-newline value
 continuations before comment, quote, escape, and boolean processing; indentation
 on the continued physical line remains meaningful.
 
-Git's system/global configuration, conditional includes, and environment
+Git's system/global configuration, includes, and environment
 overrides are deliberately not inherited by a library walk. If one of those
 sources changes Git's effective value, pass it explicitly with
 `Walker::git_ignore_case` or (on macOS) `Walker::git_precompose_unicode`; an
-explicit Walker setting wins over repository-local config. Ferralk identifies a
+explicit Walker setting wins over repository-local config. Use
+`clear_git_ignore_case` or `clear_git_precompose_unicode` to resume local
+detection on a reused builder. Ferralk identifies a
 case variant of `.gitignore`/`.ignore` in a listing only to attempt Git's
 canonical open, so a case-sensitive filesystem continues to expose that
 variant as an ordinary file.
@@ -197,6 +199,8 @@ that hold one, not as a way to spell a relative one.
 ### Several roots in one walk
 
 `Walker::add_root` and `Walker::add_roots` extend a walk to more than one tree.
+For a fallible caller-supplied root list, `Walker::try_add_root` borrows the
+builder, so one rejected root does not lose the configured walk.
 A caller with several source directories used to build one walker per directory,
 and with it one thread pool per directory; the roots are now the walk's initial
 directories and share the scheduler and helper-spawn floor. The
@@ -264,6 +268,12 @@ arithmetic; write the part below the root instead, where `**/*.ts` says what
 lexically is wrong across a symlink, and resolving it properly would mean
 touching the filesystem to compile a pattern. Naming the root itself selects
 nothing, because the walk emits what is inside the root.
+
+The same candidate guard applies to relative patterns. Brace alternatives are
+expanded, so `{.,..}` is rejected as an attempt to name the unwalkable dot and
+dot-dot components. Extglob-only components such as `@(.)`, `@(..)/x`, and
+`?(.)/x` remain deliberately opaque matcher text instead; they select no walk
+candidate rather than becoming path operations.
 
 A pattern about a different tree is not an error, because a caller may hold one
 pattern list and run it against several roots. It selects nothing and — the
