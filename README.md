@@ -29,44 +29,47 @@ For an unreleased Git dependency, pin a revision for repeatable builds.
 
 ## Local benchmark snapshot
 
-The matcher snapshot below was refreshed on 2026-08-27 on a Mac Studio with an
-Apple M1 Ultra, 20 cores, 64 GB RAM, macOS 26.5.2, Rust 1.96.0, and
-Criterion 0.8.2. It is a local comparison, not a portable promise. The zlob
-row was refreshed on the same host with zlob 1.6.3, Zig 0.16.0, and libclang
-22.1.8. The expanded multi-library walker comparison is in
-[benchmark evidence](docs/benchmark-evidence.md), which also describes the
-lanes, limitations, and reproduction commands. Matcher values use the common
-`src/**/*.rs` syntax; lower is better.
+This snapshot was refreshed on 2026-08-28 on a Mac Studio with an Apple M1
+Ultra, 20 cores, 64 GB RAM, macOS 26.5.2, Rust 1.96.0, and Node.js 24.19.0. It
+is a local comparison, not a portable promise. Lower is better.
+
+Matcher values use the common `src/**/*.rs` syntax. The Rust and zlob rows are
+Criterion point estimates; the Node.js rows are medians of fifteen
+order-rotated samples, each containing 100,000 matches.
 
 | Matcher | Match | Non-match |
 | --- | ---: | ---: |
-| Ferralk (compiled, 2026-08-27) | 11 ns | 3 ns |
-| zlob 1.6.3 (compiled, 2026-08-27) | 37 ns | 2 ns |
-| globset (compiled, 2026-08-27) | 40 ns | 40 ns |
-| fast-glob (interpreted, 2026-08-27) | 98 ns | 107 ns |
-| wax (compiled, 2026-08-27) | 31 ns | 31 ns |
+| Ferralk (compiled) | **10 ns** | 3 ns |
+| zlob 1.6.3 (compiled) | 37 ns | **2 ns** |
+| `globset` (compiled) | 39 ns | 39 ns |
+| `fast-glob` (interpreted) | 97 ns | 106 ns |
+| `wax` (compiled) | 31 ns | 31 ns |
+| `picomatch` 4.0.7 (compiled, Node.js) | 80.9 ns | 90.9 ns |
+| `micromatch` 4.0.8 (compiled, Node.js) | 80.6 ns | 91.0 ns |
+| `minimatch` 10.2.6 (compiled, Node.js) | 238.3 ns | 219.0 ns |
 
-On this common syntax Ferralk is faster than both `globset` and `fast-glob` in
-the current refresh. The complete current matcher table, including long-path
-and adversarial cases, is in the benchmark evidence document.
+The walker fixture contains 53,600 files. An **unscoped** query such as
+`**/*.{ts,tsx}` can match anywhere, so every walker must inspect the complete
+tree. A **scoped** query such as `{src,packages}/**/*.{ts,tsx}` names the only
+roots that can match. Ferralk can therefore skip the rest of the tree,
+especially `node_modules`, directly from the pattern.
 
-The following small-fixture Walker snapshot is retained from 2026-08-19 for
-continuity. The current 53,600-file, multi-library Walker comparison is in the
-benchmark evidence document; lower is better.
+| Walker | Unscoped, 7,400 matches | Scoped, 2,600 matches |
+| --- | ---: | ---: |
+| Ferralk portable, 4 threads | 37.91 ms | 6.46 ms |
+| Ferralk macOS-native, 4 threads | 37.54 ms | **6.31 ms** |
+| zlob 1.6.3, 4 threads | **26.64 ms** | 29.19 ms |
+| Node.js `node:fs` sync | 286.49 ms | 31.51 ms |
+| `glob` 13.0.6 async | 48.56 ms | 8.08 ms |
+| `fast-glob` 3.3.3 async | 50.73 ms | 8.29 ms |
+| `tinyglobby` 0.2.17 async | 47.34 ms | 8.21 ms |
+| `fdir` 6.5.0 + `picomatch` async | 47.08 ms | 42.09 ms |
 
-| Walker | Time |
-| --- | ---: |
-| Ferralk serial | 1.48 ms |
-| Ferralk parallel | 0.99 ms |
-| `ignore` parallel | 3.00 ms |
-| zlob parallel | 0.86 ms |
-
-Ferralk parallel is about 3× faster than `ignore` on this fixture, while zlob
-is about 1.15× faster than Ferralk. That ordering is fixture-dependent: on a
-5120-file tree the wall-time lane measures `ignore` parallel level with Ferralk
-on Linux and behind it on macOS. Treat any single row as one shape, and see
-[benchmark evidence](docs/benchmark-evidence.md) for the lanes that carry the
-broader picture.
+The Rust walker rows are Criterion point estimates; the Node.js rows are
+medians of ten order-rotated samples. The APIs and estimators are not identical,
+so these are same-host context rather than a universal ranking. See
+[benchmark evidence](docs/benchmark-evidence.md) for the complete tables,
+exact commands, sampling details, semantic differences, and limitations.
 
 For the same comparison on real repositories instead of fixtures — including the
 `ignore`-with-hand-pruning arm the RFC's question really turns on — see

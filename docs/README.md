@@ -10,7 +10,7 @@ working examples. This directory contains the durable technical record.
 | [Compatibility guide](compatibility-guide.md) | Migrating supported zlob 1.6.3 behaviour to the Ferralk API. |
 | [Compatibility matrix](compatibility-matrix.md) | A precise capability-by-capability status. |
 | [Corpus format](corpus-format.md) | Maintaining or reviewing JSONL behavioural cases. |
-| [Benchmark evidence](benchmark-evidence.md) | What is measured, how to reproduce it, and how ferralk compares with `globset`, `fast-glob`, `ignore` and zlob. |
+| [Benchmark evidence](benchmark-evidence.md) | What is measured, how to reproduce it, what scoped queries mean, and how ferralk compares with Rust, Node.js, and zlob libraries. |
 | [Palamedes adoption](palamedes-adoption.md) | A consumer integration measured over four releases on two real repositories, and which finding produced which change here. |
 | [Deferred follow-up](external-release-gates.md) | Open work tracked in GitHub after the initial release. |
 | [ADRs](adr/README.md) | Accepted architectural decisions and their consequences. |

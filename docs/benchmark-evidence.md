@@ -120,7 +120,7 @@ measurement was made against a different codebase on different hardware and was
 never re-runnable. [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs)
 rebuilds the *shape* so the comparison can be repeated: 53,600 files, 2,600 of
 them TypeScript sources under `src/` and `packages/`, the rest a `node_modules`
-tree of 400 packages, some nesting their own dependencies.
+tree of 400 top-level packages and 200 nested dependency packages.
 
 Absolute numbers are not comparable with the RFC's; the ratios between engines
 on one host are.
@@ -132,7 +132,11 @@ and then measured against it over four releases. See
 [Palamedes adoption](palamedes-adoption.md).
 
 Every arm is run once before timing and has to return the same file count, so no
-arm can be fast by finding less. Unscoped finds 7,400 files, scoped 2,600.
+arm can be fast by finding less. The **unscoped** query can match anywhere and
+must inspect the whole tree; it finds 7,400 files. The **scoped** query names
+`src` and `packages` as its only possible roots, so a pattern-aware walker can
+skip `node_modules`; it finds 2,600 files. Here, scoped describes the query's
+root constraint, not a benchmark or process isolation boundary.
 
 ### `**/*.{ts,tsx}` — nothing can be pruned
 
@@ -215,7 +219,7 @@ once outside their match loop.
 | Node toolchain | Node.js 24.19.0, npm 11.17.0; exact dependency versions are locked in `tools/bench/node/package-lock.json` |
 | Threads | 4 for every parallel ferralk, `ignore`, and `jwalk` arm |
 | Cache | Warm: the fixture is written immediately before the measurement and then reused by all arms in that invocation |
-| Fixture | 53,600 files, 2,600 TypeScript sources under `src/` and `packages/`, and 400 dependency packages under `node_modules/` |
+| Fixture | 53,600 files, 2,600 TypeScript sources under `src/` and `packages/`, plus 400 top-level and 200 nested dependency packages under `node_modules/` |
 
 The complete refresh used these commands. `+stable` selects the installed 1.96.0
 toolchain explicitly because this host's default nightly predates the workspace
