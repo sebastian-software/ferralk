@@ -233,7 +233,7 @@ impl SweepEngine {
         };
 
         let mut state = self.initial;
-        let mut at_component_start = true;
+        let mut at_component_start = options.candidate_starts_component;
         for &byte in path {
             let separator = is_separator(byte);
             let mut mask = self.table[usize::from(byte)];
