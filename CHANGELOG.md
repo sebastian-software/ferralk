@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.7.0](https://github.com/sebastian-software/ferralk/compare/v0.6.1...v0.7.0) (2026-08-27)
+
+
+### Features
+
+* bridge walker paths to byte matchers ([#147](https://github.com/sebastian-software/ferralk/issues/147)) ([82e8dc7](https://github.com/sebastian-software/ferralk/commit/82e8dc79e2a3015bd8356b17137f18ab5800d724))
+
+
+### Bug Fixes
+
+* align Git ignore repository semantics ([#144](https://github.com/sebastian-software/ferralk/issues/144)) ([71e7622](https://github.com/sebastian-software/ferralk/commit/71e762223e5da08bfde35c8f25450d475f558eb0))
+* align gitignore byte parsing and fuzz matching ([#143](https://github.com/sebastian-software/ferralk/issues/143)) ([6e9d83e](https://github.com/sebastian-software/ferralk/commit/6e9d83e680a3e529763c9e2e6ba383fb68a90a96))
+* harden native directory backend contracts ([#146](https://github.com/sebastian-software/ferralk/issues/146)) ([6da4add](https://github.com/sebastian-software/ferralk/commit/6da4add1691d9b53cdd4979c1e3fc65ede7fa48f))
+* isolate parallel walker shutdown ([#145](https://github.com/sebastian-software/ferralk/issues/145)) ([cdcb1c9](https://github.com/sebastian-software/ferralk/commit/cdcb1c9ed57bbae000ed1afee7f4a8b340493106))
+* memoize extglob repetition states ([#141](https://github.com/sebastian-software/ferralk/issues/141)) ([068927c](https://github.com/sebastian-software/ferralk/commit/068927cb2ae2043f1769c817997756ec7fd529a2))
+
 ## [0.6.1](https://github.com/sebastian-software/ferralk/compare/v0.6.0...v0.6.1) (2026-08-26)
 
 
