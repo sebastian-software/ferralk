@@ -13,7 +13,13 @@
 //! `test/test_fnmatch.zig`. Deliberate differences live in
 //! the checked-in corpus and compatibility matrix.
 
-use std::{cell::RefCell, collections::HashSet, error::Error, fmt, ops::RangeInclusive};
+use std::{
+    cell::RefCell,
+    collections::HashSet,
+    error::Error,
+    fmt,
+    ops::{Range, RangeInclusive},
+};
 
 use memchr::{memchr, memchr2, memchr3, memmem};
 
@@ -26,6 +32,7 @@ use sweep::SweepEngine;
 pub struct Pattern {
     alternatives: Vec<CompiledAlternative>,
     path_filter_alternatives: Option<Vec<CompiledAlternative>>,
+    parsed_path_component_ranges: Vec<Range<usize>>,
     options: PatternOptions,
 }
 
@@ -178,7 +185,22 @@ impl Pattern {
         pattern: impl AsRef<[u8]>,
         options: PatternOptions,
     ) -> Result<Self, PatternError> {
-        Self::compile_within(pattern.as_ref(), options, &mut IrBudget::new())
+        let pattern = pattern.as_ref();
+        let mut compiled = Self::compile_within(pattern, options, &mut IrBudget::new())?;
+        compiled.parsed_path_component_ranges = parsed_path_component_ranges(pattern, options)?;
+        Ok(compiled)
+    }
+
+    /// Byte ranges of slash-delimited components in the source expression.
+    ///
+    /// The ranges refer to the bytes passed to [`Pattern::compile`]. They are
+    /// found by the same class, brace, extglob, and escape grammar used to
+    /// compile the pattern, so an embedding layer can impose a path policy
+    /// without reparsing glob syntax itself.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn parsed_path_component_ranges(&self) -> &[Range<usize>] {
+        &self.parsed_path_component_ranges
     }
 
     /// The compile every alternative shares, carrying the budget that bounds
@@ -589,6 +611,7 @@ impl Pattern {
         Ok(Self {
             alternatives,
             path_filter_alternatives,
+            parsed_path_component_ranges: Vec::new(),
             options,
         })
     }
@@ -2106,6 +2129,56 @@ fn parse_class(
     })
 }
 
+/// Finds slash components outside the syntax constructs the compiler owns.
+///
+/// This is deliberately adjacent to, and calls, the parser helpers rather
+/// than reimplementing their delimiters in a consumer. Brace expansion runs
+/// before character-class parsing, so a raw `}` closes a brace even when it
+/// appears in text that a later class parser would otherwise consume. Extglob
+/// groups likewise use their raw parenthesis matcher before compiling an arm.
+/// Character classes are consulted only after those group openers, matching
+/// the ordinary token compiler.
+fn parsed_path_component_ranges(
+    pattern: &[u8],
+    options: PatternOptions,
+) -> Result<Vec<Range<usize>>, PatternError> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < pattern.len() {
+        if pattern[index] == b'\\' && options.escape {
+            index += 2;
+            continue;
+        }
+        if options.braces
+            && pattern[index] == b'{'
+            && let Some(close) = matching_brace(pattern, index, options.escape)
+        {
+            index = close + 1;
+            continue;
+        }
+        if pattern[index] == b'[' {
+            let (_, next) = parse_class(pattern, index, options.escape)?;
+            index = next;
+            continue;
+        }
+        if options.extglob
+            && detect_extglob_at(pattern, index).is_some()
+            && let Some(close) = closing_extglob_parenthesis(pattern, index + 1, options.escape)
+        {
+            index = close + 1;
+            continue;
+        }
+        if pattern[index] == b'/' {
+            ranges.push(start..index);
+            start = index + 1;
+        }
+        index += 1;
+    }
+    ranges.push(start..pattern.len());
+    Ok(ranges)
+}
+
 fn parse_posix_class(name: &[u8]) -> Option<PosixClass> {
     match name {
         b"alnum" => Some(PosixClass::Alnum),
@@ -3449,6 +3522,68 @@ mod tests {
         assert!(compile("[[:digit:]]").is_match("7"));
         assert!(compile("[[:word:]]").is_match("_"));
         assert!(compile("[![:space:]]").is_match("x"));
+    }
+
+    #[test]
+    fn parsed_path_component_ranges_share_the_compiler_grammar() {
+        let options = PatternOptions::default().braces(true).extglob(true);
+        fn components(source: &str, options: PatternOptions) -> Vec<&str> {
+            let pattern = Pattern::compile(source, options).expect("review pattern compiles");
+            pattern
+                .parsed_path_component_ranges()
+                .iter()
+                .map(|range| &source[range.clone()])
+                .collect()
+        }
+
+        let posix = Pattern::compile("src/[[:alpha:]/../].rs", options).unwrap();
+        assert!(posix.is_match("src/a.rs"));
+        assert_eq!(
+            components("src/[[:alpha:]/../].rs", options),
+            ["src", "[[:alpha:]/../].rs"]
+        );
+
+        let leading_bracket = Pattern::compile("src/[]/../].rs", options).unwrap();
+        assert!(leading_bracket.is_match("src/].rs"));
+        assert_eq!(components("src/[]/../].rs", options), ["src", "[]/../].rs"]);
+
+        // A proper group hides its alternatives, including a dead `..` arm.
+        assert_eq!(
+            components("{dead/../branch,src/main.rs}", options),
+            ["{dead/../branch,src/main.rs}"]
+        );
+        assert_eq!(
+            components("@(dead/../branch|src/main.rs)", options),
+            ["@(dead/../branch|src/main.rs)"]
+        );
+        assert_eq!(
+            components("{dead/{nested/../branch},src/main.rs}", options),
+            ["{dead/{nested/../branch},src/main.rs}"]
+        );
+        assert_eq!(
+            components("@(dead/@(nested/../branch)|src/main.rs)", options),
+            ["@(dead/@(nested/../branch)|src/main.rs)"]
+        );
+        assert_eq!(
+            components(r"dead\/../branch", options),
+            [r"dead\/..", "branch"]
+        );
+
+        // Brace and extglob close on their raw delimiters, even where a
+        // later character-class parse would read that delimiter as a member.
+        // The following `..` is therefore a real top-level component.
+        for source in [
+            "{dead/[}]]/../x,src/main.rs}",
+            "@(dead/[)]]/../x|src/main.rs)",
+        ] {
+            let pattern = Pattern::compile(source, options).expect("review pattern compiles");
+            assert!(
+                pattern
+                    .parsed_path_component_ranges()
+                    .iter()
+                    .any(|range| &source[range.clone()] == "..")
+            );
+        }
     }
 
     #[test]
