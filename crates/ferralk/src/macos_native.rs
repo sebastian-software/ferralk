@@ -623,9 +623,13 @@ fn read_direntries_from_open_directory(
     listing.clear();
     loop {
         let byte_count = loop {
+            clear_direntries_eof_tail(buffer);
             // SAFETY: `buffer` is owned, writable, and lives through the call;
             // its length is passed verbatim. `base` is a valid mutable u64, and
             // `directory` owns the open descriptor for the duration of reads.
+            // The extended EOF tail is reset immediately before every call so
+            // pre-10.15 kernels, which never write that extension, cannot
+            // leave a stale bit claiming EOF.
             let byte_count = unsafe {
                 __getdirentries64(
                     directory.as_raw_fd(),
@@ -797,6 +801,18 @@ fn has_direntries_eof_flag(buffer: &[u8]) -> bool {
     u32::from_ne_bytes(tail.try_into().expect("tail has u32 width")) & GETDIRENTRIES64_EOF != 0
 }
 
+/// Clears exactly XNU's optional extended EOF word before a syscall that may
+/// expose it. Older kernels leave this out-of-band word untouched, so zero is
+/// the conservative "no EOF" value while supported kernels retain their fast
+/// final-batch signal.
+fn clear_direntries_eof_tail(buffer: &mut [u8]) {
+    if buffer.len() < GETDIRENTRIES64_EXTENDED_BUFFER_MINIMUM {
+        return;
+    }
+    let tail_start = buffer.len() - std::mem::size_of::<u32>();
+    buffer[tail_start..].fill(0);
+}
+
 fn malformed_record() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -821,11 +837,12 @@ mod tests {
     use super::{
         ATTR_CMN_ERROR, ATTR_CMN_NAME, ATTR_CMN_OBJTYPE, ATTR_CMN_RETURNED_ATTRS,
         ATTRIBUTE_RECORD_HEADER_SIZE, BUFFER_SIZE, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG,
-        DT_SOCK, Listing, NAME_OFFSET, NativeDirectoryReadError, VBLK, VCHR, VDIR, VFIFO, VSOCK,
-        bulk_entry_kind, entry_kind, for_each_record, has_direntries_eof_flag,
-        is_unsupported_bulk_error, is_unsupported_direntries_error, open_directory,
-        parse_bulk_record, parse_records, parse_records_with_entry_kind, read_bulk_directory,
-        read_directory, read_direntries_directory, read_open_directory_with_portable_fallback,
+        DT_SOCK, GETDIRENTRIES64_EOF, Listing, NAME_OFFSET, NativeDirectoryReadError, VBLK, VCHR,
+        VDIR, VFIFO, VSOCK, bulk_entry_kind, clear_direntries_eof_tail, entry_kind,
+        for_each_record, has_direntries_eof_flag, is_unsupported_bulk_error,
+        is_unsupported_direntries_error, open_directory, parse_bulk_record, parse_records,
+        parse_records_with_entry_kind, read_bulk_directory, read_directory,
+        read_direntries_directory, read_open_directory_with_portable_fallback,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -1289,6 +1306,35 @@ mod tests {
         assert_eq!(listing.entries()[0].name(), "entry");
         assert!(has_direntries_eof_flag(&buffer));
         assert!(!has_direntries_eof_flag(&buffer[..1023]));
+    }
+
+    #[test]
+    fn direntries_nonwriting_extended_tail_cannot_end_a_full_batch_early() {
+        // Simulate a pre-10.15 successful syscall: it fills every returned
+        // dirent byte but does not know about, and therefore does not touch,
+        // the optional EOF word at the end of the extended buffer.
+        let mut buffer = vec![0_u8; 1040];
+        let record = record(b"entry", DT_REG);
+        let byte_count = buffer.len() - std::mem::size_of::<u32>();
+        assert_eq!(byte_count % record.len(), 0, "the mock fills a whole batch");
+        buffer[byte_count..].copy_from_slice(&GETDIRENTRIES64_EOF.to_ne_bytes());
+
+        // This is the pre-syscall operation in
+        // `read_direntries_from_open_directory`; the mocked syscall below
+        // deliberately leaves the tail unchanged.
+        clear_direntries_eof_tail(&mut buffer);
+        for slot in buffer[..byte_count].chunks_exact_mut(record.len()) {
+            slot.copy_from_slice(&record);
+        }
+
+        let mut listing = Listing::default();
+        parse_records(Path::new("/tmp"), &buffer[..byte_count], &mut listing)
+            .expect("all returned records still parse");
+        assert_eq!(listing.entries().len(), byte_count / record.len());
+        assert!(
+            !has_direntries_eof_flag(&buffer),
+            "a kernel that does not write the extension means no EOF"
+        );
     }
 
     #[test]
