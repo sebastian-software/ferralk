@@ -1,6 +1,7 @@
 [package]
 name = "ferralk-glob"
 description = "Portable, byte-first glob matching for ferralk."
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

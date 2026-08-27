@@ -8,6 +8,7 @@ on:
     # Surface new RustSec advisories in quiet phases. Only the audit job runs
     # on this trigger; every other job is guarded below.
     - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -111,6 +112,44 @@ jobs:
           cargo check -p ferralk -p bench
           --features ferralk/native-linux,bench/native-linux
           --all-targets --locked
+
+  msrv-policy:
+    name: MSRV stable-minus-two policy
+    # Fetching release metadata is intentionally kept off ordinary pull
+    # requests: a network outage must not make deterministic CI flaky.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check the manifest against Rust stable
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 --retry-delay 5 --silent --show-error \
+            https://static.rust-lang.org/dist/channel-rust-stable.toml \
+            --output channel-rust-stable.toml
+
+          stable=$(awk '
+            $0 == "[pkg.rust]" { in_rust = 1; next }
+            /^\[/ { in_rust = 0 }
+            in_rust && $1 == "version" {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' channel-rust-stable.toml)
+          test -n "$stable"
+
+          IFS=. read -r major minor patch <<EOF
+          $stable
+          EOF
+          test "$major" = 1
+          test "$minor" -ge 2
+          expected="$major.$((minor - 2))"
+          declared=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          test -n "$declared"
+
+          echo "Rust stable is $stable; policy expects MSRV $expected."
+          test "$declared" = "$expected"
 
   semver:
     name: public API compatibility

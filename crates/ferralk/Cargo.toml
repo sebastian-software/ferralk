@@ -1,6 +1,7 @@
 [package]
 name = "ferralk"
 description = "Portable filesystem walking for ferralk."
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

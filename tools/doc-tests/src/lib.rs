@@ -7,6 +7,8 @@ const DOCUMENTS: &[&str] = &[
     "CONTRIBUTING.md",
     "README.md",
     "RFC-zig-free-zlob-port.md",
+    "crates/ferralk-glob/README.md",
+    "crates/ferralk/README.md",
     "docs/README.md",
     "docs/benchmark-evidence.md",
     "docs/usage.md",
@@ -38,7 +40,7 @@ const DOCUMENTS: &[&str] = &[
 ];
 
 #[cfg(test)]
-const EXPECTED_COMPILED_RUST_FENCES: usize = 14;
+const EXPECTED_COMPILED_RUST_FENCES: usize = 16;
 
 #[cfg(test)]
 struct FencePolicy {
@@ -71,6 +73,18 @@ const FENCE_POLICIES: &[FencePolicy] = &[
     FencePolicy {
         path: "RFC-zig-free-zlob-port.md",
         compiled_rust_fences: 3,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "crates/ferralk-glob/README.md",
+        compiled_rust_fences: 1,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "crates/ferralk/README.md",
+        compiled_rust_fences: 1,
         ignored_rust_fences: 0,
         intentional_text_fragments: &[],
     },
@@ -255,6 +269,12 @@ pub mod repository_readme {}
 
 #[doc = include_str!("../../../RFC-zig-free-zlob-port.md")]
 pub mod rfc {}
+
+#[doc = include_str!("../../../crates/ferralk-glob/README.md")]
+pub mod ferralk_glob_readme {}
+
+#[doc = include_str!("../../../crates/ferralk/README.md")]
+pub mod ferralk_readme {}
 
 #[doc = include_str!("../../../docs/README.md")]
 pub mod index {}
