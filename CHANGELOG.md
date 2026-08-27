@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.8.0](https://github.com/sebastian-software/ferralk/compare/v0.7.0...v0.8.0) (2026-08-27)
+
+
+### Features
+
+* add non-consuming walker pattern builders ([#153](https://github.com/sebastian-software/ferralk/issues/153)) ([e5b7534](https://github.com/sebastian-software/ferralk/commit/e5b7534016d556b9aaba3ad9bf9751341e5a9900))
+* document crates and maintain MSRV policy ([#151](https://github.com/sebastian-software/ferralk/issues/151)) ([15a3df2](https://github.com/sebastian-software/ferralk/commit/15a3df278b0ddcf4121c29878b9f0abdc36685d9))
+
+
+### Bug Fixes
+
+* align Git ignore filesystem adaptations ([#152](https://github.com/sebastian-software/ferralk/issues/152)) ([bf850e6](https://github.com/sebastian-software/ferralk/commit/bf850e6a25dbf79b56a0d70907b9126d230cb78d))
+* clarify walker root semantics ([#148](https://github.com/sebastian-software/ferralk/issues/148)) ([81d7ac2](https://github.com/sebastian-software/ferralk/commit/81d7ac2328a29e9c5607c73c9a0ea26750da3574))
+* scope symlink cycle guards per root ([#150](https://github.com/sebastian-software/ferralk/issues/150)) ([d609d53](https://github.com/sebastian-software/ferralk/commit/d609d539a7186056c6805d80f93ab7a99a555a8d))
+
 ## [0.7.0](https://github.com/sebastian-software/ferralk/compare/v0.6.1...v0.7.0) (2026-08-27)
 
 
