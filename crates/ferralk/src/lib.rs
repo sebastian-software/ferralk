@@ -1651,6 +1651,7 @@ impl Listing {
     }
 }
 
+#[cfg_attr(all(feature = "native-macos", target_os = "macos"), allow(dead_code))]
 struct StdBackend;
 
 impl DirectoryBackend for StdBackend {
@@ -1669,6 +1670,7 @@ impl DirectoryBackend for StdBackend {
 /// the path opened by the operating system; `reported_path` keeps deferred
 /// per-entry errors anchored at the caller's path when a native no-follow
 /// descriptor is exposed through `/dev/fd` for a safe fallback.
+#[cfg_attr(all(feature = "native-macos", target_os = "macos"), allow(dead_code))]
 fn read_portable_directory(
     directory: &Path,
     reported_path: &Path,
@@ -1734,6 +1736,7 @@ struct SystemBackend;
     all(feature = "native-macos", target_os = "macos"),
     all(feature = "native-linux", target_os = "linux")
 ))]
+#[cfg_attr(all(feature = "native-macos", target_os = "macos"), allow(dead_code))]
 fn read_native_or_portable(
     listing: &mut Listing,
     native: impl FnOnce(&mut Listing) -> std::io::Result<()>,
@@ -1756,20 +1759,14 @@ impl DirectoryBackend for SystemBackend {
     ) -> std::io::Result<()> {
         #[cfg(all(feature = "native-macos", target_os = "macos"))]
         {
-            read_native_or_portable(
-                listing,
-                |listing| macos_native::read_directory(path, refuse_final_symlink, listing),
-                |listing| {
-                    if refuse_final_symlink {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Unsupported,
-                            "native directory reader is unavailable and the portable fallback cannot preserve no-follow traversal",
-                        ))
-                    } else {
-                        StdBackend.read_directory(path, follow_symlinks, false, listing)
-                    }
-                },
-            )
+            // macOS performs its capability fallback inside the native module,
+            // where it still owns the protected directory descriptor. Keeping
+            // ordinary `Unsupported` I/O errors out of the generic adapter is
+            // essential: a DT_UNKNOWN stat may report that kind after a batch,
+            // and a path fallback would discard the usable siblings.
+            let _ = follow_symlinks;
+            macos_native::read_directory(path, refuse_final_symlink, listing)
+                .map_err(macos_native::NativeDirectoryReadError::into_io_error)
         }
         #[cfg(all(
             feature = "native-linux",

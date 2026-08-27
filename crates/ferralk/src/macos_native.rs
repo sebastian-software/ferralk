@@ -98,6 +98,35 @@ std::thread_local! {
     static DIRENTRIES_BUFFER: RefCell<Box<[u8; BUFFER_SIZE]>> = RefCell::new(Box::new([0; BUFFER_SIZE]));
 }
 
+/// Distinguishes a rejected private reader from an error while using it.
+///
+/// A capability result is produced only by `__getdirentries64` returning raw
+/// `EINVAL` or `ENOTSUP` before the first accepted batch. In particular, an
+/// entry's metadata error can also have `ErrorKind::Unsupported`, but its
+/// directory descriptor has already advanced and must never be reread through
+/// the portable stream.
+#[derive(Debug)]
+pub(super) enum NativeDirectoryReadError {
+    CapabilityUnavailable(io::Error),
+    Io(io::Error),
+}
+
+impl From<io::Error> for NativeDirectoryReadError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl NativeDirectoryReadError {
+    pub(super) fn into_io_error(self) -> io::Error {
+        match self {
+            Self::CapabilityUnavailable(error) | Self::Io(error) => error,
+        }
+    }
+}
+
+type NativeDirectoryReadResult = Result<(), NativeDirectoryReadError>;
+
 #[repr(C)]
 struct AttrList {
     bitmap_count: u16,
@@ -130,9 +159,10 @@ pub(super) fn read_directory(
     path: &Path,
     refuse_final_symlink: bool,
     listing: &mut Listing,
-) -> io::Result<()> {
+) -> NativeDirectoryReadResult {
     if NATIVE_UNSUPPORTED.load(Ordering::Relaxed) {
-        return read_portable_directory_from_path(path, refuse_final_symlink, listing);
+        read_portable_directory_from_path(path, refuse_final_symlink, listing)?;
+        return Ok(());
     }
     read_direntries_directory(path, refuse_final_symlink, listing)
 }
@@ -412,7 +442,7 @@ fn read_direntries_directory(
     path: &Path,
     refuse_final_symlink: bool,
     listing: &mut Listing,
-) -> io::Result<()> {
+) -> NativeDirectoryReadResult {
     DIRENTRIES_BUFFER.with(|buffer| {
         let mut buffer = buffer.borrow_mut();
         read_direntries_directory_with_buffer(path, refuse_final_symlink, &mut buffer[..], listing)
@@ -424,7 +454,7 @@ fn read_direntries_directory_with_buffer(
     refuse_final_symlink: bool,
     buffer: &mut [u8],
     listing: &mut Listing,
-) -> io::Result<()> {
+) -> NativeDirectoryReadResult {
     let used_portable_fallback = read_open_directory_with_portable_fallback(
         path,
         refuse_final_symlink,
@@ -449,12 +479,12 @@ fn read_open_directory_with_portable_fallback(
     refuse_final_symlink: bool,
     buffer: &mut [u8],
     listing: &mut Listing,
-    native: impl FnOnce(&File, &Path, &mut [u8], &mut Listing) -> io::Result<()>,
-) -> io::Result<bool> {
+    native: impl FnOnce(&File, &Path, &mut [u8], &mut Listing) -> NativeDirectoryReadResult,
+) -> Result<bool, NativeDirectoryReadError> {
     let directory = open_directory(path, refuse_final_symlink)?;
     match native(&directory, path, buffer, listing) {
         Ok(()) => Ok(false),
-        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+        Err(NativeDirectoryReadError::CapabilityUnavailable(_)) => {
             read_portable_directory_from_open_file(directory, path, listing)?;
             Ok(true)
         }
@@ -587,7 +617,7 @@ fn read_direntries_from_open_directory(
     path: &Path,
     buffer: &mut [u8],
     listing: &mut Listing,
-) -> io::Result<()> {
+) -> NativeDirectoryReadResult {
     let mut base = 0_u64;
     let mut primed = false;
     listing.clear();
@@ -610,9 +640,9 @@ fn read_direntries_from_open_directory(
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
                 if is_unsupported_direntries_error(&error, primed) {
-                    return Err(io::Error::new(io::ErrorKind::Unsupported, error));
+                    return Err(NativeDirectoryReadError::CapabilityUnavailable(error));
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
         if byte_count == 0 {
@@ -634,9 +664,18 @@ fn malformed_bulk_record() -> io::Error {
 }
 
 fn parse_records(directory: &Path, records: &[u8], listing: &mut Listing) -> io::Result<()> {
+    parse_records_with_entry_kind(directory, records, listing, entry_kind)
+}
+
+fn parse_records_with_entry_kind(
+    directory: &Path,
+    records: &[u8],
+    listing: &mut Listing,
+    mut classify: impl FnMut(&Path, &OsStr, u8) -> io::Result<Option<(bool, bool)>>,
+) -> io::Result<()> {
     for_each_record(records, |name, directory_type| {
         let name = OsStr::from_bytes(name);
-        match entry_kind(directory, name, directory_type) {
+        match classify(directory, name, directory_type) {
             Ok(Some((is_dir, is_symlink))) => listing.push(name, is_dir, is_symlink),
             Ok(None) => {}
             Err(error) => defer_entry_stat_error(listing, directory.join(name), error)?,
@@ -782,11 +821,11 @@ mod tests {
     use super::{
         ATTR_CMN_ERROR, ATTR_CMN_NAME, ATTR_CMN_OBJTYPE, ATTR_CMN_RETURNED_ATTRS,
         ATTRIBUTE_RECORD_HEADER_SIZE, BUFFER_SIZE, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG,
-        DT_SOCK, Listing, NAME_OFFSET, VBLK, VCHR, VDIR, VFIFO, VSOCK, bulk_entry_kind, entry_kind,
-        for_each_record, has_direntries_eof_flag, is_unsupported_bulk_error,
-        is_unsupported_direntries_error, open_directory, parse_bulk_record, parse_records,
-        read_bulk_directory, read_directory, read_direntries_directory,
-        read_open_directory_with_portable_fallback,
+        DT_SOCK, Listing, NAME_OFFSET, NativeDirectoryReadError, VBLK, VCHR, VDIR, VFIFO, VSOCK,
+        bulk_entry_kind, entry_kind, for_each_record, has_direntries_eof_flag,
+        is_unsupported_bulk_error, is_unsupported_direntries_error, open_directory,
+        parse_bulk_record, parse_records, parse_records_with_entry_kind, read_bulk_directory,
+        read_directory, read_direntries_directory, read_open_directory_with_portable_fallback,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -1055,7 +1094,9 @@ mod tests {
                 // still enumerates the opened subtree.
                 fs::rename(&descendant, &moved).expect("move opened directory");
                 symlink(&target, &descendant).expect("replace path with a link");
-                Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+                Err(NativeDirectoryReadError::CapabilityUnavailable(
+                    std::io::Error::from_raw_os_error(45),
+                ))
             },
         )
         .expect("unsupported native read degrades through the descriptor");
@@ -1067,6 +1108,56 @@ mod tests {
             "the fallback never reopens the swapped path"
         );
         fs::remove_dir_all(root).expect("remove descriptor fallback fixture");
+    }
+
+    #[test]
+    fn entry_unsupported_after_a_batch_never_restarts_the_descriptor_reader() {
+        let root = fixture_root("entry-unsupported-after-batch");
+        fs::create_dir_all(&root).expect("create fixture directory");
+        fs::write(root.join("from-portable-fallback"), b"fixture")
+            .expect("write portable fallback marker");
+        let mut records = record(b"sibling", DT_REG);
+        records.extend(record(b"unknown", 0));
+
+        let mut buffer = vec![0_u8; BUFFER_SIZE];
+        let mut listing = Listing::default();
+        let error = read_open_directory_with_portable_fallback(
+            &root,
+            true,
+            &mut buffer,
+            &mut listing,
+            |_, path, _, listing| {
+                // This models a native call that accepted `records` as its
+                // first batch. The DT_UNKNOWN classification then reports an
+                // ordinary metadata Unsupported error, which is not a reader
+                // capability signal even though it has the same ErrorKind.
+                listing.clear();
+                parse_records_with_entry_kind(path, &records, listing, |_, _, directory_type| {
+                    if directory_type == 0 {
+                        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+                    } else {
+                        Ok(Some((false, false)))
+                    }
+                })?;
+                Ok(())
+            },
+        )
+        .expect_err("an entry metadata error is not a capability fallback");
+
+        assert_eq!(
+            error.into_io_error().kind(),
+            std::io::ErrorKind::Unsupported,
+            "the entry failure still reaches the walker error policy"
+        );
+        assert!(
+            listing.contains("sibling"),
+            "the accepted batch is retained"
+        );
+        assert!(
+            !listing.contains("from-portable-fallback"),
+            "the advanced descriptor was never resumed through fdopendir"
+        );
+        fs::remove_dir_all(root).expect("remove fixture directory");
     }
 
     #[test]
