@@ -43,6 +43,12 @@ pub struct PatternOptions {
     escape: bool,
     component_wildcards: bool,
     root_component_wildcards: bool,
+    /// Whether byte zero of this candidate starts a path component.
+    ///
+    /// Extglob alternatives borrow a range from their enclosing candidate.
+    /// The range can start in the middle of a component, where a leading dot
+    /// is an ordinary byte rather than a hidden-name marker.
+    candidate_starts_component: bool,
 }
 
 impl Default for PatternOptions {
@@ -56,6 +62,7 @@ impl Default for PatternOptions {
             escape: true,
             component_wildcards: false,
             root_component_wildcards: false,
+            candidate_starts_component: true,
         }
     }
 }
@@ -897,7 +904,9 @@ impl Pattern {
         let &byte = path.get(path_index)?;
         (accepts(byte)
             && (!Self::component_wildcard(tokens, token_index, options) || !is_separator(byte))
-            && (options.match_hidden || byte != b'.' || !at_component_start(path, path_index)))
+            && (options.match_hidden
+                || byte != b'.'
+                || !at_component_start(path, path_index, options)))
         .then_some((token_index + 1, path_index + 1))
     }
 
@@ -1277,7 +1286,7 @@ fn star_consumes_byte(
     recursive: bool,
 ) -> bool {
     (recursive || !options.component_wildcards || !is_separator(byte))
-        && (options.match_hidden || byte != b'.' || !at_component_start(path, path_index))
+        && (options.match_hidden || byte != b'.' || !at_component_start(path, path_index, options))
 }
 
 /// First index at or after `path_index` that a star may not consume.
@@ -1301,6 +1310,7 @@ fn star_barrier(
         barrier = barrier.min(next_component_dot(
             path,
             path_index,
+            options.candidate_starts_component,
             &mut scans.component_dot,
         ));
     }
@@ -1383,11 +1393,16 @@ fn next_separator(bytes: &[u8]) -> Option<usize> {
 ///
 /// Past index 0 a component starts exactly after a separator, so the blocked
 /// positions are the dots that directly follow one.
-fn next_component_dot(path: &[u8], index: usize, cache: &mut FirstAtOrAfter) -> usize {
+fn next_component_dot(
+    path: &[u8],
+    index: usize,
+    candidate_starts_component: bool,
+    cache: &mut FirstAtOrAfter,
+) -> usize {
     if let Some(found) = cache.get(index) {
         return found;
     }
-    if index == 0 && path.first() == Some(&b'.') {
+    if index == 0 && candidate_starts_component && path.first() == Some(&b'.') {
         return cache.record(0, 0);
     }
     let start = index.saturating_sub(1);
@@ -1811,7 +1826,7 @@ impl FastPath {
                             }
                             if !options.match_hidden
                                 && byte == b'.'
-                                && at_component_start(path, path_index)
+                                && at_component_start(path, path_index, options)
                             {
                                 return false;
                             }
@@ -1826,7 +1841,7 @@ impl FastPath {
                                 || !class.matches(byte, options.case_insensitive)
                                 || (!options.match_hidden
                                     && byte == b'.'
-                                    && at_component_start(path, path_index))
+                                    && at_component_start(path, path_index, options))
                             {
                                 return false;
                             }
@@ -1841,7 +1856,13 @@ impl FastPath {
                 path_index == path.len()
             }
             Self::Star => {
-                options.match_hidden || !contains_hidden_component_in(path, 0, path.len())
+                options.match_hidden
+                    || !contains_hidden_component_in(
+                        path,
+                        0,
+                        path.len(),
+                        options.candidate_starts_component,
+                    )
             }
             Self::PrefixStar { prefix } => {
                 let Some(variable) = strip_literal_prefix(path, prefix, options.case_insensitive)
@@ -1849,14 +1870,25 @@ impl FastPath {
                     return false;
                 };
                 options.match_hidden
-                    || !contains_hidden_component_in(path, path.len() - variable.len(), path.len())
+                    || !contains_hidden_component_in(
+                        path,
+                        path.len() - variable.len(),
+                        path.len(),
+                        options.candidate_starts_component,
+                    )
             }
             Self::StarSuffix { suffix } => {
                 let Some(variable) = strip_literal_suffix(path, suffix, options.case_insensitive)
                 else {
                     return false;
                 };
-                options.match_hidden || !contains_hidden_component_in(path, 0, variable.len())
+                options.match_hidden
+                    || !contains_hidden_component_in(
+                        path,
+                        0,
+                        variable.len(),
+                        options.candidate_starts_component,
+                    )
             }
             Self::InfixStar { prefix, suffix } => {
                 let Some(remainder) = strip_literal_prefix(path, prefix, options.case_insensitive)
@@ -1874,6 +1906,7 @@ impl FastPath {
                         path,
                         variable_start,
                         variable_start + variable.len(),
+                        options.candidate_starts_component,
                     )
             }
             Self::StaticStar { prefix, suffix } => {
@@ -1887,7 +1920,12 @@ impl FastPath {
                     return false;
                 }
                 options.match_hidden
-                    || !contains_hidden_component_in(path, variable_start, variable_end)
+                    || !contains_hidden_component_in(
+                        path,
+                        variable_start,
+                        variable_end,
+                        options.candidate_starts_component,
+                    )
             }
             Self::RecursiveTerminalPrefix { prefix } => {
                 let Some(remainder) = strip_literal_prefix(path, prefix, options.case_insensitive)
@@ -1901,6 +1939,7 @@ impl FastPath {
                                 path,
                                 path.len() - remainder.len() + 1,
                                 path.len(),
+                                options.candidate_starts_component,
                             ))
             }
             Self::RecursivePrefixSuffix {
@@ -1938,6 +1977,7 @@ impl FastPath {
                         path,
                         variable_start,
                         variable_start + variable.len(),
+                        options.candidate_starts_component,
                     )
             }
         }
@@ -2025,14 +2065,21 @@ fn strip_literal_suffix<'a>(
         .then_some(&path[..start])
 }
 
-fn contains_hidden_component_in(path: &[u8], start: usize, end: usize) -> bool {
+fn contains_hidden_component_in(
+    path: &[u8],
+    start: usize,
+    end: usize,
+    candidate_starts_component: bool,
+) -> bool {
     let Some(segment) = path.get(start..end) else {
         return false;
     };
     let mut offset = start;
     while let Some(found) = memchr(b'.', &segment[offset - start..]) {
         let index = offset + found;
-        if index == 0 || is_separator(path[index - 1]) {
+        if (index == 0 && candidate_starts_component)
+            || (index > 0 && is_separator(path[index - 1]))
+        {
             return true;
         }
         offset = index + 1;
@@ -3267,8 +3314,9 @@ fn is_separator(byte: u8) -> bool {
     byte == b'/' || (cfg!(windows) && byte == b'\\')
 }
 
-fn at_component_start(path: &[u8], index: usize) -> bool {
-    index == 0 || path.get(index - 1).is_some_and(|byte| is_separator(*byte))
+fn at_component_start(path: &[u8], index: usize, options: PatternOptions) -> bool {
+    (index == 0 && options.candidate_starts_component)
+        || (index > 0 && path.get(index - 1).is_some_and(|byte| is_separator(*byte)))
 }
 
 fn bytes_equal(expected: u8, actual: u8, case_insensitive: bool) -> bool {
@@ -3307,6 +3355,11 @@ enum ExtglobKind {
 struct CompiledExtglob {
     steps: Vec<ExtglobStep>,
     groups: Vec<ExtglobGroup>,
+    /// Dense memo state for every interpreter offset that participates in the
+    /// recurrence: the entry point plus each group start and continuation.
+    /// The byte-indexed step table remains the interpreter's address space.
+    memo_state_indices: Vec<usize>,
+    memo_state_count: usize,
     /// Original-source byte offsets for `steps`, retained after brace
     /// expansion so walker diagnostics preserve `PatternError` provenance.
     walker_source_provenance: Option<SourceProvenance>,
@@ -3414,9 +3467,24 @@ fn compile_extglob(
         }
         steps[index] = step;
     }
+    let mut memo_state_indices = vec![usize::MAX; pattern.len() + 1];
+    let mut memo_state_count = 0;
+    let mut add_memo_state = |offset| {
+        if memo_state_indices[offset] == usize::MAX {
+            memo_state_indices[offset] = memo_state_count;
+            memo_state_count += 1;
+        }
+    };
+    add_memo_state(0);
+    for group in &groups {
+        add_memo_state(group.start);
+        add_memo_state(group.rest);
+    }
     Ok(Some(CompiledExtglob {
         steps,
         groups,
+        memo_state_indices,
+        memo_state_count,
         walker_source_provenance: walker_source_provenance.cloned(),
         leading_dot_is_normalized,
     }))
@@ -3634,9 +3702,10 @@ fn split_extglob_alternatives(content: &[u8], escapes: bool) -> Vec<std::ops::Ra
 struct ExtglobScratch {
     /// One visited-position frame per repetition in flight.
     visited: Vec<u64>,
-    /// Program/path states explored by this match. Kept sparse so a large
-    /// pattern and candidate do not allocate their full Cartesian product.
-    failed: HashSet<(usize, usize)>,
+    /// Program/path states explored by this match, one bit each. Only the
+    /// interpreter offsets reachable through extglob recursion receive a
+    /// dense row, so this is O(groups x candidate length) bits.
+    failed: Vec<u64>,
     /// Deferred continuation positions, partitioned by active repetition
     /// calls so sequential groups reuse one allocation without sharing work.
     repeated: Vec<usize>,
@@ -3645,7 +3714,7 @@ struct ExtglobScratch {
 /// Borrows the extglob scratch buffers for one match.
 struct ExtglobMatchState<'scratch> {
     visited: &'scratch mut Vec<u64>,
-    failed: &'scratch mut HashSet<(usize, usize)>,
+    failed: ExtglobFailedStates<'scratch>,
     repeated: &'scratch mut Vec<usize>,
 }
 
@@ -3673,7 +3742,7 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                 repeated.clear();
                 let mut state = ExtglobMatchState {
                     visited,
-                    failed,
+                    failed: ExtglobFailedStates::new(program, path, failed),
                     repeated,
                 };
                 match_extglob_from(program, path, 0, 0, options, &mut state)
@@ -3682,9 +3751,11 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
             if scratch.visited.capacity() > RETAINED_SCRATCH_WORDS {
                 scratch.visited.shrink_to(RETAINED_SCRATCH_WORDS);
             }
+            scratch.failed.clear();
             if scratch.failed.capacity() > RETAINED_SCRATCH_WORDS {
                 scratch.failed.shrink_to(RETAINED_SCRATCH_WORDS);
             }
+            scratch.repeated.clear();
             if scratch.repeated.capacity() > RETAINED_SCRATCH_WORDS {
                 scratch.repeated.shrink_to(RETAINED_SCRATCH_WORDS);
             }
@@ -3699,7 +3770,7 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
             } = &mut scratch;
             let mut state = ExtglobMatchState {
                 visited,
-                failed,
+                failed: ExtglobFailedStates::new(program, path, failed),
                 repeated,
             };
             match_extglob_from(program, path, 0, 0, options, &mut state)
@@ -3711,6 +3782,63 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
 #[cfg(test)]
 fn extglob_visited_capacity() -> usize {
     EXTGLOB_SCRATCH.with(|cell| cell.borrow().visited.capacity())
+}
+
+/// Scratch capacities after an extglob match, used to keep the retained
+/// thread-local allocation bounded without relying on process RSS.
+#[cfg(test)]
+fn extglob_scratch_capacities() -> (usize, usize, usize) {
+    EXTGLOB_SCRATCH.with(|cell| {
+        let scratch = cell.borrow();
+        (
+            scratch.visited.capacity(),
+            scratch.failed.capacity(),
+            scratch.repeated.capacity(),
+        )
+    })
+}
+
+#[cfg(test)]
+fn extglob_failed_len() -> usize {
+    EXTGLOB_SCRATCH.with(|cell| cell.borrow().failed.len())
+}
+
+/// A dense bitset over the extglob interpreter states and candidate offsets.
+struct ExtglobFailedStates<'scratch> {
+    width: usize,
+    states: &'scratch mut [u64],
+}
+
+impl<'scratch> ExtglobFailedStates<'scratch> {
+    fn new(program: &CompiledExtglob, path: &[u8], scratch: &'scratch mut Vec<u64>) -> Self {
+        let width = path.len() + 1;
+        let words = Self::required_words(program, path.len());
+        if scratch.len() < words {
+            scratch.resize(words, 0);
+        }
+        let states = &mut scratch[..words];
+        states.fill(0);
+        Self { width, states }
+    }
+
+    fn required_words(program: &CompiledExtglob, path_len: usize) -> usize {
+        program
+            .memo_state_count
+            .saturating_mul(path_len + 1)
+            .div_ceil(u64::BITS as usize)
+    }
+
+    fn insert(&mut self, state_index: usize, path_index: usize) -> bool {
+        let state = state_index * self.width + path_index;
+        let word = &mut self.states[state / u64::BITS as usize];
+        let mask = 1_u64 << (state % u64::BITS as usize);
+        if *word & mask != 0 {
+            false
+        } else {
+            *word |= mask;
+            true
+        }
+    }
 }
 
 /// Reserves a zeroed frame of `positions` bits and returns its first word.
@@ -3752,7 +3880,10 @@ fn match_extglob_from(
     // backtrack point. It can therefore be shared across sequential groups and
     // within one repetition: once a suffix has been explored, another
     // partition cannot make it succeed.
-    if !state.failed.insert((pattern_index, path_index)) {
+    if !state
+        .failed
+        .insert(program.memo_state_index(pattern_index), path_index)
+    {
         return false;
     }
 
@@ -3768,7 +3899,7 @@ fn match_extglob_from(
             if leading_period_is_forbidden
                 && !options.match_hidden
                 && path.get(path_index) == Some(&b'.')
-                && at_component_start(path, path_index)
+                && at_component_start(path, path_index, options)
             {
                 return false;
             }
@@ -3811,7 +3942,7 @@ fn match_extglob_from(
                         (!options.component_wildcards || !is_separator(byte))
                             && (options.match_hidden
                                 || byte != b'.'
-                                || !at_component_start(path, path_index))
+                                || !at_component_start(path, path_index, options))
                     }) {
                         pattern_index += 1;
                         path_index += 1;
@@ -3833,7 +3964,7 @@ fn match_extglob_from(
                         (!options.component_wildcards || !is_separator(byte))
                             && (options.match_hidden
                                 || byte != b'.'
-                                || !at_component_start(path, path_index))
+                                || !at_component_start(path, path_index, options))
                             && class.matches(byte, options.case_insensitive)
                     }) {
                         pattern_index = *next;
@@ -3881,7 +4012,7 @@ fn match_extglob_from(
             }
             if !options.match_hidden
                 && path.get(star_path_index) == Some(&b'.')
-                && at_component_start(path, star_path_index)
+                && at_component_start(path, star_path_index, options)
             {
                 return false;
             }
@@ -3943,7 +4074,12 @@ fn match_extglob_group(
         ExtglobKind::Negated => {
             for end in path_index..=extglob_component_end(path, path_index, options) {
                 if group.alternatives.iter().all(|alternative| {
-                    !match_extglob_alternative_exact(alternative, &path[path_index..end], options)
+                    !match_extglob_alternative_exact(
+                        alternative,
+                        &path[path_index..end],
+                        at_component_start(path, path_index, options),
+                        options,
+                    )
                 }) && match_extglob_from(program, path, group.rest, end, options, state)
                 {
                     return true;
@@ -3998,12 +4134,21 @@ fn match_extglob_repeated(
                 .into_iter()
                 .flatten()
             {
-                if match_extglob_alternative_exact(alternative, &path[path_index..end], options) {
+                if match_extglob_alternative_exact(
+                    alternative,
+                    &path[path_index..end],
+                    at_component_start(path, path_index, options),
+                    options,
+                ) {
                     if match_extglob_from(program, path, group.rest, end, options, state) {
                         matched = true;
                         break;
                     }
-                    if end > path_index && state.failed.insert((group.start, end)) {
+                    if end > path_index
+                        && state
+                            .failed
+                            .insert(program.memo_state_index(group.start), end)
+                    {
                         state.repeated.push(end);
                     }
                 }
@@ -4033,8 +4178,12 @@ fn match_extglob_alternative(
             .into_iter()
             .flatten()
         {
-            if match_extglob_alternative_exact(alternative, &path[path_index..end], options)
-                && match_extglob_from(program, path, group.rest, end, options, state)
+            if match_extglob_alternative_exact(
+                alternative,
+                &path[path_index..end],
+                at_component_start(path, path_index, options),
+                options,
+            ) && match_extglob_from(program, path, group.rest, end, options, state)
             {
                 return true;
             }
@@ -4051,6 +4200,7 @@ fn match_extglob_alternative(
 fn match_extglob_alternative_exact(
     alternative: &ExtglobAlternative,
     path: &[u8],
+    candidate_starts_component: bool,
     options: PatternOptions,
 ) -> bool {
     if alternative.width.is_some_and(|width| width != path.len()) {
@@ -4062,6 +4212,7 @@ fn match_extglob_alternative_exact(
     let mut options = PatternOptions {
         braces: false,
         extglob: false,
+        candidate_starts_component,
         ..options
     };
     if options.root_component_wildcards {
@@ -4101,11 +4252,24 @@ fn extglob_component_end(path: &[u8], path_index: usize, options: PatternOptions
     }
 }
 
+impl CompiledExtglob {
+    fn memo_state_index(&self, offset: usize) -> usize {
+        let state_index = self.memo_state_indices[offset];
+        debug_assert_ne!(
+            state_index,
+            usize::MAX,
+            "only the entry point and group transitions participate in extglob recursion"
+        );
+        state_index
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         FailedStates, FastPath, Pattern, PatternOptions, Prefilter, Token, WalkerPathViability,
-        extglob_visited_capacity, scratch_capacities,
+        extglob_failed_len, extglob_scratch_capacities, extglob_visited_capacity,
+        scratch_capacities,
     };
 
     fn compile(pattern: &str) -> Pattern {
@@ -4885,6 +5049,75 @@ mod tests {
         let single = Pattern::compile("+(a)", PatternOptions::default().extglob(true))
             .expect("single repeating extglob compiles");
         assert!(single.is_match("a".repeat(5_000)));
+    }
+
+    #[test]
+    fn extglob_memo_is_dense_and_releases_large_candidates() {
+        let pattern = Pattern::compile("+(a)+(a)", PatternOptions::default().extglob(true))
+            .expect("repeating extglobs compile");
+        let program = pattern.alternatives[0]
+            .extglob
+            .as_ref()
+            .expect("the pattern carries an extglob program");
+        assert_eq!(program.memo_state_count, 3);
+        assert_eq!(
+            [
+                program.memo_state_index(0),
+                program.memo_state_index(program.groups[0].rest),
+                program.memo_state_index(program.groups[1].rest),
+            ],
+            [0, 1, 2],
+            "the recurrence rows are stable and dense"
+        );
+
+        let mut candidate = "a".repeat(2_000_000);
+        candidate.push('x');
+        assert_eq!(
+            super::ExtglobFailedStates::required_words(program, candidate.len()),
+            93_751,
+            "three dense state rows need one bit per candidate offset"
+        );
+        assert!(!pattern.is_match(&candidate));
+
+        let capacities = extglob_scratch_capacities();
+        assert!(
+            capacities.1 <= super::RETAINED_SCRATCH_WORDS,
+            "the failed-state bitset must not retain the adversarial table: {capacities:?}"
+        );
+        assert_eq!(
+            extglob_failed_len(),
+            0,
+            "the retained failed-state bitset must be logically empty"
+        );
+
+        assert!(pattern.is_match("aa"));
+        assert_eq!(
+            extglob_scratch_capacities(),
+            capacities,
+            "a later small match reuses the capped scratch allocation"
+        );
+    }
+
+    #[test]
+    fn extglob_alternatives_keep_the_enclosing_component_context() {
+        let options = PatternOptions::default().extglob(true);
+        let star = Pattern::compile("a@(*)", options).expect("extglob compiles");
+        let question = Pattern::compile("a@(?b)", options).expect("extglob compiles");
+        assert!(star.is_match("a.b"));
+        assert!(question.is_match("a.b"));
+
+        let path_group = Pattern::compile("dir/a@(*)", options).expect("extglob compiles");
+        assert!(path_group.is_match_path("dir/a.b"));
+        assert!(path_group.is_match_glob_path("dir/a.b"));
+
+        let at_start = Pattern::compile("@(*)", options).expect("extglob compiles");
+        assert!(!at_start.is_match(".b"));
+        assert!(!at_start.is_match_path(".b"));
+        assert!(!at_start.is_match_glob_path(".b"));
+
+        let after_separator = Pattern::compile("dir/@(*)", options).expect("extglob compiles");
+        assert!(!after_separator.is_match_path("dir/.b"));
+        assert!(!after_separator.is_match_glob_path("dir/.b"));
     }
 
     #[test]

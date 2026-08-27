@@ -8,3 +8,7 @@
 {"id":"extsuite-recursive-directory","kind":"match_paths","pattern":"**/@(foo|bar)/*.txt","path":"","paths":["src/foo/test.txt","src/bar/test.txt","src/baz/test.txt","lib/foo/data.txt"],"matches":["src/foo/test.txt","src/bar/test.txt","lib/foo/data.txt"],"flags":["extglob","recursive_double_star"],"expected":true,"source":"zlob_1_6_3"}
 {"id":"extsuite-brace-negation","kind":"match_paths","pattern":"{src,lib}/*.!(h)","path":"","paths":["src/main.c","src/main.h","lib/util.c","lib/util.h"],"matches":["src/main.c","lib/util.c"],"flags":["braces","extglob"],"expected":true,"source":"zlob_1_6_3"}
 {"id":"extsuite-disabled-literal","kind":"match_paths","pattern":"@(foo|bar).js","path":"","paths":["foo.js","bar.js","@(foo|bar).js"],"matches":["@(foo|bar).js"],"flags":[],"expected":true,"source":"zlob_1_6_3"}
+{"id":"extsuite-dot-mid-component-star","pattern":"a@(*)","path":"a.b","flags":["extglob"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"extsuite-dot-mid-component-question","pattern":"a@(?b)","path":"a.b","flags":["extglob"],"expected":true,"source":"zlob_1_6_3"}
+{"id":"extsuite-dot-candidate-start","pattern":"@(*)","path":".b","flags":["extglob"],"expected":false,"source":"zlob_1_6_3"}
+{"id":"extsuite-dot-separator-boundary","pattern":"dir/@(*)","path":"dir/.b","flags":["extglob"],"expected":false,"source":"zlob_1_6_3"}
