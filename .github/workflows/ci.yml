@@ -56,7 +56,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test
       - run: cargo test -p corpus -p harness -p bench
-      - run: cargo test --doc -p doc-tests
+      - run: cargo test -p doc-tests
       - run: cargo run -p harness -- corpus
 
   macos-native:
