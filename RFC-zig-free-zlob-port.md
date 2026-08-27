@@ -635,4 +635,3 @@ decision is recorded individually under [docs/adr/](docs/adr/README.md).
 - [glob-match repository](https://github.com/devongovett/glob-match)
 - [Ferroni — in-house pure-Rust Oniguruma port](https://github.com/sebastian-software/ferroni)
 - [Palamedes source-discovery optimization issue #875](https://github.com/sebastian-software/palamedes/issues/875)
-- [Local source-discovery benchmark notes](palamedes/benchmarks/source-discovery-prototype/NOTES.md)

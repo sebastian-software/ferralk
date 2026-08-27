@@ -300,16 +300,18 @@ Run the normal workspace suite before changing matcher or walker behaviour:
 
 ```sh
 cargo test --workspace --locked
-cargo fmt --check
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo run -p harness -- corpus
 ```
 
 The minimum supported Rust version is written down once, as `rust-version`
 under `[workspace.package]` in the root `Cargo.toml`; the CI MSRV job reads
 that field instead of pinning a version of its own. Per
 [ADR-0004](adr/0004-msrv-stable-minus-two.md) the MSRV tracks current stable
-minus two releases, so when a new stable lands, bumping it is one edit to that
-field plus a changelog entry — no workflow change.
+minus two releases. The scheduled/manual policy check compares that field with
+Rust's official stable-channel metadata, so a new stable release turns drift
+into a targeted maintenance update rather than a surprise in ordinary CI.
 
 The checked-in JSONL corpus is the behavioural source of truth. Read
 [corpus-format.md](corpus-format.md) before adding a case. Fuzz targets live in

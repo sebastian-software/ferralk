@@ -1,4 +1,5 @@
 #![deny(unsafe_code)]
+#![warn(missing_docs)]
 #![doc = "Portable filesystem walking."]
 
 //! A safe std::fs walker with a portable `std::fs` backend.
@@ -309,7 +310,11 @@ pub enum WalkEntryKind {
 }
 
 /// One matching filesystem entry.
-#[derive(Debug)]
+///
+/// Entries are [`Clone`], so callers can retain an entry in more than one
+/// collection. Cloning preserves the captured path, walk-root identity, entry
+/// flags, depth, and optional metadata snapshot.
+#[derive(Debug, Clone)]
 pub struct WalkEntry {
     path: PathBuf,
     /// The walk root this entry was found under. Shared per root rather than
@@ -3702,6 +3707,29 @@ mod tests {
             assert_ne!(metadata.ino(), 0);
             assert_ne!(metadata.mode() & 0o400, 0);
         }
+    }
+
+    #[test]
+    fn walk_entries_are_cloneable_with_their_metadata_snapshot() {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("five.bin"), b"12345").expect("write clone fixture");
+
+        let result = Walker::new(&fixture.root)
+            .options(WalkOptions::default().sort(true).metadata(true))
+            .collect()
+            .expect("walk succeeds");
+        let entry = result
+            .entries()
+            .iter()
+            .find(|entry| entry.path().ends_with("five.bin"))
+            .expect("fixture file is returned");
+        let clone = entry.clone();
+
+        assert_eq!(clone.path(), entry.path());
+        assert_eq!(clone.root(), entry.root());
+        assert_eq!(clone.kind(), entry.kind());
+        assert_eq!(clone.depth(), entry.depth());
+        assert_eq!(clone.metadata().map(fs::Metadata::len), Some(5));
     }
 
     #[test]

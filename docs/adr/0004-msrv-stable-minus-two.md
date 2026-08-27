@@ -13,9 +13,12 @@ library consumers; an overly conservative one costs API ergonomics.
 ## Decision
 
 MSRV is the current stable minus two releases (~3 months), declared via
-`rust-version` in Cargo.toml and verified by a dedicated CI job. During 0.x a
-bump may land in any minor release; from 1.0 on, bumps are minor-version
-events with a changelog entry.
+`rust-version` in Cargo.toml and verified by a dedicated CI job. A separate
+scheduled/manual policy check compares that value with Rust's official stable
+channel metadata; it deliberately does not run on ordinary pull requests, so
+temporary network failures cannot make routine CI flaky. During 0.x a bump may
+land in any minor release; from 1.0 on, bumps are minor-version events with a
+changelog entry.
 
 ## Consequences
 

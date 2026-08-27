@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 #![doc = "Portable, byte-first glob matching."]
 
 //! Compiled, byte-first glob patterns with explicit behaviour-changing options.
@@ -196,6 +197,21 @@ impl Pattern {
     }
 
     /// Compiles a pattern once for repeated matching against raw path bytes.
+    ///
+    /// ```
+    /// use ferralk_glob::{Pattern, PatternOptions};
+    ///
+    /// let source_file = Pattern::compile(
+    ///     "src/**/*.{rs,toml}",
+    ///     PatternOptions::default()
+    ///         .recursive_double_star(true)
+    ///         .braces(true),
+    /// )?;
+    ///
+    /// assert!(source_file.is_match_glob_path("src/lib.rs"));
+    /// assert!(!source_file.is_match_glob_path("src/generated/lib.rs.bak"));
+    /// # Ok::<(), ferralk_glob::PatternError>(())
+    /// ```
     pub fn compile(
         pattern: impl AsRef<[u8]>,
         options: PatternOptions,
@@ -2934,12 +2950,11 @@ impl ProvenanceBudget {
 ///
 /// # Errors
 ///
-/// Reports a pattern that asks for more than [`MAX_BRACE_ALTERNATIVES`]
-/// alternatives, or whose expansion would write more than
-/// [`MAX_BRACE_EXPANSION_BYTES`], so a caller never has to assume the expansion
-/// succeeds. Glob syntax is not checked here: an unclosed brace is ordinary
-/// text, the way [`Pattern::compile`] treats it, and anything else malformed is
-/// reported when the alternative it belongs to is compiled.
+/// Reports a pattern that exceeds the documented brace-expansion limits, so a
+/// caller never has to assume expansion succeeds. Glob syntax is not checked
+/// here: an unclosed brace is ordinary text, the way [`Pattern::compile`]
+/// treats it, and anything else malformed is reported when the alternative it
+/// belongs to is compiled.
 pub fn expand_braces(
     pattern: impl AsRef<[u8]>,
     options: PatternOptions,
@@ -3069,14 +3084,15 @@ struct BraceExpansion {
 /// `expanded.len() + pending.len()` only ever grows and every pending entry
 /// yields at least one alternative, so it is a running lower bound on the final
 /// count. Checking it before each push therefore rejects exactly the patterns
-/// whose expansion would pass [`MAX_BRACE_ALTERNATIVES`], and bounds the memory
-/// rather than only the result.
+/// whose expansion would exceed the documented alternative limit, and bounds
+/// memory rather than only the result.
 ///
-/// The bytes written are counted against [`MAX_BRACE_EXPANSION_BYTES`] the same
-/// way, and that is what bounds the time: rewriting the whole pattern per group
-/// is quadratic in its length even where it expands to one alternative. The
-/// running total only grows too, so stopping at the first write that passes the
-/// limit rejects exactly the patterns whose finished expansion would.
+/// The bytes written are counted against the documented expansion-byte limit
+/// the same way, and that is what bounds the time: rewriting the whole pattern
+/// per group is quadratic in its length even where it expands to one
+/// alternative. The running total only grows too, so stopping at the first
+/// write that exceeds the limit rejects exactly the patterns whose finished
+/// expansion would.
 fn expand_brace_alternatives_with_provenance(
     pattern: &[u8],
     source_provenance: Option<&SourceProvenance>,
