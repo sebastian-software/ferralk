@@ -640,14 +640,15 @@ impl Walker {
     /// ```
     /// use ferralk::Walker;
     ///
-    /// // On a Unix host these two select the same entries of a walk rooted at
-    /// // `/repo`. The Windows spelling of the second is `C:/repo/src/**/*.ts`
-    /// // for a walk rooted at `C:/repo`.
-    /// # #[cfg(not(windows))]
-    /// # {
-    /// let written_relative = Walker::new("/repo").include("src/**/*.ts")?;
-    /// let held_absolute = Walker::new("/repo").include("/repo/src/**/*.ts")?;
-    /// # }
+    /// // These select the same entries. The absolute spelling follows the
+    /// // host's path syntax: `/repo` on Unix and `C:/repo` on Windows.
+    /// let (root, absolute) = if cfg!(windows) {
+    ///     ("C:/repo", "C:/repo/src/**/*.ts")
+    /// } else {
+    ///     ("/repo", "/repo/src/**/*.ts")
+    /// };
+    /// let written_relative = Walker::new(root).include("src/**/*.ts")?;
+    /// let held_absolute = Walker::new(root).include(absolute)?;
     /// # Ok::<(), ferralk::ferralk_glob::PatternError>(())
     /// ```
     pub fn include(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
