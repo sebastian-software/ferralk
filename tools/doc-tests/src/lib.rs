@@ -364,6 +364,8 @@ pub mod fuzzing {}
 mod tests {
     use std::{collections::BTreeSet, fs, path::Path};
 
+    use serde_json::Value;
+
     use super::{DOCUMENTS, EXPECTED_COMPILED_RUST_FENCES, FENCE_POLICIES, FencePolicy};
 
     #[derive(Debug)]
@@ -427,6 +429,56 @@ mod tests {
     }
 
     #[test]
+    fn release_please_versioned_consumer_docs_match_the_workspace() {
+        let repository_root = repository_root();
+        let workspace_version = workspace_version(&repository_root);
+        let release_please =
+            fs::read_to_string(repository_root.join(".release-please-config.json"))
+                .expect("Release Please configuration is readable");
+        let release_please: Value =
+            serde_json::from_str(&release_please).expect("Release Please configuration is JSON");
+
+        let extra_files = release_please["packages"]["."]["extra-files"]
+            .as_array()
+            .expect("Release Please package has extra files");
+        let expected_documents = [
+            ("README.md", 3_usize),
+            ("docs/usage.md", 1_usize),
+            ("docs/external-release-gates.md", 1_usize),
+        ];
+
+        for (path, expected_annotation_count) in expected_documents {
+            assert!(
+                extra_files
+                    .iter()
+                    .any(|entry| { entry["type"] == "generic" && entry["path"] == path }),
+                "Release Please must update every versioned consumer document: {path}"
+            );
+
+            let document = fs::read_to_string(repository_root.join(path))
+                .unwrap_or_else(|error| panic!("{path} is readable: {error}"));
+            let annotated_lines = document
+                .lines()
+                .filter(|line| line.contains("x-release-please-version"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                annotated_lines.len(),
+                expected_annotation_count,
+                "every consumer-facing current-version reference in {path} must be annotated"
+            );
+
+            for line in annotated_lines {
+                let versions = semver_values(line);
+                assert_eq!(
+                    versions,
+                    vec![workspace_version.as_str()],
+                    "the Release Please annotation in {path} must select exactly the workspace version: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn fence_scanner_matches_rustdoc_fence_classification_and_real_closers() {
         let fences = scan_fenced_code_blocks(
             "```\nlet bare: u8 = 1;\n```\n\
@@ -482,6 +534,60 @@ mod tests {
 
     fn repository_root() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    fn workspace_version(repository_root: &Path) -> String {
+        fs::read_to_string(repository_root.join("Cargo.toml"))
+            .expect("workspace manifest is readable")
+            .lines()
+            .skip_while(|line| line.trim() != "[workspace.package]")
+            .skip(1)
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("version = \"")
+                    .and_then(|value| value.strip_suffix('\"'))
+            })
+            .map(str::to_owned)
+            .expect("workspace package declares a version")
+    }
+
+    fn semver_values(line: &str) -> Vec<&str> {
+        let bytes = line.as_bytes();
+        let mut versions = Vec::new();
+        let mut index = 0;
+
+        while index < bytes.len() {
+            if !bytes[index].is_ascii_digit() {
+                index += 1;
+                continue;
+            }
+
+            let start = index;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+            if index == bytes.len() || bytes[index] != b'.' {
+                continue;
+            }
+            index += 1;
+            let minor_start = index;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+            if minor_start == index || index == bytes.len() || bytes[index] != b'.' {
+                continue;
+            }
+            index += 1;
+            let patch_start = index;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+            if patch_start != index {
+                versions.push(&line[start..index]);
+            }
+        }
+
+        versions
     }
 
     fn assert_fence_policy(policy: &FencePolicy, fences: &[MarkdownFence]) {

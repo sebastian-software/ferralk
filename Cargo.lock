@@ -265,6 +265,7 @@ version = "0.8.0"
 dependencies = [
  "ferralk",
  "ferralk-glob",
+ "serde_json",
 ]
 
 [[package]]

@@ -38,6 +38,20 @@ one a stale baseline attributed to whichever pull request was open at the time.
 amendment, and [benchmark evidence](docs/benchmark-evidence.md) describes the
 lanes that remain.
 
+## Communicate pre-1.0 contract changes
+
+During `0.x`, a consumer-facing behaviour change must be marked as breaking in
+its Conventional Commit. Put `!` after the type or scope (for example,
+`fix(walker)!: preserve caller cancellation`) or add a `BREAKING CHANGE:`
+footer. Do this even when the Rust type signatures are unchanged: changed
+runtime errors, validation, cancellation, traversal, matching, and default
+policy are all part of the consumer contract.
+
+Release Please recognizes those markers and renders a dedicated breaking-change
+section in the release notes. Describe the old and new observable behaviour in
+the pull request as well, so the generated summary has the context consumers
+need.
+
 ## Before opening a pull request
 
 ```sh

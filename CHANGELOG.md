@@ -15,6 +15,15 @@
 * clarify walker root semantics ([#148](https://github.com/sebastian-software/ferralk/issues/148)) ([81d7ac2](https://github.com/sebastian-software/ferralk/commit/81d7ac2328a29e9c5607c73c9a0ea26750da3574))
 * scope symlink cycle guards per root ([#150](https://github.com/sebastian-software/ferralk/issues/150)) ([d609d53](https://github.com/sebastian-software/ferralk/commit/d609d539a7186056c6805d80f93ab7a99a555a8d))
 
+
+### Compatibility notes
+
+* **Breaking:** pattern compilation now rejects `.` and `..` path components
+  instead of accepting them. Correct the pattern before constructing a matcher
+  or walker.
+* `ErrorPolicy::Skip` now reports an open or read failure for a caller-supplied
+  root. It still skips recoverable failures discovered below a root.
+
 ## [0.7.0](https://github.com/sebastian-software/ferralk/compare/v0.6.1...v0.7.0) (2026-08-27)
 
 
@@ -30,6 +39,13 @@
 * harden native directory backend contracts ([#146](https://github.com/sebastian-software/ferralk/issues/146)) ([6da4add](https://github.com/sebastian-software/ferralk/commit/6da4add1691d9b53cdd4979c1e3fc65ede7fa48f))
 * isolate parallel walker shutdown ([#145](https://github.com/sebastian-software/ferralk/issues/145)) ([cdcb1c9](https://github.com/sebastian-software/ferralk/commit/cdcb1c9ed57bbae000ed1afee7f4a8b340493106))
 * memoize extglob repetition states ([#141](https://github.com/sebastian-software/ferralk/issues/141)) ([068927c](https://github.com/sebastian-software/ferralk/commit/068927cb2ae2043f1769c817997756ec7fd529a2))
+
+
+### Compatibility notes
+
+* **Breaking:** walker-internal aborts, visitor stops, worker-start failures,
+  and worker panics no longer cancel a caller-shared `CancellationToken`.
+  Walkers only observe that token; callers retain ownership and may reuse it.
 
 ## [0.6.1](https://github.com/sebastian-software/ferralk/compare/v0.6.0...v0.6.1) (2026-08-26)
 
