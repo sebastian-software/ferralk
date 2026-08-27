@@ -642,8 +642,8 @@ impl Walker {
         }
     }
 
-    /// Adds an OR-ed include pattern. No includes means every non-excluded
-    /// entry is returned.
+    /// Adds an OR-ed include pattern and returns the builder for consuming
+    /// chains. No includes means every non-excluded entry is returned.
     ///
     /// The pattern may be absolute. See [`Walker::exclude`] for what that
     /// means and when it is rejected.
@@ -662,7 +662,41 @@ impl Walker {
     /// let held_absolute = Walker::new(root).include(absolute)?;
     /// # Ok::<(), ferralk::ferralk_glob::PatternError>(())
     /// ```
+    ///
+    /// For a caller-supplied list that may contain invalid patterns, use
+    /// [`Walker::try_include`] instead. It borrows the builder, so rejecting a
+    /// pattern leaves the caller's configured walker available for the next
+    /// pattern.
     pub fn include(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
+        self.try_include(pattern)?;
+        Ok(self)
+    }
+
+    /// Adds an OR-ed include pattern without consuming the builder.
+    ///
+    /// This is the borrowed counterpart to [`Walker::include`]. It is useful
+    /// when applying a user-supplied pattern list: an invalid pattern returns
+    /// its [`PatternError`] and leaves this walker unchanged, so later entries
+    /// can still be considered. A valid pattern has the same semantics as
+    /// [`Walker::include`] and composes with every root and matcher mode
+    /// already configured on this walker.
+    ///
+    /// ```no_run
+    /// use ferralk::Walker;
+    ///
+    /// let mut walker = Walker::new("workspace");
+    /// for pattern in ["src/**/*.rs", "[a", "tests/**/*.rs"] {
+    ///     if let Err(error) = walker.try_include(pattern) {
+    ///         eprintln!("skipping {pattern:?}: {error}");
+    ///     }
+    /// }
+    ///
+    /// // The two valid patterns remain configured despite the rejected `[a`.
+    /// let result = walker.collect()?;
+    /// # let _ = result;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn try_include(&mut self, pattern: impl AsRef<[u8]>) -> Result<&mut Self, PatternError> {
         let pattern = pattern.as_ref();
         // Compiled for every root before any of them is changed, so a pattern
         // one root rejects leaves the walker as it was rather than half updated.
@@ -736,7 +770,22 @@ impl Walker {
     ///     assert!(Walker::new("/repo").exclude("/**/*.tmp").is_err());
     /// }
     /// ```
+    ///
+    /// For a caller-supplied list that may contain invalid patterns, use
+    /// [`Walker::try_exclude`] instead. It preserves the configured builder
+    /// when a pattern is rejected.
     pub fn exclude(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
+        self.try_exclude(pattern)?;
+        Ok(self)
+    }
+
+    /// Adds an OR-ed exclude pattern without consuming the builder.
+    ///
+    /// This is the borrowed counterpart to [`Walker::exclude`]. It has the
+    /// same all-or-nothing compilation rule as [`Walker::try_include`]: a
+    /// rejected pattern leaves every root and previously configured filter
+    /// unchanged, while a valid one composes with them.
+    pub fn try_exclude(&mut self, pattern: impl AsRef<[u8]>) -> Result<&mut Self, PatternError> {
         let pattern = pattern.as_ref();
         let compiled = self.compile_for_every_root(pattern)?;
         for (root, pattern) in self.roots.iter_mut().zip(compiled) {
@@ -2826,6 +2875,45 @@ mod tests {
             .collect()
     }
 
+    fn rooted_relative_paths(entries: &[WalkEntry]) -> Vec<(PathBuf, PathBuf)> {
+        let mut paths = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.root().to_path_buf(),
+                    entry
+                        .path()
+                        .strip_prefix(entry.root())
+                        .expect("entry is rooted in its declared root")
+                        .to_path_buf(),
+                )
+            })
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+        paths
+    }
+
+    type RootFilterSources = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+    fn configured_filter_sources(walker: &Walker) -> Vec<RootFilterSources> {
+        walker
+            .roots
+            .iter()
+            .map(|root| {
+                (
+                    root.includes
+                        .iter()
+                        .map(|pattern| pattern.source.clone())
+                        .collect(),
+                    root.excludes
+                        .iter()
+                        .map(|pattern| pattern.source.clone())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn include_exclude_and_sort_are_applied_to_relative_paths() {
         let fixture = Fixture::new();
@@ -2847,6 +2935,85 @@ mod tests {
             vec![PathBuf::from("src/main.rs")]
         );
         assert!(result.errors().is_empty());
+    }
+
+    #[test]
+    fn borrowed_pattern_lists_keep_the_builder_and_filter_every_frontend() {
+        let fixture = Fixture::new();
+        let alpha = fixture.root.join("alpha");
+        let beta = fixture.root.join("beta");
+        for root in ["alpha", "beta"] {
+            fixture.write(format!("{root}/src/keep.rs"));
+            fixture.write(format!("{root}/src/remove.rs"));
+            fixture.write(format!("{root}/src/ignore.txt"));
+            fixture.write(format!("{root}/.hidden.rs"));
+        }
+
+        let mut walker = Walker::new(&alpha)
+            .add_root(&beta)
+            .expect("valid second root")
+            .match_hidden(true)
+            .wildcard_mode(WildcardMode::SeparatorCrossing)
+            .options(WalkOptions::default().files_only(true).sort(true));
+
+        walker
+            .try_include("*.rs")
+            .expect("first supplied include is valid");
+        let before_bad_include = walker.clone();
+        assert!(walker.try_include("[a").is_err());
+        assert_eq!(walker.include_sources, before_bad_include.include_sources);
+        assert_eq!(walker.exclude_sources, before_bad_include.exclude_sources);
+        assert_eq!(
+            configured_filter_sources(&walker),
+            configured_filter_sources(&before_bad_include),
+            "a rejected include must not update any root"
+        );
+        walker
+            .try_include("**/also.rs")
+            .expect("a later supplied include still composes");
+
+        walker
+            .try_exclude("**/remove.rs")
+            .expect("first supplied exclude is valid");
+        let before_bad_exclude = walker.clone();
+        assert!(walker.try_exclude("[a").is_err());
+        assert_eq!(walker.include_sources, before_bad_exclude.include_sources);
+        assert_eq!(walker.exclude_sources, before_bad_exclude.exclude_sources);
+        assert_eq!(
+            configured_filter_sources(&walker),
+            configured_filter_sources(&before_bad_exclude),
+            "a rejected exclude must not update any root"
+        );
+        walker
+            .try_exclude("**/generated/**")
+            .expect("a later supplied exclude still composes");
+
+        let expected = vec![
+            (alpha.clone(), PathBuf::from(".hidden.rs")),
+            (alpha.clone(), PathBuf::from("src/keep.rs")),
+            (beta.clone(), PathBuf::from(".hidden.rs")),
+            (beta.clone(), PathBuf::from("src/keep.rs")),
+        ];
+        for threads in [1, 4] {
+            let collected = walker
+                .clone()
+                .threads(threads)
+                .collect()
+                .expect("collect succeeds");
+            assert_eq!(rooted_relative_paths(collected.entries()), expected);
+
+            let visited = walker
+                .clone()
+                .threads(threads)
+                .visit(|_| Verdict::Keep)
+                .expect("visit succeeds");
+            assert_eq!(rooted_relative_paths(visited.entries()), expected);
+        }
+        let streamed = walker
+            .stream()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream succeeds");
+        assert_eq!(rooted_relative_paths(&streamed), expected);
     }
 
     #[test]

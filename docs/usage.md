@@ -75,6 +75,37 @@ if result.was_cancelled() {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+### Keep a configured walker when input patterns are invalid
+
+The chaining `Walker::include` and `Walker::exclude` methods intentionally
+consume and return the builder, which keeps ordinary configuration concise. For
+a caller-supplied pattern list, use their borrowed `try_` counterparts instead.
+Each rejected pattern leaves the complete `Walker` unchanged, so valid entries
+before and after it still compose across all configured roots and matcher modes.
+
+```rust,no_run
+use ferralk::{WalkOptions, Walker};
+
+let mut walker = Walker::new("workspace")
+    .add_root("generated-workspace")?
+    .options(WalkOptions::default().files_only(true));
+
+for pattern in ["src/**/*.rs", "[a", "tests/**/*.rs"] {
+    if let Err(error) = walker.try_include(pattern) {
+        eprintln!("skipping invalid include {pattern:?}: {error}");
+    }
+}
+for pattern in ["**/generated/**", "[a", "**/*.tmp"] {
+    if let Err(error) = walker.try_exclude(pattern) {
+        eprintln!("skipping invalid exclude {pattern:?}: {error}");
+    }
+}
+
+let result = walker.collect()?;
+# let _ = result;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 Important defaults:
 
 - Ordinary wildcards (`*`, `?`, classes) stay inside one path component, so
