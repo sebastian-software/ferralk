@@ -150,6 +150,10 @@ Important defaults:
   resolved (including one `commondir`), and the file closest to an entry
   decides, as in Git. In-tree `.gitignore` and `.ignore` symlinks are ignored
   rather than followed; `.git/info/exclude` keeps Git's link-following behavior.
+  Each ignore or repository-metadata file is capped at 8 MiB, and each rule
+  file at 100,000 lines. A rule file that exceeds either limit, or otherwise
+  cannot be read, contributes no rules and is reported as a `read_ignore`
+  failure through the configured `ErrorPolicy`.
 
   Ferralk reads `core.ignoreCase` and `core.precomposeUnicode` from the
   repository-local `.git/config`; a linked worktree also reads its private
@@ -216,7 +220,9 @@ Important defaults:
   root must not look like an empty tree. Other roots continue, so a multi-root
   walk can return their entries alongside the failed root's error. `stream()`
   yields that root error as an item under both `Collect` and `Skip`; `Abort`
-  returns it immediately.
+  returns it immediately. Ignore-rule read and safety-limit failures use the
+  `read_ignore` operation; under `Skip` they are omitted like other
+  descendant-level recoverable failures.
 - Results are unsorted unless `WalkOptions::sort(true)` is set.
 - Metadata is not fetched unless `WalkOptions::metadata(true)` is set.
 - `stream()` yields entries and recoverable errors incrementally. It is

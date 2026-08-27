@@ -89,7 +89,7 @@ mod parallel;
 mod scheduler;
 
 use classify::{DirectoryTask, EmittedEntry, EntryAction, TraversalContext, classify_entry};
-use gitignore::IgnoreScope;
+use gitignore::{IgnoreReadError, IgnoreScope};
 
 /// Controls what a walk does after a recoverable filesystem error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -587,6 +587,11 @@ pub struct Walker {
     threads: usize,
 }
 
+/// Hard ceiling for eagerly allocated worker slots. The scheduler still
+/// starts helpers lazily, but every configured slot owns queues and scratch
+/// buffers as soon as a walk widens.
+const MAX_WORKERS: usize = 256;
+
 impl RootPlan {
     /// Where the root-relative part of a walked path starts, in bytes.
     ///
@@ -639,7 +644,8 @@ impl Walker {
             wildcard_mode: WildcardMode::default(),
             threads: std::thread::available_parallelism()
                 .map(std::num::NonZeroUsize::get)
-                .unwrap_or(1),
+                .unwrap_or(1)
+                .min(MAX_WORKERS),
         }
     }
 
@@ -1066,11 +1072,19 @@ impl Walker {
         self
     }
 
-    /// Limits `collect()` to this many workers. Zero is clamped to one;
-    /// `stream()` remains single-threaded to preserve incremental delivery.
+    /// Limits `collect()` to this many workers. Values are clamped to
+    /// `1..=256`; `stream()` remains single-threaded to preserve incremental
+    /// delivery. The upper bound caps the queues, scratch buffers, and
+    /// potential operating-system threads one walk can reserve.
     #[must_use]
     pub const fn threads(mut self, threads: usize) -> Self {
-        self.threads = if threads == 0 { 1 } else { threads };
+        self.threads = if threads == 0 {
+            1
+        } else if threads > MAX_WORKERS {
+            MAX_WORKERS
+        } else {
+            threads
+        };
         self
     }
 
@@ -1188,6 +1202,7 @@ impl Walker {
             ignores: IgnoreScope::default(),
             depth: 0,
             root: 0,
+            pending_errors: Vec::new(),
             cancelled: false,
             stopped: false,
         }
@@ -1223,12 +1238,16 @@ impl Walker {
         self.roots
             .iter()
             .enumerate()
-            .map(|(index, plan)| DirectoryTask {
-                path: plan.path.clone(),
-                depth: 0,
-                root: index,
-                cycle_guard: Arc::new(CycleGuard::default()),
-                ignores: IgnoreScope::for_root(self, backend, &plan.path),
+            .map(|(index, plan)| {
+                let (ignores, ignore_errors) = IgnoreScope::for_root(self, backend, &plan.path);
+                DirectoryTask {
+                    path: plan.path.clone(),
+                    depth: 0,
+                    root: index,
+                    cycle_guard: Arc::new(CycleGuard::default()),
+                    ignores,
+                    ignore_errors,
+                }
             })
             .collect()
     }
@@ -1712,7 +1731,7 @@ trait DirectoryBackend {
     /// this separate prevents a repository-wide exclude from weakening the
     /// in-tree no-follow rule above.
     fn read_repository_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-        fs::read(path)
+        read_bounded_file(path)
     }
 
     /// Identifies a directory for the follow-symlinks loop guard.
@@ -1734,6 +1753,31 @@ trait DirectoryBackend {
     }
 }
 
+/// Ignore and repository-metadata files are configuration, not bulk input.
+/// Eight MiB leaves orders of magnitude above measured repository files while
+/// bounding one attacker-controlled read below the matcher's own 64 MiB brace
+/// expansion ceiling.
+pub(crate) const MAX_IGNORE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+pub(crate) fn read_bounded_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_bounded(fs::File::open(path)?)
+}
+
+fn read_bounded(file: fs::File) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut contents = Vec::new();
+    file.take(MAX_IGNORE_FILE_BYTES + 1)
+        .read_to_end(&mut contents)?;
+    if contents.len() as u64 > MAX_IGNORE_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "configuration file exceeds the 8 MiB safety limit",
+        ));
+    }
+    Ok(contents)
+}
+
 /// Reads a rule file found in the tree being walked.
 ///
 /// Unix opens the final path component with `O_NOFOLLOW`, so exchanging a
@@ -1744,15 +1788,13 @@ trait DirectoryBackend {
 /// stable standard-library API exposes one.
 #[cfg(unix)]
 fn read_in_tree_ignore_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt};
+    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
 
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    let mut contents = Vec::new();
-    file.read_to_end(&mut contents)?;
-    Ok(contents)
+    read_bounded(file)
 }
 
 #[cfg(not(unix))]
@@ -1760,7 +1802,7 @@ fn read_in_tree_ignore_file(path: &Path) -> std::io::Result<Vec<u8>> {
     if fs::symlink_metadata(path)?.file_type().is_symlink() {
         return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
     }
-    fs::read(path)
+    read_bounded_file(path)
 }
 
 /// What identifies a directory that the follow-symlinks guard has seen.
@@ -1801,6 +1843,8 @@ impl CycleGuard {
 const CYCLE_KEY_OPERATION: &str = "metadata";
 #[cfg(not(unix))]
 const CYCLE_KEY_OPERATION: &str = "canonicalize";
+
+const IGNORE_FILE_OPERATION: &str = "read_ignore";
 
 /// One directory's entries, held in buffers the walk reuses.
 ///
@@ -2114,8 +2158,41 @@ pub struct WalkStream {
     depth: usize,
     /// Which root that directory sits under, for the same reason.
     root: usize,
+    /// Ignore-file failures discovered while preparing the current directory.
+    pending_errors: Vec<PendingWalkError>,
     cancelled: bool,
     stopped: bool,
+}
+
+/// Unwind-safe error data kept between iterator calls. `std::io::Error` may own
+/// arbitrary error objects that are not unwind-safe, while `WalkStream` has
+/// historically guaranteed the standard unwind auto traits.
+#[derive(Debug)]
+struct PendingWalkError {
+    operation: &'static str,
+    path: PathBuf,
+    kind: std::io::ErrorKind,
+    message: String,
+}
+
+impl PendingWalkError {
+    fn from_ignore(error: IgnoreReadError) -> Self {
+        let (path, source) = error.into_parts();
+        Self {
+            operation: IGNORE_FILE_OPERATION,
+            path,
+            kind: source.kind(),
+            message: source.to_string(),
+        }
+    }
+
+    fn into_walk_error(self) -> WalkError {
+        WalkError::new(
+            self.operation,
+            self.path,
+            std::io::Error::new(self.kind, self.message),
+        )
+    }
 }
 
 impl WalkStream {
@@ -2152,6 +2229,28 @@ impl WalkStream {
         }
     }
 
+    fn queue_ignore_errors(
+        &mut self,
+        errors: Vec<IgnoreReadError>,
+    ) -> Option<Result<WalkEntry, WalkError>> {
+        match self.walker.error_policy {
+            ErrorPolicy::Skip => None,
+            ErrorPolicy::Abort => errors.into_iter().next().map(|error| {
+                self.stopped = true;
+                let (path, source) = error.into_parts();
+                Err(WalkError::new(IGNORE_FILE_OPERATION, path, source))
+            }),
+            ErrorPolicy::Collect => {
+                self.pending_errors
+                    .extend(errors.into_iter().rev().map(PendingWalkError::from_ignore));
+                self.pending_errors
+                    .pop()
+                    .map(PendingWalkError::into_walk_error)
+                    .map(Err)
+            }
+        }
+    }
+
     fn prepare_directory(&mut self, task: DirectoryTask) -> Option<Result<WalkEntry, WalkError>> {
         let DirectoryTask {
             path,
@@ -2159,6 +2258,7 @@ impl WalkStream {
             root,
             cycle_guard,
             ignores,
+            mut ignore_errors,
         } = task;
         if self.walker.options.follow_symlinks {
             match SystemBackend.cycle_key(&path) {
@@ -2179,14 +2279,17 @@ impl WalkStream {
             Ok(()) => {
                 // The directory's own ignore files join the chain here, once,
                 // recognized in the listing that was just read.
-                self.ignores = ignores.enter(&self.walker, &SystemBackend, &path, &self.listing);
+                let (ignores, mut entered_errors) =
+                    ignores.enter(&self.walker, &SystemBackend, &path, &self.listing);
+                self.ignores = ignores;
+                ignore_errors.append(&mut entered_errors);
                 self.depth = depth;
                 self.root = root;
                 self.cycle_guard = cycle_guard;
                 self.next_entry = 0;
                 self.directory = path;
                 reset_to_directory(&mut self.path, &self.directory);
-                None
+                self.queue_ignore_errors(ignore_errors)
             }
             Err(source) => {
                 // A backend can fail after appending entries. They belong to
@@ -2251,6 +2354,9 @@ impl Iterator for WalkStream {
             if self.check_cancellation() {
                 self.stopped = true;
                 return None;
+            }
+            if let Some(error) = self.pending_errors.pop() {
+                return Some(Err(error.into_walk_error()));
             }
             if self.next_entry < self.listing.entries().len() {
                 let index = self.next_entry;
@@ -2386,8 +2492,13 @@ impl<'walker> WalkState<'walker> {
             root,
             cycle_guard,
             ignores,
+            ignore_errors,
         } = task;
         let is_root = depth == 0;
+        for error in ignore_errors {
+            let (path, source) = error.into_parts();
+            self.handle_error(IGNORE_FILE_OPERATION, path, source, false)?;
+        }
         if self.walker.options.follow_symlinks
             && !self.mark_directory(backend, &cycle_guard, &path, is_root)?
         {
@@ -2432,7 +2543,11 @@ impl<'walker> WalkState<'walker> {
         }
         // The directory's own ignore files join the chain here, once,
         // recognized in the listing that was just read.
-        let ignores = ignores.enter(self.walker, backend, path, &scratch.listing);
+        let (ignores, ignore_errors) = ignores.enter(self.walker, backend, path, &scratch.listing);
+        for error in ignore_errors {
+            let (path, source) = error.into_parts();
+            self.handle_error(IGNORE_FILE_OPERATION, path, source, false)?;
+        }
         scratch.path.clear();
         scratch.path.push(path);
         for index in 0..scratch.listing.entries().len() {
@@ -2589,6 +2704,15 @@ mod tests {
         fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
 
         assert_unwind_safe::<WalkStream>();
+    }
+
+    #[test]
+    fn worker_budget_is_bounded_at_both_ends() {
+        assert_eq!(Walker::new(".").threads(0).threads, 1);
+        assert_eq!(
+            Walker::new(".").threads(usize::MAX).threads,
+            super::MAX_WORKERS
+        );
     }
 
     /// Compiles one walker pattern the way `include` and `exclude` do, in the
@@ -2835,12 +2959,14 @@ mod tests {
         backend: &impl super::DirectoryBackend,
         path: PathBuf,
     ) -> super::DirectoryTask {
+        let (ignores, ignore_errors) = super::IgnoreScope::for_root(walker, backend, &path);
         super::DirectoryTask {
             path: path.clone(),
             depth: 0,
             root: 0,
             cycle_guard: std::sync::Arc::new(super::CycleGuard::default()),
-            ignores: super::IgnoreScope::for_root(walker, backend, &path),
+            ignores,
+            ignore_errors,
         }
     }
 
@@ -5134,6 +5260,66 @@ mod tests {
                 "the walk has to read the nested ignore files through the backend"
             );
         }
+    }
+
+    #[test]
+    fn oversized_ignore_files_follow_the_configured_error_policy() {
+        let fixture = Fixture::new();
+        fixture.write("visible.txt");
+        let ignore_path = fixture.root.join(".gitignore");
+        let ignore_file = fs::File::create(&ignore_path).expect("create oversized ignore file");
+        ignore_file
+            .set_len(super::MAX_IGNORE_FILE_BYTES + 1)
+            .expect("size oversized ignore file");
+
+        for threads in [1, 4] {
+            let result = Walker::new(&fixture.root)
+                .respect_git_ignore(true)
+                .threads(threads)
+                .error_policy(ErrorPolicy::Collect)
+                .collect()
+                .expect("collect policy keeps walking");
+            assert_eq!(result.errors().len(), 1);
+            assert_eq!(result.errors()[0].operation(), "read_ignore");
+            assert_eq!(result.errors()[0].path(), ignore_path);
+            assert!(
+                relative_paths(result.entries(), &fixture.root)
+                    .contains(&PathBuf::from("visible.txt")),
+                "an unreadable rule file cannot silently hide unrelated entries"
+            );
+        }
+
+        let skipped = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .threads(1)
+            .error_policy(ErrorPolicy::Skip)
+            .collect()
+            .expect("skip policy keeps walking");
+        assert!(skipped.errors().is_empty());
+
+        let aborted = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .threads(1)
+            .error_policy(ErrorPolicy::Abort)
+            .collect()
+            .expect_err("abort policy reports the ignore failure immediately");
+        assert_eq!(aborted.operation(), "read_ignore");
+        assert_eq!(aborted.path(), ignore_path);
+
+        let streamed = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Collect)
+            .stream()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            streamed.iter().filter(|item| item.is_err()).count(),
+            1,
+            "the stream yields the ignore failure exactly once"
+        );
+        assert!(streamed.iter().any(|item| {
+            item.as_ref()
+                .is_ok_and(|entry| entry.path().ends_with("visible.txt"))
+        }));
     }
 
     /// The chain is rebuilt per directory now, so a rule at the root still has

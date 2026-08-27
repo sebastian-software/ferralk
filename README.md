@@ -117,8 +117,9 @@ for error in result.errors() {
 ```
 
 `collect()` uses available parallelism by default; use `threads(1)` for a
-single-threaded collection. `stream()` is intentionally single-threaded and
-unsorted so it can yield entries incrementally.
+single-threaded collection. Worker budgets are clamped to `1..=256` to bound
+per-walk queues and operating-system threads. `stream()` is intentionally
+single-threaded and unsorted so it can yield entries incrementally.
 
 ## Documentation
 

@@ -24,6 +24,7 @@ use std::{
 use super::{
     DirectoryBackend, Listing, Walker, glob_path_bytes,
     ignore_rules::{RuleSet, RuleSetBuilder},
+    read_bounded_file,
 };
 
 /// Ignore files of a directory, in increasing precedence: a later file wins.
@@ -31,6 +32,32 @@ const IGNORE_FILES: [&str; 2] = [".gitignore", ".ignore"];
 
 /// Repository-wide excludes, which the root's own ignore files override.
 const REPOSITORY_EXCLUDE_FILE: &str = "info/exclude";
+
+/// A single ignore file may contribute at most this many rule lines. The byte
+/// limit bounds I/O; this second dimension bounds compiled matchers even for a
+/// file made entirely of one-byte rules.
+const MAX_IGNORE_RULES: usize = 100_000;
+
+#[derive(Debug)]
+pub(crate) struct IgnoreReadError {
+    pub(crate) path: PathBuf,
+    kind: std::io::ErrorKind,
+    message: String,
+}
+
+impl IgnoreReadError {
+    fn new(path: PathBuf, source: std::io::Error) -> Self {
+        Self {
+            path,
+            kind: source.kind(),
+            message: source.to_string(),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (PathBuf, std::io::Error) {
+        (self.path, std::io::Error::new(self.kind, self.message))
+    }
+}
 
 /// The repository-local filesystem adaptations Git applies before ignore
 /// matching. They are derived once per walk root and carried through every
@@ -59,22 +86,18 @@ impl IgnoreScope {
         walker: &Walker,
         backend: &B,
         root: &Path,
-    ) -> Self {
+    ) -> (Self, Vec<IgnoreReadError>) {
         if !walker.respect_git_ignore {
-            return Self::default();
+            return (Self::default(), Vec::new());
         }
         let layout = repository_layout(root);
         let adaptation = GitIgnoreAdaptation::effective(walker, layout.as_ref());
-        Self {
+        let scope = Self {
             rules: None,
             adaptation,
-        }
-        .link(read_repository_rules(
-            backend,
-            root,
-            layout.as_ref(),
-            adaptation,
-        ))
+        };
+        let (rules, errors) = read_repository_rules(backend, root, layout.as_ref(), adaptation);
+        (scope.link(rules), errors)
     }
 
     /// Adds `directory`'s own ignore files to the chain. Called once, when the
@@ -87,19 +110,19 @@ impl IgnoreScope {
         backend: &B,
         directory: &Path,
         listing: &Listing,
-    ) -> Self {
+    ) -> (Self, Vec<IgnoreReadError>) {
         if !walker.respect_git_ignore {
-            return self;
+            return (self, Vec::new());
         }
         let present = IGNORE_FILES
             .into_iter()
             .filter(|file| listing.contains_git_ignore_name(file))
             .collect::<Vec<_>>();
         if present.is_empty() {
-            return self;
+            return (self, Vec::new());
         }
-        let rules = read_rules(backend, directory, &present, self.adaptation);
-        self.link(rules)
+        let (rules, errors) = read_rules(backend, directory, &present, self.adaptation);
+        (self.link(rules), errors)
     }
 
     /// Verdict for one entry of the directory this scope describes.
@@ -163,19 +186,25 @@ fn read_rules<B: DirectoryBackend + ?Sized>(
     directory: &Path,
     files: &[&str],
     adaptation: GitIgnoreAdaptation,
-) -> RuleSet {
+) -> (RuleSet, Vec<IgnoreReadError>) {
     let mut builder = RuleSetBuilder::new(
         directory,
         adaptation.case_insensitive,
         adaptation.precompose_unicode,
     );
+    let mut errors = Vec::new();
     for file in files {
         let path = directory.join(file);
-        if let Ok(contents) = backend.read_ignore_file(&path) {
-            add_rules(&mut builder, &contents);
+        match backend.read_ignore_file(&path) {
+            Ok(contents) => match validate_rule_count(&contents) {
+                Ok(()) => add_rules(&mut builder, &contents),
+                Err(source) => errors.push(IgnoreReadError::new(path, source)),
+            },
+            Err(source) if ignored_in_tree_read_error(&source) => {}
+            Err(source) => errors.push(IgnoreReadError::new(path, source)),
         }
     }
-    builder.build()
+    (builder.build(), errors)
 }
 
 /// Reads the repository-wide exclude file for `root`.
@@ -191,20 +220,58 @@ fn read_repository_rules<B: DirectoryBackend + ?Sized>(
     root: &Path,
     layout: Option<&RepositoryLayout>,
     adaptation: GitIgnoreAdaptation,
-) -> RuleSet {
+) -> (RuleSet, Vec<IgnoreReadError>) {
     let mut builder = RuleSetBuilder::new(
         root,
         adaptation.case_insensitive,
         adaptation.precompose_unicode,
     );
     let Some(layout) = layout else {
-        return builder.build();
+        return (builder.build(), Vec::new());
     };
     let path = layout.common_directory.join(REPOSITORY_EXCLUDE_FILE);
-    if let Ok(contents) = backend.read_repository_file(&path) {
-        add_rules(&mut builder, &contents);
+    let mut errors = Vec::new();
+    match backend.read_repository_file(&path) {
+        Ok(contents) => match validate_rule_count(&contents) {
+            Ok(()) => add_rules(&mut builder, &contents),
+            Err(source) => errors.push(IgnoreReadError::new(path, source)),
+        },
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => errors.push(IgnoreReadError::new(path, source)),
     }
-    builder.build()
+    (builder.build(), errors)
+}
+
+fn validate_rule_count(contents: &[u8]) -> std::io::Result<()> {
+    let terminated_lines = contents
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .take(MAX_IGNORE_RULES + 1)
+        .count();
+    let line_count =
+        terminated_lines + usize::from(!contents.is_empty() && contents.last() != Some(&b'\n'));
+    if line_count > MAX_IGNORE_RULES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ignore file exceeds the 100,000-rule safety limit",
+        ));
+    }
+    Ok(())
+}
+
+fn ignored_in_tree_read_error(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(not(unix))]
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return true;
+    }
+    false
 }
 
 /// The private git directory and its common directory. They are the same for
@@ -235,10 +302,12 @@ fn repository_layout(root: &Path) -> Option<RepositoryLayout> {
         return None;
     }
 
-    let private_directory =
-        resolve_metadata_path(root, parse_gitdir_pointer(&fs::read(&dot_git).ok()?)?)?;
+    let private_directory = resolve_metadata_path(
+        root,
+        parse_gitdir_pointer(&read_bounded_file(&dot_git).ok()?)?,
+    )?;
     let common_dir = private_directory.join("commondir");
-    match fs::read(common_dir) {
+    match read_bounded_file(&common_dir) {
         Ok(contents) => Some(RepositoryLayout {
             common_directory: resolve_metadata_path(
                 &private_directory,
@@ -294,11 +363,11 @@ impl GitIgnoreAdaptation {
 
 fn read_repository_config(layout: &RepositoryLayout) -> GitConfig {
     let mut config = GitConfig::default();
-    if let Ok(contents) = fs::read(layout.common_directory.join("config")) {
+    if let Ok(contents) = read_bounded_file(&layout.common_directory.join("config")) {
         apply_config(&mut config, &contents);
     }
     if config.worktree_config == Some(true)
-        && let Ok(contents) = fs::read(layout.private_directory.join("config.worktree"))
+        && let Ok(contents) = read_bounded_file(&layout.private_directory.join("config.worktree"))
     {
         // Worktree config is read after the common config, so its last value
         // wins just as `git config --worktree` does.
@@ -610,7 +679,20 @@ fn add_rules(builder: &mut RuleSetBuilder, contents: &[u8]) {
 mod tests {
     use std::path::Path;
 
-    use super::{GitConfig, RuleSetBuilder, add_rules, apply_config, parse_git_bool};
+    use super::{
+        GitConfig, MAX_IGNORE_RULES, RuleSetBuilder, add_rules, apply_config, parse_git_bool,
+        validate_rule_count,
+    };
+
+    #[test]
+    fn ignore_rule_count_has_a_hard_limit() {
+        let at_limit = vec![b'\n'; MAX_IGNORE_RULES];
+        assert!(validate_rule_count(&at_limit).is_ok());
+
+        let over_limit = vec![b'\n'; MAX_IGNORE_RULES + 1];
+        let error = validate_rule_count(&over_limit).expect_err("one extra rule is rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn byte_lines_continue_after_invalid_utf8_and_match_byte_patterns() {

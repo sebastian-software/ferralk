@@ -22,7 +22,8 @@ use std::{
 };
 
 use super::{
-    CycleGuard, DirectoryBackend, ListedEntry, WalkEntry, Walker, gitignore::IgnoreScope,
+    CycleGuard, DirectoryBackend, ListedEntry, WalkEntry, Walker,
+    gitignore::{IgnoreReadError, IgnoreScope},
     glob_bytes, has_hidden_component, should_skip_git_directory,
 };
 
@@ -96,6 +97,9 @@ pub(crate) struct DirectoryTask {
     /// every entry's path.
     pub(crate) depth: usize,
     pub(crate) ignores: IgnoreScope,
+    /// Repository-level ignore errors are discovered while the root task is
+    /// built and consumed exactly once by the frontend that opens it.
+    pub(crate) ignore_errors: Vec<IgnoreReadError>,
 }
 
 /// Root-specific state carried by a directory while it is classified.
@@ -276,6 +280,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         root: context.root,
         cycle_guard: Arc::clone(context.cycle_guard),
         ignores: ignores.clone(),
+        ignore_errors: Vec::new(),
     };
     if !emit {
         if descend {

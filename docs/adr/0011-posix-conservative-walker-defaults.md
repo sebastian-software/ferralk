@@ -18,7 +18,7 @@ Everything behavior-changing should be an explicit builder call.
 | `*` matches leading-period names | no (`match_hidden` opts in) |
 | sorting | off (unsorted, nondeterministic order) |
 | `ErrorPolicy` | `Collect` |
-| threads | `available_parallelism()` (once the scheduler exists) |
+| threads | `min(available_parallelism(), 256)`; explicit budgets clamp to `1..=256` |
 
 ## Consequences
 

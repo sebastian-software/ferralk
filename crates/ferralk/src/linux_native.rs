@@ -1056,12 +1056,14 @@ mod tests {
             .next()
             .expect("a walk has a root")
             .to_path_buf();
+        let (ignores, ignore_errors) = crate::IgnoreScope::for_root(walker, &StdBackend, &root);
         let task = crate::DirectoryTask {
             path: root.clone(),
             depth: 0,
             root: 0,
             cycle_guard: std::sync::Arc::new(crate::CycleGuard::default()),
-            ignores: crate::IgnoreScope::for_root(walker, &StdBackend, &root),
+            ignores,
+            ignore_errors,
         };
         state
             .walk_directory(&StdBackend, task)

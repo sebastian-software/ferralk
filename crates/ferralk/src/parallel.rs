@@ -592,6 +592,7 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
         root,
         cycle_guard,
         ignores,
+        ignore_errors,
     } = task;
     #[cfg(test)]
     if should_panic_in_directory(&path) {
@@ -601,6 +602,13 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
         return;
     }
     let is_root = depth == 0;
+    for error in ignore_errors {
+        let (path, source) = error.into_parts();
+        shared.record_error(super::IGNORE_FILE_OPERATION, path, source, false);
+        if shared.should_stop() {
+            return;
+        }
+    }
     if shared.walker.options.follow_symlinks
         && !mark_directory(shared, &cycle_guard, &path, is_root)
     {
@@ -624,7 +632,15 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
     // The directory's own ignore files join the chain here. Every directory is
     // processed once, so every ignore file is read once, whatever the worker
     // count.
-    let ignores = ignores.enter(&shared.walker, shared.backend, &path, &worker.listing);
+    let (ignores, ignore_errors) =
+        ignores.enter(&shared.walker, shared.backend, &path, &worker.listing);
+    for error in ignore_errors {
+        let (path, source) = error.into_parts();
+        shared.record_error(super::IGNORE_FILE_OPERATION, path, source, false);
+        if shared.should_stop() {
+            return;
+        }
+    }
     worker.path.clear();
     worker.path.push(&path);
     for index in 0..worker.listing.entries().len() {

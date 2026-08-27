@@ -145,12 +145,14 @@ fn walk_portable(walker: &Walker) -> (Vec<WalkEntry>, Vec<WalkError>) {
         .next()
         .expect("a walk has a root")
         .to_path_buf();
+    let (ignores, ignore_errors) = IgnoreScope::for_root(walker, &StdBackend, &root);
     let task = DirectoryTask {
         path: root.clone(),
         depth: 0,
         root: 0,
         cycle_guard: std::sync::Arc::new(crate::CycleGuard::default()),
-        ignores: IgnoreScope::for_root(walker, &StdBackend, &root),
+        ignores,
+        ignore_errors,
     };
     state
         .walk_directory(&StdBackend, task)

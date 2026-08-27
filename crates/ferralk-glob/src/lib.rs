@@ -19,14 +19,13 @@ use std::{
     collections::{BTreeMap, HashSet},
     error::Error,
     fmt,
-    ops::RangeInclusive,
 };
 
 use memchr::{memchr, memchr2, memchr3, memmem};
 
 mod sweep;
 
-use sweep::SweepEngine;
+use sweep::{SweepEngine, SweepState};
 
 /// A compiled glob pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3361,6 +3360,11 @@ enum ExtglobKind {
 struct CompiledExtglob {
     steps: Vec<ExtglobStep>,
     groups: Vec<ExtglobGroup>,
+    /// Linear-space Thompson machine for eligible positive extglobs.
+    /// Negation needs substring-complement semantics, while plain outer stars
+    /// retain legacy backtracking quirks; those cases stay on the compatible
+    /// explicit worklist below.
+    positive_nfa: Option<PositiveExtglobNfa>,
     /// Dense memo state for every interpreter offset that participates in the
     /// recurrence: the entry point plus each group start and continuation.
     /// The byte-indexed step table remains the interpreter's address space.
@@ -3397,6 +3401,59 @@ enum ExtglobStep {
     UnclosedGroup { byte: u8 },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PositiveExtglobNfa {
+    states: Vec<PositiveExtglobState>,
+    start: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PositiveExtglobState {
+    Epsilon {
+        targets: Vec<usize>,
+        blocks_leading_period: bool,
+    },
+    Consume {
+        matcher: PositiveExtglobMatcher,
+        next: usize,
+    },
+    Star {
+        matcher: PositiveExtglobMatcher,
+        next: usize,
+    },
+    Match,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PositiveExtglobMatcher {
+    Literal(u8),
+    GroupLiteral(u8),
+    GroupSeparator,
+    Wildcard(WildcardScope),
+    Class(Class, WildcardScope),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WildcardScope {
+    /// The outer extglob interpreter keeps ordinary wildcards component-local
+    /// whenever component matching is enabled.
+    Extglob,
+    /// Every byte of a group alternative is constrained to the current
+    /// component when component matching is enabled, including literal
+    /// separators and recursively spelled stars.
+    Group,
+}
+
+struct PositiveExtglobBuilder<'budget> {
+    states: Vec<PositiveExtglobState>,
+    budget: &'budget mut IrBudget,
+}
+
+struct PositiveExtglobClosureScratch {
+    seen: Vec<bool>,
+    pending: Vec<usize>,
+}
+
 /// One alternative of a group, compiled as a whole-candidate pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExtglobAlternative {
@@ -3417,6 +3474,393 @@ struct ExtglobGroup {
     start: usize,
     /// Offset just past the closing parenthesis.
     rest: usize,
+}
+
+impl PositiveExtglobNfa {
+    fn compile(
+        steps: &[ExtglobStep],
+        groups: &[ExtglobGroup],
+        budget: &mut IrBudget,
+    ) -> Result<Option<Self>, PatternError> {
+        if groups
+            .iter()
+            .any(|group| group.kind == ExtglobKind::Negated)
+            || steps.iter().any(|step| {
+                matches!(
+                    step,
+                    ExtglobStep::Star { .. } | ExtglobStep::UnclosedGroup { byte: b'*' }
+                )
+            })
+        {
+            return Ok(None);
+        }
+        let mut builder = PositiveExtglobBuilder {
+            states: Vec::new(),
+            budget,
+        };
+        let accept = builder.push(PositiveExtglobState::Match, 0)?;
+        let mut suffixes = vec![None; steps.len() + 1];
+        suffixes[steps.len()] = Some(accept);
+
+        for index in (0..steps.len()).rev() {
+            let start =
+                match &steps[index] {
+                    ExtglobStep::NoMatch => None,
+                    ExtglobStep::Byte(byte) => builder
+                        .consume(PositiveExtglobMatcher::Literal(*byte), suffixes[index + 1])?,
+                    ExtglobStep::Any => builder.consume(
+                        PositiveExtglobMatcher::Wildcard(WildcardScope::Extglob),
+                        suffixes[index + 1],
+                    )?,
+                    ExtglobStep::Class { class, next } => builder.consume(
+                        PositiveExtglobMatcher::Class(class.clone(), WildcardScope::Extglob),
+                        suffixes[*next],
+                    )?,
+                    ExtglobStep::Star { .. } => {
+                        unreachable!("outer stars keep the compatible interpreter")
+                    }
+                    ExtglobStep::Escape { escaped } => {
+                        let mut targets = Vec::new();
+                        if let Some(target) = suffixes[index + 2] {
+                            targets.push(builder.push(
+                                PositiveExtglobState::Consume {
+                                    matcher: PositiveExtglobMatcher::Literal(*escaped),
+                                    next: target,
+                                },
+                                1,
+                            )?);
+                        }
+                        if let Some(target) = suffixes[index + 1] {
+                            targets.push(builder.push(
+                                PositiveExtglobState::Consume {
+                                    matcher: PositiveExtglobMatcher::Literal(b'\\'),
+                                    next: target,
+                                },
+                                1,
+                            )?);
+                        }
+                        builder.epsilon(targets, false)?
+                    }
+                    ExtglobStep::Group(group) => {
+                        let group = &groups[*group];
+                        builder.group(group, suffixes[group.rest])?
+                    }
+                    ExtglobStep::UnclosedGroup { byte: b'*' } => {
+                        unreachable!("unclosed outer stars keep the compatible interpreter")
+                    }
+                    ExtglobStep::UnclosedGroup { byte: b'?' } => builder.consume(
+                        PositiveExtglobMatcher::Wildcard(WildcardScope::Extglob),
+                        suffixes[index + 1],
+                    )?,
+                    ExtglobStep::UnclosedGroup { byte } => builder
+                        .consume(PositiveExtglobMatcher::Literal(*byte), suffixes[index + 1])?,
+                };
+            suffixes[index] = start;
+        }
+        Ok(suffixes[0].map(|start| Self {
+            states: builder.states,
+            start,
+        }))
+    }
+
+    fn is_match(&self, path: &[u8], options: PatternOptions) -> bool {
+        let mut current = Vec::new();
+        let mut next = Vec::new();
+        let mut scratch = PositiveExtglobClosureScratch {
+            seen: vec![false; self.states.len()],
+            pending: Vec::new(),
+        };
+        self.add_closure(
+            self.start,
+            path.first().copied(),
+            options.candidate_starts_component,
+            options,
+            &mut current,
+            &mut scratch,
+        );
+
+        let mut at_component_start = options.candidate_starts_component;
+        for (path_index, &byte) in path.iter().enumerate() {
+            next.clear();
+            scratch.seen.fill(false);
+            let next_byte = path.get(path_index + 1).copied();
+            let next_starts_component = is_separator(byte);
+            for &state in &current {
+                match &self.states[state] {
+                    PositiveExtglobState::Consume {
+                        matcher,
+                        next: target,
+                    } if matcher.matches(byte, at_component_start, options) => {
+                        self.add_closure(
+                            *target,
+                            next_byte,
+                            next_starts_component,
+                            options,
+                            &mut next,
+                            &mut scratch,
+                        );
+                    }
+                    PositiveExtglobState::Star { matcher, .. }
+                        if matcher.matches(byte, at_component_start, options) =>
+                    {
+                        self.add_closure(
+                            state,
+                            next_byte,
+                            next_starts_component,
+                            options,
+                            &mut next,
+                            &mut scratch,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            if next.is_empty() {
+                return false;
+            }
+            std::mem::swap(&mut current, &mut next);
+            at_component_start = next_starts_component;
+        }
+        current
+            .iter()
+            .any(|&state| matches!(self.states[state], PositiveExtglobState::Match))
+    }
+
+    fn add_closure(
+        &self,
+        start: usize,
+        byte: Option<u8>,
+        at_component_start: bool,
+        options: PatternOptions,
+        active: &mut Vec<usize>,
+        scratch: &mut PositiveExtglobClosureScratch,
+    ) {
+        scratch.pending.clear();
+        scratch.pending.push(start);
+        while let Some(state) = scratch.pending.pop() {
+            if std::mem::replace(&mut scratch.seen[state], true) {
+                continue;
+            }
+            match &self.states[state] {
+                PositiveExtglobState::Epsilon {
+                    targets,
+                    blocks_leading_period,
+                } => {
+                    if *blocks_leading_period
+                        && !options.match_hidden
+                        && at_component_start
+                        && byte == Some(b'.')
+                    {
+                        continue;
+                    }
+                    scratch.pending.extend(targets.iter().copied());
+                }
+                PositiveExtglobState::Star { next, .. } => {
+                    active.push(state);
+                    scratch.pending.push(*next);
+                }
+                PositiveExtglobState::Consume { .. } | PositiveExtglobState::Match => {
+                    active.push(state);
+                }
+            }
+        }
+    }
+}
+
+impl PositiveExtglobMatcher {
+    fn matches(&self, byte: u8, at_component_start: bool, options: PatternOptions) -> bool {
+        match self {
+            Self::Literal(expected) => bytes_equal(*expected, byte, options.case_insensitive),
+            Self::GroupLiteral(expected) => {
+                (!options.component_wildcards || !is_separator(byte))
+                    && bytes_equal(*expected, byte, options.case_insensitive)
+            }
+            Self::GroupSeparator => !options.component_wildcards && is_separator(byte),
+            Self::Wildcard(scope) => scope.accepts(byte, at_component_start, options),
+            Self::Class(class, scope) => {
+                scope.accepts(byte, at_component_start, options)
+                    && class.matches(byte, options.case_insensitive)
+            }
+        }
+    }
+}
+
+impl WildcardScope {
+    fn accepts(self, byte: u8, at_component_start: bool, options: PatternOptions) -> bool {
+        let crosses_separator = match self {
+            Self::Extglob | Self::Group => !options.component_wildcards,
+        };
+        (!is_separator(byte) || crosses_separator)
+            && (options.match_hidden || byte != b'.' || !at_component_start)
+    }
+}
+
+impl PositiveExtglobBuilder<'_> {
+    fn push(
+        &mut self,
+        state: PositiveExtglobState,
+        edge_count: usize,
+    ) -> Result<usize, PatternError> {
+        // A state contains an enum payload and every edge is one stored index.
+        // Charging two IR units for the payload plus one per edge deliberately
+        // overestimates the actual allocation before it is made.
+        self.budget.charge(2 + edge_count, 0)?;
+        let index = self.states.len();
+        self.states.push(state);
+        Ok(index)
+    }
+
+    fn consume(
+        &mut self,
+        matcher: PositiveExtglobMatcher,
+        next: Option<usize>,
+    ) -> Result<Option<usize>, PatternError> {
+        next.map(|next| self.push(PositiveExtglobState::Consume { matcher, next }, 1))
+            .transpose()
+    }
+
+    fn star(
+        &mut self,
+        matcher: PositiveExtglobMatcher,
+        next: Option<usize>,
+    ) -> Result<Option<usize>, PatternError> {
+        next.map(|next| self.push(PositiveExtglobState::Star { matcher, next }, 1))
+            .transpose()
+    }
+
+    fn epsilon(
+        &mut self,
+        mut targets: Vec<usize>,
+        blocks_leading_period: bool,
+    ) -> Result<Option<usize>, PatternError> {
+        targets.sort_unstable();
+        targets.dedup();
+        if targets.is_empty() {
+            return Ok(None);
+        }
+        if targets.len() == 1 && !blocks_leading_period {
+            return Ok(targets.first().copied());
+        }
+        let edge_count = targets.len();
+        self.push(
+            PositiveExtglobState::Epsilon {
+                targets,
+                blocks_leading_period,
+            },
+            edge_count,
+        )
+        .map(Some)
+    }
+
+    fn group(
+        &mut self,
+        group: &ExtglobGroup,
+        rest: Option<usize>,
+    ) -> Result<Option<usize>, PatternError> {
+        let Some(rest) = rest else {
+            return Ok(None);
+        };
+        let blocks_leading_period = !extglob_group_allows_literal_leading_period(group);
+        match group.kind {
+            ExtglobKind::ExactlyOne => {
+                let alternatives = self.alternatives(group, rest)?;
+                self.epsilon(alternatives, blocks_leading_period)
+            }
+            ExtglobKind::Optional => {
+                let mut alternatives = self.alternatives(group, rest)?;
+                alternatives.push(rest);
+                self.epsilon(alternatives, blocks_leading_period)
+            }
+            ExtglobKind::ZeroOrMore | ExtglobKind::OneOrMore => {
+                let hub = self.push(
+                    PositiveExtglobState::Epsilon {
+                        targets: Vec::new(),
+                        blocks_leading_period: false,
+                    },
+                    0,
+                )?;
+                let alternatives = self.alternatives(group, hub)?;
+                let mut loop_targets = alternatives.clone();
+                loop_targets.push(rest);
+                let edge_count = loop_targets.len();
+                self.budget.charge(edge_count, 0)?;
+                self.states[hub] = PositiveExtglobState::Epsilon {
+                    targets: loop_targets,
+                    blocks_leading_period: false,
+                };
+                if group.kind == ExtglobKind::ZeroOrMore {
+                    self.epsilon(vec![hub], blocks_leading_period)
+                } else {
+                    self.epsilon(alternatives, blocks_leading_period)
+                }
+            }
+            ExtglobKind::Negated => unreachable!("negated groups do not compile to this NFA"),
+        }
+    }
+
+    fn alternatives(
+        &mut self,
+        group: &ExtglobGroup,
+        next: usize,
+    ) -> Result<Vec<usize>, PatternError> {
+        let mut starts = Vec::new();
+        for alternative in &group.alternatives {
+            let Some(compiled) = &alternative.compiled else {
+                continue;
+            };
+            for alternative in compiled {
+                if let Some(start) = self.tokens(&alternative.tokens, next)? {
+                    starts.push(start);
+                }
+            }
+        }
+        Ok(starts)
+    }
+
+    fn tokens(&mut self, tokens: &[Token], next: usize) -> Result<Option<usize>, PatternError> {
+        let mut start = Some(next);
+        for (token_index, token) in tokens.iter().enumerate().rev() {
+            start = match token {
+                Token::Literal(literal) => {
+                    let mut literal_start = start;
+                    for &byte in literal.iter().rev() {
+                        literal_start = self
+                            .consume(PositiveExtglobMatcher::GroupLiteral(byte), literal_start)?;
+                    }
+                    literal_start
+                }
+                Token::Separator => self.consume(PositiveExtglobMatcher::GroupSeparator, start)?,
+                Token::Any => self.consume(
+                    PositiveExtglobMatcher::Wildcard(WildcardScope::Group),
+                    start,
+                )?,
+                Token::Class(class) => self.consume(
+                    PositiveExtglobMatcher::Class(class.clone(), WildcardScope::Group),
+                    start,
+                )?,
+                Token::Star => self.star(
+                    PositiveExtglobMatcher::Wildcard(WildcardScope::Group),
+                    start,
+                )?,
+                Token::PathStar => self.star(
+                    PositiveExtglobMatcher::Wildcard(WildcardScope::Group),
+                    start,
+                )?,
+                Token::RecursiveStar | Token::RecursivePrefix => self.star(
+                    PositiveExtglobMatcher::Wildcard(WildcardScope::Group),
+                    start,
+                )?,
+            };
+            if token_index + 2 == tokens.len()
+                && matches!(token, Token::Separator)
+                && matches!(tokens.last(), Some(Token::RecursiveStar))
+                && let Some(normal) = start
+            {
+                start = self.epsilon(vec![normal, next], false)?;
+            }
+        }
+        Ok(start)
+    }
 }
 
 /// Compiles the extglob program for `pattern`, or `None` when it has no group.
@@ -3486,9 +3930,11 @@ fn compile_extglob(
         add_memo_state(group.start);
         add_memo_state(group.rest);
     }
+    let positive_nfa = PositiveExtglobNfa::compile(&steps, &groups, budget)?;
     Ok(Some(CompiledExtglob {
         steps,
         groups,
+        positive_nfa,
         memo_state_indices,
         memo_state_count,
         walker_source_provenance: walker_source_provenance.cloned(),
@@ -3719,16 +4165,16 @@ struct ExtglobScratch {
     /// The previous match's distinct failed states, retained only as
     /// deterministic test instrumentation.
     failed_state_count: usize,
-    /// Deferred continuation positions, partitioned by active repetition
-    /// calls so sequential groups reuse one allocation without sharing work.
-    repeated: Vec<usize>,
+    /// Deferred `(program, candidate)` continuations. Extglob groups append
+    /// work here instead of recursing through the native stack.
+    pending: Vec<(usize, usize)>,
 }
 
 /// Borrows the extglob scratch buffers for one match.
 struct ExtglobMatchState<'scratch> {
     visited: &'scratch mut Vec<u64>,
     failed: ExtglobFailedStates<'scratch>,
-    repeated: &'scratch mut Vec<usize>,
+    pending: &'scratch mut Vec<(usize, usize)>,
 }
 
 thread_local! {
@@ -3742,6 +4188,9 @@ thread_local! {
 /// the general scratch, so holding both at once would push every sub-match
 /// onto the re-entrancy fallback and allocate there.
 fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: PatternOptions) -> bool {
+    if let Some(nfa) = &program.positive_nfa {
+        return nfa.is_match(path, options);
+    }
     EXTGLOB_SCRATCH.with(|cell| match cell.try_borrow_mut() {
         Ok(mut scratch) => {
             let matched = {
@@ -3752,11 +4201,11 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                     failed_page_count,
                     #[cfg(test)]
                     failed_state_count,
-                    repeated,
+                    pending,
                 } = &mut *scratch;
                 visited.clear();
                 failed.clear();
-                repeated.clear();
+                pending.clear();
                 #[cfg(test)]
                 {
                     *failed_page_count = 0;
@@ -3772,7 +4221,7 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                         #[cfg(test)]
                         failed_state_count,
                     ),
-                    repeated,
+                    pending,
                 };
                 match_extglob_from(program, path, 0, 0, options, &mut state)
             };
@@ -3786,9 +4235,9 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
             if scratch.failed.capacity() > retained_rows {
                 scratch.failed.shrink_to(retained_rows);
             }
-            scratch.repeated.clear();
-            if scratch.repeated.capacity() > RETAINED_SCRATCH_WORDS {
-                scratch.repeated.shrink_to(RETAINED_SCRATCH_WORDS);
+            scratch.pending.clear();
+            if scratch.pending.capacity() > RETAINED_SCRATCH_WORDS {
+                scratch.pending.shrink_to(RETAINED_SCRATCH_WORDS);
             }
             matched
         }
@@ -3801,7 +4250,7 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                 failed_page_count,
                 #[cfg(test)]
                 failed_state_count,
-                repeated,
+                pending,
             } = &mut scratch;
             let mut state = ExtglobMatchState {
                 visited,
@@ -3813,17 +4262,11 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                     #[cfg(test)]
                     failed_state_count,
                 ),
-                repeated,
+                pending,
             };
             match_extglob_from(program, path, 0, 0, options, &mut state)
         }
     })
-}
-
-/// Capacity the calling thread's extglob visited buffer currently holds.
-#[cfg(test)]
-fn extglob_visited_capacity() -> usize {
-    EXTGLOB_SCRATCH.with(|cell| cell.borrow().visited.capacity())
 }
 
 /// Scratch capacities after an extglob match, used to keep the retained
@@ -3836,7 +4279,7 @@ fn extglob_scratch_capacities() -> (usize, usize, usize) {
             scratch.visited.capacity(),
             scratch.failed.capacity() * std::mem::size_of::<ExtglobFailedRow>()
                 / std::mem::size_of::<u64>(),
-            scratch.repeated.capacity(),
+            scratch.pending.capacity(),
         )
     })
 }
@@ -3943,7 +4386,46 @@ fn visit(visited: &mut [u64], base: usize, position: usize) -> bool {
     }
 }
 
+fn visited(visited: &[u64], base: usize, position: usize) -> bool {
+    visited[base + position / u64::BITS as usize] & (1_u64 << (position % u64::BITS as usize)) != 0
+}
+
 fn match_extglob_from(
+    program: &CompiledExtglob,
+    path: &[u8],
+    start: usize,
+    start_path_index: usize,
+    options: PatternOptions,
+    state: &mut ExtglobMatchState<'_>,
+) -> bool {
+    let pending_base = state.pending.len();
+    state.pending.push((start, start_path_index));
+    let mut matched = false;
+    while state.pending.len() > pending_base {
+        let (start, start_path_index) = state
+            .pending
+            .pop()
+            .expect("the extglob continuation slice is non-empty");
+        if !state
+            .failed
+            .insert(program.memo_state_index(start), start_path_index)
+        {
+            continue;
+        }
+        if match_extglob_task(program, path, start, start_path_index, options, state) {
+            matched = true;
+            break;
+        }
+    }
+    state.pending.truncate(pending_base);
+    matched
+}
+
+/// Runs one deterministic outer-program branch. Groups append their possible
+/// continuations to the shared work list, so sequential groups consume heap
+/// work rather than native call frames. A preceding plain star keeps its local
+/// two-pointer backtrack state and queues the group for each reachable split.
+fn match_extglob_task(
     program: &CompiledExtglob,
     path: &[u8],
     start: usize,
@@ -3957,17 +4439,6 @@ fn match_extglob_from(
     let mut star_pattern_index = 0_usize;
     let mut star_path_index = 0_usize;
     let mut has_star = false;
-
-    // Every recursive branch reaches a program step with no inherited star
-    // backtrack point. It can therefore be shared across sequential groups and
-    // within one repetition: once a suffix has been explored, another
-    // partition cannot make it succeed.
-    if !state
-        .failed
-        .insert(program.memo_state_index(pattern_index), path_index)
-    {
-        return false;
-    }
 
     while path_index < path.len() || pattern_index < steps.len() {
         if pattern_index < steps.len() {
@@ -3987,16 +4458,7 @@ fn match_extglob_from(
             }
             match &steps[pattern_index] {
                 ExtglobStep::Group(group) => {
-                    if match_extglob_group(
-                        program,
-                        &program.groups[*group],
-                        path,
-                        path_index,
-                        options,
-                        state,
-                    ) {
-                        return true;
-                    }
+                    queue_extglob_group(&program.groups[*group], path, path_index, options, state);
                     if has_star && star_path_index < path.len() {
                         pattern_index = star_pattern_index;
                         star_path_index += 1;
@@ -4130,148 +4592,243 @@ fn extglob_group_allows_literal_leading_period(group: &ExtglobGroup) -> bool {
     })
 }
 
-fn match_extglob_group(
-    program: &CompiledExtglob,
+fn queue_extglob_group(
     group: &ExtglobGroup,
     path: &[u8],
     path_index: usize,
     options: PatternOptions,
     state: &mut ExtglobMatchState<'_>,
-) -> bool {
+) {
     match group.kind {
         ExtglobKind::ExactlyOne => {
-            match_extglob_alternative(program, group, path, path_index, options, state)
+            let mut ends = Vec::new();
+            matching_extglob_group_ends(group, path, path_index, options, &mut ends);
+            queue_extglob_continuations(state, group.rest, ends);
         }
         ExtglobKind::Optional => {
-            match_extglob_from(program, path, group.rest, path_index, options, state)
-                || match_extglob_alternative(program, group, path, path_index, options, state)
+            state.pending.push((group.rest, path_index));
+            let mut ends = Vec::new();
+            matching_extglob_group_ends(group, path, path_index, options, &mut ends);
+            queue_extglob_continuations(state, group.rest, ends);
         }
         ExtglobKind::ZeroOrMore => {
-            match_extglob_from(program, path, group.rest, path_index, options, state)
-                || match_extglob_repetition(program, group, path, path_index, options, state)
+            state.pending.push((group.rest, path_index));
+            let ends = matching_extglob_repetition_ends(group, path, path_index, options, state);
+            queue_extglob_continuations(state, group.rest, ends);
         }
         ExtglobKind::OneOrMore => {
-            match_extglob_repetition(program, group, path, path_index, options, state)
+            let ends = matching_extglob_repetition_ends(group, path, path_index, options, state);
+            queue_extglob_continuations(state, group.rest, ends);
         }
         ExtglobKind::Negated => {
-            for end in path_index..=extglob_component_end(path, path_index, options) {
-                if group.alternatives.iter().all(|alternative| {
-                    !match_extglob_alternative_exact(
-                        alternative,
-                        &path[path_index..end],
-                        at_component_start(path, path_index, options),
-                        options,
-                    )
-                }) && match_extglob_from(program, path, group.rest, end, options, state)
-                {
-                    return true;
+            let component_end = extglob_component_end(path, path_index, options);
+            let mut excluded = vec![false; component_end - path_index + 1];
+            let mut ends = Vec::new();
+            matching_extglob_group_ends(group, path, path_index, options, &mut ends);
+            for end in ends {
+                excluded[end - path_index] = true;
+            }
+            for (offset, excluded) in excluded.into_iter().enumerate() {
+                if !excluded {
+                    state.pending.push((group.rest, path_index + offset));
                 }
             }
-            false
         }
     }
 }
 
-/// Runs a repetition under its own visited frame.
-///
-/// The frame replaces the hash set the interpreter built per group encounter.
-/// It is a stack because a repetition can reach another one through its rest,
-/// and each needs its own set of already-tried positions.
-fn match_extglob_repetition(
-    program: &CompiledExtglob,
-    group: &ExtglobGroup,
-    path: &[u8],
-    path_index: usize,
-    options: PatternOptions,
+fn queue_extglob_continuations(
     state: &mut ExtglobMatchState<'_>,
-) -> bool {
-    let base = push_visited(state.visited, path.len() + 1);
-    let matched = match_extglob_repeated(program, group, path, path_index, options, state, base);
-    state.visited.truncate(base);
-    matched
+    rest: usize,
+    ends: impl IntoIterator<Item = usize>,
+) {
+    state
+        .pending
+        .extend(ends.into_iter().map(|end| (rest, end)));
 }
 
-fn match_extglob_repeated(
-    program: &CompiledExtglob,
+fn matching_extglob_group_ends(
+    group: &ExtglobGroup,
+    path: &[u8],
+    path_index: usize,
+    options: PatternOptions,
+    output: &mut Vec<usize>,
+) {
+    for alternative in &group.alternatives {
+        matching_extglob_alternative_ends(alternative, path, path_index, options, output);
+    }
+    output.sort_unstable();
+    output.dedup();
+}
+
+/// All offsets reachable after one or more repetitions of `group`.
+///
+/// Variable-width alternatives run as streaming sweeps. Whenever a prior
+/// match reaches the current offset, their initial boundary is injected into
+/// the live state. This evaluates every possible partition in one candidate
+/// pass instead of rematching every suffix from every reached offset.
+fn matching_extglob_repetition_ends(
     group: &ExtglobGroup,
     path: &[u8],
     path_index: usize,
     options: PatternOptions,
     state: &mut ExtglobMatchState<'_>,
-    base: usize,
-) -> bool {
-    let work_base = state.repeated.len();
-    state.repeated.push(path_index);
-    let mut matched = false;
-    while state.repeated.len() > work_base {
-        let path_index = state
-            .repeated
-            .pop()
-            .expect("the non-empty repetition work slice has a position");
-        if !visit(state.visited, base, path_index) {
+) -> Vec<usize> {
+    let component_end = extglob_component_end(path, path_index, options);
+    let position_count = component_end - path_index + 1;
+    state.visited.clear();
+    let reachable_base = push_visited(state.visited, position_count);
+    let matched_base = push_visited(state.visited, position_count);
+    visit(state.visited, reachable_base, 0);
+
+    let mut sweeps: Vec<(&SweepEngine, SweepState)> = Vec::new();
+    let mut fixed = Vec::new();
+    let mut fallback = Vec::new();
+    for alternative in &group.alternatives {
+        if alternative.width.is_some() {
+            fixed.push(alternative);
             continue;
         }
-        for alternative in &group.alternatives {
-            for end in extglob_alternative_ends(alternative, path, path_index, options)
-                .into_iter()
-                .flatten()
-            {
-                if match_extglob_alternative_exact(
-                    alternative,
-                    &path[path_index..end],
-                    at_component_start(path, path_index, options),
-                    options,
-                ) {
-                    if match_extglob_from(program, path, group.rest, end, options, state) {
-                        matched = true;
-                        break;
-                    }
-                    if end > path_index
-                        && state
-                            .failed
-                            .insert(program.memo_state_index(group.start), end)
-                    {
-                        state.repeated.push(end);
-                    }
-                }
-            }
-            if matched {
-                break;
+        let Some(compiled) = &alternative.compiled else {
+            continue;
+        };
+        let mut has_fallback = false;
+        for compiled in compiled {
+            if let Some(sweep) = &compiled.sweep {
+                sweeps.push((sweep, sweep.empty_state()));
+            } else {
+                has_fallback = true;
             }
         }
-        if matched {
-            break;
+        if has_fallback {
+            fallback.push(alternative);
         }
     }
-    state.repeated.truncate(work_base);
-    matched
+
+    let mut ends = Vec::new();
+    for offset in 0..position_count {
+        let absolute = path_index + offset;
+        if visited(state.visited, reachable_base, offset) {
+            for alternative in &fixed {
+                let Some(width) = alternative.width else {
+                    unreachable!("fixed alternatives carry a width");
+                };
+                let Some(end) = absolute.checked_add(width) else {
+                    continue;
+                };
+                if end <= component_end
+                    && match_extglob_alternative_exact(
+                        alternative,
+                        &path[absolute..end],
+                        at_component_start(path, absolute, options),
+                        options,
+                    )
+                {
+                    let reached = end - path_index;
+                    visit(state.visited, reachable_base, reached);
+                    visit(state.visited, matched_base, reached);
+                }
+            }
+            for alternative in &fallback {
+                ends.clear();
+                matching_extglob_alternative_ends(alternative, path, absolute, options, &mut ends);
+                for &end in &ends {
+                    let reached = end - path_index;
+                    visit(state.visited, reachable_base, reached);
+                    visit(state.visited, matched_base, reached);
+                }
+            }
+            for (sweep, sweep_state) in &mut sweeps {
+                sweep.inject_start(sweep_state);
+                if sweep.accepts(sweep_state) {
+                    visit(state.visited, matched_base, offset);
+                }
+            }
+        }
+
+        if absolute == component_end {
+            break;
+        }
+        let byte = path[absolute];
+        let starts_component = at_component_start(path, absolute, options);
+        for (sweep, sweep_state) in &mut sweeps {
+            if sweep.advance(sweep_state, byte, starts_component, options)
+                && sweep.accepts(sweep_state)
+            {
+                visit(state.visited, reachable_base, offset + 1);
+                visit(state.visited, matched_base, offset + 1);
+            }
+        }
+    }
+
+    (0..position_count)
+        .filter(|&offset| visited(state.visited, matched_base, offset))
+        .map(|offset| path_index + offset)
+        .collect()
 }
 
-fn match_extglob_alternative(
-    program: &CompiledExtglob,
-    group: &ExtglobGroup,
+fn matching_extglob_alternative_ends(
+    alternative: &ExtglobAlternative,
     path: &[u8],
     path_index: usize,
     options: PatternOptions,
-    state: &mut ExtglobMatchState<'_>,
-) -> bool {
-    for alternative in &group.alternatives {
-        for end in extglob_alternative_ends(alternative, path, path_index, options)
-            .into_iter()
-            .flatten()
-        {
-            if match_extglob_alternative_exact(
+    output: &mut Vec<usize>,
+) {
+    let component_end = extglob_component_end(path, path_index, options);
+    if let Some(width) = alternative.width {
+        let Some(end) = path_index.checked_add(width) else {
+            return;
+        };
+        if end <= component_end
+            && match_extglob_alternative_exact(
                 alternative,
                 &path[path_index..end],
                 at_component_start(path, path_index, options),
                 options,
-            ) && match_extglob_from(program, path, group.rest, end, options, state)
-            {
-                return true;
+            )
+        {
+            output.push(end);
+        }
+        return;
+    }
+
+    let Some(alternatives) = &alternative.compiled else {
+        return;
+    };
+    let alternative_options = extglob_alternative_options(path, path_index, options);
+    let suffix = &path[path_index..component_end];
+    for compiled in alternatives {
+        if let Some(sweep) = &compiled.sweep {
+            sweep.matching_prefix_ends(suffix, alternative_options, path_index, output);
+        } else {
+            for end in path_index..=component_end {
+                if Pattern::match_alternatives(
+                    std::slice::from_ref(compiled),
+                    alternative_options,
+                    &path[path_index..end],
+                ) {
+                    output.push(end);
+                }
             }
         }
     }
-    false
+}
+
+fn extglob_alternative_options(
+    path: &[u8],
+    path_index: usize,
+    options: PatternOptions,
+) -> PatternOptions {
+    let mut options = PatternOptions {
+        braces: false,
+        extglob: false,
+        candidate_starts_component: at_component_start(path, path_index, options),
+        ..options
+    };
+    if options.root_component_wildcards {
+        options.component_wildcards = true;
+    }
+    options
 }
 
 /// Matches one compiled alternative against the whole of `path`.
@@ -4291,35 +4848,9 @@ fn match_extglob_alternative_exact(
     let Some(alternatives) = &alternative.compiled else {
         return false;
     };
-    let mut options = PatternOptions {
-        braces: false,
-        extglob: false,
-        candidate_starts_component,
-        ..options
-    };
-    if options.root_component_wildcards {
-        options.component_wildcards = true;
-    }
+    let mut options = extglob_alternative_options(path, 0, options);
+    options.candidate_starts_component = candidate_starts_component;
     Pattern::match_alternatives(alternatives, options, path)
-}
-
-/// End offsets worth trying for one alternative.
-///
-/// A fixed-width alternative can only accept a substring of that width, so
-/// every other offset in the component would be rejected on length alone.
-fn extglob_alternative_ends(
-    alternative: &ExtglobAlternative,
-    path: &[u8],
-    path_index: usize,
-    options: PatternOptions,
-) -> Option<RangeInclusive<usize>> {
-    let component_end = extglob_component_end(path, path_index, options);
-    let Some(width) = alternative.width else {
-        return Some(path_index..=component_end);
-    };
-    // `None` where a fixed-width alternative cannot fit at all.
-    let end = path_index.checked_add(width)?;
-    (end <= component_end).then_some(end..=end)
 }
 
 fn extglob_component_end(path: &[u8], path_index: usize, options: PatternOptions) -> usize {
@@ -4350,8 +4881,7 @@ impl CompiledExtglob {
 mod tests {
     use super::{
         FailedStates, FastPath, Pattern, PatternOptions, Prefilter, Token, WalkerPathViability,
-        extglob_failed_len, extglob_failed_stats, extglob_scratch_capacities,
-        extglob_visited_capacity, scratch_capacities,
+        extglob_failed_len, extglob_failed_stats, extglob_scratch_capacities, scratch_capacities,
     };
 
     fn compile(pattern: &str) -> Pattern {
@@ -5118,7 +5648,7 @@ mod tests {
 
         // Every partition of this run reaches one of the same group/path
         // suffixes. The trailing byte makes all of them fail, exercising the
-        // global extglob state memo without a wall-clock assertion.
+        // compiled NFA's shared frontier without a wall-clock assertion.
         let mut non_matching = "a".repeat(400);
         non_matching.push('x');
         assert!(!pattern.is_match(&non_matching));
@@ -5134,83 +5664,33 @@ mod tests {
     }
 
     #[test]
-    fn extglob_memo_pages_only_reached_dense_states_and_releases_them() {
-        let pattern = Pattern::compile("+(a)+(a)", PatternOptions::default().extglob(true))
-            .expect("repeating extglobs compile");
+    fn negated_extglob_interpreter_keeps_sparse_memo_and_releases_it() {
+        let pattern = Pattern::compile(
+            "!(z)",
+            PatternOptions::default().extglob(true).match_hidden(true),
+        )
+        .expect("negated extglob compiles");
         let program = pattern.alternatives[0]
             .extglob
             .as_ref()
             .expect("the pattern carries an extglob program");
-        assert_eq!(program.memo_state_count, 3);
-        assert_eq!(
-            [
-                program.memo_state_index(0),
-                program.memo_state_index(program.groups[0].rest),
-                program.memo_state_index(program.groups[1].rest),
-            ],
-            [0, 1, 2],
-            "the recurrence rows are stable and dense"
-        );
-
-        let long_early_mismatch =
-            Pattern::compile("a+(b)", PatternOptions::default().extglob(true))
-                .expect("extglob compiles");
-        let long_candidate = "x".repeat(2_000_000);
-        assert!(!long_early_mismatch.is_match(&long_candidate));
-        assert_eq!(
-            extglob_failed_stats(),
-            (1, 1),
-            "a long candidate must not allocate an untouched state-by-candidate table"
-        );
-
-        let many_states = Pattern::compile(
-            "+(a)".repeat(2_000),
-            PatternOptions::default().extglob(true),
-        )
-        .expect("many extglobs compile");
-        let many_program = many_states.alternatives[0]
-            .extglob
-            .as_ref()
-            .expect("the pattern carries an extglob program");
-        assert!(many_program.memo_state_count > 2_000);
-        assert!(!many_states.is_match("x"));
-        assert_eq!(
-            extglob_failed_stats(),
-            (1, 1),
-            "unreached dense rows must remain page-free after an early mismatch"
-        );
-
-        let mut candidate = "a".repeat(2_000_000);
-        candidate.push('x');
-        assert!(!pattern.is_match(&candidate));
+        assert!(program.positive_nfa.is_none());
+        assert!(pattern.is_match("x"));
         let (pages, states) = extglob_failed_stats();
         assert!(
-            pages > 1 && states > 1,
-            "the recurrence should visit several memo bits"
-        );
-        assert!(
-            pages
-                <= program.memo_state_count
-                    * candidate.len().div_ceil(super::EXTGLOB_MEMO_PAGE_BITS),
-            "materialized pages stay within the exact dense-row/page shape"
+            pages > 0 && states > 0,
+            "the fallback memo records reached states"
         );
 
         let capacities = extglob_scratch_capacities();
         assert!(
             capacities.1 <= super::RETAINED_SCRATCH_WORDS,
-            "the failed-state bitset must not retain the adversarial table: {capacities:?}"
+            "the failed-state bitset must stay within its retained cap: {capacities:?}"
         );
         assert_eq!(
             extglob_failed_len(),
             0,
-            "the retained failed-state bitset must be logically empty"
-        );
-
-        assert!(pattern.is_match("aa"));
-        assert_eq!(
-            extglob_scratch_capacities(),
-            capacities,
-            "a later small match reuses the capped scratch allocation"
+            "the retained memo is logically empty"
         );
     }
 
@@ -5320,25 +5800,108 @@ mod tests {
     }
 
     #[test]
-    fn extglob_matches_reuse_the_thread_local_visited_buffer() {
-        // The repetition kinds are the ones that used to build a hash set per
-        // group encounter.
+    fn extglobs_avoid_native_stack_recursion() {
         let options = PatternOptions::default().extglob(true);
-        let pattern = Pattern::compile("+(a|ab)c", options).expect("repetition compiles");
-        let candidate = "aababc";
-        for _ in 0..8 {
-            assert!(pattern.is_match(candidate));
+        let pattern = Pattern::compile("+(a*)b", options).expect("repetition compiles");
+        let program = pattern.alternatives[0]
+            .extglob
+            .as_ref()
+            .expect("the pattern carries an extglob program");
+        assert!(program.positive_nfa.is_some());
+
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                assert!(!pattern.is_match("a".repeat(50_000)));
+                let sequential = Pattern::compile("@(a)".repeat(2_000), options)
+                    .expect("sequential groups compile");
+                assert!(sequential.is_match("a".repeat(2_000)));
+
+                // An outer star deliberately retains the compatible
+                // interpreter. Its continuation work must be heap-backed too.
+                let compatible = Pattern::compile(["*", &"@(a)".repeat(800)].concat(), options)
+                    .expect("compatible extglob compiles");
+                assert!(compatible.is_match("a".repeat(800)));
+            })
+            .expect("spawn a small-stack matcher worker")
+            .join()
+            .expect("positive extglobs must not recurse through the native stack");
+    }
+
+    #[test]
+    fn positive_extglob_nfa_agrees_with_the_fallback_interpreter() {
+        let candidates = byte_words(b"ab./", 5);
+        for source in [
+            "@(a|ab)b",
+            "?(a|b)c",
+            "*(a|bc)d",
+            "+(a*|b?)c",
+            "@(|a)b",
+            "+(|a)b",
+            "a@(b|[a-c])/?(.x|y)",
+            r"x\@(a|b)@(c)",
+        ] {
+            for match_hidden in [false, true] {
+                for case_insensitive in [false, true] {
+                    let options = PatternOptions::default()
+                        .extglob(true)
+                        .recursive_double_star(true)
+                        .match_hidden(match_hidden)
+                        .case_insensitive(case_insensitive);
+                    let compiled = Pattern::compile(source, options)
+                        .expect("positive differential pattern compiles");
+                    let mut interpreted = compiled.clone();
+                    for alternative in interpreted
+                        .alternatives
+                        .iter_mut()
+                        .chain(interpreted.path_filter_alternatives.iter_mut().flatten())
+                    {
+                        alternative
+                            .extglob
+                            .as_mut()
+                            .expect("every differential pattern carries an extglob")
+                            .positive_nfa = None;
+                    }
+                    for candidate in &candidates {
+                        assert_eq!(
+                            compiled.is_match(candidate),
+                            interpreted.is_match(candidate),
+                            "is_match diverges for {source:?} against {candidate:?} under {options:?}"
+                        );
+                        assert_eq!(
+                            compiled.is_match_path(candidate),
+                            interpreted.is_match_path(candidate),
+                            "is_match_path diverges for {source:?} against {candidate:?} under {options:?}"
+                        );
+                        assert_eq!(
+                            compiled.is_match_glob_path(candidate),
+                            interpreted.is_match_glob_path(candidate),
+                            "is_match_glob_path diverges for {source:?} against {candidate:?} under {options:?}"
+                        );
+                    }
+                }
+            }
         }
-        let warm = extglob_visited_capacity();
-        assert!(warm > 0, "a repetition must have used the visited buffer");
-        for _ in 0..1_000 {
-            assert!(pattern.is_match(candidate));
-        }
-        assert_eq!(
-            extglob_visited_capacity(),
-            warm,
-            "steady-state extglob matching must not grow the visited buffer"
+    }
+
+    #[test]
+    fn outer_stars_keep_extglobs_legacy_backtracking_semantics() {
+        let options = PatternOptions::default()
+            .extglob(true)
+            .recursive_double_star(true);
+        let star_before_group = Pattern::compile("*@(a)b", options).expect("extglob compiles");
+        assert!(
+            star_before_group.alternatives[0]
+                .extglob
+                .as_ref()
+                .is_some_and(|program| program.positive_nfa.is_none())
         );
+        assert!(star_before_group.is_match_glob_path("/ab"));
+
+        let retained = Pattern::compile("a@(b|[a-c])*/?(.x|y)", options)
+            .expect("backtracking extglob compiles");
+        assert!(retained.is_match_path("aa//"));
+        assert!(!retained.is_match("aa/./"));
     }
 
     #[test]
@@ -6293,14 +6856,38 @@ mod tests {
         let extglob = Pattern::compile("@(a|b)*", PatternOptions::default().extglob(true)).unwrap();
         assert!(extglob.alternatives[0].sweep.is_none());
 
-        // Past the position cap the memoized matcher stays responsible, and
-        // both engines still answer alike.
+        // Past one machine word the wide sweep stays responsible, and the
+        // retained memoized oracle still answers alike.
         let oversized_source = [b"a".repeat(70), b"*B".to_vec()].concat();
         let oversized = Pattern::compile(&oversized_source, PatternOptions::default()).unwrap();
-        assert!(oversized.alternatives[0].sweep.is_none());
+        assert!(oversized.alternatives[0].sweep.is_some());
         let candidate = [b"a".repeat(70), b"xB".to_vec()].concat();
         assert!(oversized.is_match(&candidate));
         assert!(oversized.engines_agree(&candidate));
+    }
+
+    #[test]
+    fn wide_sweep_agrees_across_machine_word_boundaries() {
+        let prefixes = [
+            ["a".repeat(62), "***B".to_owned()].concat(),
+            ["*a".repeat(40), "*B".to_owned()].concat(),
+            ["a/".repeat(32), "**/B".to_owned()].concat(),
+            ["[aB]?".repeat(33), "*".to_owned()].concat(),
+        ];
+        let mut candidates = Vec::new();
+        for prefix in ["a".repeat(62), "a".repeat(80), "a/".repeat(32)] {
+            for suffix in byte_words(b"aB./", 3) {
+                candidates.push([prefix.as_bytes(), suffix.as_slice()].concat());
+            }
+        }
+        for source in &prefixes {
+            for match_hidden in [false, true] {
+                let options = PatternOptions::default()
+                    .recursive_double_star(true)
+                    .match_hidden(match_hidden);
+                assert_sweep_agrees(source.as_bytes(), options, &candidates);
+            }
+        }
     }
 
     #[test]
