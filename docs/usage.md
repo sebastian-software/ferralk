@@ -129,6 +129,9 @@ Important defaults:
   filesystem, so a case-sensitive filesystem never treats it as a magic file.
   On macOS only, `core.precomposeUnicode=true` NFC-normalizes valid UTF-8
   candidate components before matching and leaves invalid bytes untouched.
+  These local booleans accept Git's named forms, bare keys, empty assignments,
+  and signed base-zero integer forms (including `K`/`M`/`G` scaling); malformed
+  values do not override an earlier valid repository-local value.
 
   System/global config, conditional includes, and environment overrides are
   intentionally not consulted: they are process-wide state outside a library

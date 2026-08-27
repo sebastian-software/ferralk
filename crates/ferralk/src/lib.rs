@@ -3841,6 +3841,49 @@ mod tests {
         }
     }
 
+    fn git_config_bool(root: &Path, key: &str) -> bool {
+        let output = Command::new("git")
+            .args(["config", "--type=bool", "--get", key])
+            .current_dir(root)
+            .output()
+            .expect("run Git config boolean oracle");
+        assert!(
+            output.status.success(),
+            "Git config boolean oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        match String::from_utf8(output.stdout)
+            .expect("Git config boolean output is UTF-8")
+            .trim()
+        {
+            "true" => true,
+            "false" => false,
+            value => panic!("unexpected Git config boolean output: {value:?}"),
+        }
+    }
+
+    fn git_config_file_bool(config: &Path, key: &str) -> bool {
+        let output = Command::new("git")
+            .args(["config", "--file"])
+            .arg(config)
+            .args(["--type=bool", "--get", key])
+            .output()
+            .expect("run Git config file boolean oracle");
+        assert!(
+            output.status.success(),
+            "Git config file boolean oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        match String::from_utf8(output.stdout)
+            .expect("Git config boolean output is UTF-8")
+            .trim()
+        {
+            "true" => true,
+            "false" => false,
+            value => panic!("unexpected Git config boolean output: {value:?}"),
+        }
+    }
+
     #[test]
     fn repository_ignorecase_matches_git_for_rules_negation_and_anchors() {
         let fixture = Fixture::new();
@@ -3951,6 +3994,64 @@ mod tests {
     }
 
     #[test]
+    fn numeric_and_empty_ignorecase_values_match_the_git_oracle() {
+        let fixture = Fixture::new();
+        fixture.write("BUILD.log");
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("initialize Git oracle");
+        assert!(initialized.success());
+        fs::write(fixture.root.join(".gitignore"), b"build.log\n").expect("write rule");
+        let config = fixture.root.join(".git/config");
+
+        for (value, expected) in [
+            ("", false),
+            ("\"\"", false),
+            ("+0", false),
+            ("-0", false),
+            ("+2", true),
+            ("-7", true),
+            ("  +2  # whitespace and comment", true),
+        ] {
+            fs::write(
+                &config,
+                format!("[core]\nignoreCase = {}\nIGNORECASE = {value}\n", !expected),
+            )
+            .expect("write duplicate config");
+            assert_eq!(
+                git_config_bool(&fixture.root, "core.ignoreCase"),
+                expected,
+                "Git must accept {value:?}",
+            );
+            let walked = Walker::new(&fixture.root)
+                .respect_git_ignore(true)
+                .collect()
+                .expect("walk with Git boolean value");
+            assert_eq!(
+                !relative_paths(walked.entries(), &fixture.root)
+                    .contains(&PathBuf::from("BUILD.log")),
+                expected,
+                "the later {value:?} value must override the earlier opposite value",
+            );
+        }
+
+        fs::write(&config, b"[core]\nignoreCase = false\nIGNORECASE\n")
+            .expect("write bare boolean config");
+        assert!(git_config_bool(&fixture.root, "core.ignoreCase"));
+        let bare_true = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("walk with bare true");
+        assert!(
+            !relative_paths(bare_true.entries(), &fixture.root)
+                .contains(&PathBuf::from("BUILD.log")),
+            "a bare key must retain Git's true behavior"
+        );
+    }
+
+    #[test]
     fn case_variant_ignore_file_follows_the_filesystem_canonical_open() {
         let fixture = Fixture::new();
         fixture.write("build.log");
@@ -4020,12 +4121,13 @@ mod tests {
             .status()
             .expect("initialize Git oracle");
         assert!(initialized.success());
-        let configured = Command::new("git")
-            .args(["config", "core.precomposeUnicode", "true"])
-            .current_dir(&fixture.root)
-            .status()
-            .expect("configure precompose Unicode");
-        assert!(configured.success());
+        let config = fixture.root.join(".git/config");
+        fs::write(
+            &config,
+            b"[core]\nprecomposeUnicode = false\nPRECOMPOSEUNICODE = -7\n",
+        )
+        .expect("write numeric precompose Unicode config");
+        assert!(git_config_bool(&fixture.root, "core.precomposeUnicode"));
 
         assert!(git_check_ignore(&fixture.root, decomposed));
         let enabled = Walker::new(&fixture.root)
@@ -4046,12 +4148,12 @@ mod tests {
                 .contains(&PathBuf::from(decomposed))
         );
 
-        let configured = Command::new("git")
-            .args(["config", "core.precomposeUnicode", "false"])
-            .current_dir(&fixture.root)
-            .status()
-            .expect("disable precompose Unicode");
-        assert!(configured.success());
+        fs::write(
+            &config,
+            b"[core]\nprecomposeUnicode = true\nPRECOMPOSEUNICODE = \"\"\n",
+        )
+        .expect("write empty precompose Unicode config");
+        assert!(!git_config_bool(&fixture.root, "core.precomposeUnicode"));
         assert!(!git_check_ignore(&fixture.root, decomposed));
         let disabled = Walker::new(&fixture.root)
             .respect_git_ignore(true)
@@ -4356,12 +4458,12 @@ mod tests {
         fs::create_dir_all(&common_git).expect("create common Git directory");
         fs::write(
             common_git.join("config"),
-            b"[extensions]\nworktreeConfig = true\n[core]\nignorecase = false\n",
+            b"[extensions]\nworktreeConfig = false\nWORKTREECONFIG = +2\n[core]\nignorecase = false\n",
         )
         .expect("write common config");
         fs::write(
             private_git.join("config.worktree"),
-            b"[CORE]\nignoreCASE = true\n",
+            b"[CORE]\nignoreCASE = -7\n",
         )
         .expect("write worktree config");
         fs::write(
@@ -4371,6 +4473,11 @@ mod tests {
         .expect("write worktree pointer");
         fs::write(checkout.join(".gitignore"), b"build.log\n").expect("write ignore rule");
         fs::write(checkout.join("BUILD.log"), b"fixture").expect("write mixed-case candidate");
+
+        assert!(git_config_file_bool(
+            &common_git.join("config"),
+            "extensions.worktreeConfig"
+        ));
 
         let walked = Walker::new(&checkout)
             .respect_git_ignore(true)

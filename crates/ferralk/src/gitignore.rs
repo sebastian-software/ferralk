@@ -302,8 +302,8 @@ fn read_repository_config(layout: &RepositoryLayout) -> GitConfig {
 }
 
 /// Reads the tiny, stable config surface this adapter needs. Git config names
-/// are case-insensitive; values are intentionally accepted only when Git's
-/// boolean spellings are unambiguous. Unsupported config forms leave the
+/// are case-insensitive; values follow Git's boolean grammar, including empty
+/// and base-zero integer values. Unsupported config forms leave the
 /// repository-local default intact rather than guessing.
 fn apply_config(config: &mut GitConfig, contents: &[u8]) {
     let Ok(contents) = std::str::from_utf8(contents) else {
@@ -365,22 +365,87 @@ fn strip_config_comment(line: &str) -> &str {
 }
 
 fn parse_git_bool(value: &str) -> Option<bool> {
-    let value = value.trim().trim_matches('"');
-    if value.eq_ignore_ascii_case("true")
+    let value = decode_git_config_value(value.trim())?;
+    if value.is_empty() {
+        Some(false)
+    } else if value.eq_ignore_ascii_case("true")
         || value.eq_ignore_ascii_case("yes")
         || value.eq_ignore_ascii_case("on")
-        || value == "1"
     {
         Some(true)
     } else if value.eq_ignore_ascii_case("false")
         || value.eq_ignore_ascii_case("no")
         || value.eq_ignore_ascii_case("off")
-        || value == "0"
     {
         Some(false)
     } else {
-        None
+        parse_git_config_int(&value).map(|value| value != 0)
     }
+}
+
+/// Decodes the quoted escapes that Git's config parser resolves before it
+/// hands a value to its boolean parser. Whitespace outside quotes is already
+/// trimmed by the caller; whitespace inside quotes deliberately remains part
+/// of the value and therefore makes a boolean invalid, as it does in Git.
+fn decode_git_config_value(value: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(value.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            decoded.push(match character {
+                't' => '\t',
+                'b' => '\u{8}',
+                'n' => '\n',
+                '\\' | '"' => character,
+                _ => return None,
+            });
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else {
+            decoded.push(character);
+        }
+    }
+    (!quoted && !escaped).then_some(decoded)
+}
+
+/// Git parses a numeric boolean through its signed `int` config grammar:
+/// optional sign, C base-zero notation, and K/M/G binary scaling. Values that
+/// overflow that `int` are invalid rather than silently changing the setting.
+fn parse_git_config_int(value: &str) -> Option<i32> {
+    let (negative, value) = match value.as_bytes().first() {
+        Some(b'+') => (false, &value[1..]),
+        Some(b'-') => (true, &value[1..]),
+        _ => (false, value),
+    };
+    let (digits, scale) = match value.as_bytes().last() {
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 1024_i64),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 1024_i64.pow(2)),
+        Some(b'g' | b'G') => (&value[..value.len() - 1], 1024_i64.pow(3)),
+        _ => (value, 1),
+    };
+    let (radix, digits) = if let Some(digits) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, digits)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (8, &digits[1..])
+    } else {
+        (10, digits)
+    };
+    let magnitude = i64::from_str_radix(digits, radix)
+        .ok()?
+        .checked_mul(scale)?;
+    let value = if negative {
+        magnitude.checked_neg()?
+    } else {
+        magnitude
+    };
+    i32::try_from(value).ok()
 }
 
 fn parse_gitdir_pointer(contents: &[u8]) -> Option<PathBuf> {
@@ -445,7 +510,7 @@ fn add_rules(builder: &mut RuleSetBuilder, contents: &[u8]) {
 mod tests {
     use std::path::Path;
 
-    use super::{GitConfig, RuleSetBuilder, add_rules, apply_config};
+    use super::{GitConfig, RuleSetBuilder, add_rules, apply_config, parse_git_bool};
 
     #[test]
     fn byte_lines_continue_after_invalid_utf8_and_match_byte_patterns() {
@@ -488,5 +553,39 @@ mod tests {
         assert_eq!(config.ignore_case, Some(false));
         assert_eq!(config.precompose_unicode, Some(false));
         assert_eq!(config.worktree_config, Some(true));
+    }
+
+    #[test]
+    fn local_config_boolean_values_follow_git_grammar() {
+        for (value, expected) in [
+            ("", Some(false)),
+            ("\"\"", Some(false)),
+            ("true", Some(true)),
+            ("No", Some(false)),
+            ("+0", Some(false)),
+            ("-0", Some(false)),
+            ("+2", Some(true)),
+            ("-7", Some(true)),
+            ("0x0", Some(false)),
+            ("0x2", Some(true)),
+            ("010", Some(true)),
+            ("1G", Some(true)),
+            ("2G", None),
+            ("09", None),
+            ("1.0", None),
+            ("invalid", None),
+        ] {
+            assert_eq!(parse_git_bool(value), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_later_boolean_does_not_override_a_valid_value() {
+        let mut config = GitConfig::default();
+        apply_config(
+            &mut config,
+            b"[core]\nignorecase = false\nignorecase = not-a-bool\n",
+        );
+        assert_eq!(config.ignore_case, Some(false));
     }
 }
