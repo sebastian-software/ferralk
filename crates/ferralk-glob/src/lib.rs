@@ -3449,9 +3449,54 @@ struct PositiveExtglobBuilder<'budget> {
     budget: &'budget mut IrBudget,
 }
 
+#[derive(Default)]
 struct PositiveExtglobClosureScratch {
     seen: Vec<bool>,
     pending: Vec<usize>,
+}
+
+#[derive(Default)]
+struct PositiveExtglobMatchScratch {
+    current: Vec<usize>,
+    next: Vec<usize>,
+    closure: PositiveExtglobClosureScratch,
+}
+
+impl PositiveExtglobMatchScratch {
+    fn prepare(&mut self, state_count: usize) {
+        self.current.clear();
+        self.next.clear();
+        self.closure.seen.resize(state_count, false);
+        self.closure.seen.fill(false);
+        self.closure.pending.clear();
+    }
+
+    fn release(&mut self) {
+        self.current.clear();
+        if self.current.capacity() > RETAINED_SCRATCH_WORDS {
+            self.current.shrink_to(RETAINED_SCRATCH_WORDS);
+        }
+        self.next.clear();
+        if self.next.capacity() > RETAINED_SCRATCH_WORDS {
+            self.next.shrink_to(RETAINED_SCRATCH_WORDS);
+        }
+        self.closure.pending.clear();
+        if self.closure.pending.capacity() > RETAINED_SCRATCH_WORDS {
+            self.closure.pending.shrink_to(RETAINED_SCRATCH_WORDS);
+        }
+        let retained_seen_bits = RETAINED_SCRATCH_WORDS * u64::BITS as usize;
+        if self.closure.seen.capacity() > retained_seen_bits {
+            self.closure.seen.clear();
+            self.closure.seen.shrink_to(retained_seen_bits);
+        }
+    }
+}
+
+// A positive NFA touches the same four state buffers for every candidate, so
+// keep their allocation per thread just like the general and fallback engines.
+thread_local! {
+    static POSITIVE_EXTGLOB_SCRATCH: RefCell<PositiveExtglobMatchScratch> =
+        RefCell::new(PositiveExtglobMatchScratch::default());
 }
 
 /// One alternative of a group, compiled as a whole-candidate pattern.
@@ -3564,28 +3609,48 @@ impl PositiveExtglobNfa {
     }
 
     fn is_match(&self, path: &[u8], options: PatternOptions) -> bool {
-        let mut current = Vec::new();
-        let mut next = Vec::new();
-        let mut scratch = PositiveExtglobClosureScratch {
-            seen: vec![false; self.states.len()],
-            pending: Vec::new(),
-        };
+        POSITIVE_EXTGLOB_SCRATCH.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut scratch) => {
+                scratch.prepare(self.states.len());
+                let matched = self.is_match_with_scratch(path, options, &mut scratch);
+                scratch.release();
+                matched
+            }
+            Err(_) => {
+                let mut scratch = PositiveExtglobMatchScratch::default();
+                scratch.prepare(self.states.len());
+                self.is_match_with_scratch(path, options, &mut scratch)
+            }
+        })
+    }
+
+    fn is_match_with_scratch(
+        &self,
+        path: &[u8],
+        options: PatternOptions,
+        scratch: &mut PositiveExtglobMatchScratch,
+    ) -> bool {
+        let PositiveExtglobMatchScratch {
+            current,
+            next,
+            closure,
+        } = scratch;
         self.add_closure(
             self.start,
             path.first().copied(),
             options.candidate_starts_component,
             options,
-            &mut current,
-            &mut scratch,
+            current,
+            closure,
         );
 
         let mut at_component_start = options.candidate_starts_component;
         for (path_index, &byte) in path.iter().enumerate() {
             next.clear();
-            scratch.seen.fill(false);
+            closure.seen.fill(false);
             let next_byte = path.get(path_index + 1).copied();
             let next_starts_component = is_separator(byte);
-            for &state in &current {
+            for &state in current.iter() {
                 match &self.states[state] {
                     PositiveExtglobState::Consume {
                         matcher,
@@ -3596,8 +3661,8 @@ impl PositiveExtglobNfa {
                             next_byte,
                             next_starts_component,
                             options,
-                            &mut next,
-                            &mut scratch,
+                            next,
+                            closure,
                         );
                     }
                     PositiveExtglobState::Star { matcher, .. }
@@ -3608,8 +3673,8 @@ impl PositiveExtglobNfa {
                             next_byte,
                             next_starts_component,
                             options,
-                            &mut next,
-                            &mut scratch,
+                            next,
+                            closure,
                         );
                     }
                     _ => {}
@@ -3618,7 +3683,7 @@ impl PositiveExtglobNfa {
             if next.is_empty() {
                 return false;
             }
-            std::mem::swap(&mut current, &mut next);
+            std::mem::swap(current, next);
             at_component_start = next_starts_component;
         }
         current
@@ -3665,6 +3730,21 @@ impl PositiveExtglobNfa {
             }
         }
     }
+}
+
+/// Scratch capacities after a positive-extglob NFA match, used to verify that
+/// repeated matches reuse bounded thread-local allocations.
+#[cfg(test)]
+fn positive_extglob_scratch_capacities() -> (usize, usize, usize, usize) {
+    POSITIVE_EXTGLOB_SCRATCH.with(|cell| {
+        let scratch = cell.borrow();
+        (
+            scratch.current.capacity(),
+            scratch.next.capacity(),
+            scratch.closure.seen.capacity(),
+            scratch.closure.pending.capacity(),
+        )
+    })
 }
 
 impl PositiveExtglobMatcher {
@@ -4881,7 +4961,8 @@ impl CompiledExtglob {
 mod tests {
     use super::{
         FailedStates, FastPath, Pattern, PatternOptions, Prefilter, Token, WalkerPathViability,
-        extglob_failed_len, extglob_failed_stats, extglob_scratch_capacities, scratch_capacities,
+        extglob_failed_len, extglob_failed_stats, extglob_scratch_capacities,
+        positive_extglob_scratch_capacities, scratch_capacities,
     };
 
     fn compile(pattern: &str) -> Pattern {
@@ -5661,6 +5742,64 @@ mod tests {
         let single = Pattern::compile("+(a)", PatternOptions::default().extglob(true))
             .expect("single repeating extglob compiles");
         assert!(single.is_match("a".repeat(5_000)));
+    }
+
+    #[test]
+    fn positive_extglob_nfa_reuses_thread_local_scratch() {
+        let pattern = Pattern::compile(
+            "@(src|tests)/lib.rs",
+            PatternOptions::default().extglob(true),
+        )
+        .expect("positive extglob compiles");
+        assert!(pattern.is_match("src/lib.rs"));
+        assert!(!pattern.is_match("vendor/lib.rs"));
+
+        let warmed = positive_extglob_scratch_capacities();
+        assert!(
+            warmed.0 > 0 && warmed.1 > 0 && warmed.2 > 0 && warmed.3 > 0,
+            "the NFA populated every reusable buffer: {warmed:?}"
+        );
+        for _ in 0..1_000 {
+            assert!(pattern.is_match("tests/lib.rs"));
+            assert!(!pattern.is_match("vendor/lib.rs"));
+        }
+        assert_eq!(
+            positive_extglob_scratch_capacities(),
+            warmed,
+            "steady-state matches must not grow the reusable buffers"
+        );
+    }
+
+    #[test]
+    fn positive_extglob_nfa_releases_oversized_scratch() {
+        let mut scratch = super::PositiveExtglobMatchScratch::default();
+        scratch.current.reserve(super::RETAINED_SCRATCH_WORDS + 1);
+        scratch.next.reserve(super::RETAINED_SCRATCH_WORDS + 1);
+        scratch
+            .closure
+            .pending
+            .reserve(super::RETAINED_SCRATCH_WORDS + 1);
+        let retained_seen_bits = super::RETAINED_SCRATCH_WORDS * u64::BITS as usize;
+        scratch.closure.seen.reserve(retained_seen_bits + 1);
+
+        scratch.release();
+
+        assert!(scratch.current.capacity() <= super::RETAINED_SCRATCH_WORDS);
+        assert!(scratch.next.capacity() <= super::RETAINED_SCRATCH_WORDS);
+        assert!(scratch.closure.pending.capacity() <= super::RETAINED_SCRATCH_WORDS);
+        assert!(scratch.closure.seen.capacity() <= retained_seen_bits);
+    }
+
+    #[test]
+    fn positive_extglob_nfa_has_a_reentrant_scratch_fallback() {
+        let pattern = Pattern::compile("@(src|tests)", PatternOptions::default().extglob(true))
+            .expect("positive extglob compiles");
+
+        super::POSITIVE_EXTGLOB_SCRATCH.with(|cell| {
+            let _borrow = cell.borrow_mut();
+            assert!(pattern.is_match("src"));
+            assert!(!pattern.is_match("vendor"));
+        });
     }
 
     #[test]
