@@ -46,7 +46,7 @@ callers do not need lossy UTF-8 conversion.
 `Walker` replaces zlob's output-buffer-oriented traversal with owned entries,
 structured errors, and an explicit root:
 
-```rust
+```rust,no_run
 use ferralk::{ErrorPolicy, WalkOptions, Walker};
 
 let result = Walker::new(".")
@@ -74,6 +74,7 @@ let result = Walker::new(".")
 | walker `max_depth` | `WalkOptions::max_depth(depth)` |
 | walker entry depth | `WalkEntry::depth()` counts relative components below the root |
 | walker entry basename | `WalkEntry::basename()` preserves the native `OsStr` name |
+| match a walker entry with `Pattern` | `entry.path_bytes()` passes its native encoded bytes to the byte-first matcher without allocation |
 | walker entry kind | `WalkEntry::{kind,is_symlink}` exposes file, directory, or symlink identity |
 | thread count | `Walker::threads(n)`; `collect()` defaults to available parallelism |
 | metadata requests | `WalkOptions::metadata(true)` |
@@ -101,7 +102,9 @@ described next.
 on Windows too — so a pattern built by joining `PathBuf`s carries separators
 the matcher reads as "the next byte, literally":
 
-```rust
+```rust,no_run
+# use ferralk::Walker;
+# let root = std::path::PathBuf::from(".");
 // WRONG on Windows. `PathBuf::join` produces `C:\repo\src\**\*.ts`, where
 // every `\` escapes the byte after it: the pattern asks for a file whose
 // name contains a literal `*`, which Windows cannot even create.
@@ -153,7 +156,9 @@ there a file may genuinely be named `src*.ts`.
 that a path is not automatically a valid pattern: if any component contains
 `*`, `?`, `[` or `{`, those bytes are syntax and need escaping with `\`.
 
-```rust
+```rust,no_run
+# use ferralk::Walker;
+# let root = std::path::PathBuf::from(".");
 let as_pattern = root.to_string_lossy().replace('\\', "/");
 let walker = Walker::new(&root).include(format!("{as_pattern}/src/**/*.ts"))?;
 # Ok::<(), ferralk::ferralk_glob::PatternError>(())

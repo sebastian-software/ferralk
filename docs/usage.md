@@ -49,7 +49,7 @@ policy twice.
 include accepts every non-excluded entry. Excluded directories are pruned only
 when the walker can prove that no include can re-admit a descendant.
 
-```rust
+```rust,no_run
 use ferralk::{CancellationToken, ErrorPolicy, WalkOptions, Walker};
 
 let cancellation = CancellationToken::default();
@@ -174,20 +174,31 @@ and cost a load of a shared atomic on the walk's hottest loop.
 predicate afterwards runs it on one thread over the whole list. On a large tree
 that pass is big enough to cancel out the threads the walk just used.
 
-`visit()` asks the predicate on the worker that produced the entry:
+`visit()` asks the predicate on the worker that produced the entry. A
+`WalkEntry` keeps its native `Path`, while `Pattern` is byte-first; pass
+`WalkEntry::path_bytes()` to bridge them without allocating or converting
+through UTF-8. The bytes are the native `OsStr::as_encoded_bytes()` form: raw
+filesystem bytes on Unix and lossless WTF-8 on Windows (ADR-0005).
 
-```rust
-use ferralk::{Verdict, Walker};
+```rust,no_run
+use ferralk::{Verdict, Walker, ferralk_glob::{Pattern, PatternOptions}};
+
+let my_matcher = Pattern::compile(
+    "**/*.rs",
+    PatternOptions::default().recursive_double_star(true),
+)?;
 
 let result = Walker::new("src")
     .threads(4)
     .visit(|entry| {
-        if my_matcher.is_match(entry.path()) {
+        if my_matcher.is_match(entry.path_bytes()) {
             Verdict::Keep
         } else {
             Verdict::Skip
         }
     })?;
+# let _ = result;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Everything else behaves as it does for `collect()`: cancellation, the error
@@ -213,7 +224,7 @@ An ordinary wildcard does not cover a leading period, so `**/*.ts` skips
 the whole subtree stays out of the result. `Walker::match_hidden(true)` opts in
 for include and exclude patterns alike:
 
-```rust
+```rust,no_run
 use ferralk::{WalkOptions, Walker};
 
 let result = Walker::new("workspace")

@@ -211,7 +211,7 @@ the check been a file count rather than a path-by-path diff.
 
 The whole of discovery, in round 4's form:
 
-```rust
+```text
 Walker::new(first)
     .wildcard_mode(WildcardMode::SeparatorCrossing)
     .match_hidden(true)
