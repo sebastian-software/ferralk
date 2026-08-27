@@ -6813,6 +6813,7 @@ mod tests {
                 b"src/.ts".to_vec(),
                 b"src/index.ts".to_vec(),
                 b"SRC/INDEX.TSX".to_vec(),
+                b"packages/.js".to_vec(),
                 b"packages/index.cjs".to_vec(),
                 b"packages/deep/index.vue".to_vec(),
                 b"vendor/index.ts".to_vec(),
@@ -6825,6 +6826,11 @@ mod tests {
                     .into_iter()
                     .map(|suffix| [b"src/".as_slice(), suffix.as_slice()].concat()),
             );
+            // The recursive prefix and star may both consume nothing. Use a
+            // non-first prefix/suffix pair so the first-alternative shortcut
+            // cannot conceal a boundary error in the aggregate matcher.
+            assert!(fast.is_match("packages/.js"));
+            assert!(fast.is_match_glob_path("packages/.js"));
             for candidate in candidates {
                 assert_eq!(
                     fast.is_match(&candidate),
