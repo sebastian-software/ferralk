@@ -440,11 +440,22 @@ mod tests {
             Some("// ```text is content, not a nested fence")
         );
         assert!(is_rust_fence("no_run,sh"));
-        assert!(is_rust_fence("text,rust"));
+        assert!(is_rust_fence("no_run,rust"));
+        assert!(is_rust_fence("rust,no_run"));
+        assert!(!is_rust_fence("sh,no_run"));
+        assert!(!is_rust_fence("json,should_panic"));
+        assert!(!is_rust_fence("unknown-language,should_panic"));
+        assert!(is_rust_fence("should_panic,unknown-language"));
+        assert!(is_rust_fence("sh,rust"));
+        assert!(is_rust_fence("rust,sh"));
+        assert!(is_rust_fence("ignore-x86_64,no_run"));
+        assert!(is_ignored_rust_fence("ignore-x86_64,no_run"));
+        assert!(is_rust_fence("edition2024,compile_fail"));
+        assert!(is_rust_fence("compile_fail,edition2024"));
+        assert!(is_rust_fence("  no_run,  rust  "));
         assert!(is_rust_fence("compile_fail,E0308"));
         assert!(is_rust_fence("test_harness"));
         assert!(is_rust_fence("standalone_crate"));
-        assert!(!is_rust_fence("text,no_run"));
         assert!(!is_rust_fence("allow_fail"));
         assert!(!is_rust_fence("unknown-language"));
     }
@@ -570,13 +581,7 @@ mod tests {
         if tokens.contains(&"rust") {
             return true;
         }
-        if tokens
-            .iter()
-            .any(|token| is_explicit_non_rust_marker(token))
-        {
-            return false;
-        }
-        tokens.iter().any(|token| is_rustdoc_rust_attribute(token))
+        is_rustdoc_rust_attribute(tokens[0])
     }
 
     fn is_ignored_rust_fence(info: &str) -> bool {
@@ -590,10 +595,6 @@ mod tests {
     fn fence_tokens(info: &str) -> impl Iterator<Item = &str> {
         info.split(|character: char| character == ',' || character.is_ascii_whitespace())
             .filter(|part| !part.is_empty())
-    }
-
-    fn is_explicit_non_rust_marker(token: &str) -> bool {
-        matches!(token, "text" | "notrust" | "custom")
     }
 
     fn is_rustdoc_rust_attribute(token: &str) -> bool {
