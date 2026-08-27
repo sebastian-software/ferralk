@@ -173,8 +173,12 @@ that hold one, not as a way to spell a relative one.
 `Walker::add_root` and `Walker::add_roots` extend a walk to more than one tree.
 A caller with several source directories used to build one walker per directory,
 and with it one thread pool per directory; the roots are now the walk's initial
-directories and everything downstream of that is shared — the scheduler, the
-helper-spawn floor, and the visited-directory guard.
+directories and share the scheduler and helper-spawn floor. The
+visited-directory guard stays per root traversal: descendants of one root share
+its guard, while separately supplied roots — including duplicates, overlaps and
+symlink aliases — receive independent guards. Following symlinks therefore
+still stops genuine cycles within each root without deduplicating one root's
+entries against another's.
 
 | Question | Answer |
 | --- | --- |

@@ -2,7 +2,6 @@
 
 use std::{
     any::Any,
-    collections::HashSet,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     path::{Path, PathBuf},
     sync::{
@@ -12,12 +11,15 @@ use std::{
     thread,
 };
 
+#[cfg(test)]
+use std::collections::HashSet;
+
 use crossbeam_deque::{Steal, Stealer, Worker};
 
 use super::{
-    CANCELLATION_STRIDE, CYCLE_KEY_OPERATION, CycleKey, DirectoryBackend, EntryVisitor,
+    CANCELLATION_STRIDE, CYCLE_KEY_OPERATION, CycleGuard, DirectoryBackend, EntryVisitor,
     ErrorPolicy, Listing, Verdict, WalkEntry, WalkError, WalkResult, Walker,
-    classify::{DirectoryTask, EmittedEntry, EntryAction, classify_entry},
+    classify::{DirectoryTask, EmittedEntry, EntryAction, TraversalContext, classify_entry},
     own_path, reset_to_directory,
     scheduler::{CacheLine, Coordinator, Scheduler, WorkerSlot},
 };
@@ -307,11 +309,6 @@ struct Shared<'backend> {
     abort_error: Mutex<Option<WalkError>>,
     startup_error: Mutex<Option<WalkError>>,
     panic: Mutex<Option<Box<dyn Any + Send + 'static>>>,
-    /// The follow-symlinks guard. One mutex rather than shards: the key is
-    /// sixteen `Copy` bytes, so the critical section is a hash and an insert,
-    /// and the measurement in the pull request found sharding unmeasurable
-    /// against a walk that is dominated by syscalls.
-    visited_directories: Mutex<HashSet<CycleKey>>,
 }
 
 impl<'backend> Shared<'backend> {
@@ -334,7 +331,6 @@ impl<'backend> Shared<'backend> {
             abort_error: Mutex::new(None),
             startup_error: Mutex::new(None),
             panic: Mutex::new(None),
-            visited_directories: Mutex::new(HashSet::new()),
         }
     }
 
@@ -594,6 +590,7 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
         path,
         depth,
         root,
+        cycle_guard,
         ignores,
     } = task;
     #[cfg(test)]
@@ -604,7 +601,9 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
         return;
     }
     let is_root = depth == 0;
-    if shared.walker.options.follow_symlinks && !mark_directory(shared, &path, is_root) {
+    if shared.walker.options.follow_symlinks
+        && !mark_directory(shared, &cycle_guard, &path, is_root)
+    {
         return;
     }
     if let Err(source) = shared.backend.read_directory(
@@ -647,7 +646,10 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
             &worker.listing.entries()[index],
             &ignores,
             depth,
-            root,
+            TraversalContext {
+                root,
+                cycle_guard: &cycle_guard,
+            },
         );
         act(shared, worker, action);
         reset_to_directory(&mut worker.path, &path);
@@ -657,11 +659,16 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
     }
 }
 
-fn mark_directory(shared: &Shared, directory: &Path, is_root: bool) -> bool {
+fn mark_directory(
+    shared: &Shared,
+    cycle_guard: &CycleGuard,
+    directory: &Path,
+    is_root: bool,
+) -> bool {
     // The key is computed outside the lock, so the critical section holds only
     // the hash and the insert.
     match shared.backend.cycle_key(directory) {
-        Ok(key) => lock(&shared.visited_directories).insert(key),
+        Ok(key) => cycle_guard.mark(key),
         Err(source) => {
             shared.record_error(
                 CYCLE_KEY_OPERATION,

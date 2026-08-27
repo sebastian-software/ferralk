@@ -516,6 +516,7 @@ mod tests {
             path: root.clone(),
             depth: 0,
             root: 0,
+            cycle_guard: std::sync::Arc::new(crate::CycleGuard::default()),
             ignores: crate::IgnoreScope::for_root(walker, &StdBackend, &root),
         };
         state

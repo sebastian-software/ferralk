@@ -15,7 +15,7 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -87,7 +87,7 @@ pub use ignore_rules::fuzz_rule_bytes as fuzz_ignore_rule_bytes;
 mod parallel;
 mod scheduler;
 
-use classify::{DirectoryTask, EmittedEntry, EntryAction, classify_entry};
+use classify::{DirectoryTask, EmittedEntry, EntryAction, TraversalContext, classify_entry};
 use gitignore::IgnoreScope;
 
 /// Controls what a walk does after a recoverable filesystem error.
@@ -738,9 +738,10 @@ impl Walker {
     /// Adds another root to the same walk.
     ///
     /// One walker, one thread pool, several trees: the roots become the walk's
-    /// initial directories and share everything downstream of that - the
-    /// scheduler, the helper-spawn floor, and the visited-directory guard. A
-    /// caller with several source trees no longer pays pool startup per tree.
+    /// initial directories and share the scheduler and helper-spawn floor. Each
+    /// root keeps its own visited-directory guard, so following symlinks still
+    /// preserves the same concatenation semantics as separate walks. A caller
+    /// with several source trees no longer pays pool startup per tree.
     ///
     /// # Semantics
     ///
@@ -1041,7 +1042,7 @@ impl Walker {
             next_entry: 0,
             path: PathBuf::new(),
             directory: PathBuf::new(),
-            visited_directories: HashSet::new(),
+            cycle_guard: Arc::new(CycleGuard::default()),
             ignores: IgnoreScope::default(),
             depth: 0,
             root: 0,
@@ -1084,6 +1085,7 @@ impl Walker {
                 path: plan.path.clone(),
                 depth: 0,
                 root: index,
+                cycle_guard: Arc::new(CycleGuard::default()),
                 ignores: IgnoreScope::for_root(self, backend, &plan.path),
             })
             .collect()
@@ -1632,6 +1634,22 @@ type CycleKey = (u64, u64);
 #[cfg(not(unix))]
 type CycleKey = PathBuf;
 
+/// Directories one root traversal has already entered while following links.
+///
+/// A separately supplied root receives its own guard; descendant tasks share
+/// their root's guard, which breaks cycles without deduplicating overlaps.
+#[derive(Debug, Default)]
+pub(crate) struct CycleGuard(Mutex<HashSet<CycleKey>>);
+
+impl CycleGuard {
+    fn mark(&self, key: CycleKey) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key)
+    }
+}
+
 /// Names the call whose failure ends a directory in follow mode, so the
 /// reported operation stays the one that actually ran.
 #[cfg(unix)]
@@ -1920,7 +1938,8 @@ pub struct WalkStream {
     /// The same directory without an entry on it, kept so `path` can be reset
     /// by [`reset_to_directory`] rather than by `PathBuf::pop`.
     directory: PathBuf,
-    visited_directories: HashSet<CycleKey>,
+    /// The guard belonging to the directory currently being delivered.
+    cycle_guard: Arc<CycleGuard>,
     /// Ignore rules of the directory whose entries are being delivered.
     ignores: IgnoreScope,
     /// Depth of that same directory, so its entries need not recount it.
@@ -1970,12 +1989,13 @@ impl WalkStream {
             path,
             depth,
             root,
+            cycle_guard,
             ignores,
         } = task;
         if self.walker.options.follow_symlinks {
             match SystemBackend.cycle_key(&path) {
                 Ok(key) => {
-                    if !self.visited_directories.insert(key) {
+                    if !cycle_guard.mark(key) {
                         return None;
                     }
                 }
@@ -1994,6 +2014,7 @@ impl WalkStream {
                 self.ignores = ignores.enter(&self.walker, &SystemBackend, &path, &self.listing);
                 self.depth = depth;
                 self.root = root;
+                self.cycle_guard = cycle_guard;
                 self.next_entry = 0;
                 self.directory = path;
                 reset_to_directory(&mut self.path, &self.directory);
@@ -2023,7 +2044,10 @@ impl WalkStream {
             &self.listing.entries()[index],
             &self.ignores,
             self.depth,
-            self.root,
+            TraversalContext {
+                root: self.root,
+                cycle_guard: &self.cycle_guard,
+            },
         );
         // Only an emitted entry needs a path of its own, and the stream hands
         // every one of them to the caller.
@@ -2090,7 +2114,6 @@ struct WalkState<'walker> {
     visitor: EntryVisitor<'walker>,
     entries: Vec<WalkEntry>,
     errors: Vec<WalkError>,
-    visited_directories: HashSet<CycleKey>,
     /// Buffers of directories this frontend has finished with. It descends by
     /// recursion, so several directories are open at once and each needs its
     /// own; a pool hands the deepest frame the buffers the last one returned.
@@ -2159,7 +2182,6 @@ impl<'walker> WalkState<'walker> {
             visitor,
             entries: Vec::new(),
             errors: Vec::new(),
-            visited_directories: HashSet::new(),
             scratch: Vec::new(),
             spare: PathBuf::new(),
             cancelled: false,
@@ -2194,14 +2216,27 @@ impl<'walker> WalkState<'walker> {
             path,
             depth,
             root,
+            cycle_guard,
             ignores,
         } = task;
         let is_root = depth == 0;
-        if self.walker.options.follow_symlinks && !self.mark_directory(backend, &path, is_root)? {
+        if self.walker.options.follow_symlinks
+            && !self.mark_directory(backend, &cycle_guard, &path, is_root)?
+        {
             return Ok(());
         }
         let mut scratch = self.scratch.pop().unwrap_or_default();
-        let outcome = self.walk_listing(backend, &path, depth, root, ignores, &mut scratch);
+        let outcome = self.walk_listing(
+            backend,
+            &path,
+            depth,
+            TraversalContext {
+                root,
+                cycle_guard: &cycle_guard,
+            },
+            ignores,
+            &mut scratch,
+        );
         scratch.listing.clear();
         self.scratch.push(scratch);
         outcome
@@ -2214,7 +2249,7 @@ impl<'walker> WalkState<'walker> {
         backend: &impl DirectoryBackend,
         path: &Path,
         depth: usize,
-        root: usize,
+        context: TraversalContext<'_>,
         ignores: IgnoreScope,
         scratch: &mut DirectoryScratch,
     ) -> Result<(), WalkError> {
@@ -2252,7 +2287,7 @@ impl<'walker> WalkState<'walker> {
                 &scratch.listing.entries()[index],
                 &ignores,
                 depth,
-                root,
+                context,
             );
             let outcome = self.act(backend, action, &scratch.path);
             reset_to_directory(&mut scratch.path, path);
@@ -2267,11 +2302,12 @@ impl<'walker> WalkState<'walker> {
     fn mark_directory(
         &mut self,
         backend: &impl DirectoryBackend,
+        cycle_guard: &CycleGuard,
         directory: &Path,
         is_root: bool,
     ) -> Result<bool, WalkError> {
         match backend.cycle_key(directory) {
-            Ok(key) => Ok(self.visited_directories.insert(key)),
+            Ok(key) => Ok(cycle_guard.mark(key)),
             Err(source) => {
                 self.handle_error(
                     CYCLE_KEY_OPERATION,
@@ -2632,6 +2668,7 @@ mod tests {
             path: path.clone(),
             depth: 0,
             root: 0,
+            cycle_guard: std::sync::Arc::new(super::CycleGuard::default()),
             ignores: super::IgnoreScope::for_root(walker, backend, &path),
         }
     }
@@ -4960,10 +4997,26 @@ mod tests {
         threads: usize,
         frontend: Frontend,
     ) -> RootedOutcome {
+        multi_root_outcome_with_following(roots, include, threads, frontend, false)
+    }
+
+    /// The same acceptance harness under either symlink policy. Keeping the
+    /// policy explicit lets the multi-root contract pin the cycle guard too:
+    /// following links must change what one root sees, never whether another
+    /// root gets to see its own traversal.
+    fn multi_root_outcome_with_following(
+        roots: &[PathBuf],
+        include: Option<&str>,
+        threads: usize,
+        frontend: Frontend,
+        follow_symlinks: bool,
+    ) -> RootedOutcome {
         let (first, rest) = roots.split_first().expect("at least one root");
-        let mut walker = Walker::new(first)
-            .threads(threads)
-            .options(WalkOptions::default().files_only(true));
+        let mut walker = Walker::new(first).threads(threads).options(
+            WalkOptions::default()
+                .files_only(true)
+                .follow_symlinks(follow_symlinks),
+        );
         for root in rest {
             walker = walker.add_root(root).expect("the root takes the patterns");
         }
@@ -5086,6 +5139,92 @@ mod tests {
             vec![(outer.clone(), 2), (inner.clone(), 1)],
             "each copy is one level below the root it came from"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn following_links_keeps_overlapping_and_duplicate_roots_independent() {
+        use std::os::unix::fs::symlink;
+
+        // `back` makes a genuine cycle for every root traversal. The nested
+        // and duplicate roots must nevertheless reproduce their corresponding
+        // single-root walks exactly, including the root and depth carried by
+        // every overlapping path.
+        let fixture = Fixture::new();
+        fixture.write("outer/own.txt");
+        fixture.write("outer/inner/shared.txt");
+        fixture.write("outer/inner/deep/leaf.txt");
+        symlink("..", fixture.root.join("outer/inner/back")).expect("create cycle");
+
+        let outer = fixture.root.join("outer");
+        let inner = outer.join("inner");
+        let alias = fixture.root.join("outer-alias");
+        symlink("outer", &alias).expect("create root alias");
+        let overlapping = [outer.clone(), inner.clone()];
+        let duplicate = [outer.clone(), outer.clone()];
+        let aliases = [outer.clone(), alias];
+        for roots in [&overlapping[..], &duplicate[..], &aliases[..]] {
+            for (frontend, threads) in [
+                (Frontend::Collect, 1),
+                (Frontend::Collect, 4),
+                (Frontend::Visit, 1),
+                (Frontend::Visit, 4),
+                (Frontend::Stream, 1),
+            ] {
+                let together =
+                    multi_root_outcome_with_following(roots, None, threads, frontend, true);
+                let separately = RootedOutcome::concatenated(roots.iter().map(|root| {
+                    multi_root_outcome_with_following(
+                        std::slice::from_ref(root),
+                        None,
+                        threads,
+                        frontend,
+                        true,
+                    )
+                }));
+                assert_eq!(
+                    together, separately,
+                    "{frontend:?} with {threads} thread(s) and roots {roots:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parallel_following_links_keeps_root_attribution_stable_under_stress() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let outer = fixture.root.join("outer");
+        let inner = outer.join("inner");
+        for branch in 0..32 {
+            for leaf in 0..8 {
+                fixture.write(format!("outer/inner/branch-{branch}/leaf-{leaf}.txt"));
+            }
+        }
+        symlink("..", inner.join("back")).expect("create cycle");
+        let roots = [outer, inner];
+        let expected = RootedOutcome::concatenated(roots.iter().map(|root| {
+            multi_root_outcome_with_following(
+                std::slice::from_ref(root),
+                None,
+                1,
+                Frontend::Collect,
+                true,
+            )
+        }));
+
+        // The workers can race over the two roots' overlapping subtrees on
+        // every run. A shared guard used to make which root won observable in
+        // both `root()` and `depth()`; repeat far beyond one schedule.
+        for run in 0..24 {
+            assert_eq!(
+                multi_root_outcome_with_following(&roots, None, 4, Frontend::Collect, true),
+                expected,
+                "parallel run {run} changed overlap attribution"
+            );
+        }
     }
 
     /// Patterns are root-relative and apply under every root; an absolute one
