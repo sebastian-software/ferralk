@@ -1,7 +1,8 @@
 # Deferred follow-up
 
-Ferralk 0.6.0 is published. There are no external release gates and no numeric
-performance gates; GitHub tracks the remaining follow-up work.
+Ferralk 0.8.0 is published. <!-- x-release-please-version --> There are no
+external release gates and no numeric performance gates; GitHub tracks the
+remaining follow-up work.
 
 The native filesystem parity corpus that used to sit in this table closed with
 [#12](https://github.com/sebastian-software/ferralk/issues/12): eleven parity
