@@ -76,6 +76,10 @@ Optional zlob context, which needs **Zig 0.16** and libclang because zlob 1.6.3
 builds through `build.rs` and bindgen:
 
 ```sh
+# macOS/Homebrew setup used for the current local run:
+brew install zig llvm
+export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+
 cargo bench -p bench --bench walker_palamedes --features zlob-oracle
 cargo bench -p bench --bench walker_zlob --features zlob-oracle
 cargo bench -p bench --bench matcher_zlob --features zlob-oracle
@@ -83,7 +87,8 @@ cargo bench -p bench --bench matcher_zlob --features zlob-oracle
 
 zlob is context, never a baseline anything depends on: its benches are behind
 the `zlob-oracle` feature, its workflow is manual dispatch only, and no
-automatic lane requires Zig.
+automatic lane requires Zig. The current local run used Zig 0.16.0 and
+libclang 22.1.8 from Homebrew.
 
 The measurements below were taken with:
 
@@ -167,7 +172,7 @@ directories through `std::fs`, on macOS as everywhere else.
 ## Expanded library comparison on this machine, 2026-08-27
 
 The comparison was refreshed on the current checkout and extended with four
-popular Rust libraries:
+popular Rust libraries plus zlob as the optional cross-language reference:
 
 | Library | Locked version | Role in the comparison | Important scope note |
 | --- | ---: | --- | --- |
@@ -175,6 +180,7 @@ popular Rust libraries:
 | [`jwalk`](https://crates.io/crates/jwalk/0.9.0) | 0.9.0 | Serial and four-thread traversal plus a caller-side `globset` | The current release is marked deprecated by its package metadata. |
 | [`globwalk`](https://crates.io/crates/globwalk/0.9.1) | 0.9.1 | Integrated serial glob walking | Built on `walkdir` and `ignore` overrides. |
 | [`wax`](https://crates.io/crates/wax/0.7.0) | 0.7.0 | Integrated serial glob walking and compiled matching | UTF-8/regex-based API; the comparison is valid only for this ASCII fixture. |
+| [`zlob`](https://github.com/dmtrKovalenko/zlob) | 1.6.3 | Integrated parallel glob walking and compiled matching | Zig library behind a C ABI; local builds need Zig 0.16 and libclang. |
 
 `ignore` + `globset`, `globset`, `fast-glob`, ferralk, and zlob remain in the
 existing lanes. Every walker arm was checked for the exact same result count
@@ -194,10 +200,11 @@ once outside their match loop.
 | Benchmark revision | `0ac2adc` (source tree used for this run) |
 | Toolchain | rustc/cargo 1.96.0, LLVM 22.1.0 |
 | Benchmark stack | Criterion 0.8.2, release profile; exact dependency versions are locked in `Cargo.lock` |
+| zlob toolchain | Zig 0.16.0, libclang 22.1.8 from Homebrew |
 | Threads | 4 for every parallel ferralk, `ignore`, and `jwalk` arm |
 | Cache | Warm: the fixture is written immediately before the measurement and then reused by all arms in that invocation |
 | Fixture | 53,600 files, 2,600 TypeScript sources under `src/` and `packages/`, and 400 dependency packages under `node_modules/` |
-| Commands | `cargo bench -p bench --bench matcher -- --output-format bencher --noplot`; `cargo bench -p bench --bench walker_palamedes -- --output-format bencher --noplot`; the same walker command with `--features native-macos` |
+| Commands | `cargo bench -p bench --bench matcher -- --output-format bencher --noplot`; `cargo bench -p bench --bench matcher_zlob --features zlob-oracle -- --output-format bencher --noplot`; `cargo bench -p bench --bench walker_palamedes -- --output-format bencher --noplot`; the same walker command with `--features native-macos` and with `--features zlob-oracle` |
 
 The tables report Criterion's point estimates in milliseconds. They are
 indicative wall times, not a performance gate. Lower is better. The native
@@ -209,7 +216,7 @@ unscoped `ferralk` parallel arm had unusually high spread in this run
 | Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
 | --- | ---: | ---: |
 | ferralk, serial | 79.28 ms | 13.92 ms |
-| **ferralk, 4 threads** | 51.42 ms | **8.50 ms** |
+| ferralk, 4 threads | 51.42 ms | **8.50 ms** |
 | `ignore` serial + `globset` | 116.32 ms | 101.06 ms |
 | `walkdir` serial + `globset` | 113.51 ms | 97.42 ms |
 | `jwalk` serial + `globset` | 100.14 ms | 102.29 ms |
@@ -218,14 +225,15 @@ unscoped `ferralk` parallel arm had unusually high spread in this run
 | `wax` serial | 120.71 ms | 18.41 ms |
 | `ignore` parallel + overrides | 51.32 ms | 46.40 ms |
 | `ignore` parallel + hand-pruned subtree | — | 10.91 ms |
+| zlob, 4 threads | **35.99 ms** | 38.24 ms |
 
-On the unscoped query, `jwalk` plus caller-side `globset` is 1.4% faster than
-Ferralk's four-thread arm in this run (50.72 ms versus 51.42 ms). On the
-scoped query, Ferralk is faster because it prunes `node_modules` from the
-pattern itself: 8.50 ms versus 18.41 ms for `wax`, 50.12 ms for `jwalk`, and
-46.40 ms for `ignore` overrides. The hand-pruned `ignore` arm remains the
-closest comparison at 10.91 ms, but it needs an extra caller policy that the
-Ferralk pattern already expresses.
+On the unscoped query, zlob is the fastest arm in this run at 35.99 ms; Ferralk
+and `jwalk` plus caller-side `globset` follow at 51.42 ms and 50.72 ms. On the
+scoped query, Ferralk is fastest because it prunes `node_modules` from the
+pattern itself: 8.50 ms versus 18.41 ms for `wax`, 38.24 ms for zlob, and
+50.12 ms for `jwalk`. The hand-pruned `ignore` arm remains the closest
+selection-policy comparison at 10.91 ms, but it needs an extra caller policy
+that the Ferralk pattern already expresses.
 
 ### macOS-native backend
 
@@ -236,44 +244,49 @@ Ferralk pattern already expresses.
 | `ignore` serial + `globset` | 85.89 ms | 88.91 ms |
 | `walkdir` serial + `globset` | 84.35 ms | 84.57 ms |
 | `jwalk` serial + `globset` | 88.28 ms | 94.96 ms |
-| `jwalk`, 4 threads + `globset` | **44.92 ms** | 47.49 ms |
+| `jwalk`, 4 threads + `globset` | 44.92 ms | 47.49 ms |
 | `globwalk` serial | 86.91 ms | 89.06 ms |
 | `wax` serial | 107.90 ms | 18.10 ms |
 | `ignore` parallel + overrides | 49.57 ms | 53.21 ms |
 | `ignore` parallel + hand-pruned subtree | — | 10.82 ms |
+| zlob, 4 threads | **37.00 ms** | 39.26 ms |
 
 The native reader changes Ferralk's serial unscoped result from 79.28 ms to
 61.36 ms in this final run, and the scoped result from 13.92 ms to 11.42 ms.
 The unscoped native parallel point estimate is an outlier with high spread;
 the scoped native Ferralk result is the best measured arm at 8.04 ms, while
-`wax` is the only other integrated walker close at 18.10 ms.
+zlob is the fastest unscoped cross-language reference at 37.00 ms and `wax` is
+the only other integrated walker close to Ferralk on the scoped query at
+18.10 ms.
 
 The new references answer a comparison question, not an adoption question.
 `jwalk` is deprecated, `walkdir` has no matching or pruning policy, `globwalk`
 uses a different override contract, and `wax` accepts UTF-8 expressions rather
 than Ferralk's arbitrary-byte matcher. Exact semantic compatibility still
 comes from the checked-in corpus and caller parity tests, not from these
-wall-time rows. zlob was not included in this refresh because Zig is not
-installed on the host; its last separately dated context measurements remain
-in the existing zlob context and macOS-native sections.
+wall-time rows. zlob was run in the same fixture and invocation as the other
+walker arms after installing Zig 0.16.0 and libclang 22.1.8 locally. It remains
+an optional context lane rather than an automated baseline.
 
 ### Matcher refresh
 
 The matcher lane was run in the same environment. These rows use the current
-point estimates and add `wax` to the existing compiled baselines:
+point estimates and add `wax` and zlob to the existing compiled baselines:
 
-| Case | ferralk | `globset` | `fast-glob` | `wax` |
-| --- | ---: | ---: | ---: | ---: |
-| `common` matching | **11 ns** | 40 ns | 98 ns | 31 ns |
-| `common` non-matching | **3 ns** | 40 ns | 107 ns | 31 ns |
-| `long_path` matching | **13 ns** | 205 ns | 545 ns | 180 ns |
-| `long_path` non-matching | **3 ns** | 201 ns | 545 ns | 189 ns |
-| `backtracking` non-matching | **4 ns** | 102 ns | 249 ns | 81 ns |
+| Case | ferralk | zlob | `globset` | `fast-glob` | `wax` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `common` matching | **11 ns** | 37 ns | 40 ns | 98 ns | 31 ns |
+| `common` non-matching | **3 ns** | **2 ns** | 40 ns | 107 ns | 31 ns |
+| `long_path` matching | **13 ns** | 74 ns | 205 ns | 545 ns | 180 ns |
+| `long_path` non-matching | **3 ns** | **2 ns** | 201 ns | 545 ns | 189 ns |
+| `backtracking` non-matching | **4 ns** | 30 ns | 102 ns | 249 ns | 81 ns |
 
 `wax` is faster than `globset` on the long-path and adversarial rows here, but
-that does not erase the API and byte-semantics differences. The complete
-matcher output, including compilation and path-filter shapes, is produced by
-[`matcher.rs`](../tools/bench/benches/matcher.rs).
+that does not erase the API and byte-semantics differences. zlob is competitive
+on short non-matches and the adversarial case, while Ferralk remains faster on
+the matching and long-path cases. The Ferralk/baseline output is produced by
+[`matcher.rs`](../tools/bench/benches/matcher.rs), and the optional zlob rows by
+[`matcher_zlob.rs`](../tools/bench/benches/matcher_zlob.rs).
 
 ## The macOS native backend, 2026-08-20
 
