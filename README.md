@@ -57,8 +57,9 @@ especially `node_modules`, directly from the pattern.
 | Walker | Unscoped, 7,400 matches | Scoped, 2,600 matches |
 | --- | ---: | ---: |
 | Ferralk portable, 4 threads | 37.78 ms | **4.29 ms** |
+| zlob 1.6.3, same portable run | **20.12 ms** | 20.30 ms |
 | Ferralk macOS-native, 4 threads | 33.90 ms | 6.27 ms |
-| zlob 1.6.3, 4 threads | **30.22 ms** | 20.93 ms |
+| zlob 1.6.3, same native run | 30.22 ms | 20.93 ms |
 | Node.js `node:fs` sync | 286.49 ms | 31.51 ms |
 | `glob` 13.0.6 async | 48.56 ms | 8.08 ms |
 | `fast-glob` 3.3.3 async | 50.73 ms | 8.29 ms |
@@ -67,9 +68,9 @@ especially `node_modules`, directly from the pattern.
 
 The Rust walker rows are Criterion point estimates; the Node.js rows are
 medians of ten order-rotated samples. The APIs and estimators are not identical,
-so these are same-host context rather than a universal ranking. The zlob row
-comes from the same invocation as the macOS-native Ferralk row; the portable
-row is a separate invocation. See
+so these are same-host context rather than a universal ranking. zlob appears
+twice to keep each Rust comparison inside one invocation; its spread shows the
+host-load noise between the two runs, not a backend change. See
 [benchmark evidence](docs/benchmark-evidence.md) for the complete tables,
 exact commands, sampling details, semantic differences, and limitations.
 
