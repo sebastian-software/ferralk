@@ -30,7 +30,7 @@
 
 use std::{
     cell::RefCell,
-    ffi::{CString, OsStr, c_int, c_void},
+    ffi::{CString, OsStr, OsString, c_int, c_void},
     fs::{self, File, OpenOptions},
     io,
     ops::Range,
@@ -40,7 +40,10 @@ use std::{
         io::{AsRawFd, FromRawFd, IntoRawFd},
     },
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use super::{Listing, defer_entry_stat_error};
@@ -94,6 +97,33 @@ const ATTRIBUTE_RECORD_HEADER_SIZE: usize = std::mem::size_of::<u32>() + ATTRIBU
 /// one, which is the semantics the bulk reader established.
 static NATIVE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
+/// Process-wide ceiling for descriptors retained beyond one directory read.
+///
+/// Relative opens are an optimization, so reaching the ceiling falls back to
+/// the existing full-path open instead of turning a wide tree into `EMFILE`.
+const MAX_RETAINED_DIRECTORIES: usize = 256;
+static RETAINED_DIRECTORIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static RETAINED_DIRECTORY_LIMIT: OnceLock<usize> = OnceLock::new();
+
+fn retained_directory_limit() -> usize {
+    *RETAINED_DIRECTORY_LIMIT.get_or_init(|| {
+        let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: `limits` points at writable storage for one `rlimit`; a
+        // successful call initializes it before `assume_init` below.
+        let status = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) };
+        if status != 0 {
+            return 64;
+        }
+        // SAFETY: `getrlimit` returned success and initialized the output.
+        let soft_limit = unsafe { limits.assume_init() }.rlim_cur;
+        usize::try_from(soft_limit)
+            .unwrap_or(MAX_RETAINED_DIRECTORIES)
+            .saturating_div(4)
+            .min(MAX_RETAINED_DIRECTORIES)
+    })
+}
+
 std::thread_local! {
     static DIRENTRIES_BUFFER: RefCell<Box<[u8; BUFFER_SIZE]>> = RefCell::new(Box::new([0; BUFFER_SIZE]));
 }
@@ -109,6 +139,33 @@ std::thread_local! {
 pub(super) enum NativeDirectoryReadError {
     CapabilityUnavailable(io::Error),
     Io(io::Error),
+}
+
+/// Parent capability and basename retained by a queued child directory.
+#[derive(Debug, Clone)]
+pub(super) struct RelativeDirectoryOpen {
+    pub(super) parent: Arc<RetainedDirectory>,
+    pub(super) name: OsString,
+}
+
+#[derive(Debug)]
+pub(super) struct RetainedDirectory(File);
+
+impl RetainedDirectory {
+    fn retain(directory: File) -> Option<Arc<Self>> {
+        RETAINED_DIRECTORIES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
+                (retained < retained_directory_limit()).then_some(retained + 1)
+            })
+            .ok()
+            .map(|_| Arc::new(Self(directory)))
+    }
+}
+
+impl Drop for RetainedDirectory {
+    fn drop(&mut self) {
+        RETAINED_DIRECTORIES.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl From<io::Error> for NativeDirectoryReadError {
@@ -157,14 +214,15 @@ unsafe extern "C" {
 
 pub(super) fn read_directory(
     path: &Path,
+    relative: Option<&RelativeDirectoryOpen>,
     refuse_final_symlink: bool,
     listing: &mut Listing,
 ) -> NativeDirectoryReadResult {
     if NATIVE_UNSUPPORTED.load(Ordering::Relaxed) {
-        read_portable_directory_from_path(path, refuse_final_symlink, listing)?;
+        read_portable_directory_from_path(path, relative, refuse_final_symlink, listing)?;
         return Ok(());
     }
-    read_direntries_directory(path, refuse_final_symlink, listing)
+    read_direntries_directory(path, relative, refuse_final_symlink, listing)
 }
 
 fn unsupported(message: &'static str) -> io::Error {
@@ -188,6 +246,37 @@ fn open_directory(path: &Path, refuse_final_symlink: bool) -> io::Result<File> {
             0
         };
     OpenOptions::new().read(true).custom_flags(flags).open(path)
+}
+
+/// Opens a queued child relative to the still-open parent that named it.
+fn open_scheduled_directory(
+    path: &Path,
+    relative: Option<&RelativeDirectoryOpen>,
+    refuse_final_symlink: bool,
+) -> io::Result<File> {
+    let Some(relative) = relative else {
+        return open_directory(path, refuse_final_symlink);
+    };
+    let name = CString::new(relative.name.as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let flags = libc::O_RDONLY
+        | libc::O_CLOEXEC
+        | O_DIRECTORY
+        | if refuse_final_symlink {
+            libc::O_NOFOLLOW
+        } else {
+            0
+        };
+    // SAFETY: the parent `Arc<File>` keeps a live directory descriptor for the
+    // duration of the call; `name` is NUL-terminated and has no interior NUL.
+    // No creation flag is present, so `openat` takes no mode argument.
+    let descriptor = unsafe { libc::openat(relative.parent.0.as_raw_fd(), name.as_ptr(), flags) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a non-negative `openat` result is a new owned descriptor. This
+    // `File` is its sole owner and closes it exactly once.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
 /// The `getattrlistbulk` reader, kept as the regression boundary the module
@@ -440,23 +529,32 @@ fn bulk_entry_kind(
 
 fn read_direntries_directory(
     path: &Path,
+    relative: Option<&RelativeDirectoryOpen>,
     refuse_final_symlink: bool,
     listing: &mut Listing,
 ) -> NativeDirectoryReadResult {
     DIRENTRIES_BUFFER.with(|buffer| {
         let mut buffer = buffer.borrow_mut();
-        read_direntries_directory_with_buffer(path, refuse_final_symlink, &mut buffer[..], listing)
+        read_direntries_directory_with_buffer(
+            path,
+            relative,
+            refuse_final_symlink,
+            &mut buffer[..],
+            listing,
+        )
     })
 }
 
 fn read_direntries_directory_with_buffer(
     path: &Path,
+    relative: Option<&RelativeDirectoryOpen>,
     refuse_final_symlink: bool,
     buffer: &mut [u8],
     listing: &mut Listing,
 ) -> NativeDirectoryReadResult {
     let used_portable_fallback = read_open_directory_with_portable_fallback(
         path,
+        relative,
         refuse_final_symlink,
         buffer,
         listing,
@@ -476,14 +574,18 @@ fn read_direntries_directory_with_buffer(
 /// escape this function.
 fn read_open_directory_with_portable_fallback(
     path: &Path,
+    relative: Option<&RelativeDirectoryOpen>,
     refuse_final_symlink: bool,
     buffer: &mut [u8],
     listing: &mut Listing,
     native: impl FnOnce(&File, &Path, &mut [u8], &mut Listing) -> NativeDirectoryReadResult,
 ) -> Result<bool, NativeDirectoryReadError> {
-    let directory = open_directory(path, refuse_final_symlink)?;
+    let directory = open_scheduled_directory(path, relative, refuse_final_symlink)?;
     match native(&directory, path, buffer, listing) {
-        Ok(()) => Ok(false),
+        Ok(()) => {
+            listing.native_directory = RetainedDirectory::retain(directory);
+            Ok(false)
+        }
         Err(NativeDirectoryReadError::CapabilityUnavailable(_)) => {
             read_portable_directory_from_open_file(directory, path, listing)?;
             Ok(true)
@@ -498,10 +600,11 @@ fn read_open_directory_with_portable_fallback(
 /// have changed between scheduling and this open.
 fn read_portable_directory_from_path(
     path: &Path,
+    relative: Option<&RelativeDirectoryOpen>,
     refuse_final_symlink: bool,
     listing: &mut Listing,
 ) -> io::Result<()> {
-    let directory = open_directory(path, refuse_final_symlink)?;
+    let directory = open_scheduled_directory(path, relative, refuse_final_symlink)?;
     read_portable_directory_from_open_file(directory, path, listing)
 }
 
@@ -823,6 +926,7 @@ fn malformed_record() -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::OsString,
         fs,
         os::unix::fs::symlink,
         path::{Path, PathBuf},
@@ -837,12 +941,12 @@ mod tests {
     use super::{
         ATTR_CMN_ERROR, ATTR_CMN_NAME, ATTR_CMN_OBJTYPE, ATTR_CMN_RETURNED_ATTRS,
         ATTRIBUTE_RECORD_HEADER_SIZE, BUFFER_SIZE, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG,
-        DT_SOCK, GETDIRENTRIES64_EOF, Listing, NAME_OFFSET, NativeDirectoryReadError, VBLK, VCHR,
-        VDIR, VFIFO, VSOCK, bulk_entry_kind, clear_direntries_eof_tail, entry_kind,
-        for_each_record, has_direntries_eof_flag, is_unsupported_bulk_error,
-        is_unsupported_direntries_error, open_directory, parse_bulk_record, parse_records,
-        parse_records_with_entry_kind, read_bulk_directory, read_directory,
-        read_direntries_directory, read_open_directory_with_portable_fallback,
+        DT_SOCK, GETDIRENTRIES64_EOF, Listing, NAME_OFFSET, NativeDirectoryReadError,
+        RelativeDirectoryOpen, RetainedDirectory, VBLK, VCHR, VDIR, VFIFO, VSOCK, bulk_entry_kind,
+        clear_direntries_eof_tail, entry_kind, for_each_record, has_direntries_eof_flag,
+        is_unsupported_bulk_error, is_unsupported_direntries_error, open_directory,
+        parse_bulk_record, parse_records, parse_records_with_entry_kind, read_bulk_directory,
+        read_directory, read_direntries_directory, read_open_directory_with_portable_fallback,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -1048,7 +1152,8 @@ mod tests {
             "a no-follow directory open rejects the changed path: {error}"
         );
         let mut listing = Listing::default();
-        read_directory(&link, false, &mut listing).expect("follow mode still opens through a link");
+        read_directory(&link, None, false, &mut listing)
+            .expect("follow mode still opens through a link");
         assert!(listing.contains("inside"));
         fs::remove_dir_all(root).expect("remove no-follow fixture");
     }
@@ -1087,6 +1192,33 @@ mod tests {
     }
 
     #[test]
+    fn relative_child_open_stays_with_the_parent_descriptor_after_path_replacement() {
+        let root = fixture_root("relative-open-parent-swap");
+        let parent = root.join("parent");
+        let moved = root.join("opened-parent");
+        fs::create_dir_all(parent.join("child")).expect("create original child");
+        fs::write(parent.join("child/original"), b"fixture").expect("write original marker");
+
+        let relative = RelativeDirectoryOpen {
+            parent: RetainedDirectory::retain(
+                open_directory(&parent, false).expect("open original parent"),
+            )
+            .expect("the test retains one descriptor"),
+            name: OsString::from("child"),
+        };
+        fs::rename(&parent, &moved).expect("move the opened parent");
+        fs::create_dir_all(parent.join("child")).expect("create replacement child");
+        fs::write(parent.join("child/escaped"), b"fixture").expect("write replacement marker");
+
+        let mut listing = Listing::default();
+        read_directory(&parent.join("child"), Some(&relative), true, &mut listing)
+            .expect("open child relative to retained parent");
+        assert!(listing.contains("original"));
+        assert!(!listing.contains("escaped"));
+        fs::remove_dir_all(root).expect("remove relative-open fixture");
+    }
+
+    #[test]
     fn unsupported_no_follow_descendant_reuses_its_open_descriptor() {
         let root = fixture_root("descriptor-fallback");
         let descendant = root.join("scheduled");
@@ -1101,6 +1233,7 @@ mod tests {
         let mut listing = Listing::default();
         let used_portable_fallback = read_open_directory_with_portable_fallback(
             &descendant,
+            None,
             true,
             &mut buffer,
             &mut listing,
@@ -1140,6 +1273,7 @@ mod tests {
         let mut listing = Listing::default();
         let error = read_open_directory_with_portable_fallback(
             &root,
+            None,
             true,
             &mut buffer,
             &mut listing,
@@ -1377,13 +1511,13 @@ mod tests {
         // What the walk actually reads through.
         assert_eq!(
             describe(&|listing| {
-                read_directory(&root, false, listing).expect("native reader succeeds");
+                read_directory(&root, None, false, listing).expect("native reader succeeds");
             }),
             portable
         );
         assert_eq!(
             describe(&|listing| {
-                read_direntries_directory(&root, false, listing)
+                read_direntries_directory(&root, None, false, listing)
                     .expect("direntries reader succeeds");
             }),
             portable
@@ -1462,6 +1596,7 @@ mod tests {
         let (ignores, ignore_errors) = crate::IgnoreScope::for_root(walker, &StdBackend, &root);
         let task = crate::DirectoryTask {
             path: root.clone(),
+            open: crate::DirectoryOpen::default(),
             depth: 0,
             root: 0,
             cycle_guard: std::sync::Arc::new(crate::CycleGuard::default()),

@@ -588,6 +588,7 @@ fn try_take(
 fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: DirectoryTask) {
     let DirectoryTask {
         path,
+        open,
         depth,
         root,
         cycle_guard,
@@ -614,8 +615,9 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
     {
         return;
     }
-    if let Err(source) = shared.backend.read_directory(
+    if let Err(source) = shared.backend.read_scheduled_directory(
         &path,
+        &open,
         shared.walker.options.follow_symlinks,
         !shared.walker.options.follow_symlinks && depth > 0,
         &mut worker.listing,
@@ -660,6 +662,7 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
             shared.backend,
             &worker.path,
             &worker.listing.entries()[index],
+            &worker.listing,
             &ignores,
             depth,
             TraversalContext {

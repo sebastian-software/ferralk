@@ -22,7 +22,7 @@ use std::{
 };
 
 use super::{
-    CycleGuard, DirectoryBackend, ListedEntry, WalkEntry, Walker,
+    CycleGuard, DirectoryBackend, DirectoryOpen, ListedEntry, Listing, WalkEntry, Walker,
     gitignore::{IgnoreReadError, IgnoreScope},
     glob_bytes, has_hidden_component, should_skip_git_directory,
 };
@@ -86,6 +86,10 @@ impl EmittedEntry {
 #[derive(Debug)]
 pub(crate) struct DirectoryTask {
     pub(crate) path: PathBuf,
+    /// Backend-specific capability for opening this directory without
+    /// resolving its complete path again. Empty on backends that do not expose
+    /// one.
+    pub(crate) open: DirectoryOpen,
     /// Which of the walk's roots this directory sits under. Carried down the
     /// tree rather than rediscovered, because it selects the patterns and the
     /// root-relative offset that apply here.
@@ -159,6 +163,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     backend: &B,
     path: &Path,
     entry: &ListedEntry,
+    listing: &Listing,
     ignores: &IgnoreScope,
     directory_depth: usize,
     context: TraversalContext<'_>,
@@ -276,6 +281,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     // is one of the few places that has to own a path.
     let task = || DirectoryTask {
         path: path.to_path_buf(),
+        open: backend.child_directory_open(listing, entry.name()),
         depth,
         root: context.root,
         cycle_guard: Arc::clone(context.cycle_guard),
