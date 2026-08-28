@@ -15,6 +15,7 @@ records the same for releases.
 | Matcher, wall time | Compiled-pattern matching and compilation, against `globset`, `fast-glob`, and `wax` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
 | Walker, wall time | Warm-cache traversal of a synthetic tree, ferralk serial and parallel against `ignore` parallel, one job per backend that ships | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request, medians in the job summary and as an artifact | No |
 | Engine comparison | One repository shape, every engine on the same query and the same file set | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), run on demand | No |
+| zlob ablations | Ferralk and zlob on one fixed fixture, split into traversal, filtering, result retention, and path-representation costs | [`walker_zlob_ablation.rs`](../tools/bench/benches/walker_zlob_ablation.rs), run on demand | No |
 | zlob context | The same matcher and walker shapes against zlob 1.6.3 | [`zlob-benchmark.yml`](../.github/workflows/zlob-benchmark.yml), manual dispatch only | No |
 | Node.js ecosystem context | The same matcher cases and repository-shaped walker fixture against current locked Node libraries | [`tools/bench/node`](../tools/bench/node), run on demand | No |
 
@@ -92,6 +93,7 @@ export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
 
 cargo bench -p bench --bench walker_palamedes --features zlob-oracle
 cargo bench -p bench --bench walker_zlob --features zlob-oracle
+cargo bench -p bench --bench walker_zlob_ablation --features native-macos,zlob-oracle
 cargo bench -p bench --bench matcher_zlob --features zlob-oracle
 ```
 
@@ -120,7 +122,7 @@ measurement was made against a different codebase on different hardware and was
 never re-runnable. [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs)
 rebuilds the *shape* so the comparison can be repeated: 53,600 files, 2,600 of
 them TypeScript sources under `src/` and `packages/`, the rest a `node_modules`
-tree of 400 packages, some nesting their own dependencies.
+tree of 400 top-level packages and 200 nested dependency packages.
 
 Absolute numbers are not comparable with the RFC's; the ratios between engines
 on one host are.
@@ -132,7 +134,11 @@ and then measured against it over four releases. See
 [Palamedes adoption](palamedes-adoption.md).
 
 Every arm is run once before timing and has to return the same file count, so no
-arm can be fast by finding less. Unscoped finds 7,400 files, scoped 2,600.
+arm can be fast by finding less. The **unscoped** query can match anywhere and
+must inspect the whole tree; it finds 7,400 files. The **scoped** query names
+`src` and `packages` as its only possible roots, so a pattern-aware walker can
+skip `node_modules`; it finds 2,600 files. Here, scoped describes the query's
+root constraint, not a benchmark or process isolation boundary.
 
 ### `**/*.{ts,tsx}` — nothing can be pruned
 
@@ -208,14 +214,14 @@ once outside their match loop.
 | --- | --- |
 | Host | Mac Studio (Mac13,2), Apple M1 Ultra, 20 cores (16 performance, 4 efficiency), 64 GB RAM |
 | OS | macOS 26.5.2, build 25F84; Darwin 25.5.0, arm64 |
-| Benchmark revision | `c9727b8` (source tree used for this run) |
+| Benchmark revision | `b5d78e0` (source tree used for the walker refresh) |
 | Toolchain | rustc/cargo 1.96.0, LLVM 22.1.2 |
 | Benchmark stack | Criterion 0.8.2, release profile; exact dependency versions are locked in `Cargo.lock` |
 | zlob toolchain | Zig 0.16.0, libclang 22.1.8 from Homebrew |
 | Node toolchain | Node.js 24.19.0, npm 11.17.0; exact dependency versions are locked in `tools/bench/node/package-lock.json` |
 | Threads | 4 for every parallel ferralk, `ignore`, and `jwalk` arm |
 | Cache | Warm: the fixture is written immediately before the measurement and then reused by all arms in that invocation |
-| Fixture | 53,600 files, 2,600 TypeScript sources under `src/` and `packages/`, and 400 dependency packages under `node_modules/` |
+| Fixture | 53,600 files, 2,600 TypeScript sources under `src/` and `packages/`, plus 400 top-level and 200 nested dependency packages under `node_modules/` |
 
 The complete refresh used these commands. `+stable` selects the installed 1.96.0
 toolchain explicitly because this host's default nightly predates the workspace
@@ -238,53 +244,55 @@ same fixture and host load.
 
 | Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
 | --- | ---: | ---: |
-| ferralk, serial | 60.84 ms | 10.95 ms |
-| ferralk, 4 threads | 37.91 ms | **6.46 ms** |
-| `ignore` serial + `globset` | 86.42 ms | 85.24 ms |
-| `walkdir` serial + `globset` | 74.39 ms | 73.58 ms |
-| `jwalk` serial + `globset` | 80.12 ms | 79.79 ms |
-| `jwalk`, 4 threads + `globset` | 39.72 ms | 36.54 ms |
-| `globwalk` serial | 77.03 ms | 79.53 ms |
-| `wax` serial | 98.07 ms | 15.93 ms |
-| `ignore` parallel + overrides | 39.35 ms | 38.57 ms |
-| `ignore` parallel + hand-pruned subtree | — | 9.52 ms |
-| zlob, 4 threads | **29.68 ms** | 31.66 ms |
+| ferralk, serial | 58.59 ms | 10.58 ms |
+| ferralk, 4 threads | 37.78 ms | **4.29 ms** |
+| `ignore` serial + `globset` | 75.31 ms | 74.68 ms |
+| `walkdir` serial + `globset` | 74.06 ms | 71.67 ms |
+| `jwalk` serial + `globset` | 77.66 ms | 74.47 ms |
+| `jwalk`, 4 threads + `globset` | 37.98 ms | 25.85 ms |
+| `globwalk` serial | 76.29 ms | 74.77 ms |
+| `wax` serial | 98.66 ms | 14.92 ms |
+| `ignore` parallel + overrides | 29.57 ms | 28.43 ms |
+| `ignore` parallel + hand-pruned subtree | — | 7.14 ms |
+| zlob, 4 threads | **20.12 ms** | 20.30 ms |
 
-On the unscoped query, zlob is the fastest arm at 29.68 ms. Ferralk follows at
-37.91 ms, alongside parallel `ignore` at 39.35 ms and `jwalk` plus caller-side
-`globset` at 39.72 ms. On the scoped query, Ferralk is fastest because it prunes
-`node_modules` from the pattern itself: 6.46 ms versus 9.52 ms for hand-pruned
-`ignore`, 15.93 ms for `wax`, and 31.66 ms for zlob. The `ignore` arm needs an
+On the unscoped query, zlob is the fastest arm at 20.12 ms. Ferralk is level
+with four-thread `jwalk` at 37.78 and 37.98 ms. On the scoped query, Ferralk is
+fastest because it prunes `node_modules` from the pattern itself: 4.29 ms versus
+7.14 ms for hand-pruned `ignore`, 14.92 ms for `wax`, and 20.30 ms for zlob. The
+`ignore` arm needs an
 extra caller policy that the Ferralk pattern already expresses.
 
 ### macOS-native backend
 
 | Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
 | --- | ---: | ---: |
-| ferralk, serial | 52.46 ms | 10.02 ms |
-| ferralk, 4 threads | 37.54 ms | **6.31 ms** |
-| `ignore` serial + `globset` | 87.52 ms | 86.62 ms |
-| `walkdir` serial + `globset` | 74.92 ms | 74.05 ms |
-| `jwalk` serial + `globset` | 78.84 ms | 79.81 ms |
-| `jwalk`, 4 threads + `globset` | 40.76 ms | 31.38 ms |
-| `globwalk` serial | 77.82 ms | 80.83 ms |
-| `wax` serial | 97.98 ms | 15.62 ms |
-| `ignore` parallel + overrides | 33.46 ms | 40.58 ms |
-| `ignore` parallel + hand-pruned subtree | — | 8.37 ms |
-| zlob, 4 threads | **26.64 ms** | 29.19 ms |
+| ferralk, serial | 48.08 ms | 9.44 ms |
+| ferralk, 4 threads | 33.90 ms | **6.27 ms** |
+| `ignore` serial + `globset` | 76.68 ms | 75.76 ms |
+| `walkdir` serial + `globset` | 84.72 ms | 75.35 ms |
+| `jwalk` serial + `globset` | 85.08 ms | 77.45 ms |
+| `jwalk`, 4 threads + `globset` | 49.50 ms | 26.16 ms |
+| `globwalk` serial | 83.85 ms | 73.85 ms |
+| `wax` serial | 100.05 ms | 14.97 ms |
+| `ignore` parallel + overrides | 39.11 ms | 27.73 ms |
+| `ignore` parallel + hand-pruned subtree | — | 7.13 ms |
+| zlob, 4 threads | **30.22 ms** | 20.93 ms |
 
-The native reader changes Ferralk's serial unscoped result from 60.84 ms to
-52.46 ms in these two adjacent runs, while the parallel result stays level at
-37.91 and 37.54 ms. The scoped native Ferralk result is the best measured arm
-at 6.31 ms, ahead of hand-pruned `ignore` at 8.37 ms and `wax` at 15.62 ms.
-zlob remains the fastest unscoped cross-language reference at 26.64 ms.
+The native run puts Ferralk at 33.90 ms unscoped, 3.68 ms behind the zlob arm in
+the same invocation. Scoped Ferralk remains ahead at 6.27 ms because it avoids
+the dependency subtree. The portable run happened under materially different
+host load: its zlob estimate is 20.12 ms, while the adjacent native invocation
+puts the same zlob code at 30.22 ms. Do not attribute differences between the
+two tables to Ferralk's backend; compare arms inside a table, and use the paired
+ablations below for claims about a code change.
 
-Relative to the previous 2026-08-27 refresh, the new brace-suffix-set path
-lowers Ferralk's scoped point estimates from 13.92/8.50 ms to 10.95/6.46 ms on
-the portable backend and from 11.42/8.04 ms to 10.02/6.31 ms on the native
-backend (serial/parallel). Those are 12–24% lower point estimates, not a claim
-that the code change alone accounts for every difference between separate
-wall-time runs.
+Relative to the previous 2026-08-28 table, native Ferralk's unscoped point
+estimate moved from 37.54 to 33.90 ms. The targeted, before/after comparisons
+attribute a 4.9% improvement to parent-relative directory opens and a further
+10.3% to depth-first local queues. The complete-table change is context, not a
+sum of those percentages: it is a separate wall-time run with different host
+load.
 
 The new references answer a comparison question, not an adoption question.
 `jwalk` is deprecated, `walkdir` has no matching or pruning policy, `globwalk`
@@ -294,6 +302,34 @@ comes from the checked-in corpus and caller parity tests, not from these
 wall-time rows. zlob was run in the same fixture and invocation as the other
 walker arms with Zig 0.16.0 and libclang 22.1.8 installed locally. It remains an
 optional context lane rather than an automated baseline.
+
+### What zlob's unscoped lead comes from
+
+A source audit found no single matcher shortcut hidden behind the unscoped
+number. Its walker combines several low-level choices: a raw
+`getdirentries64` scanner on macOS, retained parent directory handles with
+`openat` for children, last-in-first-out local work queues, fixed per-worker
+path storage, contiguous name bytes with compact entry records, and lazy helper
+startup. Ferralk already used the raw scanner and lazy startup. The ablation
+lane tested the remaining plausible differences one at a time on the same
+53,600-file fixture.
+
+| Variant | Targeted result | Decision |
+| --- | --- | --- |
+| Retain a parent directory capability and open queued children relative to it | **4.90% faster**; 95% interval 2.62–7.36%, `p < 0.01` | Kept on macOS. Retention is capped at the smaller of 256 descriptors or one quarter of `RLIMIT_NOFILE`; full-path opens remain the fallback. |
+| Change only worker-local queues from FIFO to LIFO | **10.33% faster** over 53,600 files; 95% interval 6.72–13.27%, `p < 0.01` | Kept. A 5,120-file control improved 3.5%; a 128-file control regressed 0.04 ms (4%), an accepted sub-millisecond trade-off. |
+| Reset a scratch `PathBuf` by truncating its Unix bytes | 6 ns microbenchmark versus 12 ns for copying the parent and 22 ns for `pop`; no significant complete-walk change | Rejected: the isolated operation is not an end-to-end bottleneck. |
+| Store listing names in one byte vector plus offsets | Complete-walk interval −3.20% to +6.55%, `p = 0.51` | Rejected: no measurable improvement. |
+| Retain result paths in shared 256 KiB chunks | 145 µs versus 193 µs to retain 7,400 synthetic paths | Rejected for now: the maximum isolated saving is small and would complicate the public owned-path representation. |
+| Start helpers at three queued directories instead of eight | 1.56% lower point estimate, inside Criterion's noise threshold | Rejected: it conflicts with the existing 36-shape startup sweep and does not establish a robust win. |
+
+The two retained changes copy zlob's useful *shape*, not its implementation.
+Ferralk uses safe queue primitives and keeps unsafe macOS handle operations
+inside the native backend. Local LIFO processing also preserves the public
+contract: unsorted parallel result order is deliberately unspecified. The
+ablation benchmark is diagnostic rather than a headline; its collect/count and
+path microbenchmarks explain where time can go, while `walker_palamedes` remains
+the complete engine comparison.
 
 ### Matcher refresh
 
@@ -370,9 +406,9 @@ the median. Every candidate must return 7,400 files for the unscoped query and
 | `fdir` + `picomatch` sync | 87.31 ms | 80.60 ms |
 | `fdir` + `picomatch` async | **47.08 ms** | 42.09 ms |
 
-The fastest Node medians are 47.08 ms unscoped and 8.08 ms scoped. The adjacent
-Criterion runs put portable Ferralk at 37.91 and 6.46 ms and native Ferralk at
-37.54 and 6.31 ms. That is useful same-host context, not a formal ranking: the
+The fastest Node medians are 47.08 ms unscoped and 8.08 ms scoped. The current
+Criterion runs put portable Ferralk at 37.78 and 4.29 ms and native Ferralk at
+33.90 and 6.27 ms. That is useful same-host context, not a formal ranking: the
 Rust table uses Criterion point estimates while the Node harness reports a
 median of ten samples, and the APIs do not offer identical semantics.
 

@@ -45,6 +45,11 @@ harness = false
 required-features = ["zlob-oracle"]
 
 [[bench]]
+name = "walker_zlob_ablation"
+harness = false
+required-features = ["zlob-oracle"]
+
+[[bench]]
 name = "matcher_zlob"
 harness = false
 required-features = ["zlob-oracle"]

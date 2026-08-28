@@ -1242,6 +1242,7 @@ impl Walker {
                 let (ignores, ignore_errors) = IgnoreScope::for_root(self, backend, &plan.path);
                 DirectoryTask {
                     path: plan.path.clone(),
+                    open: DirectoryOpen::default(),
                     depth: 0,
                     root: index,
                     cycle_guard: Arc::new(CycleGuard::default()),
@@ -1683,6 +1684,13 @@ fn has_closing_parenthesis(pattern: &[u8], open: usize) -> bool {
     false
 }
 
+/// A backend-specific capability retained when a child directory is queued.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DirectoryOpen {
+    #[cfg(all(feature = "native-macos", target_os = "macos"))]
+    relative: Option<macos_native::RelativeDirectoryOpen>,
+}
+
 /// The filesystem calls that traversal and classification make, so one mock
 /// can drive the serial and the parallel frontend alike.
 trait DirectoryBackend {
@@ -1698,6 +1706,27 @@ trait DirectoryBackend {
         refuse_final_symlink: bool,
         listing: &mut Listing,
     ) -> std::io::Result<()>;
+
+    /// Reads a queued directory through a retained capability when the backend
+    /// has one. Path-based backends and tests keep the ordinary method above.
+    fn read_scheduled_directory(
+        &self,
+        path: &Path,
+        open: &DirectoryOpen,
+        follow_symlinks: bool,
+        refuse_final_symlink: bool,
+        listing: &mut Listing,
+    ) -> std::io::Result<()> {
+        let _ = open;
+        self.read_directory(path, follow_symlinks, refuse_final_symlink, listing)
+    }
+
+    /// Retains what this backend needs to open one child relative to the
+    /// directory represented by `listing`.
+    fn child_directory_open(&self, listing: &Listing, name: &OsStr) -> DirectoryOpen {
+        let _ = (listing, name);
+        DirectoryOpen::default()
+    }
 
     /// Follows symlinks; decides whether a link points at a directory.
     fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
@@ -1861,6 +1890,8 @@ const IGNORE_FILE_OPERATION: &str = "read_ignore";
 #[derive(Debug, Default)]
 pub(crate) struct Listing {
     entries: Vec<ListedEntry>,
+    #[cfg(all(feature = "native-macos", target_os = "macos"))]
+    native_directory: Option<Arc<macos_native::RetainedDirectory>>,
     /// Entries in use. `entries` may be longer: the tail is buffers kept for
     /// the next directory.
     len: usize,
@@ -1928,6 +1959,10 @@ impl Listing {
     /// Drops the previous directory's entries, keeping their buffers.
     pub(crate) fn clear(&mut self) {
         self.len = 0;
+        #[cfg(all(feature = "native-macos", target_os = "macos"))]
+        {
+            self.native_directory = None;
+        }
         self.deferred_errors.clear();
     }
 
@@ -2112,7 +2147,7 @@ impl DirectoryBackend for SystemBackend {
             // essential: a DT_UNKNOWN stat may report that kind after a batch,
             // and a path fallback would discard the usable siblings.
             let _ = follow_symlinks;
-            macos_native::read_directory(path, refuse_final_symlink, listing)
+            macos_native::read_directory(path, None, refuse_final_symlink, listing)
                 .map_err(macos_native::NativeDirectoryReadError::into_io_error)
         }
         #[cfg(all(
@@ -2134,6 +2169,48 @@ impl DirectoryBackend for SystemBackend {
             all(feature = "native-linux", target_os = "linux")
         )))]
         StdBackend.read_directory(path, follow_symlinks, refuse_final_symlink, listing)
+    }
+
+    fn read_scheduled_directory(
+        &self,
+        path: &Path,
+        _open: &DirectoryOpen,
+        follow_symlinks: bool,
+        refuse_final_symlink: bool,
+        listing: &mut Listing,
+    ) -> std::io::Result<()> {
+        #[cfg(all(feature = "native-macos", target_os = "macos"))]
+        {
+            let _ = follow_symlinks;
+            macos_native::read_directory(
+                path,
+                _open.relative.as_ref(),
+                refuse_final_symlink,
+                listing,
+            )
+            .map_err(macos_native::NativeDirectoryReadError::into_io_error)
+        }
+        #[cfg(not(all(feature = "native-macos", target_os = "macos")))]
+        self.read_directory(path, follow_symlinks, refuse_final_symlink, listing)
+    }
+
+    fn child_directory_open(&self, listing: &Listing, name: &OsStr) -> DirectoryOpen {
+        #[cfg(all(feature = "native-macos", target_os = "macos"))]
+        {
+            DirectoryOpen {
+                relative: listing.native_directory.as_ref().map(|directory| {
+                    macos_native::RelativeDirectoryOpen {
+                        parent: Arc::clone(directory),
+                        name: name.to_os_string(),
+                    }
+                }),
+            }
+        }
+        #[cfg(not(all(feature = "native-macos", target_os = "macos")))]
+        {
+            let _ = (listing, name);
+            DirectoryOpen::default()
+        }
     }
 }
 
@@ -2254,6 +2331,7 @@ impl WalkStream {
     fn prepare_directory(&mut self, task: DirectoryTask) -> Option<Result<WalkEntry, WalkError>> {
         let DirectoryTask {
             path,
+            open,
             depth,
             root,
             cycle_guard,
@@ -2270,8 +2348,9 @@ impl WalkStream {
                 Err(source) => return self.error(CYCLE_KEY_OPERATION, path, source, depth == 0),
             }
         }
-        match SystemBackend.read_directory(
+        match SystemBackend.read_scheduled_directory(
             &path,
+            &open,
             self.walker.options.follow_symlinks,
             !self.walker.options.follow_symlinks && depth > 0,
             &mut self.listing,
@@ -2318,6 +2397,7 @@ impl WalkStream {
             TraversalContext {
                 root: self.root,
                 cycle_guard: &self.cycle_guard,
+                listing: &self.listing,
             },
         );
         // Only an emitted entry needs a path of its own, and the stream hands
@@ -2481,41 +2561,23 @@ impl<'walker> WalkState<'walker> {
     fn walk_directory(
         &mut self,
         backend: &impl DirectoryBackend,
-        task: DirectoryTask,
+        mut task: DirectoryTask,
     ) -> Result<(), WalkError> {
         if self.check_cancellation() {
             return Ok(());
         }
-        let DirectoryTask {
-            path,
-            depth,
-            root,
-            cycle_guard,
-            ignores,
-            ignore_errors,
-        } = task;
-        let is_root = depth == 0;
-        for error in ignore_errors {
+        let is_root = task.depth == 0;
+        for error in std::mem::take(&mut task.ignore_errors) {
             let (path, source) = error.into_parts();
             self.handle_error(IGNORE_FILE_OPERATION, path, source, false)?;
         }
         if self.walker.options.follow_symlinks
-            && !self.mark_directory(backend, &cycle_guard, &path, is_root)?
+            && !self.mark_directory(backend, &task.cycle_guard, &task.path, is_root)?
         {
             return Ok(());
         }
         let mut scratch = self.scratch.pop().unwrap_or_default();
-        let outcome = self.walk_listing(
-            backend,
-            &path,
-            depth,
-            TraversalContext {
-                root,
-                cycle_guard: &cycle_guard,
-            },
-            ignores,
-            &mut scratch,
-        );
+        let outcome = self.walk_listing(backend, task, &mut scratch);
         scratch.listing.clear();
         self.scratch.push(scratch);
         outcome
@@ -2526,15 +2588,15 @@ impl<'walker> WalkState<'walker> {
     fn walk_listing(
         &mut self,
         backend: &impl DirectoryBackend,
-        path: &Path,
-        depth: usize,
-        context: TraversalContext<'_>,
-        ignores: IgnoreScope,
+        task: DirectoryTask,
         scratch: &mut DirectoryScratch,
     ) -> Result<(), WalkError> {
+        let path = task.path.as_path();
+        let depth = task.depth;
         let is_root = depth == 0;
-        if let Err(source) = backend.read_directory(
+        if let Err(source) = backend.read_scheduled_directory(
             path,
+            &task.open,
             self.walker.options.follow_symlinks,
             !self.walker.options.follow_symlinks && depth > 0,
             &mut scratch.listing,
@@ -2543,7 +2605,9 @@ impl<'walker> WalkState<'walker> {
         }
         // The directory's own ignore files join the chain here, once,
         // recognized in the listing that was just read.
-        let (ignores, ignore_errors) = ignores.enter(self.walker, backend, path, &scratch.listing);
+        let (ignores, ignore_errors) =
+            task.ignores
+                .enter(self.walker, backend, path, &scratch.listing);
         for error in ignore_errors {
             let (path, source) = error.into_parts();
             self.handle_error(IGNORE_FILE_OPERATION, path, source, false)?;
@@ -2570,7 +2634,11 @@ impl<'walker> WalkState<'walker> {
                 &scratch.listing.entries()[index],
                 &ignores,
                 depth,
-                context,
+                TraversalContext {
+                    root: task.root,
+                    cycle_guard: &task.cycle_guard,
+                    listing: &scratch.listing,
+                },
             );
             let outcome = self.act(backend, action, &scratch.path);
             reset_to_directory(&mut scratch.path, path);
@@ -2962,6 +3030,7 @@ mod tests {
         let (ignores, ignore_errors) = super::IgnoreScope::for_root(walker, backend, &path);
         super::DirectoryTask {
             path: path.clone(),
+            open: super::DirectoryOpen::default(),
             depth: 0,
             root: 0,
             cycle_guard: std::sync::Arc::new(super::CycleGuard::default()),

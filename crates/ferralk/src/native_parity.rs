@@ -148,6 +148,7 @@ fn walk_portable(walker: &Walker) -> (Vec<WalkEntry>, Vec<WalkError>) {
     let (ignores, ignore_errors) = IgnoreScope::for_root(walker, &StdBackend, &root);
     let task = DirectoryTask {
         path: root.clone(),
+        open: crate::DirectoryOpen::default(),
         depth: 0,
         root: 0,
         cycle_guard: std::sync::Arc::new(crate::CycleGuard::default()),
