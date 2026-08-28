@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.1](https://github.com/sebastian-software/ferralk/compare/v0.9.0...v0.9.1) (2026-08-28)
+
+
+### Performance Improvements
+
+* **glob:** accelerate brace suffix sets ([#183](https://github.com/sebastian-software/ferralk/issues/183)) ([c9727b8](https://github.com/sebastian-software/ferralk/commit/c9727b8af732887f739e99da3101fca4c79b9db2))
+* **walker:** narrow the zlob gap on macOS ([#186](https://github.com/sebastian-software/ferralk/issues/186)) ([a9a2c48](https://github.com/sebastian-software/ferralk/commit/a9a2c482f36f26384fce710f56a063b50aca60c7))
+
 ## [0.9.0](https://github.com/sebastian-software/ferralk/compare/v0.8.1...v0.9.0) (2026-08-27)
 
 
