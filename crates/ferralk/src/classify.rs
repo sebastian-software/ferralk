@@ -106,11 +106,12 @@ pub(crate) struct DirectoryTask {
     pub(crate) ignore_errors: Vec<IgnoreReadError>,
 }
 
-/// Root-specific state carried by a directory while it is classified.
+/// Directory-specific state carried while one of its entries is classified.
 #[derive(Clone, Copy)]
 pub(crate) struct TraversalContext<'a> {
     pub(crate) root: usize,
     pub(crate) cycle_guard: &'a Arc<CycleGuard>,
+    pub(crate) listing: &'a Listing,
 }
 
 /// A filesystem call that failed while classifying one entry.
@@ -163,7 +164,6 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     backend: &B,
     path: &Path,
     entry: &ListedEntry,
-    listing: &Listing,
     ignores: &IgnoreScope,
     directory_depth: usize,
     context: TraversalContext<'_>,
@@ -281,7 +281,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     // is one of the few places that has to own a path.
     let task = || DirectoryTask {
         path: path.to_path_buf(),
-        open: backend.child_directory_open(listing, entry.name()),
+        open: backend.child_directory_open(context.listing, entry.name()),
         depth,
         root: context.root,
         cycle_guard: Arc::clone(context.cycle_guard),

@@ -668,12 +668,12 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
             shared.backend,
             &worker.path,
             &worker.listing.entries()[index],
-            &worker.listing,
             &ignores,
             depth,
             TraversalContext {
                 root,
                 cycle_guard: &cycle_guard,
+                listing: &worker.listing,
             },
         );
         act(shared, worker, action);

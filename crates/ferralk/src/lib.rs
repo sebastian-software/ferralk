@@ -2392,12 +2392,12 @@ impl WalkStream {
             &SystemBackend,
             &self.path,
             &self.listing.entries()[index],
-            &self.listing,
             &self.ignores,
             self.depth,
             TraversalContext {
                 root: self.root,
                 cycle_guard: &self.cycle_guard,
+                listing: &self.listing,
             },
         );
         // Only an emitted entry needs a path of its own, and the stream hands
@@ -2561,43 +2561,23 @@ impl<'walker> WalkState<'walker> {
     fn walk_directory(
         &mut self,
         backend: &impl DirectoryBackend,
-        task: DirectoryTask,
+        mut task: DirectoryTask,
     ) -> Result<(), WalkError> {
         if self.check_cancellation() {
             return Ok(());
         }
-        let DirectoryTask {
-            path,
-            open,
-            depth,
-            root,
-            cycle_guard,
-            ignores,
-            ignore_errors,
-        } = task;
-        let is_root = depth == 0;
-        for error in ignore_errors {
+        let is_root = task.depth == 0;
+        for error in std::mem::take(&mut task.ignore_errors) {
             let (path, source) = error.into_parts();
             self.handle_error(IGNORE_FILE_OPERATION, path, source, false)?;
         }
         if self.walker.options.follow_symlinks
-            && !self.mark_directory(backend, &cycle_guard, &path, is_root)?
+            && !self.mark_directory(backend, &task.cycle_guard, &task.path, is_root)?
         {
             return Ok(());
         }
         let mut scratch = self.scratch.pop().unwrap_or_default();
-        let outcome = self.walk_listing(
-            backend,
-            &path,
-            &open,
-            depth,
-            TraversalContext {
-                root,
-                cycle_guard: &cycle_guard,
-            },
-            ignores,
-            &mut scratch,
-        );
+        let outcome = self.walk_listing(backend, task, &mut scratch);
         scratch.listing.clear();
         self.scratch.push(scratch);
         outcome
@@ -2608,17 +2588,15 @@ impl<'walker> WalkState<'walker> {
     fn walk_listing(
         &mut self,
         backend: &impl DirectoryBackend,
-        path: &Path,
-        open: &DirectoryOpen,
-        depth: usize,
-        context: TraversalContext<'_>,
-        ignores: IgnoreScope,
+        task: DirectoryTask,
         scratch: &mut DirectoryScratch,
     ) -> Result<(), WalkError> {
+        let path = task.path.as_path();
+        let depth = task.depth;
         let is_root = depth == 0;
         if let Err(source) = backend.read_scheduled_directory(
             path,
-            open,
+            &task.open,
             self.walker.options.follow_symlinks,
             !self.walker.options.follow_symlinks && depth > 0,
             &mut scratch.listing,
@@ -2627,7 +2605,9 @@ impl<'walker> WalkState<'walker> {
         }
         // The directory's own ignore files join the chain here, once,
         // recognized in the listing that was just read.
-        let (ignores, ignore_errors) = ignores.enter(self.walker, backend, path, &scratch.listing);
+        let (ignores, ignore_errors) =
+            task.ignores
+                .enter(self.walker, backend, path, &scratch.listing);
         for error in ignore_errors {
             let (path, source) = error.into_parts();
             self.handle_error(IGNORE_FILE_OPERATION, path, source, false)?;
@@ -2652,10 +2632,13 @@ impl<'walker> WalkState<'walker> {
                 backend,
                 &scratch.path,
                 &scratch.listing.entries()[index],
-                &scratch.listing,
                 &ignores,
                 depth,
-                context,
+                TraversalContext {
+                    root: task.root,
+                    cycle_guard: &task.cycle_guard,
+                    listing: &scratch.listing,
+                },
             );
             let outcome = self.act(backend, action, &scratch.path);
             reset_to_directory(&mut scratch.path, path);
