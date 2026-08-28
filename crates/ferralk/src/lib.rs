@@ -2174,7 +2174,7 @@ impl DirectoryBackend for SystemBackend {
     fn read_scheduled_directory(
         &self,
         path: &Path,
-        open: &DirectoryOpen,
+        _open: &DirectoryOpen,
         follow_symlinks: bool,
         refuse_final_symlink: bool,
         listing: &mut Listing,
@@ -2184,7 +2184,7 @@ impl DirectoryBackend for SystemBackend {
             let _ = follow_symlinks;
             macos_native::read_directory(
                 path,
-                open.relative.as_ref(),
+                _open.relative.as_ref(),
                 refuse_final_symlink,
                 listing,
             )

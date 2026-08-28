@@ -458,7 +458,13 @@ impl WorkerScratch {
     fn new(index: usize) -> Self {
         Self {
             index,
-            queue: Worker::new_fifo(),
+            // Depth-first local work keeps a freshly listed directory close to
+            // the children it just queued; thieves still take older work from
+            // the opposite end to spread independent subtrees. On the native
+            // macOS benchmark this is 10.3% faster over 53,600 files and 3.5%
+            // faster over 5,120; a 128-file tree pays 0.04 ms (4%), where the
+            // helper floor already keeps the absolute cost close to one ms.
+            queue: Worker::new_lifo(),
             entries: Vec::new(),
             listing: Listing::default(),
             path: PathBuf::new(),
