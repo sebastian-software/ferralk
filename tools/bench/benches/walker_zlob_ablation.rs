@@ -23,7 +23,10 @@ use std::{
     fs,
     hint::black_box,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -283,5 +286,124 @@ fn zlob_count(root: &Path, pattern: Option<&str>) -> usize {
     matched.load(Ordering::Relaxed)
 }
 
-criterion_group!(benches, walker_zlob_ablation);
+fn path_scratch_ablation(c: &mut Criterion) {
+    let directory = PathBuf::from("/tmp/ferralk-zlob-ablation/node_modules/dep-399/lib");
+    let name = std::ffi::OsStr::new("types-90.d.ts");
+
+    c.bench_function("walker_zlob_ablation/path_reset/copy_parent", |benchmark| {
+        let mut path = directory.clone();
+        benchmark.iter(|| {
+            path.push(name);
+            black_box(&path);
+            path.clear();
+            path.as_mut_os_string().push(directory.as_os_str());
+        })
+    });
+    c.bench_function(
+        "walker_zlob_ablation/path_reset/pop_component",
+        |benchmark| {
+            let mut path = directory.clone();
+            benchmark.iter(|| {
+                path.push(name);
+                black_box(&path);
+                assert!(path.pop());
+            })
+        },
+    );
+    #[cfg(unix)]
+    c.bench_function(
+        "walker_zlob_ablation/path_reset/truncate_bytes",
+        |benchmark| {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+            let directory_len = directory.as_os_str().as_bytes().len();
+            let mut path = directory.clone();
+            benchmark.iter(|| {
+                path.push(name);
+                black_box(&path);
+                let mut bytes = std::mem::take(&mut path).into_os_string().into_vec();
+                bytes.truncate(directory_len);
+                path = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+            })
+        },
+    );
+}
+
+#[derive(Clone)]
+struct ChunkedPath {
+    storage: Arc<[u8]>,
+    start: usize,
+    len: usize,
+}
+
+fn path_collection_ablation(c: &mut Criterion) {
+    const MATCHES: usize = 7_400;
+    const CHUNK_BYTES: usize = 256 * 1024;
+
+    let paths = (0..MATCHES)
+        .map(|index| {
+            PathBuf::from(format!(
+                "/tmp/ferralk-zlob-ablation/node_modules/dep-{}/lib/types-{}.d.ts",
+                index % 400,
+                index % 100
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    c.bench_function(
+        "walker_zlob_ablation/path_collect/owned_path_bufs",
+        |benchmark| {
+            benchmark.iter(|| {
+                black_box(paths.iter().cloned().collect::<Vec<PathBuf>>());
+            })
+        },
+    );
+    c.bench_function(
+        "walker_zlob_ablation/path_collect/shared_chunks",
+        |benchmark| {
+            benchmark.iter(|| {
+                let mut chunks = vec![Vec::with_capacity(CHUNK_BYTES)];
+                let mut pending = Vec::with_capacity(paths.len());
+                for path in &paths {
+                    let bytes = path.as_os_str().as_encoded_bytes();
+                    if chunks
+                        .last()
+                        .is_some_and(|chunk| chunk.len() + bytes.len() > CHUNK_BYTES)
+                    {
+                        chunks.push(Vec::with_capacity(CHUNK_BYTES.max(bytes.len())));
+                    }
+                    let chunk = chunks.last_mut().expect("one chunk exists");
+                    let start = chunk.len();
+                    chunk.extend_from_slice(bytes);
+                    pending.push((chunks.len() - 1, start, bytes.len()));
+                }
+                let chunks = chunks
+                    .into_iter()
+                    .map(Arc::<[u8]>::from)
+                    .collect::<Vec<_>>();
+                let retained = pending
+                    .into_iter()
+                    .map(|(chunk, start, len)| ChunkedPath {
+                        storage: Arc::clone(&chunks[chunk]),
+                        start,
+                        len,
+                    })
+                    .collect::<Vec<_>>();
+                black_box(
+                    retained
+                        .iter()
+                        .map(|path| path.storage[path.start..][..path.len].len())
+                        .sum::<usize>(),
+                );
+            })
+        },
+    );
+}
+
+criterion_group!(
+    benches,
+    walker_zlob_ablation,
+    path_scratch_ablation,
+    path_collection_ablation
+);
 criterion_main!(benches);
