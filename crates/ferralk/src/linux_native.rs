@@ -365,9 +365,6 @@ fn read_batch(directory: &File, buffer: &mut [u8]) -> Result<usize, ReadBatchErr
         if error.kind() == io::ErrorKind::Interrupted {
             continue;
         }
-        if error.raw_os_error() == Some(38) {
-            return Err(ReadBatchError::Io(error));
-        }
         return Err(ReadBatchError::Io(error));
     }
 
