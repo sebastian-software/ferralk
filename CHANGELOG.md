@@ -13,7 +13,14 @@
 
 ### ⚠ BREAKING CHANGES
 
-* harden matcher and walker resource limits ([#178](https://github.com/sebastian-software/ferralk/issues/178))
+* harden matcher and walker resource limits ([#178](https://github.com/sebastian-software/ferralk/issues/178)):
+  `Walker::threads` now clamps requests to `1..=256`. Ignore and repository
+  metadata files are capped at 8 MiB and rule files at 100,000 rules; an
+  unreadable or over-limit rule file now reaches the configured `ErrorPolicy`
+  as a `read_ignore` failure (including the default `Collect` policy), instead
+  of being silently skipped. Pattern compilation also enforces bounded
+  expansion and compiled-program budgets, so large wildcard patterns that
+  compiled in 0.8.x may now return `pattern compiles to too much`.
 
 ### Features
 

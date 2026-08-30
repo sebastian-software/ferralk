@@ -6093,6 +6093,17 @@ mod tests {
     }
 
     #[test]
+    fn wide_sweep_patterns_at_one_mebibyte_are_bounded() {
+        // Wide sweeps charge their bit rows to the same compiled-program
+        // budget as the narrow engine. This is a resource boundary rather
+        // than a syntax restriction: 0.8.x accepted this shape, but it could
+        // construct an unboundedly large machine.
+        let pattern = format!("{}*b", "?".repeat(1 << 20));
+        let error = Pattern::compile(&pattern, PatternOptions::default()).unwrap_err();
+        assert_eq!(error.message(), "pattern compiles to too much");
+    }
+
+    #[test]
     fn the_three_compile_budgets_are_reported_apart() {
         // Each answers a different question — how many alternatives, how much
         // text they add up to, and how much program that text becomes — so a
