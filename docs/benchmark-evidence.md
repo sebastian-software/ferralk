@@ -102,7 +102,7 @@ the `zlob-oracle` feature, its workflow is manual dispatch only, and no
 automatic lane requires Zig. The current local run used Zig 0.16.0 and
 libclang 22.1.8 from Homebrew.
 
-The measurements below were taken with:
+The engine-comparison measurements in the next section were taken with:
 
 | | |
 | --- | --- |
@@ -214,7 +214,7 @@ once outside their match loop.
 | --- | --- |
 | Host | Mac Studio (Mac13,2), Apple M1 Ultra, 20 cores (16 performance, 4 efficiency), 64 GB RAM |
 | OS | macOS 26.5.2, build 25F84; Darwin 25.5.0, arm64 |
-| Benchmark revision | `b5d78e0` (source tree used for the walker refresh) |
+| Benchmark revision | `ceab189` (merged source tree used for the walker refresh) |
 | Toolchain | rustc/cargo 1.96.0, LLVM 22.1.2 |
 | Benchmark stack | Criterion 0.8.2, release profile; exact dependency versions are locked in `Cargo.lock` |
 | zlob toolchain | Zig 0.16.0, libclang 22.1.8 from Homebrew |
@@ -287,12 +287,10 @@ puts the same zlob code at 30.22 ms. Do not attribute differences between the
 two tables to Ferralk's backend; compare arms inside a table, and use the paired
 ablations below for claims about a code change.
 
-Relative to the previous 2026-08-28 table, native Ferralk's unscoped point
-estimate moved from 37.54 to 33.90 ms. The targeted, before/after comparisons
-attribute a 4.9% improvement to parent-relative directory opens and a further
-10.3% to depth-first local queues. The complete-table change is context, not a
-sum of those percentages: it is a separate wall-time run with different host
-load.
+The targeted, before/after comparisons attribute a 4.9% improvement to
+parent-relative directory opens and a further 10.3% to depth-first local
+queues. These are separate wall-time runs, not percentages that can be summed
+into a complete-table improvement.
 
 The new references answer a comparison question, not an adoption question.
 `jwalk` is deprecated, `walkdir` has no matching or pruning policy, `globwalk`
