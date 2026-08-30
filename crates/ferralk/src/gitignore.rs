@@ -452,51 +452,62 @@ fn logical_config_lines(contents: &[u8]) -> Vec<Vec<u8>> {
     let mut logical = Vec::new();
     while let Some(line) = physical.next() {
         let mut line = line.to_vec();
-        while config_value_continues(&line) {
+        let mut continuation = config_value_continuation(&line);
+        while let Some(state) = continuation {
             line.pop();
             let Some(next) = physical.next() else {
                 break;
             };
             line.extend_from_slice(next);
+            continuation = config_value_suffix_continuation(next, state);
         }
         logical.push(line);
     }
     logical
 }
 
-/// Whether the terminal backslash is consumed by Git as a value continuation.
-/// Only a valid-looking assignment can start a value parser; any following
-/// physical line, including one that looks like a section header, is then part
-/// of that continued value.
-fn config_value_continues(line: &[u8]) -> bool {
+/// Quote state at the end of a continued config-value fragment.
+#[derive(Clone, Copy)]
+struct ConfigValueState {
+    quoted: bool,
+}
+
+/// Finds an initial assignment value and carries its quote state over a
+/// backslash continuation. Subsequent physical lines are scanned only once.
+fn config_value_continuation(line: &[u8]) -> Option<ConfigValueState> {
     let line = trim_ascii_start(line);
-    let Some(first) = line.first() else {
-        return false;
-    };
+    let first = line.first()?;
     if matches!(first, b'#' | b';' | b'[') || !first.is_ascii_alphabetic() {
-        return false;
+        return None;
     }
     let key_end = line
         .iter()
         .position(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'-'))
         .unwrap_or(line.len());
-    let Some(value) = trim_ascii_start(&line[key_end..]).strip_prefix(b"=") else {
-        return false;
-    };
-    let mut quoted = false;
+    let value = trim_ascii_start(&line[key_end..]).strip_prefix(b"=")?;
+    config_value_suffix_continuation(value, ConfigValueState { quoted: false })
+}
+
+/// Scans one physical suffix using the quote state left by its predecessor.
+/// A terminal unescaped backslash is removed by the caller before the next
+/// suffix is appended, so no escape state itself needs to cross a line break.
+fn config_value_suffix_continuation(
+    value: &[u8],
+    mut state: ConfigValueState,
+) -> Option<ConfigValueState> {
     let mut bytes = value.iter();
     while let Some(byte) = bytes.next() {
         if *byte == b'\\' {
             if bytes.next().is_none() {
-                return true;
+                return Some(state);
             }
         } else if *byte == b'"' {
-            quoted = !quoted;
-        } else if !quoted && matches!(*byte, b'#' | b';') {
-            return false;
+            state.quoted = !state.quoted;
+        } else if !state.quoted && matches!(*byte, b'#' | b';') {
+            return None;
         }
     }
-    false
+    None
 }
 
 /// Returns only the top-level sections whose variables this adapter consumes.
@@ -695,8 +706,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        GitConfig, MAX_IGNORE_RULES, RuleSetBuilder, add_rules, apply_config, parse_git_bool,
-        validate_rule_count,
+        GitConfig, MAX_IGNORE_RULES, RuleSetBuilder, add_rules, apply_config, logical_config_lines,
+        parse_git_bool, validate_rule_count,
     };
 
     #[test]
@@ -838,6 +849,23 @@ mod tests {
         assert_eq!(config.ignore_case, Some(false));
         assert_eq!(config.precompose_unicode, Some(false));
         assert_eq!(config.worktree_config, Some(true));
+    }
+
+    #[test]
+    fn long_config_continuations_are_joined_without_rescanning_the_prefix() {
+        const CONTINUATION_LINES: usize = 1 << 18;
+
+        let mut contents = Vec::with_capacity(8 + CONTINUATION_LINES * 4);
+        contents.extend_from_slice(b"[core]\nk=");
+        for _ in 0..CONTINUATION_LINES {
+            contents.extend_from_slice(b"aa\\\n");
+        }
+        contents.extend_from_slice(b"true\n");
+
+        let lines = logical_config_lines(&contents);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].ends_with(b"true"));
+        assert_eq!(lines[1].len(), 2 + CONTINUATION_LINES * 2 + 4);
     }
 
     #[test]
