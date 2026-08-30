@@ -45,9 +45,13 @@ jobs:
       # cargo-fuzz defaults to the target it was itself built for, and the
       # prebuilt binary is musl, where the sanitizer cannot link against a
       # static libc. Name this runner's host target instead.
+      # Large but bounded compile attempts are expected corpus inputs. ASAN's
+      # quarantine can retain several of those temporary allocations, so keep
+      # the RSS limit above that retained peak while bounding any one input's
+      # live allocation budget.
       - run: >-
           cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }}
-          -- -max_total_time=$MAX_TOTAL_TIME
+          -- -max_total_time=$MAX_TOTAL_TIME -rss_limit_mb=4096 -malloc_limit_mb=256
       # A failing run writes its input under fuzz/artifacts; without this
       # upload the reproducer only exists in the log (PR #43 taught us that).
       - name: Upload crash artifacts
