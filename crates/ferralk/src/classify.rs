@@ -192,10 +192,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         return EntryAction::Skip;
     }
     #[cfg(windows)]
-    let git_ignored = {
-        super::glob_bytes_into(path_bytes, glob_bytes_scratch);
-        ignores.is_ignored_bytes(glob_bytes_scratch, is_dir)
-    };
+    super::glob_bytes_into(path_bytes, glob_bytes_scratch);
     #[cfg(not(windows))]
     let normalized_bytes = glob_bytes(relative);
     #[cfg(not(windows))]
@@ -208,23 +205,26 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     if should_skip_git_directory(walker, entry.name()) {
         return EntryAction::Skip;
     }
-    let excluded = plan
-        .excludes
-        .iter()
-        .any(|pattern| pattern.matches(bytes, is_dir, walker.wildcard_mode));
-    // A matching directory is not emitted, but its descendants may still be
-    // selected by an include. Files have no descendants to re-admit.
-    if excluded && !is_dir {
-        return EntryAction::Skip;
-    }
-    #[cfg(not(windows))]
-    let git_ignored = ignores.is_ignored(path, is_dir);
-    if git_ignored && !is_dir {
-        return EntryAction::Skip;
-    }
     if entry.is_symlink() && walker.options.follow_symlinks {
-        // Resolving the link decides whether this entry is a directory, which
-        // the remaining filters and the traversal decision both depend on.
+        // A path-only rule can reject a link without observing its target, as
+        // it did before follow mode resolved directory links. Preserve that
+        // shortcut: an excluded dangling link is not a metadata error. Rules
+        // ending in `/` do need the target's kind, so resolve only after they
+        // have had no say as an unresolved link.
+        let excluded_as_link = plan
+            .excludes
+            .iter()
+            .any(|pattern| pattern.matches(bytes, false, walker.wildcard_mode));
+        #[cfg(windows)]
+        let ignored_as_link = ignores.is_ignored_bytes(glob_bytes_scratch, false);
+        #[cfg(not(windows))]
+        let ignored_as_link = ignores.is_ignored(path, false);
+        if excluded_as_link || ignored_as_link {
+            return EntryAction::Skip;
+        }
+
+        // A followed link acts as its target for every remaining
+        // directory-sensitive filter as well as for traversal.
         match backend.metadata(path) {
             Ok(metadata) => is_dir = metadata.is_dir(),
             Err(source) => {
@@ -239,6 +239,22 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
             }
         }
     }
+    let excluded = plan
+        .excludes
+        .iter()
+        .any(|pattern| pattern.matches(bytes, is_dir, walker.wildcard_mode));
+    // A matching directory is not emitted, but its descendants may still be
+    // selected by an include. Files have no descendants to re-admit.
+    if excluded && !is_dir {
+        return EntryAction::Skip;
+    }
+    #[cfg(windows)]
+    let git_ignored = ignores.is_ignored_bytes(glob_bytes_scratch, is_dir);
+    #[cfg(not(windows))]
+    let git_ignored = ignores.is_ignored(path, is_dir);
+    if git_ignored && !is_dir {
+        return EntryAction::Skip;
+    }
     if !is_dir && !walker.may_include_file(context.root, bytes) {
         return EntryAction::Skip;
     }
@@ -246,10 +262,13 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     // An ignored directory is not entered, the way Git does not enter one:
     // its contents are ignored whatever the ignore files inside it say.
     let may_include_descendant = walker.may_descend_into(context.root, bytes);
-    let exclude_proves_no_re_admission = plan.excludes.iter().any(|pattern| {
-        pattern.covers_subtree(bytes, walker.wildcard_mode)
-            && (plan.includes.is_empty() || !may_include_descendant)
-    });
+    let no_include_can_re_admit = plan.includes.is_empty() || !may_include_descendant;
+    let exclude_proves_no_re_admission = no_include_can_re_admit
+        && (excluded
+            || plan
+                .excludes
+                .iter()
+                .any(|pattern| pattern.covers_subtree(bytes, walker.wildcard_mode)));
     let descend = is_dir
         && !git_ignored
         && !exclude_proves_no_re_admission
