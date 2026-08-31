@@ -385,13 +385,20 @@ fn read_repository_config(layout: &RepositoryLayout) -> GitConfig {
 fn apply_config(config: &mut GitConfig, contents: &[u8]) {
     let mut section = None;
     for line in logical_config_lines(contents) {
-        let line = trim_ascii(strip_config_comment(&line));
+        let mut line = trim_ascii(strip_config_comment(&line));
         if line.is_empty() {
             continue;
         }
         if line.starts_with(b"[") {
-            section = parse_top_level_section(line);
-            continue;
+            let Some((parsed_section, remainder)) = parse_config_header(line) else {
+                section = None;
+                continue;
+            };
+            section = parsed_section;
+            line = trim_ascii(remainder);
+            if line.is_empty() {
+                continue;
+            }
         }
         let Some(section) = section else {
             continue;
@@ -421,6 +428,14 @@ fn apply_config(config: &mut GitConfig, contents: &[u8]) {
             _ => {}
         }
     }
+}
+
+/// Splits a section header from a variable written on the same physical line.
+/// Git resumes its character-based parser immediately after the closing `]`,
+/// so both `[core] key = value` and `[core]key = value` leave `core` active.
+fn parse_config_header(line: &[u8]) -> Option<(Option<GitConfigSection>, &[u8])> {
+    let end = line.iter().position(|byte| *byte == b']')?;
+    Some((parse_top_level_section(&line[..=end]), &line[end + 1..]))
 }
 
 /// Produces the logical config lines that Git's value parser sees. A terminal
@@ -808,6 +823,21 @@ mod tests {
         // boolean cannot replace `true` and the following key remains in core.
         assert_eq!(continued_header.ignore_case, Some(true));
         assert_eq!(continued_header.worktree_config, None);
+    }
+
+    #[test]
+    fn config_header_assignments_keep_the_section_active() {
+        let mut config = GitConfig::default();
+        apply_config(
+            &mut config,
+            b"[core] ignorecase = true\nprecomposeunicode = true\n\
+              [extensions] worktreeconfig = true\n\
+              [core]ignorecase = false\nprecomposeunicode = false\n",
+        );
+
+        assert_eq!(config.ignore_case, Some(false));
+        assert_eq!(config.precompose_unicode, Some(false));
+        assert_eq!(config.worktree_config, Some(true));
     }
 
     #[test]
