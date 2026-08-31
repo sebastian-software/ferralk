@@ -801,7 +801,7 @@ fn read_direntries_from_open_directory(
             return Ok(());
         }
         primed = true;
-        parse_records(path, &buffer[..byte_count], listing)?;
+        parse_records_from_open_directory(directory, path, &buffer[..byte_count], listing)?;
         if has_direntries_eof_flag(buffer, byte_count) {
             return Ok(());
         }
@@ -815,8 +815,27 @@ fn malformed_bulk_record() -> io::Error {
     )
 }
 
+#[cfg(test)]
 fn parse_records(directory: &Path, records: &[u8], listing: &mut Listing) -> io::Result<()> {
     parse_records_with_entry_kind(directory, records, listing, entry_kind)
+}
+
+/// Classifies raw records through the descriptor that produced them, so an
+/// unknown d_type cannot be resolved through a path swapped after opening.
+fn parse_records_from_open_directory(
+    open_directory: &File,
+    reported_path: &Path,
+    records: &[u8],
+    listing: &mut Listing,
+) -> io::Result<()> {
+    parse_records_with_entry_kind(
+        reported_path,
+        records,
+        listing,
+        |_, name, directory_type| {
+            descriptor_entry_kind(open_directory.as_raw_fd(), name, directory_type)
+        },
+    )
 }
 
 fn parse_records_with_entry_kind(
@@ -893,6 +912,7 @@ fn for_each_record(
 ///
 /// `Ok(None)` means the entry disappeared between the directory read and its
 /// stat. Persistent failures use the listing-level error channel instead.
+#[cfg(test)]
 fn entry_kind(
     directory: &Path,
     name: &OsStr,
@@ -988,12 +1008,13 @@ mod tests {
     use super::{
         ATTR_CMN_ERROR, ATTR_CMN_NAME, ATTR_CMN_OBJTYPE, ATTR_CMN_RETURNED_ATTRS,
         ATTRIBUTE_RECORD_HEADER_SIZE, BUFFER_SIZE, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG,
-        DT_SOCK, GETDIRENTRIES64_EOF, Listing, NAME_OFFSET, NativeDirectoryReadError,
-        RelativeDirectoryOpen, RetainedDirectory, VBLK, VCHR, VDIR, VFIFO, VSOCK, bulk_entry_kind,
+        DT_SOCK, Listing, NAME_OFFSET, NativeDirectoryReadError, RelativeDirectoryOpen,
+        RetainedDirectory, VBLK, VCHR, VDIR, VFIFO, VSOCK, bulk_entry_kind,
         clear_direntries_eof_tail, entry_kind, for_each_record, has_direntries_eof_flag,
         is_unsupported_bulk_error, is_unsupported_direntries_error, open_directory,
-        parse_bulk_record, parse_records, parse_records_with_entry_kind, read_bulk_directory,
-        read_directory, read_direntries_directory, read_open_directory_with_portable_fallback,
+        parse_bulk_record, parse_records, parse_records_from_open_directory,
+        parse_records_with_entry_kind, read_bulk_directory, read_directory,
+        read_direntries_directory, read_open_directory_with_portable_fallback,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -1143,6 +1164,32 @@ mod tests {
             "only the vanished entry is dropped"
         );
         assert_eq!(listing.entries()[0].name(), "survivor");
+    }
+
+    #[test]
+    fn unknown_records_stay_with_the_opened_directory_after_a_path_swap() {
+        let root = fixture_root("unknown-descriptor");
+        let listed = root.join("listed");
+        let moved = root.join("opened-before-swap");
+        let target = root.join("attacker");
+        fs::create_dir_all(&listed).expect("create listed directory");
+        fs::write(listed.join("probe"), b"fixture").expect("create original file");
+        fs::create_dir_all(target.join("probe")).expect("create swapped directory");
+        let open = open_directory(&listed, true).expect("open listed directory");
+        let records = record(b"probe", 0);
+
+        fs::rename(&listed, &moved).expect("move opened directory");
+        symlink(&target, &listed).expect("replace listed path with a link");
+
+        let mut listing = Listing::default();
+        parse_records_from_open_directory(&open, &listed, &records, &mut listing)
+            .expect("unknown record is classified through the open descriptor");
+        assert_eq!(listing.entries().len(), 1);
+        assert!(
+            !listing.entries()[0].is_dir(),
+            "the original file wins over the replacement directory"
+        );
+        fs::remove_dir_all(root).expect("remove descriptor fixture");
     }
 
     #[test]
