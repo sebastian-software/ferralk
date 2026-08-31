@@ -204,11 +204,11 @@ builder, so one rejected root does not lose the configured walk.
 A caller with several source directories used to build one walker per directory,
 and with it one thread pool per directory; the roots are now the walk's initial
 directories and share the scheduler and helper-spawn floor. The
-visited-directory guard stays per root traversal: descendants of one root share
-its guard, while separately supplied roots — including duplicates, overlaps and
-symlink aliases — receive independent guards. Following symlinks therefore
-still stops genuine cycles within each root without deduplicating one root's
-entries against another's.
+ancestor-chain guard starts empty per root traversal: each descendant task
+extends only its own path of ancestors, while separately supplied roots —
+including duplicates, overlaps and symlink aliases — start independent chains.
+Following symlinks therefore stops genuine cycles without deduplicating
+acyclic aliases, either within one root or across roots.
 
 | Question | Answer |
 | --- | --- |

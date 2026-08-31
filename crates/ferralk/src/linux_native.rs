@@ -1052,7 +1052,7 @@ mod tests {
             open: crate::DirectoryOpen::default(),
             depth: 0,
             root: 0,
-            cycle_guard: std::sync::Arc::new(crate::CycleGuard::default()),
+            ancestors: crate::AncestorChain::default(),
             ignores,
             ignore_errors,
         };

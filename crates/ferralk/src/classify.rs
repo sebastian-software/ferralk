@@ -22,7 +22,7 @@ use std::{
 };
 
 use super::{
-    CycleGuard, DirectoryBackend, DirectoryOpen, ListedEntry, Listing, WalkEntry, Walker,
+    AncestorChain, DirectoryBackend, DirectoryOpen, ListedEntry, Listing, WalkEntry, Walker,
     gitignore::{IgnoreReadError, IgnoreScope},
     glob_bytes, has_hidden_component, should_skip_git_directory,
 };
@@ -94,8 +94,9 @@ pub(crate) struct DirectoryTask {
     /// tree rather than rediscovered, because it selects the patterns and the
     /// root-relative offset that apply here.
     pub(crate) root: usize,
-    /// Shared only by this root and its descendants while following symlinks.
-    pub(crate) cycle_guard: Arc<CycleGuard>,
+    /// The directories between this task's root and its parent while following
+    /// symlinks. It detects loops without deduplicating sibling aliases.
+    pub(crate) ancestors: AncestorChain,
     /// Components between the walk root and this directory. The walk counts
     /// them once, on the way down, instead of recounting the components of
     /// every entry's path.
@@ -110,7 +111,7 @@ pub(crate) struct DirectoryTask {
 #[derive(Clone, Copy)]
 pub(crate) struct TraversalContext<'a> {
     pub(crate) root: usize,
-    pub(crate) cycle_guard: &'a Arc<CycleGuard>,
+    pub(crate) ancestors: &'a AncestorChain,
     pub(crate) listing: &'a Listing,
 }
 
@@ -284,7 +285,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         open: backend.child_directory_open(context.listing, entry.name()),
         depth,
         root: context.root,
-        cycle_guard: Arc::clone(context.cycle_guard),
+        ancestors: context.ancestors.clone(),
         ignores: ignores.clone(),
         ignore_errors: Vec::new(),
     };

@@ -3,7 +3,7 @@
 use std::{
     any::Any,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -17,8 +17,8 @@ use std::collections::HashSet;
 use crossbeam_deque::{Steal, Stealer, Worker};
 
 use super::{
-    CANCELLATION_STRIDE, CYCLE_KEY_OPERATION, CycleGuard, DirectoryBackend, EntryVisitor,
-    ErrorPolicy, Listing, Verdict, WalkEntry, WalkError, WalkResult, Walker,
+    CANCELLATION_STRIDE, CYCLE_KEY_OPERATION, DirectoryBackend, EntryVisitor, ErrorPolicy, Listing,
+    Verdict, WalkEntry, WalkError, WalkResult, Walker,
     classify::{DirectoryTask, EmittedEntry, EntryAction, TraversalContext, classify_entry},
     own_path, reset_to_directory,
     scheduler::{CacheLine, Coordinator, Scheduler, WorkerSlot},
@@ -597,7 +597,7 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
         open,
         depth,
         root,
-        cycle_guard,
+        ancestors,
         ignores,
         ignore_errors,
     } = task;
@@ -616,11 +616,22 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
             return;
         }
     }
-    if shared.walker.options.follow_symlinks
-        && !mark_directory(shared, &cycle_guard, &path, is_root)
-    {
-        return;
-    }
+    let ancestors = if shared.walker.options.follow_symlinks {
+        match shared.backend.cycle_key(&path) {
+            Ok(key) => {
+                let Some(ancestors) = ancestors.enter(key) else {
+                    return;
+                };
+                ancestors
+            }
+            Err(source) => {
+                shared.record_error(CYCLE_KEY_OPERATION, path, source, is_root);
+                return;
+            }
+        }
+    } else {
+        ancestors
+    };
     if let Err(source) = shared.backend.read_scheduled_directory(
         &path,
         &open,
@@ -672,7 +683,7 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
             depth,
             TraversalContext {
                 root,
-                cycle_guard: &cycle_guard,
+                ancestors: &ancestors,
                 listing: &worker.listing,
             },
         );
@@ -681,28 +692,6 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
     }
     while let Some(error) = worker.listing.take_deferred_error() {
         shared.record_error("read_dir", error.path, error.source.into_io_error(), false);
-    }
-}
-
-fn mark_directory(
-    shared: &Shared,
-    cycle_guard: &CycleGuard,
-    directory: &Path,
-    is_root: bool,
-) -> bool {
-    // The key is computed outside the lock, so the critical section holds only
-    // the hash and the insert.
-    match shared.backend.cycle_key(directory) {
-        Ok(key) => cycle_guard.mark(key),
-        Err(source) => {
-            shared.record_error(
-                CYCLE_KEY_OPERATION,
-                directory.to_path_buf(),
-                source,
-                is_root,
-            );
-            false
-        }
     }
 }
 
