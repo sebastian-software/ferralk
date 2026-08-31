@@ -450,6 +450,7 @@ struct WorkerScratch {
     listing: Listing,
     /// That directory's path, with the entry being classified pushed onto it.
     path: PathBuf,
+    glob_bytes: Vec<u8>,
     /// The path buffer the last dropped entry left behind. See [`own_path`].
     spare: PathBuf,
 }
@@ -468,6 +469,7 @@ impl WorkerScratch {
             entries: Vec::new(),
             listing: Listing::default(),
             path: PathBuf::new(),
+            glob_bytes: Vec::new(),
             spare: PathBuf::new(),
         }
     }
@@ -685,6 +687,7 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
                 root,
                 ancestors: &ancestors,
                 listing: &worker.listing,
+                glob_bytes_scratch: &mut worker.glob_bytes,
             },
         );
         act(shared, worker, action);
