@@ -42,10 +42,12 @@ lanes that remain.
 
 During `0.x`, a consumer-facing behaviour change must be marked as breaking in
 its Conventional Commit. Put `!` after the type or scope (for example,
-`fix(walker)!: preserve caller cancellation`) or add a `BREAKING CHANGE:`
-footer. Do this even when the Rust type signatures are unchanged: changed
-runtime errors, validation, cancellation, traversal, matching, and default
-policy are all part of the consumer contract.
+`fix(walker)!: preserve caller cancellation`) and add a filled-in `BREAKING
+CHANGE:` footer that states the old and new observable behaviour. The marker
+selects the version bump; the footer gives Release Please the consumer-facing
+text it renders into the changelog. Do this even when the Rust type signatures
+are unchanged: changed runtime errors, validation, cancellation, traversal,
+matching, and default policy are all part of the consumer contract.
 
 Release Please recognizes those markers and renders a dedicated breaking-change
 section in the release notes. Describe the old and new observable behaviour in
