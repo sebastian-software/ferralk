@@ -1999,6 +1999,16 @@ impl Listing {
         &self.entries[..self.len]
     }
 
+    /// Removes one live entry while retaining its name buffer for reuse by a
+    /// later directory. The surviving entries keep their original order.
+    #[cfg(all(feature = "native-macos", target_os = "macos"))]
+    pub(crate) fn remove_entry(&mut self, index: usize) {
+        debug_assert!(index < self.len);
+        let entry = self.entries.remove(index);
+        self.len -= 1;
+        self.entries.insert(self.len, entry);
+    }
+
     /// Records a failure for one entry without throwing away the successfully
     /// read siblings. Consumers report these after the listing is consumed.
     pub(crate) fn defer_error(&mut self, path: PathBuf, source: std::io::Error) {

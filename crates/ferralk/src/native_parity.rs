@@ -244,6 +244,90 @@ fn parity_over_a_deep_tree() {
     assert_parity("deep tree", &fixture.root, collecting_walker(&fixture.root));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+#[allow(unsafe_code)]
+fn parity_beyond_path_max_holds_for_every_frontend() {
+    use std::{
+        ffi::CString,
+        os::unix::{
+            ffi::OsStrExt,
+            io::{AsRawFd, FromRawFd},
+        },
+    };
+
+    let fixture = Fixture::new("path-max");
+    let mut directory = fixture.root.clone();
+    let mut parent = fs::File::open(&fixture.root).expect("open fixture root");
+    // Cross PATH_MAX before the retained-descriptor budget can affect the
+    // serial frontend. The fixture still needs descriptor-relative creation,
+    // because its final pathname is intentionally unusable.
+    let name = "d".repeat(200);
+    let c_name = CString::new(name.as_bytes()).expect("component contains no NUL");
+    while directory.as_os_str().as_bytes().len() <= libc::PATH_MAX as usize + 16 {
+        // Building with pathname syscalls would itself fail at PATH_MAX. Keep
+        // only the current parent descriptor and create the next component
+        // relative to it, the way the native backend does once it retains a
+        // directory descriptor.
+        let created = unsafe { libc::mkdirat(parent.as_raw_fd(), c_name.as_ptr(), 0o755) };
+        assert_eq!(created, 0, "create one level of the long path");
+        let child_fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(child_fd >= 0, "open one level of the long path");
+        // SAFETY: openat returned a new owned descriptor on success.
+        parent = unsafe { fs::File::from_raw_fd(child_fd) };
+        directory.push(&name);
+    }
+
+    let walker = collecting_walker(&fixture.root);
+    let serial = walker
+        .clone()
+        .collect()
+        .expect("serial walk collects errors");
+    let parallel = walker
+        .clone()
+        .threads(4)
+        .collect()
+        .expect("parallel walk collects errors");
+    let mut streamed_entries = Vec::new();
+    let mut streamed_errors = Vec::new();
+    for item in walker.clone().stream() {
+        match item {
+            Ok(entry) => streamed_entries.push(entry),
+            Err(error) => streamed_errors.push(error),
+        }
+    }
+    let (_, portable_errors) = walk_portable(&walker);
+    let expected_errors = describe_errors(&portable_errors, &fixture.root);
+
+    for (frontend, entries, errors) in [
+        ("serial", serial.entries(), serial.errors()),
+        ("parallel", parallel.entries(), parallel.errors()),
+        (
+            "stream",
+            streamed_entries.as_slice(),
+            streamed_errors.as_slice(),
+        ),
+    ] {
+        assert!(
+            entries.iter().all(|entry| {
+                entry.path().as_os_str().as_bytes().len() < libc::PATH_MAX as usize
+            }),
+            "beyond PATH_MAX ({frontend}): emitted an unusable pathname"
+        );
+        assert_eq!(
+            describe_errors(errors, &fixture.root),
+            expected_errors,
+            "beyond PATH_MAX ({frontend}): error classes differ from portable"
+        );
+    }
+}
+
 #[test]
 fn parity_over_a_directory_larger_than_one_read_batch() {
     // Both native readers fill a 32 KiB buffer and refill until the directory
@@ -498,6 +582,7 @@ fn parity_holds_through_the_parallel_scheduler() {
 fn the_family_matrix_matches_this_platform() {
     let mut families: BTreeMap<&str, bool> = BTreeMap::new();
     families.insert("deep tree", true);
+    families.insert("beyond PATH_MAX", cfg!(target_os = "macos"));
     families.insert("large directory", true);
     families.insert("empty directories", true);
     families.insert("filters and ignore rules", true);
@@ -515,12 +600,13 @@ fn the_family_matrix_matches_this_platform() {
         "the non-UTF-8 family belongs to Linux only; APFS rejects such names"
     );
     // This module only builds when a native backend is active, and every
-    // supported one is a Unix. A future Windows backend would land here as a
-    // failing count rather than as a quiet ten-family skip.
+    // supported one is a Unix. Linux carries the non-UTF-8 fixture; macOS
+    // carries the PATH_MAX fixture. A future backend would land here as a
+    // failing count rather than as a quiet family skip.
     let running = families.values().filter(|present| **present).count();
     assert_eq!(
         running,
-        if cfg!(target_os = "linux") { 11 } else { 10 },
+        11,
         "this platform runs {running} of {} parity families",
         families.len()
     );

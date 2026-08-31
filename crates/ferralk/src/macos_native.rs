@@ -218,11 +218,40 @@ pub(super) fn read_directory(
     refuse_final_symlink: bool,
     listing: &mut Listing,
 ) -> NativeDirectoryReadResult {
-    if NATIVE_UNSUPPORTED.load(Ordering::Relaxed) {
+    let result = if NATIVE_UNSUPPORTED.load(Ordering::Relaxed) {
         read_portable_directory_from_path(path, relative, refuse_final_symlink, listing)?;
-        return Ok(());
+        Ok(())
+    } else {
+        read_direntries_directory(path, relative, refuse_final_symlink, listing)
+    };
+    if result.is_ok() {
+        reject_path_limited_child_directories(path, listing);
     }
-    read_direntries_directory(path, relative, refuse_final_symlink, listing)
+    result
+}
+
+/// Makes descriptor-relative traversal stop where ordinary pathname traversal
+/// would. A parallel worker may otherwise emit a directory before its queued
+/// child discovers `ENAMETOOLONG`, while the depth-first frontend encounters
+/// that error before emitting the same directory.
+fn reject_path_limited_child_directories(path: &Path, listing: &mut Listing) {
+    let mut index = 0;
+    while index < listing.entries().len() {
+        let rejected = listing.entries()[index].is_dir()
+            && path
+                .join(listing.entries()[index].name())
+                .as_os_str()
+                .as_bytes()
+                .len()
+                >= libc::PATH_MAX as usize;
+        if rejected {
+            let child = path.join(listing.entries()[index].name());
+            listing.remove_entry(index);
+            listing.defer_error(child, io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+        } else {
+            index += 1;
+        }
+    }
 }
 
 fn unsupported(message: &'static str) -> io::Error {
@@ -254,6 +283,15 @@ fn open_scheduled_directory(
     relative: Option<&RelativeDirectoryOpen>,
     refuse_final_symlink: bool,
 ) -> io::Result<File> {
+    // Relative `openat` can reach a directory whose reported path has already
+    // crossed Darwin's path-only limit. Do not let retained descriptors make
+    // that an accidental frontend-dependent extension: callers receive the
+    // full path and their later metadata calls cannot use it either. Keeping
+    // the portable `ENAMETOOLONG` boundary makes serial, parallel, and stream
+    // agree regardless of how many parent descriptors happen to be retained.
+    if path.as_os_str().as_bytes().len() >= libc::PATH_MAX as usize {
+        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+    }
     let Some(relative) = relative else {
         return open_directory(path, refuse_final_symlink);
     };
