@@ -476,8 +476,13 @@ struct ConfigValueState {
 /// backslash continuation. Subsequent physical lines are scanned only once.
 fn config_value_continuation(line: &[u8]) -> Option<ConfigValueState> {
     let line = trim_ascii_start(line);
+    let line = if line.starts_with(b"[") {
+        trim_ascii_start(parse_config_header(line)?.1)
+    } else {
+        line
+    };
     let first = line.first()?;
-    if matches!(first, b'#' | b';' | b'[') || !first.is_ascii_alphabetic() {
+    if matches!(first, b'#' | b';') || !first.is_ascii_alphabetic() {
         return None;
     }
     let key_end = line
@@ -849,6 +854,10 @@ mod tests {
         assert_eq!(config.ignore_case, Some(false));
         assert_eq!(config.precompose_unicode, Some(false));
         assert_eq!(config.worktree_config, Some(true));
+
+        let mut continued = GitConfig::default();
+        apply_config(&mut continued, b"[core] ignorecase = tru\\\ne\n");
+        assert_eq!(continued.ignore_case, Some(true));
     }
 
     #[test]
