@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Unpublished Node.js ecosystem benchmark harness for ferralk development.",
   "engines": {
-    "node": ">=24.0.0"
+    "node": "v26.8.1"
   },
   "scripts": {
     "bench": "node bench.mjs",
