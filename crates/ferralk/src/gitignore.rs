@@ -152,6 +152,14 @@ impl IgnoreScope {
         node.verdict(&candidate, is_dir).unwrap_or(false)
     }
 
+    #[cfg(windows)]
+    pub(crate) fn is_ignored_bytes(&self, candidate: &[u8], is_dir: bool) -> bool {
+        self.rules
+            .as_ref()
+            .and_then(|node| node.verdict(candidate, is_dir))
+            .unwrap_or(false)
+    }
+
     /// Puts `rules` on the chain, unless they are empty: an empty matcher can
     /// never have an opinion, so keeping it would only lengthen the walk of
     /// every entry below it.

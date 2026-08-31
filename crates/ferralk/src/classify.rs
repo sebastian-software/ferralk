@@ -108,11 +108,12 @@ pub(crate) struct DirectoryTask {
 }
 
 /// Directory-specific state carried while one of its entries is classified.
-#[derive(Clone, Copy)]
 pub(crate) struct TraversalContext<'a> {
     pub(crate) root: usize,
     pub(crate) ancestors: &'a AncestorChain,
     pub(crate) listing: &'a Listing,
+    /// Reusable Windows-normalized bytes for both glob filters and gitignore.
+    pub(crate) glob_bytes_scratch: &'a mut Vec<u8>,
 }
 
 /// A filesystem call that failed while classifying one entry.
@@ -169,6 +170,9 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     directory_depth: usize,
     context: TraversalContext<'_>,
 ) -> EntryAction {
+    let glob_bytes_scratch = context.glob_bytes_scratch;
+    #[cfg(not(windows))]
+    let _ = glob_bytes_scratch;
     let plan = &walker.roots[context.root];
     let mut is_dir = entry.is_dir();
     let path_bytes = path.as_os_str().as_encoded_bytes();
@@ -184,7 +188,12 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     {
         return EntryAction::Skip;
     }
+    #[cfg(windows)]
+    let bytes = super::glob_bytes_into(path_bytes, glob_bytes_scratch);
+    #[cfg(not(windows))]
     let bytes = glob_bytes(relative);
+    #[cfg(windows)]
+    let bytes = &bytes[plan.relative_start.min(bytes.len())..];
     if walker.options.skip_hidden && has_hidden_component(bytes.as_ref()) {
         return EntryAction::Skip;
     }
@@ -200,6 +209,9 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     if excluded && !is_dir {
         return EntryAction::Skip;
     }
+    #[cfg(windows)]
+    let git_ignored = ignores.is_ignored_bytes(glob_bytes_scratch, is_dir);
+    #[cfg(not(windows))]
     let git_ignored = ignores.is_ignored(path, is_dir);
     if git_ignored && !is_dir {
         return EntryAction::Skip;

@@ -1195,6 +1195,7 @@ impl Walker {
             pending_directories,
             walker: self,
             listing: Listing::default(),
+            glob_bytes: Vec::new(),
             next_entry: 0,
             path: PathBuf::new(),
             directory: PathBuf::new(),
@@ -1281,6 +1282,18 @@ pub(crate) fn glob_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
     {
         Cow::Borrowed(bytes)
     }
+}
+
+/// Normalizes a path into caller-owned reusable storage on Windows.
+#[cfg(windows)]
+pub(crate) fn glob_bytes_into<'a>(bytes: &[u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
+    scratch.clear();
+    scratch.extend(
+        bytes
+            .iter()
+            .map(|&byte| if byte == b'\\' { b'/' } else { byte }),
+    );
+    scratch
 }
 
 /// Compiles one include or exclude for one root, rewriting it if it is
@@ -2247,6 +2260,7 @@ pub struct WalkStream {
     pending_directories: Vec<DirectoryTask>,
     /// The directory being delivered and how far through it the stream is.
     listing: Listing,
+    glob_bytes: Vec<u8>,
     next_entry: usize,
     /// That directory's path, with the entry being classified pushed onto it.
     path: PathBuf,
@@ -2422,6 +2436,7 @@ impl WalkStream {
                 root: self.root,
                 ancestors: &self.ancestors,
                 listing: &self.listing,
+                glob_bytes_scratch: &mut self.glob_bytes,
             },
         );
         // Only an emitted entry needs a path of its own, and the stream hands
@@ -2507,6 +2522,7 @@ struct WalkState<'walker> {
 struct DirectoryScratch {
     listing: Listing,
     path: PathBuf,
+    glob_bytes: Vec<u8>,
 }
 
 /// One suspended serial-directory listing. A child directory is scheduled
@@ -2725,6 +2741,7 @@ impl<'walker> WalkState<'walker> {
                     root: frame.task.root,
                     ancestors: &frame.task.ancestors,
                     listing: &frame.scratch.listing,
+                    glob_bytes_scratch: &mut frame.scratch.glob_bytes,
                 },
             );
             match action {
