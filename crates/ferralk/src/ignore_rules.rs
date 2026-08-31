@@ -20,8 +20,9 @@
 //!   component; one with a separator is anchored to its own directory.
 //! - A trailing `/**` covers what is inside a directory, so something has to
 //!   follow it.
-//! - Asterisks that do not form a whole component are ordinary stars in Git and
-//!   must not cross a separator, so `a**b` collapses to `a*b`.
+//! - Asterisks inside a component are ordinary stars in Git, so `a**b`
+//!   collapses to `a*b`; a run of two or more stars at a component suffix also
+//!   has Git's directory-spanning and zero-width forms.
 
 use std::{borrow::Cow, path::Path};
 
@@ -107,6 +108,9 @@ impl RuleSet {
 struct Rule {
     /// The rule body, one entry per path component.
     components: Vec<Component>,
+    /// The zero-component spelling of one suffix star run. Git lets `**/`
+    /// vanish with its separator, so `a**/y` also matches `ay`.
+    zero_components: Option<Vec<Component>>,
     /// A searcher for the longest run of literal bytes the rule requires.
     ///
     /// A file with a hundred rules asks every one of them about every entry,
@@ -131,7 +135,11 @@ impl Rule {
         self.gate
             .as_ref()
             .is_none_or(|gate| gate.find(candidate).is_some())
-            && matches_components(&self.components, candidate)
+            && (matches_components(&self.components, candidate)
+                || self
+                    .zero_components
+                    .as_ref()
+                    .is_some_and(|components| matches_components(components, candidate)))
     }
 }
 
@@ -301,30 +309,37 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
         None => (false, body),
     };
     // A separator anywhere but at the end binds the rule to its own directory;
-    // without one it matches at any level.
-    let anchored = body.contains(&b'/');
+    // without one it matches at any level. A slash inside a bracket expression
+    // is a class member, not a path separator.
+    let parts = split_rule_components(body);
+    let anchored = parts.len() > 1;
     let body = body.strip_prefix(b"/").unwrap_or(body);
     if body.is_empty() {
         return None;
     }
     // A single leading separator is the anchor. Any other empty component is
     // unmatchable in Git, rather than an alternate spelling of a valid rule.
-    if body.split(|byte| *byte == b'/').any(<[u8]>::is_empty) {
+    let parts = split_rule_components(body);
+    if parts.iter().any(|part| part.is_empty()) {
         return None;
     }
 
+    let star_run = parts.iter().enumerate().find_map(|(index, part)| {
+        (index + 1 < parts.len() && suffix_star_run(part) >= 2 && !all_stars(part)).then_some(index)
+    });
     let mut components = Vec::new();
     let mut gate: Option<Vec<u8>> = None;
     if !anchored {
         components.push(Component::AnyDirs);
     }
-    for part in body.split(|byte| *byte == b'/') {
-        if let Some(literal) = longest_literal_run(part)
+    for (index, part) in parts.iter().enumerate() {
+        let compiled_part = strip_bracket_separators(part);
+        if let Some(literal) = longest_literal_run(&compiled_part)
             && gate.as_ref().is_none_or(|best| best.len() < literal.len())
         {
             gate = Some(literal);
         }
-        let component = compile_component(part, case_insensitive)?;
+        let component = compile_component(&compiled_part, case_insensitive)?;
         // Two runs in a row are one run, and collapsing them keeps the matcher
         // from backtracking between them for nothing.
         if matches!(component, Component::AnyDirs)
@@ -333,6 +348,9 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
             continue;
         }
         components.push(component);
+        if star_run == Some(index) {
+            components.push(Component::AnyDirs);
+        }
     }
     if matches!(components.last(), Some(Component::AnyDirs)) {
         // `abc/**` is what is inside `abc`, so one component has to follow.
@@ -343,8 +361,36 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
         return None;
     }
 
+    let zero_components = star_run.and_then(|index| {
+        let mut zero = Vec::new();
+        if !anchored {
+            zero.push(Component::AnyDirs);
+        }
+        for (part_index, part) in parts.iter().enumerate() {
+            if part_index == index + 1 {
+                continue;
+            }
+            let fused;
+            let part = if part_index == index {
+                fused = [*part, parts[index + 1]].concat();
+                fused.as_slice()
+            } else {
+                *part
+            };
+            zero.push(compile_component(
+                &strip_bracket_separators(part),
+                case_insensitive,
+            )?);
+        }
+        if matches!(zero.last(), Some(Component::AnyDirs)) {
+            zero.push(compile_component(b"*", case_insensitive)?);
+        }
+        Some(zero)
+    });
+
     Some(Rule {
         components,
+        zero_components,
         // This prefilter is byte-exact, so it would reject a case-folded
         // candidate before the rule matcher can evaluate it.
         gate: (!case_insensitive)
@@ -355,8 +401,47 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
     })
 }
 
+/// Splits a rule on path separators, keeping a slash inside a bracket class in
+/// its component. Escaped brackets do not open a class, matching the glob
+/// parser's byte-oriented escape handling.
+fn split_rule_components(body: &[u8]) -> Vec<&[u8]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_class = false;
+    let mut index = 0;
+    while index < body.len() {
+        match body[index] {
+            b'\\' => index += 2,
+            b'[' if in_class && body.get(index + 1) == Some(&b':') => {
+                let start = index + 2;
+                if let Some(end) = memmem::find(&body[start..], b":]") {
+                    index = start + end + 2;
+                } else {
+                    index += 1;
+                }
+            }
+            b'[' if !in_class => {
+                in_class = true;
+                index += 1;
+            }
+            b']' if in_class => {
+                in_class = false;
+                index += 1;
+            }
+            b'/' if !in_class => {
+                parts.push(&body[start..index]);
+                start = index + 1;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    parts.push(&body[start..]);
+    parts
+}
+
 fn compile_component(part: &[u8], case_insensitive: bool) -> Option<Component> {
-    if part == b"**" {
+    if all_stars(part) && part.len() >= 2 {
         return Some(Component::AnyDirs);
     }
     Pattern::compile(
@@ -365,6 +450,57 @@ fn compile_component(part: &[u8], case_insensitive: bool) -> Option<Component> {
     )
     .ok()
     .map(Component::Pattern)
+}
+
+fn all_stars(part: &[u8]) -> bool {
+    !part.is_empty() && part.iter().all(|byte| *byte == b'*')
+}
+
+fn suffix_star_run(part: &[u8]) -> usize {
+    part.iter().rev().take_while(|byte| **byte == b'*').count()
+}
+
+/// Candidate components never contain a path separator, so a slash admitted
+/// by Git inside a bracket class cannot affect matching. ferralk-glob rejects
+/// it as a separator; drop just that dead class member before compiling.
+fn strip_bracket_separators(part: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(part.len());
+    let mut in_class = false;
+    let mut index = 0;
+    while index < part.len() {
+        match part[index] {
+            b'\\' if index + 1 < part.len() => {
+                result.extend_from_slice(&part[index..=index + 1]);
+                index += 2;
+            }
+            b'[' if in_class && part.get(index + 1) == Some(&b':') => {
+                let start = index + 2;
+                if let Some(end) = memmem::find(&part[start..], b":]") {
+                    result.extend_from_slice(&part[index..start + end + 2]);
+                    index = start + end + 2;
+                } else {
+                    result.push(b'[');
+                    index += 1;
+                }
+            }
+            b'[' if !in_class => {
+                in_class = true;
+                result.push(b'[');
+                index += 1;
+            }
+            b']' if in_class => {
+                in_class = false;
+                result.push(b']');
+                index += 1;
+            }
+            b'/' if in_class => index += 1,
+            byte => {
+                result.push(byte);
+                index += 1;
+            }
+        }
+    }
+    result
 }
 
 /// Adapts the candidate that one ignore file sees, not its raw pattern. Mac
@@ -713,6 +849,27 @@ mod tests {
         let directory = parse_rule("build/").expect("directory rule parses");
         assert!(directory.directory_only);
         assert!(!directory.negated);
+    }
+
+    #[test]
+    fn a_slash_inside_a_bracket_class_is_not_a_path_separator() {
+        assert_eq!(fuzz_rule("a[b/c]d", b"abd", false), Some(true));
+        assert_eq!(fuzz_rule("a[b/c]d", b"acd", false), Some(true));
+        assert_eq!(fuzz_rule("x[[:alpha:]/]y", b"xay", false), Some(true));
+    }
+
+    #[test]
+    fn suffix_star_runs_follow_git_s_directory_and_empty_cases() {
+        for candidate in [b"b".as_slice(), b"x/y/b"] {
+            assert_eq!(fuzz_rule_bytes(b"***/b", candidate, false), Some(true));
+        }
+        for candidate in [b"ay".as_slice(), b"a/y", b"ax/y", b"a/x/y"] {
+            assert_eq!(fuzz_rule_bytes(b"a**/y", candidate, false), Some(true));
+        }
+        for candidate in [b"a".as_slice(), b"ab", b"a/x"] {
+            assert_eq!(fuzz_rule_bytes(b"a**/**", candidate, false), Some(true));
+        }
+        assert_eq!(fuzz_rule_bytes(b"a**b", b"a/x/b", false), None);
     }
 
     #[test]
