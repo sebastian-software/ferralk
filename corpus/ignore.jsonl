@@ -61,3 +61,5 @@
 {"id":"ignore-061","pattern":"sec","path":"sec","flags":[],"ignore_rules":["sec\u0000ret.txt"],"expected":true,"source":"git_check_ignore","note":"Git truncates an ignore rule at its first NUL byte."}
 {"id":"ignore-062","pattern":"sec","path":"secret.txt","flags":[],"ignore_rules":["sec\u0000ret.txt"],"expected":false,"source":"git_check_ignore","note":"The text after a NUL is not part of the ignore rule."}
 {"id":"ignore-063","pattern":"\uFEFFdouble.txt","path":"\uFEFFdouble.txt","flags":[],"ignore_rules":["\uFEFF\uFEFFdouble.txt"],"expected":true,"source":"git_check_ignore","note":"Git strips exactly one initial UTF-8 BOM, leaving a second BOM as part of the rule."}
+{"id":"ignore-064","pattern":"a[b/c]d","path":"abd","flags":[],"ignore_rules":["a[b/c]d"],"expected":true,"source":"git_check_ignore","note":"A slash inside a bracket class is not a path separator."}
+{"id":"ignore-065","pattern":"x[[:alpha:]/]y","path":"xay","flags":[],"ignore_rules":["x[[:alpha:]/]y"],"expected":true,"source":"git_check_ignore","note":"A slash after a POSIX class remains a bracket-class member."}
