@@ -20,6 +20,8 @@
 //! there. Such a root is reported as unrewritable rather than guessed at, and
 //! the pattern has to be written relative to it.
 
+use std::borrow::Cow;
+
 use ferralk_glob::PatternError;
 
 use crate::first_metacharacter;
@@ -116,20 +118,19 @@ pub(crate) fn reject_path_shaped(pattern: &[u8], syntax: Syntax) -> Result<(), P
     if let Some(offset) = drive_prefix_with_backslash(pattern) {
         return Err(PatternError::new(offset, PATH_SHAPED));
     }
-    if let Some(offset) = escape_before_forbidden_byte(pattern) {
+    if let Some(offset) = path_shaped_byte(pattern) {
         return Err(PatternError::new(offset, PATH_SHAPED));
     }
     Ok(())
 }
 
-/// Offset of an escape demanding a byte Windows forbids, read from plain
-/// literal text only.
+/// Offset of a byte that makes a plain-text Windows pattern unmatchable.
 ///
 /// Stops at the first byte that could open a group rather than skipping the
 /// group, because skipping means deciding where it ends, and disagreeing with
 /// the real parser about that would resume the scan *inside* a group - which is
 /// the lossy rejection being avoided. Stopping early costs only detection.
-fn escape_before_forbidden_byte(pattern: &[u8]) -> Option<usize> {
+fn path_shaped_byte(pattern: &[u8]) -> Option<usize> {
     let mut index = 0;
     while index < pattern.len() {
         if pattern[index] == b'\\' {
@@ -141,6 +142,15 @@ fn escape_before_forbidden_byte(pattern: &[u8]) -> Option<usize> {
             }
             index += 2;
             continue;
+        }
+        // A colon cannot occur in a Windows name. The absolute `C:/` form
+        // was already rewritten before this check runs, so a plain colon here
+        // is necessarily a drive-relative or otherwise unmatchable spelling.
+        let absolute_drive_prefix = index == 1
+            && pattern.first().is_some_and(u8::is_ascii_alphabetic)
+            && pattern.get(2) == Some(&b'/');
+        if pattern[index] == b':' && !absolute_drive_prefix {
+            return Some(index);
         }
         if opens_a_group(pattern, index) {
             return None;
@@ -191,6 +201,10 @@ pub(crate) fn rewrite_in(
     root: &[u8],
     syntax: Syntax,
 ) -> Result<Rewrite, PatternError> {
+    let pattern = deverbatimize(pattern, syntax);
+    let root = deverbatimize(root, syntax);
+    let pattern = pattern.as_ref();
+    let root = root.as_ref();
     let Some(pattern_prefix) = absolute_prefix(pattern, syntax) else {
         return Ok(Rewrite::Relative);
     };
@@ -222,7 +236,8 @@ pub(crate) fn rewrite_in(
     // path, and only a plain path can be compared against the root.
     let magic = first_metacharacter(pattern);
     let mut offset = pattern_prefix;
-    for root_component in components(&root[root_prefix..]) {
+    let root_is_unc = syntax == Syntax::Windows && root[..root_prefix] == *b"//";
+    for (root_component_index, root_component) in components(&root[root_prefix..]).enumerate() {
         if root_component == b".." {
             return Err(PatternError::new(
                 0,
@@ -245,7 +260,12 @@ pub(crate) fn rewrite_in(
                     "a wildcard at or above the walk root cannot be made relative to it",
                 ));
             }
-            if component != root_component {
+            let component_agrees = if root_is_unc && root_component_index < 2 {
+                component.eq_ignore_ascii_case(root_component)
+            } else {
+                component == root_component
+            };
+            if !component_agrees {
                 return Ok(Rewrite::Outside);
             }
             offset = next;
@@ -274,6 +294,29 @@ pub(crate) fn rewrite_in(
         ));
     }
     Ok(Rewrite::Rooted(remainder.to_vec()))
+}
+
+/// Removes Windows' verbatim namespace prefix from a normalized path spelling.
+///
+/// `std::fs::canonicalize` returns `//?/C:/...` or `//?/UNC/host/share/...`
+/// on Windows. Those are alternate spellings of ordinary drive and UNC paths,
+/// not UNC shares whose host is `?`, so strip the namespace before deciding
+/// how an absolute pattern relates to its root.
+fn deverbatimize<'a>(bytes: &'a [u8], syntax: Syntax) -> Cow<'a, [u8]> {
+    if syntax != Syntax::Windows {
+        return Cow::Borrowed(bytes);
+    }
+    let Some(rest) = bytes.strip_prefix(b"//?/") else {
+        return Cow::Borrowed(bytes);
+    };
+    if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case(b"UNC/") {
+        let mut ordinary = Vec::with_capacity(rest.len() - 2);
+        ordinary.extend_from_slice(b"//");
+        ordinary.extend_from_slice(&rest[4..]);
+        Cow::Owned(ordinary)
+    } else {
+        Cow::Borrowed(rest)
+    }
 }
 
 /// Length of the prefix that makes `bytes` absolute, if it is.
@@ -472,6 +515,7 @@ mod tests {
             r"src\*.ts",
             r"C:\repo\src\**\*.ts",
             r"\\server\share\src\*.ts",
+            "C:src/*.ts",
         ] {
             assert!(
                 rejection(pattern, Syntax::Windows).is_some(),
@@ -632,6 +676,23 @@ mod tests {
         // UNC shares work the same way.
         assert_eq!(
             rooted("//host/share/a/**/*.ts", "//host/share/a", Syntax::Windows),
+            "**/*.ts"
+        );
+        // `canonicalize` returns this verbatim namespace spelling on Windows.
+        assert_eq!(
+            rooted("C:/repo/src/**/*.ts", "//?/C:/repo", Syntax::Windows),
+            "src/**/*.ts"
+        );
+        assert_eq!(
+            rooted("//?/C:/repo/src/**/*.ts", "C:/repo", Syntax::Windows),
+            "src/**/*.ts"
+        );
+        assert_eq!(
+            rooted(
+                "//HOST/SHARE/a/**/*.ts",
+                "//?/UNC/host/share/a",
+                Syntax::Windows
+            ),
             "**/*.ts"
         );
         assert_eq!(
