@@ -58,10 +58,14 @@ need.
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked
+cargo clippy --workspace --exclude oracle --all-targets --locked -- -D warnings
+cargo test --workspace --exclude oracle --locked
 cargo run -p harness -- corpus
 ```
+
+This is the pull-request gate and needs no Zig installation. The development-
+only `oracle` package links zlob; include it by dropping `--exclude oracle`
+only after installing Zig 0.16 and libclang.
 
 Changes to the native backends also need `--features native-macos` or
 `--features native-linux` on the platform that has them; the corresponding CI

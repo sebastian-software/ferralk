@@ -365,11 +365,16 @@ same atomic final-component guarantee.
 Run the normal workspace suite before changing matcher or walker behaviour:
 
 ```sh
-cargo test --workspace --locked
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --exclude oracle --all-targets --locked -- -D warnings
+cargo test --workspace --exclude oracle --locked
 cargo run -p harness -- corpus
 ```
+
+Those commands are the ordinary CI gate and deliberately exclude the
+development-only `oracle` package, so no Zig installation is needed. The
+oracle links zlob: install Zig 0.16 and libclang, then remove `--exclude
+oracle` from the test and Clippy commands when you need to validate it too.
 
 The minimum supported Rust version is written down once, as `rust-version`
 under `[workspace.package]` in the root `Cargo.toml`; the CI MSRV job reads
