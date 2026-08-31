@@ -157,11 +157,16 @@ single-threaded and unsorted so it can yield entries incrementally.
 ## Development
 
 ```sh
-cargo test --workspace --locked
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --exclude oracle --all-targets --locked -- -D warnings
+cargo test --workspace --exclude oracle --locked
 cargo run -p harness -- corpus
 ```
+
+These are the CI-gated contributor checks and do not require Zig. The optional
+`oracle` package links zlob and therefore needs Zig 0.16 and libclang; with
+those installed, run the same test and Clippy commands again without
+`--exclude oracle` to include it.
 
 See [CONTRIBUTING](CONTRIBUTING.md) for repository policy — commit signing and
 how performance claims are evidenced — and
