@@ -60,7 +60,7 @@ impl IgnoreReadError {
 }
 
 /// The repository-local filesystem adaptations Git applies before ignore
-/// matching. They are derived once per walk root and carried through every
+/// matching. They are derived once per repository and carried through every
 /// traversal frontend, including the deliberately non-Git nested-repository
 /// traversal described in the public compatibility notes.
 #[derive(Debug, Clone, Copy, Default)]
@@ -79,9 +79,10 @@ pub(crate) struct IgnoreScope {
 }
 
 impl IgnoreScope {
-    /// What the walk root inherits: the repository-wide excludes. The root's
-    /// own ignore files join like every other directory's, when the walk
-    /// enters it, and being deeper they override these.
+    /// What the walk root inherits: repository-wide excludes and the ignore
+    /// files from the repository root through its parent. The root's own
+    /// ignore files join like every other directory's, when the walk enters
+    /// it, and being deeper they override these.
     pub(crate) fn for_root<B: DirectoryBackend + ?Sized>(
         walker: &Walker,
         backend: &B,
@@ -90,14 +91,25 @@ impl IgnoreScope {
         if !walker.respect_git_ignore {
             return (Self::default(), Vec::new());
         }
-        let layout = repository_layout(root);
-        let adaptation = GitIgnoreAdaptation::effective(walker, layout.as_ref());
-        let scope = Self {
+        let repository = repository_layout(root);
+        let adaptation =
+            GitIgnoreAdaptation::effective(walker, repository.as_ref().map(|(_, layout)| layout));
+        let mut scope = Self {
             rules: None,
             adaptation,
         };
-        let (rules, errors) = read_repository_rules(backend, root, layout.as_ref(), adaptation);
-        (scope.link(rules), errors)
+        let Some((repository_root, layout)) = repository else {
+            return (scope, Vec::new());
+        };
+        let (rules, mut errors) =
+            read_repository_rules(backend, &repository_root, Some(&layout), adaptation);
+        scope = scope.link(rules);
+        for directory in ancestor_directories(&repository_root, root) {
+            let (rules, read_errors) = read_rules(backend, &directory, &IGNORE_FILES, adaptation);
+            scope = scope.link(rules);
+            errors.extend(read_errors);
+        }
+        (scope, errors)
     }
 
     /// Adds `directory`'s own ignore files to the chain. Called once, when the
@@ -155,6 +167,25 @@ impl IgnoreScope {
             adaptation: self.adaptation,
         }
     }
+}
+
+/// The directories whose in-tree rules a subtree walk inherits, from the
+/// repository root down to (but excluding) its own root.
+fn ancestor_directories(repository_root: &Path, root: &Path) -> Vec<PathBuf> {
+    if root == repository_root {
+        return Vec::new();
+    }
+    let mut directories = Vec::new();
+    let mut directory = root.parent();
+    while let Some(current) = directory {
+        directories.push(current.to_path_buf());
+        if current == repository_root {
+            break;
+        }
+        directory = current.parent();
+    }
+    directories.reverse();
+    directories
 }
 
 #[derive(Debug)]
@@ -289,9 +320,29 @@ struct RepositoryLayout {
 /// Only the exact `gitdir: ` pointer format Git writes is accepted. The path
 /// has one line, may be absolute or relative to the pointer file, and may use
 /// a single `commondir` indirection relative to the resulting git directory.
-fn repository_layout(root: &Path) -> Option<RepositoryLayout> {
-    let dot_git = root.join(".git");
-    let metadata = fs::metadata(&dot_git).ok()?;
+fn repository_layout(root: &Path) -> Option<(PathBuf, RepositoryLayout)> {
+    let mut directory = Some(root);
+    while let Some(candidate) = directory {
+        let dot_git = candidate.join(".git");
+        let metadata = match fs::metadata(&dot_git) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                directory = candidate.parent();
+                continue;
+            }
+            Err(_) => return None,
+        };
+        return repository_layout_at(candidate, dot_git, metadata)
+            .map(|layout| (candidate.to_path_buf(), layout));
+    }
+    None
+}
+
+fn repository_layout_at(
+    root: &Path,
+    dot_git: PathBuf,
+    metadata: fs::Metadata,
+) -> Option<RepositoryLayout> {
     if metadata.is_dir() {
         return Some(RepositoryLayout {
             private_directory: dot_git.clone(),

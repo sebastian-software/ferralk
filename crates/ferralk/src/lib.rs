@@ -4408,6 +4408,61 @@ mod tests {
         assert!(!streamed_paths.contains(&PathBuf::from("build")));
     }
 
+    #[test]
+    fn subtree_walk_inherits_repository_ignore_rules_excludes_and_config() {
+        let fixture = Fixture::new();
+        for path in [
+            "src/debug.LOG",
+            "src/secret.txt",
+            "src/ignored-by-info",
+            "src/deep/trace.log",
+            "src/kept.txt",
+        ] {
+            fixture.write(path);
+        }
+        let initialized = git_command()
+            .args(["init", "--quiet"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("initialize Git fixture");
+        assert!(initialized.success());
+        let configured = git_command()
+            .args(["config", "core.ignoreCase", "true"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("configure Git fixture");
+        assert!(configured.success());
+        fs::write(fixture.root.join(".gitignore"), b"*.log\n/src/secret.txt\n")
+            .expect("write repository ignore rules");
+        fs::write(fixture.root.join(".git/info/exclude"), b"ignored-by-info\n")
+            .expect("write repository excludes");
+
+        let root = fixture.root.join("src");
+        let walked = Walker::new(&root)
+            .respect_git_ignore(true)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("subtree walk succeeds");
+        let paths = relative_paths(walked.entries(), &root);
+        for candidate in [
+            "src/debug.LOG",
+            "src/secret.txt",
+            "src/ignored-by-info",
+            "src/deep/trace.log",
+        ] {
+            let relative = Path::new(candidate)
+                .strip_prefix("src")
+                .expect("candidate is below subtree root")
+                .to_path_buf();
+            assert_eq!(
+                !paths.contains(&relative),
+                git_check_ignore(&fixture.root, candidate),
+                "subtree walk must agree with Git for {candidate}",
+            );
+        }
+        assert!(paths.contains(&PathBuf::from("kept.txt")));
+    }
+
     /// Starts a Git oracle process that is independent of the developer's
     /// global and system configuration, just like the corpus harness.
     fn git_command() -> Command {
