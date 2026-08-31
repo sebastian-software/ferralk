@@ -2001,6 +2001,7 @@ impl Listing {
 
     /// Removes one live entry while retaining its name buffer for reuse by a
     /// later directory. The surviving entries keep their original order.
+    #[cfg(all(feature = "native-macos", target_os = "macos"))]
     pub(crate) fn remove_entry(&mut self, index: usize) {
         debug_assert!(index < self.len);
         let entry = self.entries.remove(index);
