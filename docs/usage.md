@@ -145,11 +145,13 @@ Important defaults:
   [compatibility guide](compatibility-guide.md#absolute-patterns-and-the-caller-side-rewrite-they-replace).
 
 - `.gitignore` and `.ignore` files are considered only after
-  `respect_git_ignore(true)`, together with the walk root's `.git/info/exclude`,
-  which they override. Linked-worktree and submodule `.git` pointer files are
-  resolved (including one `commondir`), and the file closest to an entry
-  decides, as in Git. In-tree `.gitignore` and `.ignore` symlinks are ignored
-  rather than followed; `.git/info/exclude` keeps Git's link-following behavior.
+  `respect_git_ignore(true)`. A subtree walk inherits the `.gitignore` and
+  `.ignore` chain from its repository root through the directory above the
+  walk root, plus the repository's `.git/info/exclude`; the file closest to an
+  entry decides, as in Git. Linked-worktree and submodule `.git` pointer files
+  are resolved (including one `commondir`). In-tree `.gitignore` and `.ignore`
+  symlinks are ignored rather than followed; `.git/info/exclude` keeps Git's
+  link-following behavior.
   Each ignore or repository-metadata file is capped at 8 MiB, and each rule
   file at 100,000 lines. A rule file that exceeds either limit, or otherwise
   cannot be read, contributes no rules and is reported as a `read_ignore`
@@ -181,8 +183,10 @@ Important defaults:
   repository-local detection on a reused builder.
 
   Ferralk deliberately continues into nested repositories, as ripgrep does:
-  outer ignore rules remain active inside them and their own ignore files are
-  loaded too. This differs from Git's repository-boundary behavior.
+  outer ignore rules remain active inside them and their in-tree `.gitignore`
+  and `.ignore` files are loaded too. Their own `.git/info/exclude` and local
+  Git config are not loaded. This differs from Git's repository-boundary
+  behavior.
 - Symlinks discovered below a root are not followed unless
   `WalkOptions::follow_symlinks(true)` is selected; an ancestor-chain guard
   prevents directory cycles without suppressing acyclic symlink aliases.
