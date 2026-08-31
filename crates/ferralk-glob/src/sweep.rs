@@ -286,6 +286,28 @@ impl SweepEngine {
         }
     }
 
+    /// Clears a retained state for another pass through this engine. A state
+    /// with a different representation or width belongs to another engine and
+    /// is replaced once; steady-state extglob repetitions keep their buffers.
+    pub(crate) fn reset_state(&self, state: &mut SweepState) {
+        match self {
+            Self::Narrow(_) => match state {
+                SweepState::Narrow(value) => *value = 0,
+                SweepState::Wide { .. } => *state = self.empty_state(),
+            },
+            Self::Wide(engine) => match state {
+                SweepState::Wide {
+                    state: current,
+                    next,
+                } if current.len() == engine.stars.len() && next.len() == engine.stars.len() => {
+                    current.fill(0);
+                    next.fill(0);
+                }
+                SweepState::Wide { .. } | SweepState::Narrow(_) => *state = self.empty_state(),
+            },
+        }
+    }
+
     pub(crate) fn inject_start(&self, state: &mut SweepState) {
         match (self, state) {
             (Self::Narrow(engine), SweepState::Narrow(state)) => *state |= engine.initial,
