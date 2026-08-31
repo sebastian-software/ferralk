@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.9.2](https://github.com/sebastian-software/ferralk/compare/v0.9.1...v0.9.2) (2026-08-31)
+
+
+### Bug Fixes
+
+* **walker:** parse config assignments after headers ([#199](https://github.com/sebastian-software/ferralk/issues/199)) ([616e7fe](https://github.com/sebastian-software/ferralk/commit/616e7fe545f7f38f16d55ef48935b0a1943f1ad7))
+* **walker:** remove duplicate read-batch error branch ([#196](https://github.com/sebastian-software/ferralk/issues/196)) ([3c6d1c0](https://github.com/sebastian-software/ferralk/commit/3c6d1c0eb45d1b888037c9a7b17417d19d9e1b3f))
+* **walker:** scan config continuations linearly ([#200](https://github.com/sebastian-software/ferralk/issues/200)) ([e190af4](https://github.com/sebastian-software/ferralk/commit/e190af40e33dc69b97a038fdf5160b7458b9c002))
+
 ## [0.9.1](https://github.com/sebastian-software/ferralk/compare/v0.9.0...v0.9.1) (2026-08-28)
 
 
