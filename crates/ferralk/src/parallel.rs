@@ -585,7 +585,13 @@ fn try_take(
     worker
         .queue
         .pop()
-        .or_else(|| shared.scheduler.steal_into(&worker.queue))
+        .or_else(|| {
+            let task = shared.scheduler.steal_into(&worker.queue);
+            if task.is_some() && !worker.queue.is_empty() {
+                shared.coordinator.announce_batch_handoff();
+            }
+            task
+        })
         .or_else(|| {
             // Start next door and leave the own queue out: stealing from
             // itself can only come up empty, and the offset keeps idle workers
@@ -601,7 +607,12 @@ fn try_take(
                         // steal either way. This is what the injector path
                         // already does through `Scheduler::steal_into`.
                         match stealer.steal_batch_and_pop(&worker.queue) {
-                            Steal::Success(task) => break Some(task),
+                            Steal::Success(task) => {
+                                if !worker.queue.is_empty() {
+                                    shared.coordinator.announce_batch_handoff();
+                                }
+                                break Some(task);
+                            }
                             Steal::Empty => break None,
                             Steal::Retry => continue,
                         }
