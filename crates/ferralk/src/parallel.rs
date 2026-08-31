@@ -17,8 +17,8 @@ use std::collections::HashSet;
 use crossbeam_deque::{Steal, Stealer, Worker};
 
 use super::{
-    CANCELLATION_STRIDE, CYCLE_KEY_OPERATION, DirectoryBackend, EntryVisitor, ErrorPolicy, Listing,
-    Verdict, WalkEntry, WalkError, WalkResult, Walker,
+    AncestorChain, CANCELLATION_STRIDE, CYCLE_KEY_OPERATION, DirectoryBackend, EntryVisitor,
+    ErrorPolicy, Listing, Verdict, WalkEntry, WalkError, WalkResult, Walker,
     classify::{DirectoryTask, EmittedEntry, EntryAction, TraversalContext, classify_entry},
     own_path, reset_to_directory,
     scheduler::{CacheLine, Coordinator, Scheduler, WorkerSlot},
@@ -46,7 +46,7 @@ pub(super) fn collect<B: DirectoryBackend + Sync>(
             }
             shared.coordinator.begin_task();
             let _root_task = shared.coordinator.claim_task();
-            process_directory(&shared, &mut caller, root);
+            process_directory(&shared, &mut caller, ParallelTask::Directory(root), None);
         }
     });
 
@@ -119,7 +119,7 @@ pub(super) fn collect<B: DirectoryBackend + Sync>(
 struct HelperPool<'scope, 'env> {
     scope: &'scope thread::Scope<'scope, 'env>,
     shared: &'env Arc<Shared<'env>>,
-    stealers: &'env [Stealer<DirectoryTask>],
+    stealers: &'env [Stealer<ParallelTask>],
     idle: &'env Mutex<Vec<WorkerScratch>>,
     shards: &'env Mutex<Vec<Vec<WalkEntry>>>,
 }
@@ -299,7 +299,7 @@ struct Shared<'backend> {
     /// a test mock drive the parallel frontend the same way it drives the
     /// serial one.
     backend: &'backend (dyn DirectoryBackend + Sync),
-    scheduler: Scheduler<DirectoryTask>,
+    scheduler: Scheduler<ParallelTask>,
     /// Task accounting, worker slots and the parking protocol.
     coordinator: Coordinator,
     /// Caller-controlled external cancellation. Internal shutdown is always
@@ -334,7 +334,7 @@ impl<'backend> Shared<'backend> {
         }
     }
 
-    fn schedule(&self, worker: &Worker<DirectoryTask>, task: DirectoryTask) {
+    fn schedule(&self, worker: &Worker<ParallelTask>, task: ParallelTask) {
         self.coordinator.schedule(|| worker.push(task));
     }
 
@@ -442,7 +442,7 @@ struct WorkerScratch {
     /// Position of this worker's stealer in the shared stealer list, so the
     /// idle scan can start next door and skip its own queue.
     index: usize,
-    queue: Worker<DirectoryTask>,
+    queue: Worker<ParallelTask>,
     entries: Vec<WalkEntry>,
     /// The directory this worker is reading. It takes tasks off a queue rather
     /// than descending by recursion, so one directory is open at a time and
@@ -453,6 +453,23 @@ struct WorkerScratch {
     glob_bytes: Vec<u8>,
     /// The path buffer the last dropped entry left behind. See [`own_path`].
     spare: PathBuf,
+}
+
+/// Work local to the parallel frontend.
+enum ParallelTask {
+    Directory(DirectoryTask),
+    /// The unvisited tail of a wide directory listing. It lets the serial
+    /// route make already-discovered child directories available to helpers
+    /// without reopening the directory or its ignore files.
+    Continuation {
+        path: PathBuf,
+        depth: usize,
+        root: usize,
+        ancestors: AncestorChain,
+        ignores: super::gitignore::IgnoreScope,
+        listing: Listing,
+        next_entry: usize,
+    },
 }
 
 impl WorkerScratch {
@@ -474,7 +491,7 @@ impl WorkerScratch {
         }
     }
 
-    fn flush_into(&self, scheduler: &Scheduler<DirectoryTask>) {
+    fn flush_into(&self, scheduler: &Scheduler<ParallelTask>) {
         while let Some(task) = self.queue.pop() {
             scheduler.push(task);
         }
@@ -527,7 +544,7 @@ fn drain_alone(shared: &Shared, caller: &mut WorkerScratch) -> bool {
         if shared.should_stop() {
             return false;
         }
-        process_directory(shared, caller, directory);
+        process_directory(shared, caller, directory, None);
     }
 }
 
@@ -536,7 +553,7 @@ fn run_worker(pool: HelperPool<'_, '_>, worker: &mut WorkerScratch) {
     while let Some(directory) = next_task(shared, worker, pool.stealers) {
         let _task = shared.coordinator.claim_task();
         if !shared.should_stop() {
-            process_directory(shared, worker, directory);
+            process_directory(shared, worker, directory, Some(pool));
             // The directory may have opened the tree up, so re-check whether
             // the walk can use more of the configured thread budget.
             pool.grow();
@@ -552,8 +569,8 @@ fn run_worker(pool: HelperPool<'_, '_>, worker: &mut WorkerScratch) {
 fn next_task(
     shared: &Shared,
     worker: &WorkerScratch,
-    stealers: &[Stealer<DirectoryTask>],
-) -> Option<DirectoryTask> {
+    stealers: &[Stealer<ParallelTask>],
+) -> Option<ParallelTask> {
     shared.coordinator.wait_for_task(
         || shared.should_stop(),
         || try_take(shared, worker, stealers),
@@ -563,8 +580,8 @@ fn next_task(
 fn try_take(
     shared: &Shared,
     worker: &WorkerScratch,
-    stealers: &[Stealer<DirectoryTask>],
-) -> Option<DirectoryTask> {
+    stealers: &[Stealer<ParallelTask>],
+) -> Option<ParallelTask> {
     worker
         .queue
         .pop()
@@ -593,85 +610,132 @@ fn try_take(
         })
 }
 
-fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: DirectoryTask) {
-    let DirectoryTask {
-        path,
-        open,
-        depth,
-        root,
-        ancestors,
-        ignores,
-        ignore_errors,
-    } = task;
-    #[cfg(test)]
-    if should_panic_in_directory(&path) {
-        panic!("injected directory panic");
-    }
-    if shared.should_stop() {
-        return;
-    }
-    let is_root = depth == 0;
-    for error in ignore_errors {
-        let (path, source) = error.into_parts();
-        shared.record_error(super::IGNORE_FILE_OPERATION, path, source, false);
-        if shared.should_stop() {
-            return;
-        }
-    }
-    let ancestors = if shared.walker.options.follow_symlinks {
-        match shared.backend.cycle_key(&path) {
-            Ok(key) => {
-                let Some(ancestors) = ancestors.enter(key) else {
-                    return;
-                };
-                ancestors
+fn process_directory(
+    shared: &Shared,
+    worker: &mut WorkerScratch,
+    task: ParallelTask,
+    pool: Option<HelperPool<'_, '_>>,
+) {
+    let (path, depth, root, ancestors, ignores, start_index) = match task {
+        ParallelTask::Directory(DirectoryTask {
+            path,
+            open,
+            depth,
+            root,
+            ancestors,
+            ignores,
+            ignore_errors,
+        }) => {
+            #[cfg(test)]
+            if should_panic_in_directory(&path) {
+                panic!("injected directory panic");
             }
-            Err(source) => {
-                shared.record_error(CYCLE_KEY_OPERATION, path, source, is_root);
+            if shared.should_stop() {
                 return;
             }
+            let is_root = depth == 0;
+            for error in ignore_errors {
+                let (path, source) = error.into_parts();
+                shared.record_error(super::IGNORE_FILE_OPERATION, path, source, false);
+                if shared.should_stop() {
+                    return;
+                }
+            }
+            let ancestors = if shared.walker.options.follow_symlinks {
+                match shared.backend.cycle_key(&path) {
+                    Ok(key) => {
+                        let Some(ancestors) = ancestors.enter(key) else {
+                            return;
+                        };
+                        ancestors
+                    }
+                    Err(source) => {
+                        shared.record_error(CYCLE_KEY_OPERATION, path, source, is_root);
+                        return;
+                    }
+                }
+            } else {
+                ancestors
+            };
+            if let Err(source) = shared.backend.read_scheduled_directory(
+                &path,
+                &open,
+                shared.walker.options.follow_symlinks,
+                !shared.walker.options.follow_symlinks && depth > 0,
+                &mut worker.listing,
+            ) {
+                shared.record_error("read_dir", path, source, is_root);
+                return;
+            }
+            // One add for the whole listing: the entries it returned, and the listing
+            // itself, which cost a syscall to get them.
+            shared.work_seen.fetch_add(
+                worker.listing.entries().len() + DIRECTORY_WEIGHT,
+                Ordering::AcqRel,
+            );
+            // The directory's own ignore files join the chain here. Every directory is
+            // processed once, so every ignore file is read once, whatever the worker
+            // count.
+            let (ignores, ignore_errors) =
+                ignores.enter(&shared.walker, shared.backend, &path, &worker.listing);
+            for error in ignore_errors {
+                let (path, source) = error.into_parts();
+                shared.record_error(super::IGNORE_FILE_OPERATION, path, source, false);
+                if shared.should_stop() {
+                    return;
+                }
+            }
+            (path, depth, root, ancestors, ignores, 0)
         }
-    } else {
-        ancestors
+        ParallelTask::Continuation {
+            path,
+            depth,
+            root,
+            ancestors,
+            ignores,
+            listing,
+            next_entry,
+        } => {
+            worker.listing = listing;
+            (path, depth, root, ancestors, ignores, next_entry)
+        }
     };
-    if let Err(source) = shared.backend.read_scheduled_directory(
-        &path,
-        &open,
-        shared.walker.options.follow_symlinks,
-        !shared.walker.options.follow_symlinks && depth > 0,
-        &mut worker.listing,
-    ) {
-        shared.record_error("read_dir", path, source, is_root);
-        return;
-    }
-    // One add for the whole listing: the entries it returned, and the listing
-    // itself, which cost a syscall to get them.
-    shared.work_seen.fetch_add(
-        worker.listing.entries().len() + DIRECTORY_WEIGHT,
-        Ordering::AcqRel,
-    );
-    // The directory's own ignore files join the chain here. Every directory is
-    // processed once, so every ignore file is read once, whatever the worker
-    // count.
-    let (ignores, ignore_errors) =
-        ignores.enter(&shared.walker, shared.backend, &path, &worker.listing);
-    for error in ignore_errors {
-        let (path, source) = error.into_parts();
-        shared.record_error(super::IGNORE_FILE_OPERATION, path, source, false);
-        if shared.should_stop() {
-            return;
-        }
-    }
     worker.path.clear();
     worker.path.push(&path);
-    for index in 0..worker.listing.entries().len() {
+    for index in start_index..worker.listing.entries().len() {
         // Once per directory above, and then every [`CANCELLATION_STRIDE`]
         // entries so a listing of a hundred thousand names still stops
-        // promptly. Both loads are shared state read by every worker, and the
-        // per-entry read of them bought a granularity nothing observes: the
-        // walk is already free to finish any directory it has started.
-        if index.is_multiple_of(CANCELLATION_STRIDE) && shared.should_stop() {
-            return;
+        // promptly.
+        if index.is_multiple_of(CANCELLATION_STRIDE) {
+            if shared.should_stop() {
+                return;
+            }
+            if let Some(pool) = pool {
+                // A wide listing can discover many independent subdirectories
+                // long before its current worker reaches a directory boundary.
+                pool.grow();
+            } else if index != start_index
+                && shared.tree_is_worth_helpers()
+                && (!worker.queue.is_empty() || !shared.scheduler.is_empty())
+            {
+                // Put the unvisited tail back on the caller's deque. The
+                // caller's next drain iteration sees both this continuation
+                // and the descendants already queued, then builds the pool.
+                let listing = std::mem::take(&mut worker.listing);
+                shared.schedule(
+                    &worker.queue,
+                    ParallelTask::Continuation {
+                        path,
+                        depth,
+                        root,
+                        ancestors,
+                        ignores,
+                        listing,
+                        next_entry: index,
+                    },
+                );
+                return;
+            }
         }
         // The entry's path exists only for as long as it is being decided
         // about; anything that outlives that copies it out.
@@ -703,15 +767,15 @@ fn process_directory(shared: &Shared, worker: &mut WorkerScratch, task: Director
 fn act(shared: &Shared, worker: &mut WorkerScratch, action: EntryAction) {
     match action {
         EntryAction::Skip => {}
-        EntryAction::Descend(task) => shared.schedule(&worker.queue, task),
+        EntryAction::Descend(task) => shared.schedule(&worker.queue, ParallelTask::Directory(task)),
         EntryAction::DescendAndEmit(entry, task) => {
-            shared.schedule(&worker.queue, task);
+            shared.schedule(&worker.queue, ParallelTask::Directory(task));
             shared.emit(worker, entry);
         }
         EntryAction::Emit(entry) => shared.emit(worker, entry),
         EntryAction::Failed { failure, descend } => {
             if let Some(task) = descend {
-                shared.schedule(&worker.queue, task);
+                shared.schedule(&worker.queue, ParallelTask::Directory(task));
             }
             shared.record_error(failure.operation, failure.path, failure.source, false);
         }
@@ -1111,6 +1175,42 @@ mod tests {
         assert_eq!(
             observed, 4,
             "a subtree below a single root child must still use the thread budget"
+        );
+        assert_eq!(walked_paths(&parallel), walked_paths(&serial));
+        assert!(parallel.errors().is_empty());
+    }
+
+    #[test]
+    fn a_single_wide_listing_widens_before_its_last_entry() {
+        let _rendezvous = lock(&WORKER_RENDEZVOUS_GUARD);
+        let root = unique_root("wide-listing");
+        // The helper-listing floor is deliberately much higher than the
+        // cancellation stride. If widening waited for a directory boundary,
+        // the 1,100 independent directories here would all be discovered on
+        // the caller before a helper could start.
+        for index in 0..1_100 {
+            fs::create_dir_all(root.join(format!("branch-{index:04}")))
+                .expect("create fixture directory");
+        }
+
+        let serial = Walker::new(&root)
+            .threads(1)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("serial walk succeeds");
+
+        expect_worker_threads(root.clone(), 4);
+        let parallel = Walker::new(&root)
+            .threads(4)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("parallel walk succeeds");
+        let observed = observed_worker_threads();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            observed, 4,
+            "a wide listing must make its queued children available before it ends"
         );
         assert_eq!(walked_paths(&parallel), walked_paths(&serial));
         assert!(parallel.errors().is_empty());
