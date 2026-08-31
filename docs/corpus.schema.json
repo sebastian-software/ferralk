@@ -21,6 +21,8 @@
     "flags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "default": [] },
     "ignore_rules": { "type": "array", "items": { "type": "string" }, "default": [] },
     "exclude_rules": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "candidate_is_dir": { "type": "boolean", "default": false },
+    "git_ignorecase": { "type": "boolean", "default": false },
     "nested_ignore_rules": {
       "type": "array",
       "default": [],

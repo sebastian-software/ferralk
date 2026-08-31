@@ -75,6 +75,15 @@ pub struct Case {
     /// them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude_rules: Vec<String>,
+    /// Makes the ignore candidate a directory rather than a regular file.
+    /// This preserves Git's directory-only-rule semantics in `ignore.jsonl`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub candidate_is_dir: bool,
+    /// Enables Git's repository-local `core.ignorecase` for this ignore case.
+    /// The setting is explicit so the oracle verdict is independent of the
+    /// host filesystem's case-sensitivity.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub git_ignorecase: bool,
     /// Whether the expression accepts the candidate path. A
     /// [`CaseKind::CompileError`] case never accepts and records `false`.
     pub expected: bool,
