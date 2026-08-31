@@ -10,13 +10,12 @@
 
 use std::{
     borrow::Cow,
-    collections::HashSet,
     error::Error,
     ffi::{OsStr, OsString},
     fmt, fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -176,7 +175,7 @@ pub struct WalkOptions {
 
 impl WalkOptions {
     /// Follows directory symlinks discovered below a walk root while retaining
-    /// a canonical-path cycle guard.
+    /// an ancestor-chain cycle guard.
     ///
     /// A root supplied to [`Walker::new`] or [`Walker::add_root`] is always
     /// opened as a directory, so a root that is a symlink to a directory is
@@ -806,7 +805,7 @@ impl Walker {
     ///
     /// One walker, one thread pool, several trees: the roots become the walk's
     /// initial directories and share the scheduler and helper-spawn floor. Each
-    /// root keeps its own visited-directory guard, so following symlinks still
+    /// root starts with its own ancestor-chain guard, so following symlinks still
     /// preserves the same concatenation semantics as separate walks. A caller
     /// with several source trees no longer pays pool startup per tree.
     ///
@@ -1198,7 +1197,7 @@ impl Walker {
             next_entry: 0,
             path: PathBuf::new(),
             directory: PathBuf::new(),
-            cycle_guard: Arc::new(CycleGuard::default()),
+            ancestors: AncestorChain::default(),
             ignores: IgnoreScope::default(),
             depth: 0,
             root: 0,
@@ -1245,7 +1244,7 @@ impl Walker {
                     open: DirectoryOpen::default(),
                     depth: 0,
                     root: index,
-                    cycle_guard: Arc::new(CycleGuard::default()),
+                    ancestors: AncestorChain::default(),
                     ignores,
                     ignore_errors,
                 }
@@ -1834,7 +1833,7 @@ fn read_in_tree_ignore_file(path: &Path) -> std::io::Result<Vec<u8>> {
     read_bounded_file(path)
 }
 
-/// What identifies a directory that the follow-symlinks guard has seen.
+/// What identifies a directory for the follow-symlinks ancestor-chain guard.
 ///
 /// On Unix this is `(st_dev, st_ino)`: sixteen `Copy` bytes from the one
 /// `metadata` call the guard already has to make, with no path resolution and
@@ -1850,19 +1849,35 @@ type CycleKey = (u64, u64);
 #[cfg(not(unix))]
 type CycleKey = PathBuf;
 
-/// Directories one root traversal has already entered while following links.
+/// Directories on the path from one follow-mode task's root to itself.
 ///
-/// A separately supplied root receives its own guard; descendant tasks share
-/// their root's guard, which breaks cycles without deduplicating overlaps.
-#[derive(Debug, Default)]
-pub(crate) struct CycleGuard(Mutex<HashSet<CycleKey>>);
+/// A link may name a directory reached by a sibling path without forming a
+/// loop, so the key is compared only with this task's ancestors. Persistent
+/// links make extending the chain cheap when a task is queued to a worker.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct AncestorChain(Option<Arc<AncestorLink>>);
 
-impl CycleGuard {
-    fn mark(&self, key: CycleKey) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(key)
+#[derive(Debug)]
+struct AncestorLink {
+    key: CycleKey,
+    parent: Option<Arc<AncestorLink>>,
+}
+
+impl AncestorChain {
+    /// Extends this task's chain with `key`, unless it would revisit an
+    /// ancestor and therefore close a directory cycle.
+    fn enter(&self, key: CycleKey) -> Option<Self> {
+        let mut ancestor = self.0.as_deref();
+        while let Some(link) = ancestor {
+            if link.key == key {
+                return None;
+            }
+            ancestor = link.parent.as_deref();
+        }
+        Some(Self(Some(Arc::new(AncestorLink {
+            key,
+            parent: self.0.clone(),
+        }))))
     }
 }
 
@@ -2227,8 +2242,8 @@ pub struct WalkStream {
     /// The same directory without an entry on it, kept so `path` can be reset
     /// by [`reset_to_directory`] rather than by `PathBuf::pop`.
     directory: PathBuf,
-    /// The guard belonging to the directory currently being delivered.
-    cycle_guard: Arc<CycleGuard>,
+    /// The ancestor chain of the directory currently being delivered.
+    ancestors: AncestorChain,
     /// Ignore rules of the directory whose entries are being delivered.
     ignores: IgnoreScope,
     /// Depth of that same directory, so its entries need not recount it.
@@ -2334,20 +2349,18 @@ impl WalkStream {
             open,
             depth,
             root,
-            cycle_guard,
+            ancestors,
             ignores,
             mut ignore_errors,
         } = task;
-        if self.walker.options.follow_symlinks {
+        let ancestors = if self.walker.options.follow_symlinks {
             match SystemBackend.cycle_key(&path) {
-                Ok(key) => {
-                    if !cycle_guard.mark(key) {
-                        return None;
-                    }
-                }
+                Ok(key) => ancestors.enter(key)?,
                 Err(source) => return self.error(CYCLE_KEY_OPERATION, path, source, depth == 0),
             }
-        }
+        } else {
+            ancestors
+        };
         match SystemBackend.read_scheduled_directory(
             &path,
             &open,
@@ -2364,7 +2377,7 @@ impl WalkStream {
                 ignore_errors.append(&mut entered_errors);
                 self.depth = depth;
                 self.root = root;
-                self.cycle_guard = cycle_guard;
+                self.ancestors = ancestors;
                 self.next_entry = 0;
                 self.directory = path;
                 reset_to_directory(&mut self.path, &self.directory);
@@ -2396,7 +2409,7 @@ impl WalkStream {
             self.depth,
             TraversalContext {
                 root: self.root,
-                cycle_guard: &self.cycle_guard,
+                ancestors: &self.ancestors,
                 listing: &self.listing,
             },
         );
@@ -2613,10 +2626,13 @@ impl<'walker> WalkState<'walker> {
             let (path, source) = error.into_parts();
             self.handle_error(IGNORE_FILE_OPERATION, path, source, false)?;
         }
-        if self.walker.options.follow_symlinks
-            && !self.mark_directory(backend, &task.cycle_guard, &task.path, is_root)?
-        {
-            return Ok(());
+        if self.walker.options.follow_symlinks {
+            let Some(ancestors) =
+                self.enter_directory(backend, &task.ancestors, &task.path, is_root)?
+            else {
+                return Ok(());
+            };
+            task.ancestors = ancestors;
         }
         let mut scratch = self.scratch.pop().unwrap_or_default();
         let path = task.path.as_path();
@@ -2696,7 +2712,7 @@ impl<'walker> WalkState<'walker> {
                 depth,
                 TraversalContext {
                     root: frame.task.root,
-                    cycle_guard: &frame.task.cycle_guard,
+                    ancestors: &frame.task.ancestors,
                     listing: &frame.scratch.listing,
                 },
             );
@@ -2756,15 +2772,15 @@ impl<'walker> WalkState<'walker> {
         Ok(())
     }
 
-    fn mark_directory(
+    fn enter_directory(
         &mut self,
         backend: &impl DirectoryBackend,
-        cycle_guard: &CycleGuard,
+        ancestors: &AncestorChain,
         directory: &Path,
         is_root: bool,
-    ) -> Result<bool, WalkError> {
+    ) -> Result<Option<AncestorChain>, WalkError> {
         match backend.cycle_key(directory) {
-            Ok(key) => Ok(cycle_guard.mark(key)),
+            Ok(key) => Ok(ancestors.enter(key)),
             Err(source) => {
                 self.handle_error(
                     CYCLE_KEY_OPERATION,
@@ -2772,7 +2788,7 @@ impl<'walker> WalkState<'walker> {
                     source,
                     is_root,
                 )?;
-                Ok(false)
+                Ok(None)
             }
         }
     }
@@ -3103,7 +3119,7 @@ mod tests {
             open: super::DirectoryOpen::default(),
             depth: 0,
             root: 0,
-            cycle_guard: std::sync::Arc::new(super::CycleGuard::default()),
+            ancestors: super::AncestorChain::default(),
             ignores,
             ignore_errors,
         }
@@ -8007,25 +8023,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn one_directory_under_several_names_is_entered_once_by_every_frontend() {
+    fn symlink_aliases_are_entered_by_every_frontend() {
         use std::os::unix::fs::symlink;
 
-        // Three names, one directory. The guard keys on what a name reaches,
-        // not on the name, so whichever one the walk happens to take first,
-        // the other two are recognised as the same place. Each frontend keeps
-        // its own visited set, so each is checked.
+        // Three names, one directory, but no loop: all aliases must be
+        // traversed. A walk-wide visited set used to pick one winner (racy in
+        // parallel); an ancestor chain sees no repeated key for any alias.
         let fixture = Fixture::new();
         fixture.write("real/inside.txt");
         symlink("real", fixture.root.join("first")).expect("create first directory symlink");
         symlink("real", fixture.root.join("second")).expect("create second directory symlink");
         let options = WalkOptions::default().follow_symlinks(true).sort(true);
 
-        let count_inside = |paths: Vec<PathBuf>| {
-            paths
-                .iter()
+        let inside_paths = |paths: Vec<PathBuf>| {
+            let mut paths = paths
+                .into_iter()
                 .filter(|path| path.file_name().is_some_and(|name| name == "inside.txt"))
-                .count()
+                .collect::<Vec<_>>();
+            paths.sort_unstable();
+            paths
         };
+        let expected = vec![
+            PathBuf::from("first/inside.txt"),
+            PathBuf::from("real/inside.txt"),
+            PathBuf::from("second/inside.txt"),
+        ];
 
         for threads in [1, 4] {
             let result = Walker::new(&fixture.root)
@@ -8034,9 +8056,9 @@ mod tests {
                 .collect()
                 .expect("walk succeeds");
             assert_eq!(
-                count_inside(relative_paths(result.entries(), &fixture.root)),
-                1,
-                "collect with {threads} thread(s) entered the directory more than once"
+                inside_paths(relative_paths(result.entries(), &fixture.root)),
+                expected,
+                "collect with {threads} thread(s) enters every acyclic alias"
             );
         }
 
@@ -8046,20 +8068,22 @@ mod tests {
             .map(|entry| entry.expect("fixture has no I/O errors"))
             .collect::<Vec<_>>();
         assert_eq!(
-            count_inside(relative_paths(&streamed, &fixture.root)),
-            1,
-            "the stream entered the directory more than once"
+            inside_paths(relative_paths(&streamed, &fixture.root)),
+            expected,
+            "the stream enters every acyclic alias"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn symlink_policy_prevents_or_deduplicates_directory_cycles() {
+    fn symlink_policy_prevents_directory_cycles_without_pruning_aliases() {
         use std::os::unix::fs::symlink;
 
         let fixture = Fixture::new();
         fixture.write("real/inside.txt");
-        symlink("real", fixture.root.join("linked")).expect("create directory symlink");
+        // `real/back` resolves to the root, which is already an ancestor when
+        // this entry is considered. It is a loop, unlike a sibling alias.
+        symlink("..", fixture.root.join("real/back")).expect("create cycle symlink");
 
         let without_following = Walker::new(&fixture.root)
             .options(WalkOptions::default().sort(true))
@@ -8067,12 +8091,12 @@ mod tests {
             .expect("walk succeeds");
         assert!(
             !relative_paths(without_following.entries(), &fixture.root)
-                .contains(&PathBuf::from("linked/inside.txt"))
+                .contains(&PathBuf::from("real/back/real/inside.txt"))
         );
         let link = without_following
             .entries()
             .iter()
-            .find(|entry| entry.basename() == Some(std::ffi::OsStr::new("linked")))
+            .find(|entry| entry.basename() == Some(std::ffi::OsStr::new("back")))
             .expect("symlink is reported");
         assert!(link.is_symlink());
         assert_eq!(link.kind(), WalkEntryKind::Symlink);

@@ -184,12 +184,12 @@ Important defaults:
   outer ignore rules remain active inside them and their own ignore files are
   loaded too. This differs from Git's repository-boundary behavior.
 - Symlinks discovered below a root are not followed unless
-  `WalkOptions::follow_symlinks(true)` is selected; a canonical-path guard
-  prevents directory cycles within each root traversal. Descendants of one root
-  share its guard, but separately supplied roots — including duplicates,
-  overlaps and symlink aliases — use independent guards. A root that is itself
-  a directory symlink is opened regardless, because the caller supplied it as
-  the tree to walk.
+  `WalkOptions::follow_symlinks(true)` is selected; an ancestor-chain guard
+  prevents directory cycles without suppressing acyclic symlink aliases.
+  Separately supplied roots — including duplicates, overlaps and symlink
+  aliases — start independent chains. A root that is itself a directory
+  symlink is opened regardless, because the caller supplied it as the tree to
+  walk.
 - `files_only(true)` and `directories_only(true)` filter on the kind a
   directory listing reports, and a listing reports a symlink as a symlink and
   nothing about its target. So by default `files_only` keeps every symlink -
