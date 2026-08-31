@@ -21,8 +21,10 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(not(windows))]
+use super::glob_path_bytes;
 use super::{
-    DirectoryBackend, Listing, Walker, glob_path_bytes,
+    DirectoryBackend, Listing, Walker,
     ignore_rules::{RuleSet, RuleSetBuilder},
     read_bounded_file,
 };
@@ -142,6 +144,7 @@ impl IgnoreScope {
     /// The deepest ignore file with an opinion decides, which is Git's
     /// precedence. An entry below an ignored directory never reaches this: the
     /// walk does not enter such a directory.
+    #[cfg(not(windows))]
     pub(crate) fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
         let Some(node) = self.rules.as_ref() else {
             return false;

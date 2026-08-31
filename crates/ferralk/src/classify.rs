@@ -21,10 +21,12 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(not(windows))]
+use super::glob_bytes;
 use super::{
     AncestorChain, DirectoryBackend, DirectoryOpen, ListedEntry, Listing, WalkEntry, Walker,
     gitignore::{IgnoreReadError, IgnoreScope},
-    glob_bytes, has_hidden_component, should_skip_git_directory,
+    has_hidden_component, should_skip_git_directory,
 };
 
 /// What a frontend has to do with one directory entry.
@@ -179,6 +181,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     // Every walked path is its root with names pushed onto it, so the
     // root-relative part is a suffix at a fixed offset rather than something
     // `strip_prefix` has to rediscover component by component.
+    #[cfg(not(windows))]
     let relative = &path_bytes[plan.relative_start.min(path_bytes.len())..];
     let depth = directory_depth + 1;
     if walker
@@ -189,12 +192,17 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         return EntryAction::Skip;
     }
     #[cfg(windows)]
-    let bytes = super::glob_bytes_into(path_bytes, glob_bytes_scratch);
+    let git_ignored = {
+        super::glob_bytes_into(path_bytes, glob_bytes_scratch);
+        ignores.is_ignored_bytes(glob_bytes_scratch, is_dir)
+    };
     #[cfg(not(windows))]
-    let bytes = glob_bytes(relative);
+    let normalized_bytes = glob_bytes(relative);
+    #[cfg(not(windows))]
+    let bytes = normalized_bytes.as_ref();
     #[cfg(windows)]
-    let bytes = &bytes[plan.relative_start.min(bytes.len())..];
-    if walker.options.skip_hidden && has_hidden_component(bytes.as_ref()) {
+    let bytes = &glob_bytes_scratch[plan.relative_start.min(glob_bytes_scratch.len())..];
+    if walker.options.skip_hidden && has_hidden_component(bytes) {
         return EntryAction::Skip;
     }
     if should_skip_git_directory(walker, entry.name()) {
@@ -203,14 +211,12 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     let excluded = plan
         .excludes
         .iter()
-        .any(|pattern| pattern.matches(bytes.as_ref(), is_dir, walker.wildcard_mode));
+        .any(|pattern| pattern.matches(bytes, is_dir, walker.wildcard_mode));
     // A matching directory is not emitted, but its descendants may still be
     // selected by an include. Files have no descendants to re-admit.
     if excluded && !is_dir {
         return EntryAction::Skip;
     }
-    #[cfg(windows)]
-    let git_ignored = ignores.is_ignored_bytes(glob_bytes_scratch, is_dir);
     #[cfg(not(windows))]
     let git_ignored = ignores.is_ignored(path, is_dir);
     if git_ignored && !is_dir {
@@ -233,21 +239,21 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
             }
         }
     }
-    if !is_dir && !walker.may_include_file(context.root, bytes.as_ref()) {
+    if !is_dir && !walker.may_include_file(context.root, bytes) {
         return EntryAction::Skip;
     }
 
     // An ignored directory is not entered, the way Git does not enter one:
     // its contents are ignored whatever the ignore files inside it say.
-    let may_include_descendant = walker.may_descend_into(context.root, bytes.as_ref());
+    let may_include_descendant = walker.may_descend_into(context.root, bytes);
     let exclude_proves_no_re_admission = plan.excludes.iter().any(|pattern| {
-        pattern.covers_subtree(bytes.as_ref(), walker.wildcard_mode)
+        pattern.covers_subtree(bytes, walker.wildcard_mode)
             && (plan.includes.is_empty() || !may_include_descendant)
     });
     let descend = is_dir
         && !git_ignored
         && !exclude_proves_no_re_admission
-        && walker.may_descend_at(context.root, depth, bytes.as_ref());
+        && walker.may_descend_at(context.root, depth, bytes);
     // What the kind filters count this entry as. A listing reports a symlink as
     // a symlink and nothing about its target, so left alone the filters read
     // every unfollowed symlink as a non-directory. Resolving costs one stat and
@@ -290,7 +296,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
             context.root,
             is_dir,
             kind_is_dir,
-            bytes.as_ref(),
+            bytes,
             git_ignored,
         );
 
