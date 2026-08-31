@@ -714,7 +714,8 @@ impl Walker {
         Ok(self)
     }
 
-    /// Adds an OR-ed exclude pattern. Excluded directories are not descended.
+    /// Adds an OR-ed exclude pattern. A matching directory is not emitted and
+    /// is pruned only when no include can select a descendant.
     ///
     /// # Absolute patterns
     ///
@@ -1507,7 +1508,7 @@ impl TraversalPattern {
     /// close `a/b.tmp` even though a component-scoped `*.tmp` cannot match the
     /// component `a`.
     fn covers_subtree(&self, path: &[u8], mode: WildcardMode) -> bool {
-        if self.never_matches {
+        if self.never_matches || self.directories_only {
             return false;
         }
         self.subtree_root.as_ref().is_some_and(|root| match mode {
@@ -6803,6 +6804,25 @@ mod tests {
             walk(WildcardMode::SeparatorCrossing),
             vec![PathBuf::from("a/plain/keep.rs")],
             "a crossing exclude reaches the nested one, and pruning may follow it"
+        );
+    }
+
+    #[test]
+    fn excludes_keep_descending_for_an_explicitly_included_descendant() {
+        let fixture = Fixture::new();
+        fixture.write("a/keep.txt");
+        fixture.write("a/drop.txt");
+        let result = Walker::new(&fixture.root)
+            .include("a/keep.txt")
+            .expect("valid include")
+            .exclude("a")
+            .expect("valid exclude")
+            .options(WalkOptions::default().files_only(true).sort(true))
+            .collect()
+            .expect("walk succeeds");
+        assert_eq!(
+            relative_paths(result.entries(), &fixture.root),
+            [PathBuf::from("a/keep.txt")]
         );
     }
 
