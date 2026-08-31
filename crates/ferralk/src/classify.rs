@@ -191,11 +191,13 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     if should_skip_git_directory(walker, entry.name()) {
         return EntryAction::Skip;
     }
-    if plan
+    let excluded = plan
         .excludes
         .iter()
-        .any(|pattern| pattern.matches(bytes.as_ref(), is_dir, walker.wildcard_mode))
-    {
+        .any(|pattern| pattern.matches(bytes.as_ref(), is_dir, walker.wildcard_mode));
+    // A matching directory is not emitted, but its descendants may still be
+    // selected by an include. Files have no descendants to re-admit.
+    if excluded && !is_dir {
         return EntryAction::Skip;
     }
     let git_ignored = ignores.is_ignored(path, is_dir);
@@ -225,12 +227,14 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
 
     // An ignored directory is not entered, the way Git does not enter one:
     // its contents are ignored whatever the ignore files inside it say.
+    let may_include_descendant = walker.may_descend_into(context.root, bytes.as_ref());
+    let exclude_proves_no_re_admission = plan.excludes.iter().any(|pattern| {
+        pattern.covers_subtree(bytes.as_ref(), walker.wildcard_mode)
+            && (plan.includes.is_empty() || !may_include_descendant)
+    });
     let descend = is_dir
         && !git_ignored
-        && !plan
-            .excludes
-            .iter()
-            .any(|pattern| pattern.covers_subtree(bytes.as_ref(), walker.wildcard_mode))
+        && !exclude_proves_no_re_admission
         && walker.may_descend_at(context.root, depth, bytes.as_ref());
     // What the kind filters count this entry as. A listing reports a symlink as
     // a symlink and nothing about its target, so left alone the filters read
@@ -268,14 +272,15 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
             }
         }
     }
-    let emit = should_emit(
-        walker,
-        context.root,
-        is_dir,
-        kind_is_dir,
-        bytes.as_ref(),
-        git_ignored,
-    );
+    let emit = !excluded
+        && should_emit(
+            walker,
+            context.root,
+            is_dir,
+            kind_is_dir,
+            bytes.as_ref(),
+            git_ignored,
+        );
 
     // The rules a subtree inherits travel with it, so the frontends never
     // re-derive them. A queued directory outlives the scratch buffer, so this
