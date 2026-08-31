@@ -687,11 +687,10 @@ fn read_portable_directory_from_open_file(
             };
         }
         // SAFETY: a successful `readdir` result points to a valid Darwin
-        // `dirent`; `d_namlen` bounds the name within its fixed d_name buffer.
+        // `dirent`, whose fixed `d_name` buffer is bounded below even if a
+        // filesystem reports a malformed `d_namlen`.
         let entry = unsafe { &*entry };
-        let name = unsafe {
-            std::slice::from_raw_parts(entry.d_name.as_ptr().cast::<u8>(), entry.d_namlen as usize)
-        };
+        let name = portable_dirent_name(entry);
         if name.is_empty() || name == b"." || name == b".." {
             continue;
         }
@@ -702,6 +701,14 @@ fn read_portable_directory_from_open_file(
             Err(error) => defer_entry_stat_error(listing, reported_path.join(name), error)?,
         }
     }
+}
+
+/// Returns a readdir name without trusting its filesystem-provided length.
+fn portable_dirent_name(entry: &libc::dirent) -> &[u8] {
+    let length = (entry.d_namlen as usize).min(entry.d_name.len());
+    // SAFETY: `d_name` is the fixed array embedded in this live `dirent`, and
+    // `length` is clamped to that array's exact bound above.
+    unsafe { std::slice::from_raw_parts(entry.d_name.as_ptr().cast::<u8>(), length) }
 }
 
 /// Owns the `DIR` returned by `fdopendir`, including its directory descriptor.
@@ -795,7 +802,7 @@ fn read_direntries_from_open_directory(
         }
         primed = true;
         parse_records(path, &buffer[..byte_count], listing)?;
-        if has_direntries_eof_flag(buffer) {
+        if has_direntries_eof_flag(buffer, byte_count) {
             return Ok(());
         }
     }
@@ -934,8 +941,10 @@ fn is_unsupported_direntries_error(error: &io::Error, primed: bool) -> bool {
 /// XNU reserves the final word of an extended (at least 1024-byte) buffer for
 /// `getdirentries64_flags_t`. It lies outside `byte_count`, so inspecting it
 /// after parsing cannot relax the parser's bounds.
-fn has_direntries_eof_flag(buffer: &[u8]) -> bool {
-    if buffer.len() < GETDIRENTRIES64_EXTENDED_BUFFER_MINIMUM {
+fn has_direntries_eof_flag(buffer: &[u8], byte_count: usize) -> bool {
+    if buffer.len() < GETDIRENTRIES64_EXTENDED_BUFFER_MINIMUM
+        || byte_count.saturating_add(std::mem::size_of::<u32>()) > buffer.len()
+    {
         return false;
     }
     let tail = &buffer[buffer.len() - std::mem::size_of::<u32>()..];
@@ -1476,8 +1485,8 @@ mod tests {
         parse_records(Path::new("/tmp"), &buffer[..record.len()], &mut listing)
             .expect("the parser sees only returned dirent bytes");
         assert_eq!(listing.entries()[0].name(), "entry");
-        assert!(has_direntries_eof_flag(&buffer));
-        assert!(!has_direntries_eof_flag(&buffer[..1023]));
+        assert!(has_direntries_eof_flag(&buffer, record.len()));
+        assert!(!has_direntries_eof_flag(&buffer[..1023], record.len()));
     }
 
     #[test]
@@ -1485,11 +1494,10 @@ mod tests {
         // Simulate a pre-10.15 successful syscall: it fills every returned
         // dirent byte but does not know about, and therefore does not touch,
         // the optional EOF word at the end of the extended buffer.
-        let mut buffer = vec![0_u8; 1040];
-        let record = record(b"entry", DT_REG);
-        let byte_count = buffer.len() - std::mem::size_of::<u32>();
+        let record = record(b"odd!", DT_REG);
+        let byte_count = record.len() * 40;
+        let mut buffer = vec![0_u8; byte_count];
         assert_eq!(byte_count % record.len(), 0, "the mock fills a whole batch");
-        buffer[byte_count..].copy_from_slice(&GETDIRENTRIES64_EOF.to_ne_bytes());
 
         // This is the pre-syscall operation in
         // `read_direntries_from_open_directory`; the mocked syscall below
@@ -1504,8 +1512,20 @@ mod tests {
             .expect("all returned records still parse");
         assert_eq!(listing.entries().len(), byte_count / record.len());
         assert!(
-            !has_direntries_eof_flag(&buffer),
-            "a kernel that does not write the extension means no EOF"
+            !has_direntries_eof_flag(&buffer, byte_count),
+            "a full batch overwrites the optional tail, however it happens to read"
+        );
+    }
+
+    #[test]
+    fn portable_readdir_name_never_exceeds_its_fixed_array() {
+        // `d_namlen` comes from the filesystem and can exceed the embedded
+        // `d_name` array on a malformed FUSE or network-filesystem record.
+        let mut entry = unsafe { std::mem::zeroed::<libc::dirent>() };
+        entry.d_namlen = u16::MAX;
+        assert_eq!(
+            super::portable_dirent_name(&entry).len(),
+            entry.d_name.len()
         );
     }
 
