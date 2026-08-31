@@ -626,6 +626,13 @@ fn collect_retains_an_unreadable_directory_error() {
     unreadable_permissions.set_mode(0o000);
     fs::set_permissions(&locked, unreadable_permissions).expect("make fixture unreadable");
 
+    // Root has CAP_DAC_OVERRIDE, so chmod 000 does not make this fixture
+    // unreadable in containers or privileged development environments.
+    if fs::read_dir(&locked).is_ok() {
+        fs::set_permissions(&locked, original_permissions).expect("restore fixture permissions");
+        return;
+    }
+
     let result = Walker::new(&fixture.root)
         .threads(1)
         .error_policy(ErrorPolicy::Collect)
