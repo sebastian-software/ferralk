@@ -435,6 +435,12 @@ impl Pattern {
     }
 
     /// Matches the entire candidate path.
+    ///
+    /// Extglob patterns that fall back to the retained interpreter can still
+    /// spend quadratic time on one adversarially long component. For
+    /// untrusted path-shaped input, prefer a component-scoped entry point
+    /// such as [`Self::is_match_path`] where that matches the caller's
+    /// semantics.
     #[must_use]
     pub fn is_match(&self, path: impl AsRef<[u8]>) -> bool {
         let path = path.as_ref();
@@ -4707,6 +4713,10 @@ struct ExtglobScratch {
     /// The previous match's distinct failed states, retained only as
     /// deterministic test instrumentation.
     failed_state_count: usize,
+    #[cfg(test)]
+    /// Largest number of deferred continuations live during the previous
+    /// match. This proves duplicate states never inflate the worklist.
+    pending_peak: usize,
     /// Deferred `(program, candidate)` continuations. Extglob groups append
     /// work here instead of recursing through the native stack.
     pending: Vec<(usize, usize)>,
@@ -4726,6 +4736,8 @@ struct ExtglobMatchState<'scratch> {
     visited: &'scratch mut Vec<u64>,
     failed: ExtglobFailedStates<'scratch>,
     pending: &'scratch mut Vec<(usize, usize)>,
+    #[cfg(test)]
+    pending_peak: &'scratch mut usize,
     ends: &'scratch mut Vec<usize>,
     candidate_ends: &'scratch mut Vec<usize>,
     excluded: &'scratch mut Vec<bool>,
@@ -4756,6 +4768,8 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                     failed_page_count,
                     #[cfg(test)]
                     failed_state_count,
+                    #[cfg(test)]
+                    pending_peak,
                     pending,
                     ends,
                     candidate_ends,
@@ -4773,6 +4787,7 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                 {
                     *failed_page_count = 0;
                     *failed_state_count = 0;
+                    *pending_peak = 0;
                 }
                 let mut state = ExtglobMatchState {
                     visited,
@@ -4785,6 +4800,8 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                         failed_state_count,
                     ),
                     pending,
+                    #[cfg(test)]
+                    pending_peak,
                     ends,
                     candidate_ends,
                     excluded,
@@ -4833,6 +4850,8 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                 failed_page_count,
                 #[cfg(test)]
                 failed_state_count,
+                #[cfg(test)]
+                pending_peak,
                 pending,
                 ends,
                 candidate_ends,
@@ -4850,6 +4869,8 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                     failed_state_count,
                 ),
                 pending,
+                #[cfg(test)]
+                pending_peak,
                 ends,
                 candidate_ends,
                 excluded,
@@ -4890,6 +4911,11 @@ fn extglob_failed_stats() -> (usize, usize) {
         let scratch = cell.borrow();
         (scratch.failed_page_count, scratch.failed_state_count)
     })
+}
+
+#[cfg(test)]
+fn extglob_pending_peak() -> usize {
+    EXTGLOB_SCRATCH.with(|cell| cell.borrow().pending_peak)
 }
 
 /// Failure memoization for a single dense interpreter row.
@@ -4994,19 +5020,13 @@ fn match_extglob_from(
     state: &mut ExtglobMatchState<'_>,
 ) -> bool {
     let pending_base = state.pending.len();
-    state.pending.push((start, start_path_index));
+    queue_extglob_continuation(program, state, start, start_path_index);
     let mut matched = false;
     while state.pending.len() > pending_base {
         let (start, start_path_index) = state
             .pending
             .pop()
             .expect("the extglob continuation slice is non-empty");
-        if !state
-            .failed
-            .insert(program.memo_state_index(start), start_path_index)
-        {
-            continue;
-        }
         if match_extglob_task(program, path, start, start_path_index, options, state) {
             matched = true;
             break;
@@ -5053,7 +5073,14 @@ fn match_extglob_task(
             }
             match &steps[pattern_index] {
                 ExtglobStep::Group(group) => {
-                    queue_extglob_group(&program.groups[*group], path, path_index, options, state);
+                    queue_extglob_group(
+                        program,
+                        &program.groups[*group],
+                        path,
+                        path_index,
+                        options,
+                        state,
+                    );
                     if has_star && star_path_index < path.len() {
                         pattern_index = star_pattern_index;
                         star_path_index += 1;
@@ -5188,6 +5215,7 @@ fn extglob_group_allows_literal_leading_period(group: &ExtglobGroup) -> bool {
 }
 
 fn queue_extglob_group(
+    program: &CompiledExtglob,
     group: &ExtglobGroup,
     path: &[u8],
     path_index: usize,
@@ -5197,21 +5225,21 @@ fn queue_extglob_group(
     match group.kind {
         ExtglobKind::ExactlyOne => {
             matching_extglob_group_ends(group, path, path_index, options, state.ends);
-            queue_extglob_continuations(state.pending, group.rest, state.ends.iter().copied());
+            queue_extglob_continuations(program, state, group.rest);
         }
         ExtglobKind::Optional => {
-            state.pending.push((group.rest, path_index));
+            queue_extglob_continuation(program, state, group.rest, path_index);
             matching_extglob_group_ends(group, path, path_index, options, state.ends);
-            queue_extglob_continuations(state.pending, group.rest, state.ends.iter().copied());
+            queue_extglob_continuations(program, state, group.rest);
         }
         ExtglobKind::ZeroOrMore => {
-            state.pending.push((group.rest, path_index));
+            queue_extglob_continuation(program, state, group.rest, path_index);
             matching_extglob_repetition_ends(group, path, path_index, options, state);
-            queue_extglob_continuations(state.pending, group.rest, state.ends.iter().copied());
+            queue_extglob_continuations(program, state, group.rest);
         }
         ExtglobKind::OneOrMore => {
             matching_extglob_repetition_ends(group, path, path_index, options, state);
-            queue_extglob_continuations(state.pending, group.rest, state.ends.iter().copied());
+            queue_extglob_continuations(program, state, group.rest);
         }
         ExtglobKind::Negated => {
             let component_end = extglob_component_end(path, path_index, options);
@@ -5221,9 +5249,9 @@ fn queue_extglob_group(
             for &end in state.ends.iter() {
                 state.excluded[end - path_index] = true;
             }
-            for (offset, &excluded) in state.excluded.iter().enumerate() {
-                if !excluded {
-                    state.pending.push((group.rest, path_index + offset));
+            for offset in 0..state.excluded.len() {
+                if !state.excluded[offset] {
+                    queue_extglob_continuation(program, state, group.rest, path_index + offset);
                 }
             }
         }
@@ -5231,11 +5259,35 @@ fn queue_extglob_group(
 }
 
 fn queue_extglob_continuations(
-    pending: &mut Vec<(usize, usize)>,
+    program: &CompiledExtglob,
+    state: &mut ExtglobMatchState<'_>,
     rest: usize,
-    ends: impl IntoIterator<Item = usize>,
 ) {
-    pending.extend(ends.into_iter().map(|end| (rest, end)));
+    for index in 0..state.ends.len() {
+        let end = state.ends[index];
+        queue_extglob_continuation(program, state, rest, end);
+    }
+}
+
+/// Queues a continuation once. Marking at enqueue time bounds the live
+/// worklist by the memo-state × candidate space instead of all duplicate
+/// paths that happen to discover that state before it is popped.
+fn queue_extglob_continuation(
+    program: &CompiledExtglob,
+    state: &mut ExtglobMatchState<'_>,
+    start: usize,
+    path_index: usize,
+) {
+    if state
+        .failed
+        .insert(program.memo_state_index(start), path_index)
+    {
+        state.pending.push((start, path_index));
+        #[cfg(test)]
+        {
+            *state.pending_peak = (*state.pending_peak).max(state.pending.len());
+        }
+    }
 }
 
 fn matching_extglob_group_ends(
@@ -5500,8 +5552,8 @@ mod tests {
     use super::LiteralSuffix;
     use super::{
         AlternativeFastPath, FailedStates, FastPath, Pattern, PatternOptions, Prefilter, Token,
-        WalkerPathViability, extglob_failed_len, extglob_failed_stats, extglob_scratch_capacities,
-        positive_extglob_scratch_capacities, scratch_capacities,
+        WalkerPathViability, extglob_failed_len, extglob_failed_stats, extglob_pending_peak,
+        extglob_scratch_capacities, positive_extglob_scratch_capacities, scratch_capacities,
     };
 
     fn compile(pattern: &str) -> Pattern {
@@ -6405,6 +6457,28 @@ mod tests {
             extglob_failed_len(),
             0,
             "the retained memo is logically empty"
+        );
+    }
+
+    #[test]
+    fn outer_star_deduplicates_negated_group_continuations_before_queueing() {
+        let pattern = Pattern::compile(
+            "*!(a)b",
+            PatternOptions::default().extglob(true).match_hidden(true),
+        )
+        .expect("extglob compiles");
+        assert!(
+            pattern.alternatives[0]
+                .extglob
+                .as_ref()
+                .is_some_and(|program| program.positive_nfa.is_none()),
+            "the regression exercises the retained interpreter"
+        );
+        let candidate = vec![b'a'; 4_096];
+        assert!(!pattern.is_match(&candidate));
+        assert!(
+            extglob_pending_peak() <= candidate.len() + 1,
+            "duplicate retries must not make the worklist quadratic"
         );
     }
 
