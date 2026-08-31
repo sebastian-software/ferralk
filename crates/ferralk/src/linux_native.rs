@@ -10,7 +10,7 @@
 use std::{
     cell::RefCell,
     ffi::{CStr, CString, OsStr, c_int, c_long, c_void},
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io,
     os::unix::{
         ffi::OsStrExt,
@@ -20,6 +20,9 @@ use std::{
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
 };
+
+#[cfg(test)]
+use std::fs;
 
 use super::{Listing, defer_entry_stat_error};
 
@@ -181,7 +184,7 @@ fn read_directory_from_open_directory_with_read_batch(
         if byte_count == 0 {
             return Ok(());
         }
-        parse_records(path, &buffer[..byte_count], listing)?;
+        parse_records_from_open_directory(directory, path, &buffer[..byte_count], listing)?;
         primed = true;
     }
 }
@@ -374,12 +377,40 @@ fn read_batch(directory: &File, buffer: &mut [u8]) -> Result<usize, ReadBatchErr
     }
 }
 
+/// Classifies raw records through the descriptor that was opened for this
+/// listing, so `DT_UNKNOWN` never re-resolves a raced path by name.
+fn parse_records_from_open_directory(
+    open_directory: &File,
+    reported_path: &Path,
+    records: &[u8],
+    listing: &mut Listing,
+) -> io::Result<()> {
+    parse_records_with_entry_kind(
+        reported_path,
+        records,
+        listing,
+        |_, name, directory_type| {
+            descriptor_entry_kind(open_directory.as_raw_fd(), name, directory_type)
+        },
+    )
+}
+
+#[cfg(test)]
 fn parse_records(directory: &Path, records: &[u8], listing: &mut Listing) -> io::Result<()> {
+    parse_records_with_entry_kind(directory, records, listing, entry_kind)
+}
+
+fn parse_records_with_entry_kind(
+    directory: &Path,
+    records: &[u8],
+    listing: &mut Listing,
+    mut classify: impl FnMut(&Path, &OsStr, u8) -> io::Result<Option<(bool, bool)>>,
+) -> io::Result<()> {
     for_each_record(records, |name, directory_type| {
         let name = OsStr::from_bytes(name);
         // An entry that vanished between the read and its stat costs that one
         // entry; the rest of the listing is still valid and is returned.
-        match entry_kind(directory, name, directory_type) {
+        match classify(directory, name, directory_type) {
             Ok(Some((is_dir, is_symlink))) => listing.push(name, is_dir, is_symlink),
             Ok(None) => {}
             Err(error) => defer_entry_stat_error(listing, directory.join(name), error)?,
@@ -443,6 +474,7 @@ fn for_each_record(
 ///
 /// `Ok(None)` means the entry disappeared between the directory read and its
 /// stat. Persistent failures use the listing-level error channel instead.
+#[cfg(test)]
 fn entry_kind(
     directory: &Path,
     name: &OsStr,
@@ -501,8 +533,8 @@ mod tests {
     use super::{
         BUFFER_SIZE, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG, DT_SOCK, GETDENTS_UNSUPPORTED,
         Listing, NAME_OFFSET, NativeDirectoryReadError, ReadBatchError, TYPE_OFFSET, entry_kind,
-        for_each_record, open_directory, parse_records, read_directory,
-        read_directory_from_open_directory_with_read_batch,
+        for_each_record, open_directory, parse_records, parse_records_from_open_directory,
+        read_directory, read_directory_from_open_directory_with_read_batch,
         read_open_directory_with_portable_fallback, read_portable_directory_from_open_file,
     };
 
@@ -692,6 +724,32 @@ mod tests {
         read_directory(&link, false, &mut listing).expect("follow mode still opens through a link");
         assert!(listing.contains("inside"));
         fs::remove_dir_all(root).expect("remove no-follow fixture");
+    }
+
+    #[test]
+    fn unknown_records_stay_with_the_opened_directory_after_a_path_swap() {
+        let root = fixture_root("unknown-descriptor");
+        let listed = root.join("listed");
+        let moved = root.join("opened-before-swap");
+        let target = root.join("attacker");
+        fs::create_dir_all(&listed).expect("create listed directory");
+        fs::write(listed.join("probe"), b"fixture").expect("create original file");
+        fs::create_dir_all(target.join("probe")).expect("create swapped directory");
+        let open = open_directory(&listed, true).expect("open listed directory");
+        let records = record(b"probe", 0);
+
+        fs::rename(&listed, &moved).expect("move opened directory");
+        symlink(&target, &listed).expect("replace listed path with a link");
+
+        let mut listing = Listing::default();
+        parse_records_from_open_directory(&open, &listed, &records, &mut listing)
+            .expect("unknown record is classified through the open descriptor");
+        assert_eq!(listing.entries().len(), 1);
+        assert!(
+            !listing.entries()[0].is_dir(),
+            "the original file wins over the replacement directory"
+        );
+        fs::remove_dir_all(root).expect("remove descriptor fixture");
     }
 
     #[test]
