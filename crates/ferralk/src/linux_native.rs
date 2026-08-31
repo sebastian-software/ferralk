@@ -37,13 +37,6 @@ const DT_CHR: u8 = 2;
 const DT_BLK: u8 = 6;
 const DT_SOCK: u8 = 12;
 
-/// `O_DIRECTORY`. Most architectures take it from `asm-generic`; 32-bit ARM
-/// defines its own value.
-#[cfg(not(target_arch = "arm"))]
-const O_DIRECTORY: i32 = 0o200_000;
-#[cfg(target_arch = "arm")]
-const O_DIRECTORY: i32 = 0o40_000;
-
 /// Set once the kernel reports that `getdents64` is unavailable.
 ///
 /// Whether the syscall exists is a property of the kernel and the build, not
@@ -104,7 +97,7 @@ pub(super) fn read_directory(
 /// kernel's flag handling) instead of escaping through that link. User-supplied
 /// symlink roots retain portable semantics.
 fn open_directory(path: &Path, refuse_final_symlink: bool) -> io::Result<File> {
-    let flags = O_DIRECTORY
+    let flags = libc::O_DIRECTORY
         | if refuse_final_symlink {
             libc::O_NOFOLLOW
         } else {
