@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.9.3](https://github.com/sebastian-software/ferralk/compare/v0.9.2...v0.9.3) (2026-08-31)
+
+
+### Bug Fixes
+
+* bound macOS directory entry records ([#236](https://github.com/sebastian-software/ferralk/issues/236)) ([1d6a745](https://github.com/sebastian-software/ferralk/commit/1d6a74553eb0aa2f2ab1f537f99aa24ff295387b))
+* classify unknown native entries by descriptor ([#237](https://github.com/sebastian-software/ferralk/issues/237)) ([32d8cd2](https://github.com/sebastian-software/ferralk/commit/32d8cd2c0b2fa0756f4a940fc273c205aebcff1b))
+* deduplicate queued extglob continuations ([#238](https://github.com/sebastian-software/ferralk/issues/238)) ([d5eb4ac](https://github.com/sebastian-software/ferralk/commit/d5eb4acf6b6a62ff39036dda6f3a6e800b6051e0))
+* keep native macOS walks within PATH_MAX ([#232](https://github.com/sebastian-software/ferralk/issues/232)) ([23dd6c7](https://github.com/sebastian-software/ferralk/commit/23dd6c79d2583fe2f0fbf750616b64d5ac940be4))
+* rewrite Windows verbatim roots ([#235](https://github.com/sebastian-software/ferralk/issues/235)) ([472ee22](https://github.com/sebastian-software/ferralk/commit/472ee22325a9496ef7e6cc4f13f449572696b9ab))
+* **walker:** continue config assignments after headers ([#222](https://github.com/sebastian-software/ferralk/issues/222)) ([4660fe9](https://github.com/sebastian-software/ferralk/commit/4660fe9cfe964cd5233429c8fe2ac4fcf8f89757))
+* **walker:** use libc O_DIRECTORY on Linux ([#221](https://github.com/sebastian-software/ferralk/issues/221)) ([abd4a48](https://github.com/sebastian-software/ferralk/commit/abd4a4862ba49d6098c4a5f791b168e914c55918))
+* widen while processing large directory listings ([#239](https://github.com/sebastian-software/ferralk/issues/239)) ([a8e8033](https://github.com/sebastian-software/ferralk/commit/a8e8033fe2310c4c86c8d588112fd708d8ede407))
+
+
+### Performance Improvements
+
+* reuse Windows path bytes while classifying ([#234](https://github.com/sebastian-software/ferralk/issues/234)) ([2b706d0](https://github.com/sebastian-software/ferralk/commit/2b706d0fb78b125b4b0af2a8bde0c6e1cddbb806))
+
 ## [0.9.2](https://github.com/sebastian-software/ferralk/compare/v0.9.1...v0.9.2) (2026-08-31)
 
 
