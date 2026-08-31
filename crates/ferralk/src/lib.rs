@@ -8178,6 +8178,123 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn followed_directory_symlinks_use_the_target_kind_for_excludes_and_ignores() {
+        use std::os::unix::fs::symlink;
+
+        let excluded = Fixture::new();
+        excluded.write("real/artifact.o");
+        symlink("real", excluded.root.join("linked")).expect("create directory symlink");
+        let follow = WalkOptions::default().follow_symlinks(true).sort(true);
+
+        assert_frontends_agree(
+            "followed symlink excluded as directory",
+            &excluded.root,
+            || {
+                Walker::new(&excluded.root)
+                    .exclude("linked/")
+                    .expect("valid directory exclusion")
+                    .options(follow)
+            },
+        );
+        let result = Walker::new(&excluded.root)
+            .exclude("linked/")
+            .expect("valid directory exclusion")
+            .options(follow)
+            .collect()
+            .expect("walk succeeds");
+        assert_eq!(
+            relative_paths(result.entries(), &excluded.root),
+            vec![PathBuf::from("real"), PathBuf::from("real/artifact.o")]
+        );
+
+        let ignored = Fixture::new();
+        ignored.write("real/artifact.o");
+        fs::write(ignored.root.join(".gitignore"), b"build/\n").expect("write gitignore");
+        symlink("real", ignored.root.join("build")).expect("create ignored directory symlink");
+
+        assert_frontends_agree(
+            "followed symlink ignored as directory",
+            &ignored.root,
+            || {
+                Walker::new(&ignored.root)
+                    .respect_git_ignore(true)
+                    .options(follow)
+            },
+        );
+        let result = Walker::new(&ignored.root)
+            .respect_git_ignore(true)
+            .options(follow)
+            .collect()
+            .expect("walk succeeds");
+        assert_eq!(
+            relative_paths(result.entries(), &ignored.root),
+            vec![
+                PathBuf::from(".gitignore"),
+                PathBuf::from("real"),
+                PathBuf::from("real/artifact.o"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn followed_symlinks_skipped_by_path_rules_do_not_need_a_target() {
+        use std::os::unix::fs::symlink;
+
+        let excluded = Fixture::new();
+        symlink("missing-target", excluded.root.join("hidden-link"))
+            .expect("create dangling symlink");
+        let follow = WalkOptions::default().follow_symlinks(true).sort(true);
+
+        assert_frontends_agree(
+            "path-excluded dangling followed symlink",
+            &excluded.root,
+            || {
+                Walker::new(&excluded.root)
+                    .exclude("hidden-link")
+                    .expect("valid path exclusion")
+                    .options(follow)
+            },
+        );
+        let result = Walker::new(&excluded.root)
+            .exclude("hidden-link")
+            .expect("valid path exclusion")
+            .options(follow)
+            .error_policy(ErrorPolicy::Collect)
+            .collect()
+            .expect("excluded dangling link is not an error");
+        assert!(result.entries().is_empty());
+        assert!(result.errors().is_empty());
+
+        let ignored = Fixture::new();
+        fs::write(ignored.root.join(".gitignore"), b"hidden-link\n").expect("write gitignore");
+        symlink("missing-target", ignored.root.join("hidden-link"))
+            .expect("create dangling symlink");
+
+        assert_frontends_agree(
+            "path-ignored dangling followed symlink",
+            &ignored.root,
+            || {
+                Walker::new(&ignored.root)
+                    .respect_git_ignore(true)
+                    .options(follow)
+            },
+        );
+        let result = Walker::new(&ignored.root)
+            .respect_git_ignore(true)
+            .options(follow)
+            .error_policy(ErrorPolicy::Collect)
+            .collect()
+            .expect("ignored dangling link is not an error");
+        assert_eq!(
+            relative_paths(result.entries(), &ignored.root),
+            vec![PathBuf::from(".gitignore")]
+        );
+        assert!(result.errors().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn symlink_policy_prevents_directory_cycles_without_pruning_aliases() {
         use std::os::unix::fs::symlink;
 
