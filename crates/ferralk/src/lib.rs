@@ -2468,9 +2468,9 @@ struct WalkState<'walker> {
     visitor: EntryVisitor<'walker>,
     entries: Vec<WalkEntry>,
     errors: Vec<WalkError>,
-    /// Buffers of directories this frontend has finished with. It descends by
-    /// recursion, so several directories are open at once and each needs its
-    /// own; a pool hands the deepest frame the buffers the last one returned.
+    /// Buffers of directories this frontend has finished with. A paused
+    /// directory owns its scratch while a child is being processed; completed
+    /// frames return it here for the next directory.
     scratch: Vec<DirectoryScratch>,
     /// The path buffer the last dropped entry left behind. See [`own_path`].
     spare: PathBuf,
@@ -2483,6 +2483,25 @@ struct WalkState<'walker> {
 struct DirectoryScratch {
     listing: Listing,
     path: PathBuf,
+}
+
+/// One suspended serial-directory listing. A child directory is scheduled
+/// separately, then this frame resumes at the next entry, which retains the
+/// serial walk's depth-first order without borrowing a call-stack frame.
+struct DirectoryFrame {
+    task: DirectoryTask,
+    ignores: IgnoreScope,
+    scratch: DirectoryScratch,
+    next_entry: usize,
+}
+
+/// Work the serial frontend has yet to carry out. The LIFO order models the
+/// former recursive calls while keeping arbitrarily deep trees off the Rust
+/// call stack.
+enum SerialTask {
+    Directory(DirectoryTask),
+    Resume(DirectoryFrame),
+    Emit(WalkEntry),
 }
 
 /// Entries between two cancellation checks inside one directory.
@@ -2548,6 +2567,10 @@ impl<'walker> WalkState<'walker> {
     /// entry is assembled in it rather than in a fresh allocation.
     fn emit(&mut self, path: &Path, emitted: EmittedEntry) {
         let entry = emitted.with_path(own_path(&mut self.spare, path));
+        self.emit_owned(entry);
+    }
+
+    fn emit_owned(&mut self, entry: WalkEntry) {
         match (self.visitor)(&entry) {
             Verdict::Keep => self.entries.push(entry),
             Verdict::Skip => self.spare = entry.path,
@@ -2561,7 +2584,26 @@ impl<'walker> WalkState<'walker> {
     fn walk_directory(
         &mut self,
         backend: &impl DirectoryBackend,
+        task: DirectoryTask,
+    ) -> Result<(), WalkError> {
+        let mut pending = vec![SerialTask::Directory(task)];
+        while let Some(task) = pending.pop() {
+            match task {
+                SerialTask::Directory(task) => self.start_directory(backend, task, &mut pending)?,
+                SerialTask::Resume(frame) => self.resume_directory(backend, frame, &mut pending)?,
+                SerialTask::Emit(entry) => self.emit_owned(entry),
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens one directory and schedules its first listing step. Its scratch
+    /// moves into that step, so a child cannot overwrite its parent's path.
+    fn start_directory(
+        &mut self,
+        backend: &impl DirectoryBackend,
         mut task: DirectoryTask,
+        pending: &mut Vec<SerialTask>,
     ) -> Result<(), WalkError> {
         if self.check_cancellation() {
             return Ok(());
@@ -2577,20 +2619,6 @@ impl<'walker> WalkState<'walker> {
             return Ok(());
         }
         let mut scratch = self.scratch.pop().unwrap_or_default();
-        let outcome = self.walk_listing(backend, task, &mut scratch);
-        scratch.listing.clear();
-        self.scratch.push(scratch);
-        outcome
-    }
-
-    /// The body of [`WalkState::walk_directory`], with the directory's buffers
-    /// held apart so they are returned to the pool however it ends.
-    fn walk_listing(
-        &mut self,
-        backend: &impl DirectoryBackend,
-        task: DirectoryTask,
-        scratch: &mut DirectoryScratch,
-    ) -> Result<(), WalkError> {
         let path = task.path.as_path();
         let depth = task.depth;
         let is_root = depth == 0;
@@ -2601,52 +2629,130 @@ impl<'walker> WalkState<'walker> {
             !self.walker.options.follow_symlinks && depth > 0,
             &mut scratch.listing,
         ) {
-            return self.handle_error("read_dir", path.to_path_buf(), source, is_root);
+            let result = self.handle_error("read_dir", path.to_path_buf(), source, is_root);
+            scratch.listing.clear();
+            self.scratch.push(scratch);
+            return result;
         }
         // The directory's own ignore files join the chain here, once,
         // recognized in the listing that was just read.
         let (ignores, ignore_errors) =
-            task.ignores
-                .enter(self.walker, backend, path, &scratch.listing);
+            std::mem::take(&mut task.ignores).enter(self.walker, backend, path, &scratch.listing);
         for error in ignore_errors {
             let (path, source) = error.into_parts();
-            self.handle_error(IGNORE_FILE_OPERATION, path, source, false)?;
+            if let Err(error) = self.handle_error(IGNORE_FILE_OPERATION, path, source, false) {
+                scratch.listing.clear();
+                self.scratch.push(scratch);
+                return Err(error);
+            }
         }
         scratch.path.clear();
         scratch.path.push(path);
-        for index in 0..scratch.listing.entries().len() {
+        pending.push(SerialTask::Resume(DirectoryFrame {
+            task,
+            ignores,
+            scratch,
+            next_entry: 0,
+        }));
+        Ok(())
+    }
+
+    /// Continues a paused directory until it needs to descend, at which point
+    /// it requeues itself above the child. That is the iterative equivalent of
+    /// a recursive call followed by a return to this listing.
+    fn resume_directory(
+        &mut self,
+        backend: &impl DirectoryBackend,
+        mut frame: DirectoryFrame,
+        pending: &mut Vec<SerialTask>,
+    ) -> Result<(), WalkError> {
+        let path = frame.task.path.as_path();
+        let depth = frame.task.depth;
+        while frame.next_entry < frame.scratch.listing.entries().len() {
             // A `Verdict::Stop` is this walk's own decision, already on a local
             // field, and is honoured on the very next entry. The caller's token
             // is polled every [`CANCELLATION_STRIDE`] entries instead of every
             // one, which is what costs a load through the shared `Arc`.
             if self.cancelled
-                || (index.is_multiple_of(CANCELLATION_STRIDE) && self.check_cancellation())
+                || (frame.next_entry.is_multiple_of(CANCELLATION_STRIDE)
+                    && self.check_cancellation())
             {
-                return Ok(());
+                return self.finish_directory(frame);
             }
             // The entry's path exists only for as long as it is being decided
             // about; anything that outlives that copies it out.
-            scratch.path.push(scratch.listing.entries()[index].name());
+            let index = frame.next_entry;
+            frame.next_entry += 1;
+            frame
+                .scratch
+                .path
+                .push(frame.scratch.listing.entries()[index].name());
             let action = classify_entry(
                 self.walker,
                 backend,
-                &scratch.path,
-                &scratch.listing.entries()[index],
-                &ignores,
+                &frame.scratch.path,
+                &frame.scratch.listing.entries()[index],
+                &frame.ignores,
                 depth,
                 TraversalContext {
-                    root: task.root,
-                    cycle_guard: &task.cycle_guard,
-                    listing: &scratch.listing,
+                    root: frame.task.root,
+                    cycle_guard: &frame.task.cycle_guard,
+                    listing: &frame.scratch.listing,
                 },
             );
-            let outcome = self.act(backend, action, &scratch.path);
-            reset_to_directory(&mut scratch.path, path);
-            outcome?;
+            match action {
+                EntryAction::Skip => reset_to_directory(&mut frame.scratch.path, path),
+                EntryAction::Emit(entry) => {
+                    self.emit(&frame.scratch.path, entry);
+                    reset_to_directory(&mut frame.scratch.path, path);
+                }
+                EntryAction::Descend(task) => {
+                    reset_to_directory(&mut frame.scratch.path, path);
+                    pending.push(SerialTask::Resume(frame));
+                    pending.push(SerialTask::Directory(task));
+                    return Ok(());
+                }
+                // The subtree is walked before the directory itself is
+                // recorded, the depth-first order this frontend has always
+                // exposed. Its path must now outlive the paused frame.
+                EntryAction::DescendAndEmit(entry, task) => {
+                    let entry = entry.with_path(own_path(&mut self.spare, &frame.scratch.path));
+                    reset_to_directory(&mut frame.scratch.path, path);
+                    pending.push(SerialTask::Emit(entry));
+                    pending.push(SerialTask::Resume(frame));
+                    pending.push(SerialTask::Directory(task));
+                    return Ok(());
+                }
+                EntryAction::Failed { failure, descend } => {
+                    reset_to_directory(&mut frame.scratch.path, path);
+                    if let Err(error) =
+                        self.handle_error(failure.operation, failure.path, failure.source, false)
+                    {
+                        self.finish_directory(frame)?;
+                        return Err(error);
+                    }
+                    if let Some(task) = descend {
+                        pending.push(SerialTask::Resume(frame));
+                        pending.push(SerialTask::Directory(task));
+                        return Ok(());
+                    }
+                }
+            }
         }
-        while let Some(error) = scratch.listing.take_deferred_error() {
-            self.handle_error("read_dir", error.path, error.source.into_io_error(), false)?;
+        while let Some(error) = frame.scratch.listing.take_deferred_error() {
+            if let Err(error) =
+                self.handle_error("read_dir", error.path, error.source.into_io_error(), false)
+            {
+                self.finish_directory(frame)?;
+                return Err(error);
+            }
         }
+        self.finish_directory(frame)
+    }
+
+    fn finish_directory(&mut self, mut frame: DirectoryFrame) -> Result<(), WalkError> {
+        frame.scratch.listing.clear();
+        self.scratch.push(frame.scratch);
         Ok(())
     }
 
@@ -2667,42 +2773,6 @@ impl<'walker> WalkState<'walker> {
                     is_root,
                 )?;
                 Ok(false)
-            }
-        }
-    }
-
-    /// Carries out what classification decided about one entry.
-    ///
-    /// `path` is the entry's path, borrowed from the scratch of the directory
-    /// being read. A subtree walked from here takes its buffers from the pool,
-    /// so it never disturbs that scratch and the path stays valid across the
-    /// descent.
-    fn act(
-        &mut self,
-        backend: &impl DirectoryBackend,
-        action: EntryAction,
-        path: &Path,
-    ) -> Result<(), WalkError> {
-        match action {
-            EntryAction::Skip => Ok(()),
-            EntryAction::Descend(task) => self.walk_directory(backend, task),
-            EntryAction::Emit(entry) => {
-                self.emit(path, entry);
-                Ok(())
-            }
-            // The subtree is walked before the directory itself is recorded,
-            // which is the depth-first order this frontend has always had.
-            EntryAction::DescendAndEmit(entry, task) => {
-                self.walk_directory(backend, task)?;
-                self.emit(path, entry);
-                Ok(())
-            }
-            EntryAction::Failed { failure, descend } => {
-                self.handle_error(failure.operation, failure.path, failure.source, false)?;
-                if let Some(task) = descend {
-                    self.walk_directory(backend, task)?;
-                }
-                Ok(())
             }
         }
     }
@@ -3037,6 +3107,54 @@ mod tests {
             ignores,
             ignore_errors,
         }
+    }
+
+    /// `collect` used to keep one Rust call frame per directory. A mock tree
+    /// avoids host path-length limits while still reaching past the depth that
+    /// previously exhausted the serial walk's stack.
+    #[test]
+    fn serial_collect_handles_a_deep_directory_chain_without_recursion() {
+        const DEPTH: usize = 4_096;
+
+        struct DeepChainBackend {
+            root: PathBuf,
+        }
+
+        impl super::DirectoryBackend for DeepChainBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                listing.clear();
+                let depth = path
+                    .strip_prefix(&self.root)
+                    .expect("walk only reads descendants of its root")
+                    .components()
+                    .count();
+                if depth < DEPTH {
+                    listing.push("child".as_ref(), true, false);
+                }
+                Ok(())
+            }
+        }
+
+        let backend = DeepChainBackend {
+            root: PathBuf::from("/serial-deep-chain"),
+        };
+        let result = Walker::new(&backend.root)
+            .threads(1)
+            .options(WalkOptions::default().files_only(true))
+            .collect_with(&backend)
+            .expect("the serial walker does not consume one call frame per directory");
+
+        assert!(
+            result.entries().is_empty(),
+            "the mock tree has only directories"
+        );
+        assert!(result.errors().is_empty());
     }
 
     #[test]
