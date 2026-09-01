@@ -78,3 +78,6 @@
 {"id":"ignore-082","pattern":"[!]]","path":"a","flags":[],"ignore_rules":["[!]]"],"expected":true,"source":"git_check_ignore","note":"A negated class can likewise use a closing bracket as its first literal member."}
 {"id":"ignore-083","pattern":"[!]]","path":"]","flags":[],"ignore_rules":["[!]]"],"expected":false,"source":"git_check_ignore","note":"The literal first-member closing bracket remains excluded by the negated class."}
 {"id":"ignore-084","pattern":"[!]","path":"a","flags":[],"ignore_rules":["[!]"],"expected":false,"source":"git_check_ignore","note":"A first-member closing bracket does not also close the class, so this spelling is unclosed and matches nothing."}
+{"id":"ignore-085","pattern":"[]/]","path":"]","flags":[],"ignore_rules":["[]/]"],"expected":true,"source":"git_check_ignore","note":"A slash after a first-member closing bracket remains inside the class rather than splitting the rule."}
+{"id":"ignore-086","pattern":"[]/]","path":"x/]","flags":[],"ignore_rules":["[]/]"],"expected":false,"source":"git_check_ignore","note":"The class-member slash still anchors the rule to its ignore-file directory."}
+{"id":"ignore-087","pattern":"[!]/]","path":"a","flags":[],"ignore_rules":["[!]/]"],"expected":true,"source":"git_check_ignore","note":"Component splitting preserves the first-member closing bracket and slash in a negated class too."}

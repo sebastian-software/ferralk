@@ -442,24 +442,46 @@ fn split_rule_components(body: &[u8]) -> Vec<&[u8]> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut in_class = false;
+    let mut class_saw_member = false;
     let mut index = 0;
     while index < body.len() {
         match body[index] {
-            b'\\' => index += 2,
+            b'\\' => {
+                if in_class {
+                    class_saw_member = true;
+                }
+                index += 2;
+            }
             b'[' if in_class && body.get(index + 1) == Some(&b':') => {
                 let start = index + 2;
                 if let Some(end) = memmem::find(&body[start..], b":]") {
+                    class_saw_member = true;
                     index = start + end + 2;
                 } else {
+                    class_saw_member = true;
                     index += 1;
                 }
             }
             b'[' if !in_class => {
                 in_class = true;
+                class_saw_member = false;
                 index += 1;
+                if matches!(body.get(index), Some(b'!' | b'^')) {
+                    index += 1;
+                }
             }
             b']' if in_class => {
-                in_class = false;
+                if class_saw_member {
+                    in_class = false;
+                } else {
+                    // The first `]` after `[` or `[!` is a literal member;
+                    // only a later one closes the class.
+                    class_saw_member = true;
+                }
+                index += 1;
+            }
+            b'/' if in_class => {
+                class_saw_member = true;
                 index += 1;
             }
             b'/' if !in_class => {
@@ -467,7 +489,12 @@ fn split_rule_components(body: &[u8]) -> Vec<&[u8]> {
                 start = index + 1;
                 index += 1;
             }
-            _ => index += 1,
+            _ => {
+                if in_class {
+                    class_saw_member = true;
+                }
+                index += 1;
+            }
         }
     }
     parts.push(&body[start..]);
@@ -1039,6 +1066,9 @@ mod tests {
         assert_eq!(fuzz_rule_bytes(b"[!]]", b"a", false), Some(true));
         assert_eq!(fuzz_rule_bytes(b"[!]]", b"]", false), None);
         assert_eq!(fuzz_rule_bytes(b"[!]", b"a", false), None);
+        assert_eq!(fuzz_rule_bytes(b"[]/]", b"]", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"[]/]", b"x/]", false), None);
+        assert_eq!(fuzz_rule_bytes(b"[!]/]", b"a", false), Some(true));
     }
 
     #[test]
