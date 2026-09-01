@@ -13,7 +13,7 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | Field | Required | Meaning |
 |---|---:|---|
 | `id` | yes | Stable, topic-local identifier, for example `wildcard-001`. |
-| `kind` | no | `matcher` (default), `match_glob_path` for the component-local reading, `has_wildcards` for syntax preflight, `match_paths` / `_at` for borrowed list filtering, `match_path_indices` / `_at` for positions, `compile_error` for a pattern the compiler must reject, or `absolute_pattern` for an absolute walker pattern rewritten against a walk root. |
+| `kind` | yes | `matcher`, `match_glob_path` for the component-local reading, `has_wildcards` for syntax preflight, `match_paths` / `_at` for borrowed list filtering, `match_path_indices` / `_at` for positions, `compile_error` for a pattern the compiler must reject, `ignore` for a Git-ignore verdict, or `absolute_pattern` for an absolute walker pattern rewritten against a walk root. |
 | `paths` / `matches` | no | Input and Ferralk-selected path lists for `match_paths`, preserving input order. |
 | `oracle_matches` | no | zlob's selected list for a deliberate list-result divergence. |
 | `base_path` | no | Base directory stripped before matching each input path in a `match_paths_at` case, and the walk root an `absolute_pattern` case rewrites against. |
@@ -29,7 +29,7 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | `candidate_is_dir` | no | For an ignore case, create `path` as a directory instead of a regular file. |
 | `candidate_is_symlink` | no | For a POSIX ignore case, create `path` as a symlink to a directory instead of a regular file. Mutually exclusive with `candidate_is_dir`. |
 | `git_ignorecase` | no | For an ignore case, set the isolated repository's `core.ignorecase` to `true`. |
-| `expected` | yes | Whether the expression accepts the candidate. |
+| `expected` | yes | Whether the expression accepts the candidate; for list operations, whether the real selection is non-empty; for `absolute_pattern`, whether rewriting produces a match-capable relative pattern. Exact list and rewrite results remain in their dedicated fields. |
 | `oracle_expected` | no | The external-oracle result when it deliberately differs from `expected`. |
 | `error_offset` | no | Byte offset the rejected construct must be reported at, for a `compile_error` or `absolute_pattern` case. |
 | `error_message` | no | Stable error text a `compile_error` or `absolute_pattern` case must produce. Its presence is what makes an `absolute_pattern` case a rejection. |
@@ -45,12 +45,17 @@ The topic files are `basic.jsonl`, `braces.jsonl`, `bytes.jsonl`,
 `path-matcher.jsonl`, `platform.jsonl`, `preflight.jsonl`, and
 `wildcards.jsonl`. Files are added when a topic gains a case. Case IDs do
 not change once published; a changed expected value is a new case plus an
-explanation in `note`.
+explanation in `note`. The one-time explicit-kind migration also normalized
+the previously self-compared list and absolute-pattern `expected` fields from
+their unchanged `matches`, `indices`, and `rewritten` results; those metadata
+normalizations are not matcher-verdict changes.
 
-For `ignore.jsonl`, `pattern` is the primary rule for quick review and
-`ignore_rules` is the complete ordered rule chain. The Git oracle creates an
-isolated repository, writes those lines into `.gitignore`, creates `path`, and
-uses `git check-ignore --no-index --quiet -- path`. `candidate_is_dir` keeps
+An `ignore` case may live in any topic file; routing depends on `kind`, never
+on the filename. In `ignore.jsonl`, `pattern` is the primary rule for quick
+review and `ignore_rules` is the complete ordered rule chain. The Git oracle
+creates an isolated repository, writes those lines into `.gitignore`, creates
+`path`, and uses `git check-ignore --no-index --quiet -- path`.
+`candidate_is_dir` keeps
 directory-only rules tied to an actual directory entry;
 `candidate_is_symlink` verifies that a link to a directory remains a symlink
 candidate; `git_ignorecase` opts into Git's repository-local ASCII case

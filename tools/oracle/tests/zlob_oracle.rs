@@ -2,7 +2,7 @@
 
 use std::{fs, path::Path};
 
-use corpus::{Case, CaseKind, decode_bytes};
+use corpus::{Case, CaseKind, Source, decode_bytes, parse_case};
 use zlob::{
     ZlobFlags, has_wildcards, zlob_match_paths, zlob_match_paths_at, zlob_match_paths_indices,
     zlob_match_paths_indices_at,
@@ -30,6 +30,10 @@ struct Skipped {
     absolute_pattern: usize,
     /// The verdict describes a separator platform this runner is not.
     platform: usize,
+    /// Git ignore cases belong to the Git oracle.
+    ignore: usize,
+    /// fast-glob-backed cases belong to the Oxc oracle.
+    fast_glob: usize,
 }
 
 impl Skipped {
@@ -40,6 +44,8 @@ impl Skipped {
             + self.glob_path
             + self.absolute_pattern
             + self.platform
+            + self.ignore
+            + self.fast_glob
     }
 }
 
@@ -54,15 +60,6 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
     let mut replayed = 0_usize;
     let mut skipped = Skipped::default();
     for file in files {
-        // Each topic names its own reference oracle, and `oracle_expected`
-        // records that oracle's verdict. Git owns the ignore topic and Oxc
-        // fast-glob owns its own, so neither is zlob's to replay.
-        if file
-            .file_name()
-            .is_some_and(|name| name == "ignore.jsonl" || name == "fast-glob.jsonl")
-        {
-            continue;
-        }
         for (line_number, line) in fs::read_to_string(&file)
             .expect("read corpus file")
             .lines()
@@ -71,8 +68,16 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
             if line.trim().is_empty() {
                 continue;
             }
-            let case: Case = serde_json::from_str(line)
+            let case = parse_case(line)
                 .unwrap_or_else(|error| panic!("{}:{}: {error}", file.display(), line_number + 1));
+            if case.kind == CaseKind::Ignore {
+                skipped.ignore += 1;
+                continue;
+            }
+            if case.source == Source::FastGlob {
+                skipped.fast_glob += 1;
+                continue;
+            }
             if !case.runs_on_host() {
                 skipped.platform += 1;
                 continue;
@@ -111,7 +116,9 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                         // zlob 1.6.3's Rust FFI aborts on empty input and
                         // returns corrupted bytes for this synthetic result.
                         // The frozen Zig assertion remains the source evidence.
-                        case.expected
+                        case.oracle_matches
+                            .as_ref()
+                            .is_some_and(|matches| !matches.is_empty())
                     } else {
                         let paths = text.borrowed_paths();
                         let selected = match case.kind {
@@ -128,6 +135,7 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                             | CaseKind::HasWildcards
                             | CaseKind::CompileError
                             | CaseKind::MatchGlobPath
+                            | CaseKind::Ignore
                             | CaseKind::AbsolutePattern
                             | CaseKind::MatchPathIndices
                             | CaseKind::MatchPathIndicesAt => unreachable!(),
@@ -147,7 +155,7 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                             file.display(),
                             line_number + 1
                         );
-                        case.expected
+                        !selected.is_empty()
                     }
                 }
                 CaseKind::MatchPathIndices | CaseKind::MatchPathIndicesAt => {
@@ -166,6 +174,7 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                         | CaseKind::HasWildcards
                         | CaseKind::CompileError
                         | CaseKind::MatchGlobPath
+                        | CaseKind::Ignore
                         | CaseKind::AbsolutePattern
                         | CaseKind::MatchPaths
                         | CaseKind::MatchPathsAt => unreachable!(),
@@ -182,15 +191,31 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                         file.display(),
                         line_number + 1
                     );
-                    case.expected
+                    !selected.is_empty()
                 }
-                CaseKind::CompileError | CaseKind::MatchGlobPath | CaseKind::AbsolutePattern => {
+                CaseKind::CompileError
+                | CaseKind::MatchGlobPath
+                | CaseKind::Ignore
+                | CaseKind::AbsolutePattern => {
                     unreachable!("these kinds are skipped above")
                 }
             };
+            let expected = match case.kind {
+                CaseKind::MatchPaths | CaseKind::MatchPathsAt => !case
+                    .oracle_matches
+                    .as_ref()
+                    .unwrap_or(&case.matches)
+                    .is_empty(),
+                CaseKind::MatchPathIndices | CaseKind::MatchPathIndicesAt => !case
+                    .oracle_indices
+                    .as_ref()
+                    .unwrap_or(&case.indices)
+                    .is_empty(),
+                _ => case.oracle_expected.unwrap_or(case.expected),
+            };
             assert_eq!(
                 actual,
-                case.oracle_expected.unwrap_or(case.expected),
+                expected,
                 "{}:{}: {} against {}",
                 file.display(),
                 line_number + 1,
@@ -204,14 +229,16 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
     println!(
         "replayed {replayed} corpus cases against zlob 1.6.3; skipped {} \
          ({} case-folding, {} non-UTF-8, {} compile-error, {} glob-path, \
-         {} absolute-pattern, {} other-platform)",
+         {} absolute-pattern, {} other-platform, {} Git-ignore, {} fast-glob)",
         skipped.total(),
         skipped.case_folding,
         skipped.non_utf8,
         skipped.compile_error,
         skipped.glob_path,
         skipped.absolute_pattern,
-        skipped.platform
+        skipped.platform,
+        skipped.ignore,
+        skipped.fast_glob
     );
     assert!(
         replayed >= MINIMUM_REPLAYED,

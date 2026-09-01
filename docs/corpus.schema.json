@@ -4,10 +4,10 @@
   "title": "ferralk corpus case",
   "type": "object",
   "additionalProperties": false,
-  "required": ["id", "pattern", "path", "expected", "source"],
+  "required": ["id", "kind", "pattern", "path", "expected", "source"],
   "properties": {
     "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
-    "kind": { "enum": ["matcher", "has_wildcards", "match_paths", "match_paths_at", "match_path_indices", "match_path_indices_at", "compile_error", "match_glob_path", "absolute_pattern"], "default": "matcher" },
+    "kind": { "enum": ["matcher", "has_wildcards", "match_paths", "match_paths_at", "match_path_indices", "match_path_indices_at", "compile_error", "match_glob_path", "ignore", "absolute_pattern"] },
     "paths": { "type": "array", "items": { "type": "string" }, "default": [] },
     "matches": { "type": "array", "items": { "type": "string" }, "default": [] },
     "oracle_matches": { "type": "array", "items": { "type": "string" } },

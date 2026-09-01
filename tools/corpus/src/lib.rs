@@ -4,6 +4,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// A single JSONL corpus record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,9 +12,7 @@ use serde::{Deserialize, Serialize};
 pub struct Case {
     /// Stable, topic-local identifier.
     pub id: String,
-    /// Operation described by this record. Existing records default to a full
-    /// matcher verdict for backwards-compatible JSONL decoding.
-    #[serde(default)]
+    /// Operation described by this record.
     pub kind: CaseKind,
     /// Input candidates for a [`CaseKind::MatchPaths`] operation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -143,6 +142,9 @@ pub enum CaseKind {
     /// wildcard stays inside one path component and only `**` crosses a
     /// separator. This is the filesystem-glob reading, not the fnmatch one.
     MatchGlobPath,
+    /// A Git-compatible ignore-rule verdict replayed by the Git and walker
+    /// integration tests rather than the glob matcher harness.
+    Ignore,
     /// An absolute walker pattern rewritten against a walk root: which
     /// root-relative pattern it becomes, or that it can select nothing, or
     /// that the rewrite is refused.
@@ -192,6 +194,103 @@ impl Case {
             None => true,
             Some(platform) => platform.is_host(),
         }
+    }
+}
+
+/// Parses one corpus record and rejects fields that its operation cannot use.
+///
+/// Validation happens against the raw JSON object so an explicitly present
+/// empty field cannot disappear into a Serde default and silently change the
+/// operation being replayed.
+pub fn parse_case(input: &str) -> Result<Case, String> {
+    let value: Value = serde_json::from_str(input).map_err(|error| error.to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "a corpus record must be a JSON object".to_owned())?;
+    let kind_value = object
+        .get("kind")
+        .ok_or_else(|| "a corpus record must declare kind".to_owned())?;
+    let kind: CaseKind =
+        serde_json::from_value(kind_value.clone()).map_err(|error| error.to_string())?;
+
+    for field in object.keys() {
+        if !field_is_allowed(kind, field) {
+            return Err(format!("field {field:?} is not valid for kind {kind:?}"));
+        }
+    }
+    for field in required_fields(kind) {
+        if !object.contains_key(*field) {
+            return Err(format!("kind {kind:?} requires field {field:?}"));
+        }
+    }
+
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+fn required_fields(kind: CaseKind) -> &'static [&'static str] {
+    match kind {
+        CaseKind::Matcher
+        | CaseKind::HasWildcards
+        | CaseKind::CompileError
+        | CaseKind::MatchGlobPath => &[],
+        CaseKind::MatchPaths => &["paths", "matches"],
+        CaseKind::MatchPathsAt => &["paths", "matches", "base_path"],
+        CaseKind::MatchPathIndices => &["paths", "indices"],
+        CaseKind::MatchPathIndicesAt => &["paths", "indices", "base_path"],
+        CaseKind::Ignore => &["ignore_rules"],
+        CaseKind::AbsolutePattern => &["base_path"],
+    }
+}
+
+fn field_is_allowed(kind: CaseKind, field: &str) -> bool {
+    const COMMON: &[&str] = &[
+        "id", "kind", "pattern", "path", "expected", "platform", "source", "disputed", "note",
+    ];
+    if COMMON.contains(&field) {
+        return true;
+    }
+
+    match kind {
+        CaseKind::Matcher | CaseKind::HasWildcards | CaseKind::MatchGlobPath => {
+            matches!(field, "flags" | "oracle_expected")
+        }
+        CaseKind::MatchPaths => {
+            matches!(field, "flags" | "paths" | "matches" | "oracle_matches")
+        }
+        CaseKind::MatchPathsAt => {
+            matches!(
+                field,
+                "flags" | "paths" | "matches" | "oracle_matches" | "base_path"
+            )
+        }
+        CaseKind::MatchPathIndices => {
+            matches!(field, "flags" | "paths" | "indices" | "oracle_indices")
+        }
+        CaseKind::MatchPathIndicesAt => {
+            matches!(
+                field,
+                "flags" | "paths" | "indices" | "oracle_indices" | "base_path"
+            )
+        }
+        CaseKind::CompileError => matches!(field, "flags" | "error_offset" | "error_message"),
+        CaseKind::Ignore => matches!(
+            field,
+            "ignore_rules"
+                | "nested_ignore_rules"
+                | "exclude_rules"
+                | "candidate_is_dir"
+                | "candidate_is_symlink"
+                | "git_ignorecase"
+        ),
+        CaseKind::AbsolutePattern => matches!(
+            field,
+            "flags"
+                | "base_path"
+                | "rewritten"
+                | "windows_paths"
+                | "error_offset"
+                | "error_message"
+        ),
     }
 }
 
@@ -343,7 +442,7 @@ fn push_escape(result: &mut String, byte: u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Case, CaseKind, Platform, decode_bytes, encode_bytes};
+    use super::{Case, CaseKind, Platform, decode_bytes, encode_bytes, parse_case};
 
     #[test]
     fn byte_codec_round_trips_mixed_utf8_and_non_utf8() {
@@ -361,9 +460,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_kind_defaults_to_matcher_for_existing_corpora() {
-        let case: Case = serde_json::from_str(
-            r#"{"id":"legacy","pattern":"*.rs","path":"lib.rs","expected":true,"source":"handwritten"}"#,
+    fn matcher_kind_is_explicit() {
+        let case = parse_case(
+            r#"{"id":"matcher","kind":"matcher","pattern":"*.rs","path":"lib.rs","expected":true,"source":"handwritten"}"#,
         )
         .unwrap();
 
@@ -372,6 +471,26 @@ mod tests {
         assert!(case.runs_on_host());
         assert_eq!(case.error_offset, None);
         assert_eq!(case.error_message, None);
+    }
+
+    #[test]
+    fn missing_kind_and_irrelevant_fields_are_rejected() {
+        assert!(
+            parse_case(
+                r#"{"id":"missing-kind","pattern":"*.rs","path":"lib.rs","expected":true,"source":"handwritten"}"#,
+            )
+            .is_err()
+        );
+        let error = parse_case(
+            r#"{"id":"foreign-field","kind":"matcher","pattern":"*","path":"x","paths":[],"expected":true,"source":"handwritten"}"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("paths"), "{error}");
+        let error = parse_case(
+            r#"{"id":"missing-matches","kind":"match_paths","pattern":"*","path":"","paths":[],"expected":false,"source":"handwritten"}"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("matches"), "{error}");
     }
 
     #[test]
@@ -393,7 +512,7 @@ mod tests {
     #[test]
     fn platform_cases_run_only_on_their_own_host() {
         let windows: Case = serde_json::from_str(
-            r#"{"id":"sep-windows","pattern":"a/b","path":"a\\x5Cb","expected":true,"platform":"windows","source":"handwritten"}"#,
+            r#"{"id":"sep-windows","kind":"matcher","pattern":"a/b","path":"a\\x5Cb","expected":true,"platform":"windows","source":"handwritten"}"#,
         )
         .unwrap();
         let posix = Case {
@@ -413,7 +532,7 @@ mod tests {
     #[test]
     fn optional_schema_fields_stay_absent_when_unused() {
         let case: Case = serde_json::from_str(
-            r#"{"id":"legacy","pattern":"*.rs","path":"lib.rs","expected":true,"source":"handwritten"}"#,
+            r#"{"id":"matcher","kind":"matcher","pattern":"*.rs","path":"lib.rs","expected":true,"source":"handwritten"}"#,
         )
         .unwrap();
 
@@ -439,7 +558,7 @@ mod tests {
     #[test]
     fn nested_ignore_files_carry_their_directory() {
         let case: Case = serde_json::from_str(
-            r#"{"id":"ignore-014","pattern":"!keep.log","path":"sub/keep.log","ignore_rules":["*.log"],"nested_ignore_rules":[{"directory":"sub","rules":["!keep.log"]}],"expected":false,"source":"git_check_ignore"}"#,
+            r#"{"id":"ignore-014","kind":"ignore","pattern":"!keep.log","path":"sub/keep.log","ignore_rules":["*.log"],"nested_ignore_rules":[{"directory":"sub","rules":["!keep.log"]}],"expected":false,"source":"git_check_ignore"}"#,
         )
         .unwrap();
 

@@ -5966,15 +5966,42 @@ mod tests {
     /// the walker are known to disagree, never as a way to quiet a failure.
     const KNOWN_WALKER_GAPS: &[&str] = &[];
 
+    fn corpus_cases(kind: corpus::CaseKind) -> Vec<corpus::Case> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+        let mut files = fs::read_dir(root)
+            .expect("read corpus directory")
+            .map(|entry| entry.expect("read corpus entry").path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+
+        let mut cases = Vec::new();
+        for file in files {
+            for (line_number, line) in fs::read_to_string(&file)
+                .expect("read corpus file")
+                .lines()
+                .enumerate()
+            {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let case = corpus::parse_case(line).unwrap_or_else(|error| {
+                    panic!("{}:{}: {error}", file.display(), line_number + 1)
+                });
+                if case.kind == kind {
+                    cases.push(case);
+                }
+            }
+        }
+        cases
+    }
+
     #[test]
     fn git_ignore_corpus_replays_through_the_walker() {
-        let corpus_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/ignore.jsonl");
-        for line in fs::read_to_string(corpus_path)
-            .expect("read ignore corpus")
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-        {
-            let case: corpus::Case = serde_json::from_str(line).expect("valid ignore corpus case");
+        for case in corpus_cases(corpus::CaseKind::Ignore) {
             if !case.runs_on_host() || KNOWN_WALKER_GAPS.contains(&case.id.as_str()) {
                 continue;
             }
@@ -6033,17 +6060,43 @@ mod tests {
                 fixture.write(&case.path);
             }
 
-            let result = Walker::new(&fixture.root)
+            let candidate = PathBuf::from(&case.path);
+            let serial = Walker::new(&fixture.root)
                 .respect_git_ignore(true)
+                .threads(1)
                 .collect()
-                .expect("walk succeeds");
-            let returned =
-                relative_paths(result.entries(), &fixture.root).contains(&PathBuf::from(case.path));
-            assert_eq!(
-                !returned, case.expected,
-                "walker verdict for corpus case {}",
-                case.id
-            );
+                .expect("serial walk succeeds");
+            let parallel = Walker::new(&fixture.root)
+                .respect_git_ignore(true)
+                .threads(4)
+                .collect()
+                .expect("parallel walk succeeds");
+            let streamed = Walker::new(&fixture.root)
+                .respect_git_ignore(true)
+                .threads(4)
+                .stream()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("streaming walk succeeds");
+            for (frontend, returned) in [
+                (
+                    "serial collect",
+                    relative_paths(serial.entries(), &fixture.root).contains(&candidate),
+                ),
+                (
+                    "parallel collect",
+                    relative_paths(parallel.entries(), &fixture.root).contains(&candidate),
+                ),
+                (
+                    "stream",
+                    relative_paths(&streamed, &fixture.root).contains(&candidate),
+                ),
+            ] {
+                assert_eq!(
+                    !returned, case.expected,
+                    "{frontend} verdict for corpus case {}",
+                    case.id
+                );
+            }
         }
     }
 
