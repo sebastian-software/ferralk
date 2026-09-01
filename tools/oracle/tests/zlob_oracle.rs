@@ -112,6 +112,7 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
             let path = text.path.as_str();
             if matches!(case.kind, CaseKind::MatchPaths | CaseKind::MatchPathsAt)
                 && case.flags.iter().any(|flag| flag == "nocheck")
+                && case.paths.is_empty()
             {
                 // zlob 1.6.3's Rust FFI aborts on empty input and returns
                 // corrupted bytes for this synthetic result. The frozen Zig

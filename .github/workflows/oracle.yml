@@ -6,6 +6,7 @@ on:
       - .github/workflows/oracle.yml
       - Cargo.lock
       - corpus/**
+      - crates/ferralk-glob/**
       - tools/corpus/**
       - tools/oracle/**
   schedule:

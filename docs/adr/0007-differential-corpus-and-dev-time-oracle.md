@@ -22,8 +22,9 @@ own test suite is MIT-licensed and portable 1:1.
 - **Extension:** differential generation against the live zlob oracle — a
   development-time tool only (unpublished `oracle` workspace member with zlob
   as dev-dependency, excluded from default members). Its dedicated workflow
-  runs weekly, on manual dispatch, and for pull requests changing the corpus or
-  oracle adapter. It remains outside the canonical Rust-only CI lanes.
+  runs weekly, on manual dispatch, and for pull requests changing the corpus,
+  matcher implementation, or oracle adapter. It remains outside the canonical
+  Rust-only CI lanes.
 - **Second reference:** `fast-glob` (oxc) for the common syntax subset; any
   zlob/fast-glob disagreement is itself a corpus case. For ignore semantics
   the oracle is `git check-ignore` (ADR-0006).
