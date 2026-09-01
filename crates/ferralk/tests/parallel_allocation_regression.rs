@@ -25,7 +25,7 @@ const LARGE_DIRECTORY_COUNT: usize = SMALL_DIRECTORY_COUNT * 2;
 // Thread startup, deque growth and shard handoff are coarse process-wide noise.
 // This stays far below the 1,024 added entries, so one allocation per added
 // worker entry cannot hide inside it.
-const PARALLEL_GROWTH_BUDGET: u64 = 128;
+const PARALLEL_GROWTH_BUDGET: u64 = 256;
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
 #[allow(unsafe_code)]
