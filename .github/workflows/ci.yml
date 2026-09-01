@@ -19,18 +19,52 @@ env:
 
 jobs:
   pr-title:
-    name: PR title follows Conventional Commits
+    name: PR title and commits follow Conventional Commits
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - name: Validate the future squash-merge subject
+      - name: Check out the exact pull-request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Validate every possible release-note subject
         env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_TITLE: ${{ github.event.pull_request.title }}
         shell: bash
         run: |
           pattern='^(feat|fix|perf|deps|chore|docs|refactor|test|build|ci)(\([a-z0-9][a-z0-9._/-]*\))?!?: .+'
-          if [[ ! "$PR_TITLE" =~ $pattern ]]; then
-            echo 'PR titles must use <type>[(scope)][!]: <summary>.' >&2
+
+          validate_subject() {
+            local source=$1
+            local subject=$2
+            if [[ "$subject" =~ $pattern ]]; then
+              return 0
+            fi
+            printf '%s must use <type>[(scope)][!]: <summary>: %s\n' "$source" "$subject" >&2
+            return 1
+          }
+
+          failures=0
+          if ! validate_subject 'PR title' "$PR_TITLE"; then
+            failures=1
+          fi
+
+          commit_count=0
+          while IFS=$'\t' read -r sha subject; do
+            ((commit_count += 1))
+            if ! validate_subject "Commit ${sha:0:12}" "$subject"; then
+              failures=1
+            fi
+          done < <(git log --format='%H%x09%s' "$BASE_SHA..$HEAD_SHA")
+
+          if ((commit_count == 0)); then
+            echo 'The pull-request head has no commits outside its base.' >&2
+            failures=1
+          fi
+          if ((failures != 0)); then
             echo 'Allowed types: feat, fix, perf, deps, chore, docs, refactor, test, build, ci.' >&2
             exit 1
           fi
