@@ -8294,6 +8294,68 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn includes_re_admit_descendants_through_followed_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        fixture.write("real/keep.txt");
+        symlink("real", fixture.root.join("linked")).expect("create directory symlink");
+        let follow = WalkOptions::default().follow_symlinks(true).sort(true);
+
+        let real = Walker::new(&fixture.root)
+            .exclude("real")
+            .expect("valid real-directory exclusion")
+            .include("real/keep.txt")
+            .expect("valid real-directory include")
+            .options(follow)
+            .collect()
+            .expect("real-directory walk succeeds");
+        assert_eq!(
+            relative_paths(real.entries(), &fixture.root),
+            vec![PathBuf::from("real/keep.txt")]
+        );
+
+        assert_frontends_agree(
+            "include below a path-excluded followed directory symlink",
+            &fixture.root,
+            || {
+                Walker::new(&fixture.root)
+                    .exclude("linked")
+                    .expect("valid symlink exclusion")
+                    .include("linked/keep.txt")
+                    .expect("valid descendant include")
+                    .options(follow)
+            },
+        );
+        let linked = Walker::new(&fixture.root)
+            .exclude("linked")
+            .expect("valid symlink exclusion")
+            .include("linked/keep.txt")
+            .expect("valid descendant include")
+            .options(follow)
+            .collect()
+            .expect("symlink walk succeeds");
+        assert_eq!(
+            relative_paths(linked.entries(), &fixture.root),
+            vec![PathBuf::from("linked/keep.txt")]
+        );
+
+        symlink("missing-target", fixture.root.join("dangling")).expect("create dangling symlink");
+        let dangling = Walker::new(&fixture.root)
+            .exclude("dangling")
+            .expect("valid dangling-link exclusion")
+            .include("dangling/keep.txt")
+            .expect("valid descendant include")
+            .options(follow)
+            .error_policy(ErrorPolicy::Collect)
+            .collect()
+            .expect("excluded dangling link remains recoverable");
+        assert!(dangling.entries().is_empty());
+        assert!(dangling.errors().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn followed_symlinks_skipped_by_path_rules_do_not_need_a_target() {
         use std::os::unix::fs::symlink;
 

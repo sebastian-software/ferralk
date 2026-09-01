@@ -219,7 +219,13 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         let ignored_as_link = ignores.is_ignored_bytes(glob_bytes_scratch, false);
         #[cfg(not(windows))]
         let ignored_as_link = ignores.is_ignored(path, false);
-        if excluded_as_link || ignored_as_link {
+        // Git ignores cannot be overridden by the walker's include patterns.
+        // A plain exclude can: when one of those patterns may select a
+        // descendant, resolve the link and let the regular directory path
+        // decide whether to descend.
+        let no_include_can_re_admit =
+            plan.includes.is_empty() || !walker.may_descend_into(context.root, bytes);
+        if ignored_as_link || (excluded_as_link && no_include_can_re_admit) {
             return EntryAction::Skip;
         }
 
@@ -227,6 +233,13 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         // directory-sensitive filter as well as for traversal.
         match backend.metadata(path) {
             Ok(metadata) => is_dir = metadata.is_dir(),
+            // The unresolved path exclusion already answers a dangling link;
+            // resolving it only served a possible descendant include. With no
+            // target there can be no such descendant, so keep the shortcut's
+            // historical no-error behavior.
+            Err(source) if excluded_as_link && source.kind() == std::io::ErrorKind::NotFound => {
+                return EntryAction::Skip;
+            }
             Err(source) => {
                 return EntryAction::Failed {
                     failure: EntryFailure {
