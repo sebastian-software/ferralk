@@ -46,6 +46,9 @@ use std::{
     },
 };
 
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
+
 use super::{Listing, defer_entry_stat_error};
 
 const BUFFER_SIZE: usize = 32 * 1024;
@@ -95,6 +98,36 @@ const ATTRIBUTE_RECORD_HEADER_SIZE: usize = std::mem::size_of::<u32>() + ATTRIBU
 /// guards is what makes an exotic filesystem a slow walk rather than a failed
 /// one, which is the semantics the bulk reader established.
 static NATIVE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+static NATIVE_LATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Restores the process-wide capability latch after a test, including when
+/// the test unwinds. The lock serializes tests that deliberately force this
+/// process-global fallback mode.
+#[cfg(test)]
+pub(super) struct UnsupportedLatchGuard {
+    previous: bool,
+    _lock: MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for UnsupportedLatchGuard {
+    fn drop(&mut self) {
+        NATIVE_UNSUPPORTED.store(self.previous, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn force_unsupported_latch_for_test() -> UnsupportedLatchGuard {
+    let lock = NATIVE_LATCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    UnsupportedLatchGuard {
+        previous: NATIVE_UNSUPPORTED.swap(true, Ordering::SeqCst),
+        _lock: lock,
+    }
+}
 
 /// Process-wide ceiling for descriptors retained beyond one directory read.
 ///
@@ -732,6 +765,28 @@ fn descriptor_entry_kind(
             Ok(Some((kind == libc::S_IFDIR, kind == libc::S_IFLNK)))
         }
     }
+}
+
+/// Builds a real directory listing while forcing every entry through the
+/// descriptor-relative `DT_UNKNOWN` classifier. APFS normally supplies a
+/// concrete `d_type`, so parity tests need this deterministic test-only path.
+#[cfg(test)]
+pub(super) fn read_directory_with_unknown_types_for_test(
+    path: &Path,
+    listing: &mut Listing,
+) -> io::Result<()> {
+    let directory = open_directory(path, false)?;
+    listing.clear();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        match descriptor_entry_kind(directory.as_raw_fd(), &name, 0) {
+            Ok(Some((is_dir, is_symlink))) => listing.push(&name, is_dir, is_symlink),
+            Ok(None) => {}
+            Err(error) => defer_entry_stat_error(listing, path.join(&name), error)?,
+        }
+    }
+    Ok(())
 }
 
 fn read_direntries_from_open_directory(

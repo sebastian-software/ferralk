@@ -79,6 +79,11 @@ pub struct Case {
     /// This preserves Git's directory-only-rule semantics in `ignore.jsonl`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub candidate_is_dir: bool,
+    /// Makes the ignore candidate a symlink to a directory rather than a
+    /// regular file. This distinguishes directory-only rules from rules that
+    /// merely match the symlink's pathname.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub candidate_is_symlink: bool,
     /// Enables Git's repository-local `core.ignorecase` for this ignore case.
     /// The setting is explicit so the oracle verdict is independent of the
     /// host filesystem's case-sensitivity.
@@ -417,6 +422,7 @@ mod tests {
         assert!(!encoded.contains("error_offset"), "{encoded}");
         assert!(!encoded.contains("error_message"), "{encoded}");
         assert!(!encoded.contains("nested_ignore_rules"), "{encoded}");
+        assert!(!encoded.contains("candidate_is_symlink"), "{encoded}");
     }
 
     #[test]

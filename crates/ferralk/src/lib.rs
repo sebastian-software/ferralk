@@ -5958,9 +5958,24 @@ mod tests {
                 fs::write(git.join("config"), b"[core]\nignorecase = true\n")
                     .expect("write repository config");
             }
-            if case.candidate_is_dir {
+            if case.candidate_is_dir && case.candidate_is_symlink {
+                panic!(
+                    "corpus case {} cannot be both a directory and a symlink",
+                    case.id
+                );
+            } else if case.candidate_is_dir {
                 fs::create_dir_all(fixture.root.join(&case.path))
                     .expect("create fixture candidate directory");
+            } else if case.candidate_is_symlink {
+                #[cfg(unix)]
+                {
+                    let target = fixture.root.join(".ferralk-symlink-target");
+                    fs::create_dir_all(&target).expect("create symlink target directory");
+                    std::os::unix::fs::symlink(target, fixture.root.join(&case.path))
+                        .expect("create fixture candidate symlink");
+                }
+                #[cfg(not(unix))]
+                panic!("symlink corpus case {} ran on a non-POSIX host", case.id);
             } else {
                 fixture.write(&case.path);
             }

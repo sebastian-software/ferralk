@@ -27,6 +27,7 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | `nested_ignore_rules` | no | Further `.gitignore` files below the root, each with its `directory` and `rules`. |
 | `exclude_rules` | no | Repository-wide rules written to `.git/info/exclude`; every ignore file overrides them. |
 | `candidate_is_dir` | no | For an ignore case, create `path` as a directory instead of a regular file. |
+| `candidate_is_symlink` | no | For a POSIX ignore case, create `path` as a symlink to a directory instead of a regular file. Mutually exclusive with `candidate_is_dir`. |
 | `git_ignorecase` | no | For an ignore case, set the isolated repository's `core.ignorecase` to `true`. |
 | `expected` | yes | Whether the expression accepts the candidate. |
 | `oracle_expected` | no | The external-oracle result when it deliberately differs from `expected`. |
@@ -50,9 +51,11 @@ For `ignore.jsonl`, `pattern` is the primary rule for quick review and
 `ignore_rules` is the complete ordered rule chain. The Git oracle creates an
 isolated repository, writes those lines into `.gitignore`, creates `path`, and
 uses `git check-ignore --no-index --quiet -- path`. `candidate_is_dir` keeps
-directory-only rules tied to an actual directory entry; `git_ignorecase` opts
-into Git's repository-local ASCII case folding. This keeps nested/negated
-behaviour tied to Git rather than to ferralk implementation details.
+directory-only rules tied to an actual directory entry;
+`candidate_is_symlink` verifies that a link to a directory remains a symlink
+candidate; `git_ignorecase` opts into Git's repository-local ASCII case
+folding. This keeps nested/negated behaviour tied to Git rather than to ferralk
+implementation details.
 
 `nested_ignore_rules` adds `.gitignore` files below the root. Git consults the
 file closest to the candidate last, so a deeper file overrides a shallower one,

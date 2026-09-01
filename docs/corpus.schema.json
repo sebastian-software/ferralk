@@ -22,6 +22,7 @@
     "ignore_rules": { "type": "array", "items": { "type": "string" }, "default": [] },
     "exclude_rules": { "type": "array", "items": { "type": "string" }, "default": [] },
     "candidate_is_dir": { "type": "boolean", "default": false },
+    "candidate_is_symlink": { "type": "boolean", "default": false },
     "git_ignorecase": { "type": "boolean", "default": false },
     "nested_ignore_rules": {
       "type": "array",
@@ -44,5 +45,16 @@
     "source": { "enum": ["zlob_1_6_3", "fast_glob", "git_check_ignore", "handwritten"] },
     "disputed": { "type": "boolean", "default": false },
     "note": { "type": "string" }
-  }
+  },
+  "allOf": [
+    {
+      "not": {
+        "required": ["candidate_is_dir", "candidate_is_symlink"],
+        "properties": {
+          "candidate_is_dir": { "const": true },
+          "candidate_is_symlink": { "const": true }
+        }
+      }
+    }
+  ]
 }
