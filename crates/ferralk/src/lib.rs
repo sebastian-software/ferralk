@@ -1013,6 +1013,10 @@ impl Walker {
     }
 
     /// Applies `.gitignore` rules plus zlob-compatible `.ignore` supplements.
+    ///
+    /// An explicitly supplied walk root is entered even when an inherited
+    /// rule ignores that directory itself, matching ripgrep's explicit-root
+    /// behavior. Inherited rules still filter entries below that root.
     #[must_use]
     pub const fn respect_git_ignore(mut self, enabled: bool) -> Self {
         self.respect_git_ignore = enabled;
@@ -4488,6 +4492,47 @@ mod tests {
             );
         }
         assert!(paths.contains(&PathBuf::from("kept.txt")));
+    }
+
+    #[test]
+    fn an_explicitly_ignored_walk_root_is_still_entered() {
+        let fixture = Fixture::new();
+        fixture.write("src2/kept.txt");
+        fs::create_dir(fixture.root.join(".git")).expect("create repository metadata directory");
+        fs::write(fixture.root.join(".gitignore"), b"/src2/\n").expect("write root ignore rule");
+
+        let root = fixture.root.join("src2");
+        let walked = Walker::new(&root)
+            .respect_git_ignore(true)
+            .collect()
+            .expect("explicit subtree walk succeeds");
+        let paths = relative_paths(walked.entries(), &root);
+        assert!(paths.contains(&PathBuf::from("kept.txt")));
+    }
+
+    #[test]
+    fn a_dot_segment_in_a_subtree_root_preserves_inherited_anchors() {
+        let fixture = Fixture::new();
+        for path in ["src/anch.txt", "src/rel.txt", "src/kept.txt"] {
+            fixture.write(path);
+        }
+        fs::create_dir(fixture.root.join(".git")).expect("create repository metadata directory");
+        fs::write(
+            fixture.root.join(".gitignore"),
+            b"/src/anch.txt\nsrc/rel.txt\n",
+        )
+        .expect("write anchored ignore rules");
+
+        let root = fixture.root.join(".").join("src");
+        let walked = Walker::new(&root)
+            .respect_git_ignore(true)
+            .options(WalkOptions::default().sort(true))
+            .collect()
+            .expect("dotted subtree walk succeeds");
+        assert_eq!(
+            relative_paths(walked.entries(), &root),
+            vec![PathBuf::from("kept.txt")]
+        );
     }
 
     /// Starts a Git oracle process that is independent of the developer's

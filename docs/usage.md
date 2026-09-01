@@ -148,10 +148,14 @@ Important defaults:
   `respect_git_ignore(true)`. A subtree walk inherits the `.gitignore` and
   `.ignore` chain from its repository root through the directory above the
   walk root, plus the repository's `.git/info/exclude`; the file closest to an
-  entry decides, as in Git. Linked-worktree and submodule `.git` pointer files
-  are resolved (including one `commondir`). In-tree `.gitignore` and `.ignore`
-  symlinks are ignored rather than followed; `.git/info/exclude` keeps Git's
-  link-following behavior.
+  entry decides, as in Git. The explicitly supplied walk root is always
+  entered even when an inherited rule ignores that directory, matching
+  ripgrep's explicit-root behavior; inherited rules still filter entries
+  below it. Repository discovery walks parent directories to the filesystem
+  root and does not stop at mount boundaries. Linked-worktree and submodule
+  `.git` pointer files are resolved (including one `commondir`). In-tree
+  `.gitignore` and `.ignore` symlinks are ignored rather than followed;
+  `.git/info/exclude` keeps Git's link-following behavior.
   Each ignore or repository-metadata file is capped at 8 MiB, and each rule
   file at 100,000 lines. A rule file that exceeds either limit, or otherwise
   cannot be read, contributes no rules and is reported as a `read_ignore`
