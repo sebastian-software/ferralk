@@ -2144,9 +2144,10 @@ fn read_portable_directory(
                 continue;
             }
         };
-        // The standard library's one `file_name` allocation is the portable
-        // backend's floor. The native backends read names out of a buffer they
-        // own and reach zero.
+        // The `file_name` allocation is the portable backend's visible floor.
+        // On Linux, `ReadDir` has already copied the readdir name into its own
+        // CString as well. Native backends read names out of a buffer they own
+        // and reach zero.
         listing.push(&name, file_type.is_dir(), file_type.is_symlink());
     }
     Ok(())

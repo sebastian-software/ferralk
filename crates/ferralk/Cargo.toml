@@ -27,6 +27,7 @@ libc = "=0.2.189"
 unicode-normalization = "=0.1.25"
 
 [dev-dependencies]
+allocation-counter = "=0.8.1"
 corpus = { path = "../../tools/corpus" }
 # The engine ADR-0014 replaced, kept for the test that compares the two rule
 # matchers over generated rules and paths.
