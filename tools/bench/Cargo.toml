@@ -13,7 +13,7 @@ native-macos = ["ferralk/native-macos"]
 zlob-oracle = ["dep:zlob"]
 
 [dependencies]
-zlob = { version = "=1.6.3", optional = true }
+zlob = { version = "=1.6.5", optional = true }
 
 [dev-dependencies]
 criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
