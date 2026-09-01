@@ -70,11 +70,19 @@ cargo fmt --all --check
 cargo clippy --workspace --exclude oracle --all-targets --locked -- -D warnings
 cargo test --workspace --exclude oracle --locked
 cargo run -p harness -- corpus
+cargo check --manifest-path fuzz/Cargo.toml \
+  --bin pattern_parser --bin pattern_matcher --bin ferralk_vs_fast_glob --locked
 ```
 
-This is the pull-request gate and needs no Zig installation. The development-
-only `oracle` package links zlob; include it by dropping `--exclude oracle`
-only after installing Zig 0.16 and libclang.
+This is the canonical portable preflight for a pull request and needs no Zig
+installation. The separate fuzz workspace is included because root-workspace
+commands do not compile it. The development-only `oracle` package links zlob;
+include it by dropping `--exclude oracle` only after installing Zig 0.16 and
+libclang.
+
+CI has additional platform, sanitizer, coverage, and policy lanes. In
+particular, coverage includes `oracle` and installs Zig itself; that CI setup
+does not add Zig to this local contributor preflight.
 
 Changes to the native backends also need `--features native-macos` or
 `--features native-linux` on the platform that has them; the corresponding CI

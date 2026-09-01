@@ -55,6 +55,7 @@ jobs:
       - run: >-
           cargo check --manifest-path fuzz/Cargo.toml
           --bin pattern_parser --bin pattern_matcher --bin ferralk_vs_fast_glob
+          --locked
 
   test:
     name: test (${{ matrix.os }})
