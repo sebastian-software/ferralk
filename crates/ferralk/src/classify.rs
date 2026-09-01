@@ -185,6 +185,25 @@ fn exclude_proves_no_re_admission(
                 .any(|pattern| pattern.could_match_hidden_descendant(bytes)))
 }
 
+/// Whether resolving a path-excluded link proves that it has no reachable
+/// descendant for an include to re-admit.
+fn excluded_link_has_no_reachable_target(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return true;
+    }
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(1921) {
+        // ERROR_CANT_RESOLVE_FILENAME, which std maps to the still-unstable
+        // ErrorKind::FilesystemLoop variant.
+        return true;
+    }
+    false
+}
+
 /// Decides what one directory entry means for the walk.
 ///
 /// `path` is the frontend's scratch buffer, already holding this entry's whole
@@ -270,9 +289,10 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
             Ok(metadata) => is_dir = metadata.is_dir(),
             // The unresolved path exclusion already answers a dangling link;
             // resolving it only served a possible descendant include. With no
-            // target there can be no such descendant, so keep the shortcut's
-            // historical no-error behavior.
-            Err(source) if excluded_as_link && source.kind() == std::io::ErrorKind::NotFound => {
+            // reachable target there can be no such descendant, so keep the
+            // shortcut's historical no-error behavior for dangling and looped
+            // links.
+            Err(source) if excluded_as_link && excluded_link_has_no_reachable_target(&source) => {
                 return EntryAction::Skip;
             }
             Err(source) => {

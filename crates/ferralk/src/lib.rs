@@ -8718,6 +8718,34 @@ mod tests {
         assert!(dangling.errors().is_empty());
     }
 
+    /// Resolving an excluded followed link only serves a possible descendant
+    /// include. A self-loop has no reachable descendant, just like a dangling
+    /// link, so ELOOP must restore the path-exclusion shortcut instead of
+    /// aborting the walk.
+    #[cfg(unix)]
+    #[test]
+    fn an_excluded_self_loop_cannot_abort_a_re_admitting_walk() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        symlink("loop", fixture.root.join("loop")).expect("create self-loop symlink");
+
+        for threads in [1, 4] {
+            let result = Walker::new(&fixture.root)
+                .threads(threads)
+                .exclude("loop")
+                .expect("valid self-loop exclusion")
+                .include("loop/keep.txt")
+                .expect("valid descendant include")
+                .options(WalkOptions::default().follow_symlinks(true))
+                .error_policy(ErrorPolicy::Abort)
+                .collect()
+                .expect("an excluded self-loop has no descendant that could be re-admitted");
+            assert!(result.entries().is_empty(), "threads={threads}");
+            assert!(result.errors().is_empty(), "threads={threads}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn followed_symlinks_skipped_by_path_rules_do_not_need_a_target() {
