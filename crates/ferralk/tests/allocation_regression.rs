@@ -118,14 +118,16 @@ fn assert_walk_growth(label: &str, one_batch: u64, two_batches: u64) {
     });
     // After the first sibling directory has populated the reusable listing,
     // native readers should pay only constant directory/task setup for the
-    // equally wide second sibling. std::fs::DirEntry::file_name necessarily
-    // returns one new OsString per entry, so portable readers retain exactly
-    // that per-entry floor plus the same small constant allowance.
+    // equally wide second sibling. Portable readers always pay for the
+    // OsString returned by DirEntry::file_name; on Linux, std::fs::ReadDir also
+    // copies each readdir name into an owned CString before yielding it.
     let backend_floor = if cfg!(any(
         all(feature = "native-linux", target_os = "linux"),
         all(feature = "native-macos", target_os = "macos")
     )) {
         0
+    } else if cfg!(target_os = "linux") {
+        (ENTRIES_PER_DIRECTORY * 2) as u64
     } else {
         ENTRIES_PER_DIRECTORY as u64
     };

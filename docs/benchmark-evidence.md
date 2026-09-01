@@ -13,7 +13,7 @@ records the same distinction for releases.
 
 | Lane | What it measures | Where | Gating |
 | --- | --- | --- | --- |
-| Allocation regression | Zero allocations for warmed compiled matches; steady-state serial-walker growth above the portable `DirEntry::file_name` floor, with and without Git ignore rules | [`allocation_regression.rs`](../crates/ferralk/tests/allocation_regression.rs), every platform test and both native-backend jobs | Yes |
+| Allocation regression | Zero allocations for warmed compiled matches; steady-state serial-walker growth above the platform's portable `std::fs` floor, with and without Git ignore rules | [`allocation_regression.rs`](../crates/ferralk/tests/allocation_regression.rs), every platform test and both native-backend jobs | Yes |
 | Matcher, wall time | Compiled-pattern matching and compilation, against `globset`, `fast-glob`, and `wax` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
 | Walker, wall time | Warm-cache traversal of synthetic repository-shaped trees plus a 400-level chain, including an include-plus-covering-exclude pruning arm, ferralk serial and parallel against `ignore` parallel, one job per backend that ships | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request, medians in the job summary and as an artifact | No |
 | Engine comparison | One repository shape with unscoped include, scoped include, include-plus-exclude, and gitignore-pruned queries | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), run on demand | No |
