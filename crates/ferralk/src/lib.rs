@@ -2756,8 +2756,8 @@ impl<'walker> WalkState<'walker> {
                 EntryAction::DescendAndEmit(entry, task) => {
                     let entry = entry.with_path(own_path(&mut self.spare, &frame.scratch.path));
                     reset_to_directory(&mut frame.scratch.path, path);
-                    pending.push(SerialTask::Emit(entry));
                     pending.push(SerialTask::Resume(frame));
+                    pending.push(SerialTask::Emit(entry));
                     pending.push(SerialTask::Directory(task));
                     return Ok(());
                 }
@@ -3193,6 +3193,59 @@ mod tests {
             "the mock tree has only directories"
         );
         assert!(result.errors().is_empty());
+    }
+
+    /// The explicit task stack must model the old recursive call exactly:
+    /// finish one directory's subtree, emit that directory, then continue with
+    /// its next sibling in the backend's listing order.
+    #[test]
+    fn serial_unsorted_directories_are_emitted_after_their_own_subtrees() {
+        struct OrderedTreeBackend {
+            root: PathBuf,
+        }
+
+        impl super::DirectoryBackend for OrderedTreeBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                listing.clear();
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .expect("walk only reads descendants of its root");
+                match relative.to_str().expect("fixture paths are UTF-8") {
+                    "" => {
+                        listing.push("b".as_ref(), true, false);
+                        listing.push("a".as_ref(), true, false);
+                    }
+                    "b" => listing.push("f2.txt".as_ref(), false, false),
+                    "a" => listing.push("f1.txt".as_ref(), false, false),
+                    other => panic!("unexpected directory read: {other}"),
+                }
+                Ok(())
+            }
+        }
+
+        let backend = OrderedTreeBackend {
+            root: PathBuf::from("/serial-emission-order"),
+        };
+        let result = Walker::new(&backend.root)
+            .threads(1)
+            .collect_with(&backend)
+            .expect("mock walk succeeds");
+
+        assert_eq!(
+            relative_paths(result.entries(), &backend.root),
+            [
+                PathBuf::from("b/f2.txt"),
+                PathBuf::from("b"),
+                PathBuf::from("a/f1.txt"),
+                PathBuf::from("a"),
+            ]
+        );
     }
 
     #[test]
