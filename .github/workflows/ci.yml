@@ -52,18 +52,21 @@ jobs:
             failures=1
           fi
 
-          commit_count=0
+          if ! commit_lines=$(git log --format='%H%x09%s' "$BASE_SHA..$HEAD_SHA"); then
+            echo "Could not enumerate pull-request commits: $BASE_SHA..$HEAD_SHA" >&2
+            exit 1
+          fi
+          if [[ -z "$commit_lines" ]]; then
+            echo 'The pull-request head has no commits outside its base.' >&2
+            exit 1
+          fi
+
           while IFS=$'\t' read -r sha subject; do
-            ((commit_count += 1))
             if ! validate_subject "Commit ${sha:0:12}" "$subject"; then
               failures=1
             fi
-          done < <(git log --format='%H%x09%s' "$BASE_SHA..$HEAD_SHA")
+          done <<< "$commit_lines"
 
-          if ((commit_count == 0)); then
-            echo 'The pull-request head has no commits outside its base.' >&2
-            failures=1
-          fi
           if ((failures != 0)); then
             echo 'Allowed types: feat, fix, perf, deps, chore, docs, refactor, test, build, ci.' >&2
             exit 1
