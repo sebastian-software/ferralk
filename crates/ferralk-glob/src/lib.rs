@@ -2775,21 +2775,21 @@ const MAX_POSIX_CLASS_NAME_LEN: usize = 6;
 
 impl PosixClass {
     fn matches(self, byte: u8, case_insensitive: bool) -> bool {
-        let folded = fold_ascii(byte, case_insensitive);
         match self {
-            Self::Alnum => folded.is_ascii_alphanumeric(),
-            Self::Alpha => folded.is_ascii_alphabetic(),
+            Self::Alnum => byte.is_ascii_alphanumeric(),
+            Self::Alpha => byte.is_ascii_alphabetic(),
             Self::Ascii => byte.is_ascii(),
             Self::Blank => matches!(byte, b' ' | b'\t'),
             Self::Cntrl => byte.is_ascii_control(),
             Self::Digit => byte.is_ascii_digit(),
             Self::Graph => byte.is_ascii_graphic(),
-            Self::Lower => folded.is_ascii_lowercase(),
+            Self::Lower | Self::Upper if case_insensitive => byte.is_ascii_alphabetic(),
+            Self::Lower => byte.is_ascii_lowercase(),
             Self::Print => byte.is_ascii_graphic() || byte == b' ',
             Self::Punct => byte.is_ascii_punctuation(),
             Self::Space => byte.is_ascii_whitespace(),
-            Self::Upper => folded.is_ascii_uppercase(),
-            Self::Word => folded.is_ascii_alphanumeric() || folded == b'_',
+            Self::Upper => byte.is_ascii_uppercase(),
+            Self::Word => byte.is_ascii_alphanumeric() || byte == b'_',
             Self::Xdigit => byte.is_ascii_hexdigit(),
         }
     }
@@ -6033,6 +6033,29 @@ mod tests {
         assert!(compile("[[:digit:]]").is_match("7"));
         assert!(compile("[[:word:]]").is_match("_"));
         assert!(compile("[![:space:]]").is_match("x"));
+    }
+
+    #[test]
+    fn case_folding_makes_upper_and_lower_classes_ascii_alphabetic() {
+        let folded = PatternOptions::default().case_insensitive(true);
+        for class in ["lower", "upper"] {
+            let pattern = Pattern::compile(format!("[[:{class}:]]"), folded).unwrap();
+            assert!(pattern.is_match("a"));
+            assert!(pattern.is_match("A"));
+            assert!(!pattern.is_match("1"));
+        }
+
+        let not_upper = Pattern::compile("[![:upper:]]", folded).unwrap();
+        assert!(!not_upper.is_match("A"));
+        assert!(not_upper.is_match("1"));
+
+        let path = Pattern::compile("src/[[:upper:]]*.rs", folded).unwrap();
+        assert!(path.is_match("src/Main.rs"));
+
+        assert!(compile("[[:upper:]]").is_match("A"));
+        assert!(!compile("[[:upper:]]").is_match("a"));
+        assert!(compile("[[:lower:]]").is_match("a"));
+        assert!(!compile("[[:lower:]]").is_match("A"));
     }
 
     #[test]
