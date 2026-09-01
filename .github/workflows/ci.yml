@@ -52,7 +52,7 @@ jobs:
             failures=1
           fi
 
-          if ! commit_lines=$(git log --format='%H%x09%s' "$BASE_SHA..$HEAD_SHA"); then
+          if ! commit_lines=$(git log --no-merges --format='%H%x09%s' "$BASE_SHA..$HEAD_SHA"); then
             echo "Could not enumerate pull-request commits: $BASE_SHA..$HEAD_SHA" >&2
             exit 1
           fi
