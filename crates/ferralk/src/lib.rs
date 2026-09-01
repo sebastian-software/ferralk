@@ -2955,6 +2955,8 @@ mod tests {
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
     const HOSTILE_GIT_CONFIG_FIXTURE: &str = "FERRALK_HOSTILE_GIT_CONFIG_FIXTURE";
+    const RELATIVE_ROOT_IGNORE_FIXTURE: &str = "FERRALK_RELATIVE_ROOT_IGNORE_FIXTURE";
+    const RELATIVE_ROOT_SPELLING: &str = "FERRALK_RELATIVE_ROOT_SPELLING";
 
     #[test]
     fn walk_stream_keeps_its_unwind_auto_traits() {
@@ -4684,6 +4686,56 @@ mod tests {
             relative_paths(walked.entries(), &root),
             vec![PathBuf::from("kept.txt")]
         );
+    }
+
+    #[test]
+    fn relative_root_spellings_inherit_repository_ignore_rules() {
+        if let Some(root) = std::env::var_os(RELATIVE_ROOT_IGNORE_FIXTURE) {
+            let root = PathBuf::from(root);
+            let spelling = std::env::var_os(RELATIVE_ROOT_SPELLING)
+                .expect("child receives its relative root spelling");
+            let spelling = PathBuf::from(spelling);
+            let walked = Walker::new(&spelling)
+                .respect_git_ignore(true)
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("relative-root walk succeeds");
+            assert_eq!(
+                relative_paths(walked.entries(), &spelling),
+                vec![PathBuf::from("keep.rs")],
+                "root spelling {spelling:?} must inherit repository rules from {root:?}",
+            );
+            return;
+        }
+
+        let fixture = Fixture::new();
+        fixture.write("src/debug.log");
+        fixture.write("src/secret.txt");
+        fixture.write("src/keep.rs");
+        fs::create_dir(fixture.root.join(".git")).expect("create repository metadata directory");
+        fs::write(fixture.root.join(".gitignore"), b"*.log\n/src/secret.txt\n")
+            .expect("write repository ignore rules");
+
+        for (working_directory, spelling) in [
+            (fixture.root.join("src"), "."),
+            (fixture.root.join("src"), "./"),
+            (fixture.root.clone(), "src"),
+        ] {
+            let status = Command::new(std::env::current_exe().expect("locate test binary"))
+                .args([
+                    "tests::relative_root_spellings_inherit_repository_ignore_rules",
+                    "--exact",
+                ])
+                .current_dir(working_directory)
+                .env(RELATIVE_ROOT_IGNORE_FIXTURE, &fixture.root)
+                .env(RELATIVE_ROOT_SPELLING, spelling)
+                .status()
+                .expect("run isolated relative-root regression test");
+            assert!(
+                status.success(),
+                "relative-root child failed for {spelling:?}: {status}"
+            );
+        }
     }
 
     /// Starts a Git oracle process that is independent of the developer's
