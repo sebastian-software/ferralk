@@ -1546,6 +1546,17 @@ impl TraversalPattern {
             .any(|root| shares_a_line_of_descent(root, path))
     }
 
+    /// Whether this include can reach below `path` and explicitly select a
+    /// component that wildcard-hidden policy leaves outside a covering
+    /// exclude. The matcher compiler owns the syntax analysis, including
+    /// brace and extglob alternatives; the walker adds only root reachability.
+    fn could_match_hidden_descendant(&self, path: &[u8]) -> bool {
+        self.could_match_descendant(path)
+            && self
+                .matcher
+                .can_match_hidden_component_without_match_hidden()
+    }
+
     fn matches_extension(&self, path: &[u8]) -> bool {
         if self.never_matches {
             return false;
@@ -7005,6 +7016,153 @@ mod tests {
             relative_paths(result.entries(), &fixture.root),
             [PathBuf::from("a/keep.txt")]
         );
+    }
+
+    /// A covering exclude has only one blind spot with the default glob
+    /// policy: hidden components. A broad include that cannot name one must
+    /// not turn a rejected build tree back into traversal work.
+    #[test]
+    fn covering_excludes_prune_when_includes_cannot_reach_hidden_descendants() {
+        struct PruningBackend {
+            root: PathBuf,
+            reads: Mutex<Vec<PathBuf>>,
+        }
+
+        impl super::DirectoryBackend for PruningBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                listing.clear();
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .expect("walk only reads descendants of its root");
+                self.reads
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(relative.to_path_buf());
+                if relative.as_os_str().is_empty() {
+                    listing.push("target".as_ref(), true, false);
+                    listing.push("src".as_ref(), true, false);
+                } else if relative == Path::new("target") {
+                    listing.push("visible.rs".as_ref(), false, false);
+                    listing.push(".hidden".as_ref(), true, false);
+                } else if relative == Path::new("target/.hidden") || relative == Path::new("src") {
+                    listing.push("keep.rs".as_ref(), false, false);
+                }
+                Ok(())
+            }
+        }
+
+        let walk = |include: &str, match_hidden: bool| {
+            let fixture = Fixture::new();
+            let backend = PruningBackend {
+                root: fixture.root.clone(),
+                reads: Mutex::new(Vec::new()),
+            };
+            let result = Walker::new(&fixture.root)
+                .threads(1)
+                .match_hidden(match_hidden)
+                .include(include)
+                .expect("valid include")
+                .exclude("**/target/**")
+                .expect("valid exclude")
+                .options(WalkOptions::default().files_only(true))
+                .collect_with(&backend)
+                .expect("mock walk succeeds");
+            let paths = relative_paths(result.entries(), &fixture.root);
+            let reads = backend
+                .reads
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (paths, reads)
+        };
+
+        for (include, match_hidden) in [("**/*.{rs,toml}", false), ("**/*.{rs,toml}", true)] {
+            let (paths, reads) = walk(include, match_hidden);
+            assert_eq!(paths, [PathBuf::from("src/keep.rs")]);
+            assert_eq!(
+                reads,
+                [PathBuf::new(), PathBuf::from("src")],
+                "{include} with match_hidden={match_hidden} must not open target"
+            );
+        }
+
+        let (paths, reads) = walk("**/.hidden/keep.rs", false);
+        assert_eq!(paths, [PathBuf::from("target/.hidden/keep.rs")]);
+        assert!(
+            reads.contains(&PathBuf::from("target/.hidden")),
+            "an explicit hidden include still re-admits the excluded subtree's blind spot"
+        );
+
+        let (paths, reads) = walk("**/?(.visible).hidden/keep.rs", false);
+        assert_eq!(paths, [PathBuf::from("target/.hidden/keep.rs")]);
+        assert!(
+            reads.contains(&PathBuf::from("target/.hidden")),
+            "an extglob that explicitly permits a leading period can re-admit its zero-width branch"
+        );
+    }
+
+    /// With no includes, every exclude form that rejects a directory can
+    /// prune it: a literal, a directory-only pattern, or an explicit subtree.
+    #[test]
+    fn excluded_directories_without_includes_are_never_opened() {
+        struct ReadRecordingBackend {
+            root: PathBuf,
+            reads: Mutex<Vec<PathBuf>>,
+        }
+
+        impl super::DirectoryBackend for ReadRecordingBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                listing.clear();
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .expect("walk only reads descendants of its root");
+                self.reads
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(relative.to_path_buf());
+                if relative.as_os_str().is_empty() {
+                    listing.push("target".as_ref(), true, false);
+                } else if relative == Path::new("target") {
+                    listing.push("must-not-be-read.txt".as_ref(), false, false);
+                }
+                Ok(())
+            }
+        }
+
+        for exclude in ["target", "target/", "target/**"] {
+            let fixture = Fixture::new();
+            let backend = ReadRecordingBackend {
+                root: fixture.root.clone(),
+                reads: Mutex::new(Vec::new()),
+            };
+            let result = Walker::new(&fixture.root)
+                .threads(1)
+                .exclude(exclude)
+                .expect("valid exclude")
+                .collect_with(&backend)
+                .expect("mock walk succeeds");
+
+            assert!(result.entries().is_empty(), "{exclude}");
+            assert_eq!(
+                backend
+                    .reads
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                [PathBuf::new()],
+                "{exclude} must prune the directory before opening it"
+            );
+        }
     }
 
     /// A literal that shares a component with a wildcard proves nothing about a
