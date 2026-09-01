@@ -298,13 +298,21 @@ impl DirectoryBackend for NativeUnknownTypeBackend {
         &self,
         path: &Path,
         _follow_symlinks: bool,
-        _refuse_final_symlink: bool,
+        refuse_final_symlink: bool,
         listing: &mut Listing,
     ) -> io::Result<()> {
         #[cfg(target_os = "linux")]
-        return crate::linux_native::read_directory_with_unknown_types_for_test(path, listing);
+        return crate::linux_native::read_directory_with_unknown_types_for_test(
+            path,
+            refuse_final_symlink,
+            listing,
+        );
         #[cfg(target_os = "macos")]
-        return crate::macos_native::read_directory_with_unknown_types_for_test(path, listing);
+        return crate::macos_native::read_directory_with_unknown_types_for_test(
+            path,
+            refuse_final_symlink,
+            listing,
+        );
     }
 }
 
@@ -412,9 +420,9 @@ fn parity_through_the_latched_native_fallback() {
     }
 
     #[cfg(target_os = "linux")]
-    let _latch = crate::linux_native::force_unsupported_latch_for_test();
+    let _latch = crate::linux_native::force_unsupported_latch_for_test(&fixture.root);
     #[cfg(target_os = "macos")]
-    let _latch = crate::macos_native::force_unsupported_latch_for_test();
+    let _latch = crate::macos_native::force_unsupported_latch_for_test(&fixture.root);
 
     assert_parity(
         "latched native fallback",

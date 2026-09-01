@@ -47,6 +47,8 @@ use std::{
 };
 
 #[cfg(test)]
+use std::path::PathBuf;
+#[cfg(test)]
 use std::sync::{Mutex, MutexGuard};
 
 use super::{Listing, defer_entry_stat_error};
@@ -101,32 +103,54 @@ static NATIVE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
 static NATIVE_LATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+static FORCED_UNSUPPORTED_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-/// Restores the process-wide capability latch after a test, including when
-/// the test unwinds. The lock serializes tests that deliberately force this
-/// process-global fallback mode.
+/// Restores the test-only, root-scoped latch override after a test, including
+/// when the test unwinds. Scoping keeps unrelated native-reader tests on the
+/// real backend while this fixture exercises the latched fallback.
 #[cfg(test)]
 pub(super) struct UnsupportedLatchGuard {
-    previous: bool,
+    previous: Option<PathBuf>,
     _lock: MutexGuard<'static, ()>,
 }
 
 #[cfg(test)]
 impl Drop for UnsupportedLatchGuard {
     fn drop(&mut self) {
-        NATIVE_UNSUPPORTED.store(self.previous, Ordering::SeqCst);
+        *FORCED_UNSUPPORTED_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.previous.take();
     }
 }
 
 #[cfg(test)]
-pub(super) fn force_unsupported_latch_for_test() -> UnsupportedLatchGuard {
+pub(super) fn force_unsupported_latch_for_test(root: &Path) -> UnsupportedLatchGuard {
     let lock = NATIVE_LATCH_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = FORCED_UNSUPPORTED_ROOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace(root.to_path_buf());
     UnsupportedLatchGuard {
-        previous: NATIVE_UNSUPPORTED.swap(true, Ordering::SeqCst),
+        previous,
         _lock: lock,
     }
+}
+
+fn unsupported_is_latched_for(_path: &Path) -> bool {
+    if NATIVE_UNSUPPORTED.load(Ordering::Relaxed) {
+        return true;
+    }
+    #[cfg(test)]
+    return FORCED_UNSUPPORTED_ROOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|root| _path.starts_with(root));
+    #[cfg(not(test))]
+    false
 }
 
 /// Process-wide ceiling for descriptors retained beyond one directory read.
@@ -250,7 +274,7 @@ pub(super) fn read_directory(
     refuse_final_symlink: bool,
     listing: &mut Listing,
 ) -> NativeDirectoryReadResult {
-    if NATIVE_UNSUPPORTED.load(Ordering::Relaxed) {
+    if unsupported_is_latched_for(path) {
         read_portable_directory_from_path(path, relative, refuse_final_symlink, listing)?;
         Ok(())
     } else {
@@ -773,9 +797,10 @@ fn descriptor_entry_kind(
 #[cfg(test)]
 pub(super) fn read_directory_with_unknown_types_for_test(
     path: &Path,
+    refuse_final_symlink: bool,
     listing: &mut Listing,
 ) -> io::Result<()> {
-    let directory = open_directory(path, false)?;
+    let directory = open_directory(path, refuse_final_symlink)?;
     listing.clear();
     for entry in fs::read_dir(path)? {
         let entry = entry?;
