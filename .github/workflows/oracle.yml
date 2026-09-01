@@ -1,6 +1,16 @@
 name: Replay corpus against zlob oracle
 
 on:
+  pull_request:
+    paths:
+      - .github/workflows/oracle.yml
+      - Cargo.lock
+      - corpus/**
+      - crates/ferralk-glob/**
+      - tools/corpus/**
+      - tools/oracle/**
+  schedule:
+    - cron: "23 3 * * 1"
   workflow_dispatch:
     inputs:
       reason:

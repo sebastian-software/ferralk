@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use corpus::{Case, CaseKind, Source, decode_bytes, parse_case};
 use zlob::{
@@ -8,11 +8,12 @@ use zlob::{
     zlob_match_paths_indices_at,
 };
 
-/// Lower bound on the cases this adapter must hand to zlob.
+/// Exact number of cases this adapter must hand to zlob.
 ///
-/// The corpus only grows, so a run below this floor means the skip mechanism
-/// swallowed the replay instead of exercising the oracle.
-const MINIMUM_REPLAYED: usize = 400;
+/// Any corpus change must update this inventory deliberately, so additions
+/// cannot bypass the oracle through a broadened skip condition.
+const EXPECTED_REPLAYED: usize = 521;
+const EXPECTED_SKIPPED: usize = 237;
 
 /// Cases the zlob 1.6.3 Rust API cannot express, counted by reason.
 #[derive(Default)]
@@ -34,6 +35,8 @@ struct Skipped {
     ignore: usize,
     /// fast-glob-backed cases belong to the Oxc oracle.
     fast_glob: usize,
+    /// zlob's Rust FFI cannot safely expose NOCHECK's synthetic empty-list result.
+    nocheck_empty_list: usize,
 }
 
 impl Skipped {
@@ -46,11 +49,12 @@ impl Skipped {
             + self.platform
             + self.ignore
             + self.fast_glob
+            + self.nocheck_empty_list
     }
 }
 
 #[test]
-#[ignore = "requires Zig 0.16 and libclang; run only from the manual oracle workflow"]
+#[ignore = "requires Zig 0.16 and libclang; run only from the oracle workflow"]
 fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
     let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
     let mut files = Vec::new();
@@ -58,8 +62,10 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
     files.sort();
 
     let mut replayed = 0_usize;
+    let mut replayed_by_file = BTreeMap::new();
     let mut skipped = Skipped::default();
     for file in files {
+        let mut file_replayed = 0_usize;
         for (line_number, line) in fs::read_to_string(&file)
             .expect("read corpus file")
             .lines()
@@ -104,6 +110,17 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
             };
             let pattern = text.pattern.as_str();
             let path = text.path.as_str();
+            if matches!(case.kind, CaseKind::MatchPaths | CaseKind::MatchPathsAt)
+                && case.flags.iter().any(|flag| flag == "nocheck")
+                && case.paths.is_empty()
+            {
+                // zlob 1.6.3's Rust FFI aborts on empty input and returns
+                // corrupted bytes for this synthetic result. The frozen Zig
+                // assertion remains the source evidence, but this Rust oracle
+                // must not claim that it replayed the case.
+                skipped.nocheck_empty_list += 1;
+                continue;
+            }
             let actual = match case.kind {
                 CaseKind::Matcher => zlob_match_paths(pattern, &[path], flags)
                     .unwrap_or_else(|error| {
@@ -112,51 +129,40 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                     .is_some(),
                 CaseKind::HasWildcards => has_wildcards(pattern, flags),
                 CaseKind::MatchPaths | CaseKind::MatchPathsAt => {
-                    if case.flags.iter().any(|flag| flag == "nocheck") {
-                        // zlob 1.6.3's Rust FFI aborts on empty input and
-                        // returns corrupted bytes for this synthetic result.
-                        // The frozen Zig assertion remains the source evidence.
-                        case.oracle_matches
-                            .as_ref()
-                            .is_some_and(|matches| !matches.is_empty())
-                    } else {
-                        let paths = text.borrowed_paths();
-                        let selected = match case.kind {
-                            CaseKind::MatchPaths => {
-                                zlob_match_paths(pattern, paths.as_slice(), flags)
-                            }
-                            CaseKind::MatchPathsAt => zlob_match_paths_at(
-                                text.base_path.as_str(),
-                                pattern,
-                                paths.as_slice(),
-                                flags,
-                            ),
-                            CaseKind::Matcher
-                            | CaseKind::HasWildcards
-                            | CaseKind::CompileError
-                            | CaseKind::MatchGlobPath
-                            | CaseKind::Ignore
-                            | CaseKind::AbsolutePattern
-                            | CaseKind::MatchPathIndices
-                            | CaseKind::MatchPathIndicesAt => unreachable!(),
-                        }
-                        .expect("zlob match paths")
-                        .map(|matches| matches.to_strings())
-                        .unwrap_or_default();
-                        let mut expected = case
-                            .oracle_matches
-                            .clone()
-                            .unwrap_or_else(|| case.matches.clone());
-                        expected.sort();
-                        assert_eq!(
-                            &selected,
-                            &expected,
-                            "{}:{}: list result",
-                            file.display(),
-                            line_number + 1
-                        );
-                        !selected.is_empty()
+                    let paths = text.borrowed_paths();
+                    let selected = match case.kind {
+                        CaseKind::MatchPaths => zlob_match_paths(pattern, paths.as_slice(), flags),
+                        CaseKind::MatchPathsAt => zlob_match_paths_at(
+                            text.base_path.as_str(),
+                            pattern,
+                            paths.as_slice(),
+                            flags,
+                        ),
+                        CaseKind::Matcher
+                        | CaseKind::HasWildcards
+                        | CaseKind::CompileError
+                        | CaseKind::MatchGlobPath
+                        | CaseKind::Ignore
+                        | CaseKind::AbsolutePattern
+                        | CaseKind::MatchPathIndices
+                        | CaseKind::MatchPathIndicesAt => unreachable!(),
                     }
+                    .expect("zlob match paths")
+                    .map(|matches| matches.to_strings())
+                    .unwrap_or_default();
+                    let mut expected = case
+                        .oracle_matches
+                        .clone()
+                        .unwrap_or_else(|| case.matches.clone());
+                    expected.sort();
+                    assert_eq!(
+                        &selected,
+                        &expected,
+                        "{}:{}: list result",
+                        file.display(),
+                        line_number + 1
+                    );
+                    !selected.is_empty()
                 }
                 CaseKind::MatchPathIndices | CaseKind::MatchPathIndicesAt => {
                     let paths = text.borrowed_paths();
@@ -223,13 +229,25 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
                 case.path
             );
             replayed += 1;
+            file_replayed += 1;
         }
+        replayed_by_file.insert(
+            file.strip_prefix(&corpus_root)
+                .expect("corpus file is below the corpus root")
+                .display()
+                .to_string(),
+            file_replayed,
+        );
     }
 
+    for (file, count) in &replayed_by_file {
+        println!("replayed {count:>3} cases from {file}");
+    }
     println!(
         "replayed {replayed} corpus cases against zlob 1.6.3; skipped {} \
          ({} case-folding, {} non-UTF-8, {} compile-error, {} glob-path, \
-         {} absolute-pattern, {} other-platform, {} Git-ignore, {} fast-glob)",
+         {} absolute-pattern, {} other-platform, {} Git-ignore, {} fast-glob, \
+         {} NOCHECK-empty-list)",
         skipped.total(),
         skipped.case_folding,
         skipped.non_utf8,
@@ -238,13 +256,21 @@ fn checked_in_matcher_cases_agree_with_zlob_1_6_3() {
         skipped.absolute_pattern,
         skipped.platform,
         skipped.ignore,
-        skipped.fast_glob
+        skipped.fast_glob,
+        skipped.nocheck_empty_list,
     );
-    assert!(
-        replayed >= MINIMUM_REPLAYED,
-        "the oracle replayed only {replayed} cases and skipped {}; \
-         it must replay at least {MINIMUM_REPLAYED}",
-        skipped.total()
+    assert_eq!(
+        replayed,
+        EXPECTED_REPLAYED,
+        "the oracle replayed an unexpected number of cases and skipped {}; \
+         update the exact inventory only after reviewing the corpus change",
+        skipped.total(),
+    );
+    assert_eq!(
+        skipped.total(),
+        EXPECTED_SKIPPED,
+        "the oracle skipped an unexpected number of cases; update the exact \
+         inventory only after reviewing the corpus change",
     );
 }
 
