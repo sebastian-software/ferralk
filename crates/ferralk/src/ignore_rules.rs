@@ -106,10 +106,10 @@ impl RuleSet {
 
 #[derive(Debug)]
 struct Rule {
-    /// The rule body, one entry per path component.
+    /// The ordinary directory-spanning spelling of the rule.
     components: Vec<Component>,
-    /// The zero-component spelling of one suffix star run. Git lets `**/`
-    /// vanish with its separator, so `a**/y` also matches `ay`.
+    /// The spelling where the one partial suffix run and any adjacent whole
+    /// `**` components all take their zero-width form.
     zero_components: Option<Vec<Component>>,
     /// A searcher for the longest run of literal bytes the rule requires.
     ///
@@ -308,11 +308,10 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
         Some(rest) => (true, rest),
         None => (false, body),
     };
-    // A separator anywhere but at the end binds the rule to its own directory;
-    // without one it matches at any level. A slash inside a bracket expression
-    // is a class member, not a path separator.
-    let parts = split_rule_components(body);
-    let anchored = parts.len() > 1;
+    // Git decides anchoring with a plain slash search, even when that slash is
+    // a dead member of a bracket class. Splitting still keeps class slashes in
+    // their component because candidates never contain separators there.
+    let anchored = body.contains(&b'/');
     let body = body.strip_prefix(b"/").unwrap_or(body);
     if body.is_empty() {
         return None;
@@ -324,24 +323,39 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
         return None;
     }
 
-    let star_run = parts.iter().enumerate().find_map(|(index, part)| {
-        (index + 1 < parts.len() && suffix_star_run(part) >= 2 && !all_stars(part)).then_some(index)
-    });
-    let mut components = Vec::new();
+    let mut normalized = Vec::with_capacity(parts.len());
     let mut gate: Option<Vec<u8>> = None;
-    if !anchored {
-        components.push(Component::AnyDirs);
-    }
-    for (index, part) in parts.iter().enumerate() {
-        let compiled_part = strip_bracket_separators(part);
-        if let Some(literal) = longest_literal_run(&compiled_part)
+    for part in &parts {
+        let part = strip_bracket_separators(part)?;
+        if let Some(literal) = longest_literal_run(&part)
             && gate.as_ref().is_none_or(|best| best.len() < literal.len())
         {
             gate = Some(literal);
         }
-        let component = compile_component(&compiled_part, case_insensitive)?;
-        // Two runs in a row are one run, and collapsing them keeps the matcher
-        // from backtracking between them for nothing.
+        normalized.push(part);
+    }
+
+    let mut wildcard_seen = false;
+    let mut star_run = None;
+    for (index, part) in normalized.iter().enumerate() {
+        if !wildcard_seen
+            && (index + 1 < normalized.len() || anchored)
+            && !all_stars(part)
+            && special_suffix_prefix(part).is_some()
+        {
+            star_run = Some(index);
+        }
+        wildcard_seen |= part
+            .iter()
+            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'\\'));
+    }
+
+    let mut components = Vec::with_capacity(normalized.len() + 2);
+    if !anchored {
+        components.push(Component::AnyDirs);
+    }
+    for (index, part) in normalized.iter().enumerate() {
+        let component = compile_component(part, case_insensitive)?;
         if matches!(component, Component::AnyDirs)
             && matches!(components.last(), Some(Component::AnyDirs))
         {
@@ -352,7 +366,16 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
             components.push(Component::AnyDirs);
         }
     }
-    if matches!(components.last(), Some(Component::AnyDirs)) {
+    let trailing_whole_run = normalized
+        .last()
+        .is_some_and(|part| all_stars(part) && part.len() >= 2);
+    let partial_reaches_trailing_runs = star_run.is_some_and(|index| {
+        normalized[index + 1..]
+            .iter()
+            .all(|part| all_stars(part) && part.len() >= 2)
+    });
+    let trailing_requires_component = trailing_whole_run && !partial_reaches_trailing_runs;
+    if trailing_requires_component {
         // `abc/**` is what is inside `abc`, so one component has to follow.
         components.push(compile_component(b"*", case_insensitive)?);
     }
@@ -362,27 +385,38 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
     }
 
     let zero_components = star_run.and_then(|index| {
-        let mut zero = Vec::new();
+        let mut fused = special_suffix_prefix(&normalized[index])?.to_vec();
+        let mut next = index + 1;
+        while normalized
+            .get(next)
+            .is_some_and(|part| all_stars(part) && part.len() >= 2)
+        {
+            next += 1;
+        }
+        if let Some(part) = normalized.get(next) {
+            fused.extend_from_slice(part);
+        }
+
+        let mut zero = Vec::with_capacity(components.len());
         if !anchored {
             zero.push(Component::AnyDirs);
         }
-        for (part_index, part) in parts.iter().enumerate() {
-            if part_index == index + 1 {
+        for (part_index, part) in normalized.iter().enumerate() {
+            if part_index == index {
+                zero.push(compile_component(&fused, case_insensitive)?);
+            } else if part_index > index && part_index <= next {
                 continue;
-            }
-            let fused;
-            let part = if part_index == index {
-                fused = [*part, parts[index + 1]].concat();
-                fused.as_slice()
             } else {
-                *part
-            };
-            zero.push(compile_component(
-                &strip_bracket_separators(part),
-                case_insensitive,
-            )?);
+                let component = compile_component(part, case_insensitive)?;
+                if matches!(component, Component::AnyDirs)
+                    && matches!(zero.last(), Some(Component::AnyDirs))
+                {
+                    continue;
+                }
+                zero.push(component);
+            }
         }
-        if matches!(zero.last(), Some(Component::AnyDirs)) {
+        if trailing_requires_component && next < normalized.len() - 1 {
             zero.push(compile_component(b"*", case_insensitive)?);
         }
         Some(zero)
@@ -456,51 +490,118 @@ fn all_stars(part: &[u8]) -> bool {
     !part.is_empty() && part.iter().all(|byte| *byte == b'*')
 }
 
-fn suffix_star_run(part: &[u8]) -> usize {
-    part.iter().rev().take_while(|byte| **byte == b'*').count()
+/// Prefix before a special suffix star run, on Git's literal-prefix terms.
+///
+/// Escaped metacharacters stay literal. An unescaped wildcard or class before
+/// the final run means Git already handed the whole component to wildmatch, so
+/// the run is an ordinary `*` rather than a directory-spanning spelling.
+fn special_suffix_prefix(part: &[u8]) -> Option<&[u8]> {
+    let mut index = 0;
+    let mut wildcard_before_run = false;
+    let mut run_start = None;
+    let mut run_length = 0;
+    while index < part.len() {
+        match part[index] {
+            b'\\' if index + 1 < part.len() => {
+                wildcard_before_run = true;
+                run_start = None;
+                run_length = 0;
+                index += 2;
+            }
+            b'*' => {
+                let length = part[index..]
+                    .iter()
+                    .take_while(|byte| **byte == b'*')
+                    .count();
+                run_start = Some(index);
+                run_length = length;
+                if index + length < part.len() {
+                    wildcard_before_run = true;
+                }
+                index += length;
+            }
+            b'?' | b'[' => {
+                wildcard_before_run = true;
+                run_start = None;
+                run_length = 0;
+                index += 1;
+            }
+            _ => {
+                run_start = None;
+                run_length = 0;
+                index += 1;
+            }
+        }
+    }
+    if run_length >= 2 && !wildcard_before_run {
+        run_start.map(|start| &part[..start])
+    } else {
+        None
+    }
 }
 
 /// Candidate components never contain a path separator, so a slash admitted
 /// by Git inside a bracket class cannot affect matching. ferralk-glob rejects
 /// it as a separator; drop just that dead class member before compiling.
-fn strip_bracket_separators(part: &[u8]) -> Vec<u8> {
+fn strip_bracket_separators(part: &[u8]) -> Option<Vec<u8>> {
     let mut result = Vec::with_capacity(part.len());
     let mut in_class = false;
+    let mut class_start = 0;
+    let mut class_negated = false;
+    let mut class_has_member = false;
     let mut index = 0;
     while index < part.len() {
         match part[index] {
             b'\\' if index + 1 < part.len() => {
                 result.extend_from_slice(&part[index..=index + 1]);
+                if in_class {
+                    class_has_member = true;
+                }
                 index += 2;
             }
             b'[' if in_class && part.get(index + 1) == Some(&b':') => {
                 let start = index + 2;
                 if let Some(end) = memmem::find(&part[start..], b":]") {
                     result.extend_from_slice(&part[index..start + end + 2]);
+                    class_has_member = true;
                     index = start + end + 2;
                 } else {
                     result.push(b'[');
+                    class_has_member = true;
                     index += 1;
                 }
             }
             b'[' if !in_class => {
                 in_class = true;
+                class_start = result.len();
+                class_negated = matches!(part.get(index + 1), Some(b'!' | b'^'));
+                class_has_member = false;
                 result.push(b'[');
                 index += 1;
             }
             b']' if in_class => {
                 in_class = false;
-                result.push(b']');
+                if class_has_member {
+                    result.push(b']');
+                } else if class_negated {
+                    result.truncate(class_start);
+                    result.push(b'?');
+                } else {
+                    return None;
+                }
                 index += 1;
             }
             b'/' if in_class => index += 1,
             byte => {
                 result.push(byte);
+                if in_class && !(class_negated && result.len() == class_start + 2) {
+                    class_has_member = true;
+                }
                 index += 1;
             }
         }
     }
-    result
+    Some(result)
 }
 
 /// Adapts the candidate that one ignore file sees, not its raw pattern. Mac
@@ -870,6 +971,44 @@ mod tests {
             assert_eq!(fuzz_rule_bytes(b"a**/**", candidate, false), Some(true));
         }
         assert_eq!(fuzz_rule_bytes(b"a**b", b"a/x/b", false), None);
+    }
+
+    #[test]
+    fn suffix_star_runs_respect_git_s_literal_prefix_and_juncture() {
+        for rule in [
+            b"[a]**/y".as_slice(),
+            b"a?**/y",
+            b"*a**/y",
+            b"**/a**/y",
+            b"a\\**/y",
+        ] {
+            assert_eq!(
+                fuzz_rule_bytes(rule, b"a/x/y", false),
+                None,
+                "a wildcard or escape before the run makes it an ordinary star: {}",
+                String::from_utf8_lossy(rule)
+            );
+        }
+
+        assert_eq!(fuzz_rule_bytes(b"a**/y", b"ay", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"a**/y", b"axy", false), None);
+        assert_eq!(fuzz_rule_bytes(b"a**/y", b"aXy", false), None);
+    }
+
+    #[test]
+    fn final_and_repeated_special_star_runs_follow_git() {
+        for candidate in [b"a".as_slice(), b"ab", b"a/b", b"a/x/y"] {
+            assert_eq!(fuzz_rule_bytes(b"/a**", candidate, false), Some(true));
+        }
+        assert_eq!(fuzz_rule_bytes(b"a**/**/y", b"ay", false), Some(true));
+    }
+
+    #[test]
+    fn slash_classes_use_git_s_anchoring_and_negation_rules() {
+        assert_eq!(fuzz_rule_bytes(b"a[b/c]d", b"x/abd", false), None);
+        assert_eq!(fuzz_rule_bytes(b"x[[:alpha:]/]y", b"q/xay", false), None);
+        assert_eq!(fuzz_rule_bytes(b"a[!/]d", b"abd", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"a[!/]d", b"acd", false), Some(true));
     }
 
     #[test]
