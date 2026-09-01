@@ -16,12 +16,12 @@
 //! synchronization to a problem the task graph has already solved.
 
 use std::{
+    borrow::Cow,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-#[cfg(not(windows))]
 use super::glob_path_bytes;
 use super::{
     DirectoryBackend, Listing, Walker,
@@ -78,6 +78,45 @@ pub(crate) struct IgnoreScope {
     /// that has any; directories without ignore files never appear.
     rules: Option<Arc<IgnoreNode>>,
     adaptation: GitIgnoreAdaptation,
+    candidate_root: Option<CandidateRoot>,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateRoot {
+    walk: Vec<u8>,
+    discovery: Vec<u8>,
+}
+
+impl CandidateRoot {
+    fn between(walk: &Path, discovery: &Path) -> Option<Self> {
+        let walk = without_dot_components(&glob_path_bytes(walk)).into_owned();
+        let discovery = without_dot_components(&glob_path_bytes(discovery)).into_owned();
+        (walk != discovery).then_some(Self { walk, discovery })
+    }
+
+    fn map<'a>(&self, candidate: &'a [u8]) -> Cow<'a, [u8]> {
+        let candidate = without_dot_components(candidate);
+        let relative = if self.walk.is_empty() {
+            candidate.as_ref()
+        } else if candidate.as_ref() == self.walk {
+            &[]
+        } else if candidate.as_ref().starts_with(&self.walk)
+            && candidate.get(self.walk.len()) == Some(&b'/')
+        {
+            &candidate[self.walk.len() + 1..]
+        } else {
+            return candidate;
+        };
+        let mut mapped = Vec::with_capacity(self.discovery.len() + 1 + relative.len());
+        mapped.extend_from_slice(&self.discovery);
+        if !relative.is_empty() {
+            if !mapped.ends_with(b"/") {
+                mapped.push(b'/');
+            }
+            mapped.extend_from_slice(relative);
+        }
+        Cow::Owned(mapped)
+    }
 }
 
 impl IgnoreScope {
@@ -93,12 +132,18 @@ impl IgnoreScope {
         if !walker.respect_git_ignore {
             return (Self::default(), Vec::new());
         }
-        let repository = repository_layout(root);
+        // Repository discovery needs a complete ancestor chain even when the
+        // public walk root is spelled as `.` or as one relative component.
+        // Keep the original spelling in the walker itself: entry paths and
+        // explicit-pattern anchoring are intentionally relative to that root.
+        let discovery_root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+        let repository = repository_layout(&discovery_root);
         let adaptation =
             GitIgnoreAdaptation::effective(walker, repository.as_ref().map(|(_, layout)| layout));
         let mut scope = Self {
             rules: None,
             adaptation,
+            candidate_root: CandidateRoot::between(root, &discovery_root),
         };
         let Some((repository_root, layout)) = repository else {
             return (scope, Vec::new());
@@ -106,8 +151,9 @@ impl IgnoreScope {
         let (rules, mut errors) =
             read_repository_rules(backend, &repository_root, Some(&layout), adaptation);
         scope = scope.link(rules);
-        for directory in ancestor_directories(&repository_root, root) {
-            let (rules, read_errors) = read_rules(backend, &directory, &IGNORE_FILES, adaptation);
+        for directory in ancestor_directories(&repository_root, &discovery_root) {
+            let (rules, read_errors) =
+                read_rules(backend, &directory, &directory, &IGNORE_FILES, adaptation);
             scope = scope.link(rules);
             errors.extend(read_errors);
         }
@@ -135,7 +181,21 @@ impl IgnoreScope {
         if present.is_empty() {
             return (self, Vec::new());
         }
-        let (rules, errors) = read_rules(backend, directory, &present, self.adaptation);
+        let match_directory = self.candidate_root.as_ref().map_or_else(
+            || Cow::Borrowed(directory),
+            |_| {
+                Cow::Owned(
+                    std::path::absolute(directory).unwrap_or_else(|_| directory.to_path_buf()),
+                )
+            },
+        );
+        let (rules, errors) = read_rules(
+            backend,
+            directory,
+            match_directory.as_ref(),
+            &present,
+            self.adaptation,
+        );
         (self.link(rules), errors)
     }
 
@@ -156,13 +216,19 @@ impl IgnoreScope {
         // `.` in every emitted path. Align the spelling once for the whole
         // rule chain without resolving `..` or following the filesystem.
         let candidate = glob_path_bytes(path);
-        let candidate = without_dot_components(&candidate);
+        let candidate = self.candidate_root.as_ref().map_or_else(
+            || without_dot_components(&candidate),
+            |root| root.map(&candidate),
+        );
         node.verdict(&candidate, is_dir).unwrap_or(false)
     }
 
     #[cfg(windows)]
     pub(crate) fn is_ignored_bytes(&self, candidate: &[u8], is_dir: bool) -> bool {
-        let candidate = without_dot_components(candidate);
+        let candidate = self.candidate_root.as_ref().map_or_else(
+            || without_dot_components(candidate),
+            |root| root.map(candidate),
+        );
         self.rules
             .as_ref()
             .and_then(|node| node.verdict(&candidate, is_dir))
@@ -182,6 +248,7 @@ impl IgnoreScope {
                 parent: self.rules,
             })),
             adaptation: self.adaptation,
+            candidate_root: self.candidate_root,
         }
     }
 }
@@ -232,11 +299,12 @@ impl IgnoreNode {
 fn read_rules<B: DirectoryBackend + ?Sized>(
     backend: &B,
     directory: &Path,
+    match_directory: &Path,
     files: &[&str],
     adaptation: GitIgnoreAdaptation,
 ) -> (RuleSet, Vec<IgnoreReadError>) {
     let mut builder = RuleSetBuilder::new(
-        directory,
+        match_directory,
         adaptation.case_insensitive,
         adaptation.precompose_unicode,
     );
