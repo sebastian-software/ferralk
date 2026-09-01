@@ -20,10 +20,13 @@ your local clone on this project's behalf.
 
 ## Performance evidence
 
-There is no continuous performance gate. Automated protection is the walker
-wall-time lane in
-[`walker-bench.yml`](.github/workflows/walker-bench.yml), which runs on every
-pull request and publishes medians as a job summary and an artifact.
+There is no continuous wall-time threshold. The deterministic allocation-count
+test in
+[`allocation_regression.rs`](crates/ferralk/tests/allocation_regression.rs)
+does gate matcher and serial-walker hot-path allocation floors on every
+platform and native backend. The walker wall-time lane in
+[`walker-bench.yml`](.github/workflows/walker-bench.yml) remains non-gating: it
+runs on every pull request and publishes medians as a job summary and artifact.
 
 A change that claims a performance effect carries its own evidence: run the
 relevant bench before and after on one machine, back to back, and put both

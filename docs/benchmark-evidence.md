@@ -3,15 +3,17 @@
 Performance evidence for the matcher and the walker: what is measured, where it
 runs, how to reproduce it, and what it does not establish.
 
-These numbers are decision support. There is no performance gate: no CI job
-fails on a threshold, no release is blocked on a measurement, and nothing here
-is a claim to be the fastest library. [Deferred follow-up](external-release-gates.md)
-records the same for releases.
+Wall-time numbers are decision support: no CI job fails on a timing threshold,
+no release is blocked on a benchmark measurement, and nothing here is a claim
+to be the fastest library. Deterministic allocation-count invariants are the
+exception and run as ordinary tests. [Deferred follow-up](external-release-gates.md)
+records the same distinction for releases.
 
 ## The lanes
 
 | Lane | What it measures | Where | Gating |
 | --- | --- | --- | --- |
+| Allocation regression | Zero allocations for warmed compiled matches; steady-state serial-walker growth above the portable `DirEntry::file_name` floor, with and without Git ignore rules | [`allocation_regression.rs`](../crates/ferralk/tests/allocation_regression.rs), every platform test and both native-backend jobs | Yes |
 | Matcher, wall time | Compiled-pattern matching and compilation, against `globset`, `fast-glob`, and `wax` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
 | Walker, wall time | Warm-cache traversal of synthetic repository-shaped trees plus a 400-level chain, including an include-plus-covering-exclude pruning arm, ferralk serial and parallel against `ignore` parallel, one job per backend that ships | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request, medians in the job summary and as an artifact | No |
 | Engine comparison | One repository shape with unscoped include, scoped include, include-plus-exclude, and gitignore-pruned queries | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), run on demand | No |
@@ -19,7 +21,7 @@ records the same for releases.
 | zlob context | The matcher smoke fixture and 53k-file engine comparison against zlob 1.6.5 | [`zlob-benchmark.yml`](../.github/workflows/zlob-benchmark.yml), manual dispatch on Linux only | No |
 | Node.js ecosystem context | The same matcher cases and repository-shaped walker fixture against current locked Node libraries | [`tools/bench/node`](../tools/bench/node), run on demand | No |
 
-**Why every lane measures wall time.** An earlier revision ran the matcher
+**Why every benchmark lane measures wall time.** An earlier revision ran the matcher
 under CodSpeed's simulation instrument, which counts instructions in a virtual
 machine. It was removed on 2026-08-19: over the period it ran it produced four
 false alarms and no true finding, every one of them a stale baseline rather

@@ -1,7 +1,8 @@
 # Deferred follow-up
 
 Ferralk 0.9.3 is published. <!-- x-release-please-version --> There are no
-external release gates and no numeric performance gates; GitHub tracks the
+external release gates and no noisy wall-time thresholds. Deterministic
+allocation-count invariants run with the ordinary test suite; GitHub tracks the
 remaining follow-up work.
 
 The native filesystem parity corpus that used to sit in this table closed with
