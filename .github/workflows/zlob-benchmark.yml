@@ -30,7 +30,7 @@ jobs:
           version: 0.16.0
       # See walker-bench.yml: a restored criterion directory can silence the
       # measurement while the step still exits zero.
-      - name: Measure against zlob 1.6.3
+      - name: Measure against zlob 1.6.5
         shell: bash
         run: |
           rm -rf target/criterion
@@ -49,7 +49,7 @@ jobs:
         if: always()
         run: |
           {
-            echo '### zlob 1.6.3 comparison'
+            echo '### zlob 1.6.5 comparison'
             echo
             echo '| Benchmark | ns/iter | +/- |'
             echo '| --- | ---: | ---: |'

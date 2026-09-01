@@ -16,7 +16,7 @@ records the same for releases.
 | Walker, wall time | Warm-cache traversal of synthetic repository-shaped trees plus a 400-level chain, including an include-plus-covering-exclude pruning arm, ferralk serial and parallel against `ignore` parallel, one job per backend that ships | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request, medians in the job summary and as an artifact | No |
 | Engine comparison | One repository shape with unscoped include, scoped include, include-plus-exclude, and gitignore-pruned queries | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), run on demand | No |
 | zlob ablations | Ferralk and zlob on one fixed fixture, split into traversal, filtering, result retention, and path-representation costs | [`walker_zlob_ablation.rs`](../tools/bench/benches/walker_zlob_ablation.rs), run on demand | No |
-| zlob context | The matcher smoke fixture and 53k-file engine comparison against zlob 1.6.3 | [`zlob-benchmark.yml`](../.github/workflows/zlob-benchmark.yml), manual dispatch on Linux only | No |
+| zlob context | The matcher smoke fixture and 53k-file engine comparison against zlob 1.6.5 | [`zlob-benchmark.yml`](../.github/workflows/zlob-benchmark.yml), manual dispatch on Linux only | No |
 | Node.js ecosystem context | The same matcher cases and repository-shaped walker fixture against current locked Node libraries | [`tools/bench/node`](../tools/bench/node), run on demand | No |
 
 **Why every lane measures wall time.** An earlier revision ran the matcher
@@ -83,8 +83,8 @@ produced no number that said so. The walker wall-time lane now runs one job per
 backend, macOS included; the engine comparison stays portable-only in CI and is
 compared against a native build locally.
 
-Optional zlob context, which needs **Zig 0.16** and libclang because zlob 1.6.3
-builds through `build.rs` and bindgen:
+Optional zlob context, which needs **Zig 0.16** and libclang because the pinned
+zlob Rust crate 1.6.5 builds through `build.rs` and bindgen:
 
 ```sh
 # macOS/Homebrew setup used for the current local run:
@@ -101,8 +101,9 @@ zlob is context, never a baseline anything depends on: its benches are behind
 the `zlob-oracle` feature, its workflow is manual dispatch only, and no
 automatic lane requires Zig. The dispatch workflow includes `walker_palamedes`,
 so its Rust and zlob arms provide same-invocation Linux ratios over the 53k-file
-tree; the recorded tables below remain local macOS evidence. The current local
-run used Zig 0.16.0 and libclang 22.1.8 from Homebrew.
+tree. Ferralk's compatibility target and the recorded local macOS tables below
+remain zlob 1.6.3 evidence. The current local run used Zig 0.16.0 and libclang
+22.1.8 from Homebrew.
 
 The engine-comparison measurements in the next section were taken with:
 
