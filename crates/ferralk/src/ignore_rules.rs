@@ -549,6 +549,7 @@ fn strip_bracket_separators(part: &[u8]) -> Option<Vec<u8>> {
     let mut class_start = 0;
     let mut class_negated = false;
     let mut class_has_member = false;
+    let mut class_saw_member = false;
     let mut index = 0;
     while index < part.len() {
         match part[index] {
@@ -556,6 +557,7 @@ fn strip_bracket_separators(part: &[u8]) -> Option<Vec<u8>> {
                 result.extend_from_slice(&part[index..=index + 1]);
                 if in_class {
                     class_has_member = true;
+                    class_saw_member = true;
                 }
                 index += 2;
             }
@@ -564,10 +566,12 @@ fn strip_bracket_separators(part: &[u8]) -> Option<Vec<u8>> {
                 if let Some(end) = memmem::find(&part[start..], b":]") {
                     result.extend_from_slice(&part[index..start + end + 2]);
                     class_has_member = true;
+                    class_saw_member = true;
                     index = start + end + 2;
                 } else {
                     result.push(b'[');
                     class_has_member = true;
+                    class_saw_member = true;
                     index += 1;
                 }
             }
@@ -576,26 +580,44 @@ fn strip_bracket_separators(part: &[u8]) -> Option<Vec<u8>> {
                 class_start = result.len();
                 class_negated = matches!(part.get(index + 1), Some(b'!' | b'^'));
                 class_has_member = false;
+                class_saw_member = false;
                 result.push(b'[');
                 index += 1;
+                if class_negated {
+                    result.push(part[index]);
+                    index += 1;
+                }
             }
             b']' if in_class => {
-                in_class = false;
-                if class_has_member {
-                    result.push(b']');
-                } else if class_negated {
-                    result.truncate(class_start);
-                    result.push(b'?');
+                if class_saw_member {
+                    in_class = false;
+                    if class_has_member {
+                        result.push(b']');
+                    } else if class_negated {
+                        result.truncate(class_start);
+                        result.push(b'?');
+                    } else {
+                        return None;
+                    }
                 } else {
-                    return None;
+                    // Like Git's wildmatch and the glob compiler, a closing
+                    // bracket in the first member position is literal. A
+                    // second bracket is required to close `[]]` or `[!]]`.
+                    result.push(b']');
+                    class_has_member = true;
+                    class_saw_member = true;
                 }
                 index += 1;
             }
-            b'/' if in_class => index += 1,
+            b'/' if in_class => {
+                class_saw_member = true;
+                index += 1;
+            }
             byte => {
                 result.push(byte);
-                if in_class && !(class_negated && result.len() == class_start + 2) {
+                if in_class {
                     class_has_member = true;
+                    class_saw_member = true;
                 }
                 index += 1;
             }
@@ -1009,6 +1031,14 @@ mod tests {
         assert_eq!(fuzz_rule_bytes(b"x[[:alpha:]/]y", b"q/xay", false), None);
         assert_eq!(fuzz_rule_bytes(b"a[!/]d", b"abd", false), Some(true));
         assert_eq!(fuzz_rule_bytes(b"a[!/]d", b"acd", false), Some(true));
+    }
+
+    #[test]
+    fn first_closing_bracket_remains_a_literal_class_member() {
+        assert_eq!(fuzz_rule_bytes(b"[]]", b"]", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"[!]]", b"a", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"[!]]", b"]", false), None);
+        assert_eq!(fuzz_rule_bytes(b"[!]", b"a", false), None);
     }
 
     #[test]
