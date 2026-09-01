@@ -237,6 +237,14 @@ fn open_scheduled_directory(
     relative: Option<&RelativeDirectoryOpen>,
     refuse_final_symlink: bool,
 ) -> io::Result<File> {
+    // Relative `openat` can reach a directory whose reported path has already
+    // crossed Linux's path-only limit. Do not let retained descriptors make
+    // that an accidental frontend- or RLIMIT-dependent extension: callers
+    // receive the full path and their later path-based syscalls cannot use it
+    // either. Keep the portable ENAMETOOLONG boundary for every frontend.
+    if path.as_os_str().as_bytes().len() >= libc::PATH_MAX as usize {
+        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+    }
     let Some(relative) = relative else {
         return open_directory(path, refuse_final_symlink);
     };
