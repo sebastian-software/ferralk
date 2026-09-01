@@ -52,6 +52,26 @@ impl Fixture {
         Self { root }
     }
 
+    /// Unix-domain socket addresses have a small fixed path buffer. The
+    /// ordinary fixture root records a descriptive, collision-resistant name
+    /// under the host's temp directory and can exceed that buffer on macOS,
+    /// so the socket family uses a deliberately short name in that same
+    /// writable directory.
+    #[cfg(unix)]
+    fn new_short(label: &str) -> Self {
+        for _ in 0..1024 {
+            let unique = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root =
+                std::env::temp_dir().join(format!("f-{label}-{}-{unique}", std::process::id()));
+            match fs::create_dir(&root) {
+                Ok(()) => return Self { root },
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create short parity fixture root: {error}"),
+            }
+        }
+        panic!("allocate a unique short parity fixture root");
+    }
+
     fn directory(&self, relative: impl AsRef<Path>) -> PathBuf {
         let path = self.root.join(relative);
         fs::create_dir_all(&path).expect("create parity fixture directory");
@@ -161,6 +181,31 @@ fn walk_portable(walker: &Walker) -> (Vec<WalkEntry>, Vec<WalkError>) {
     (state.entries, state.errors)
 }
 
+/// Runs the portable backend through the aborting root-error path. Unlike the
+/// collecting helper above, this returns the first error directly because
+/// [`ErrorPolicy::Abort`] ends the walk at that boundary.
+fn walk_portable_abort(walker: &Walker) -> WalkError {
+    let mut state = WalkState::new(walker, &crate::keep_every_entry);
+    let root = walker
+        .roots()
+        .next()
+        .expect("a walk has a root")
+        .to_path_buf();
+    let (ignores, ignore_errors) = IgnoreScope::for_root(walker, &StdBackend, &root);
+    let task = DirectoryTask {
+        path: root,
+        open: crate::DirectoryOpen::default(),
+        depth: 0,
+        root: 0,
+        ancestors: crate::AncestorChain::default(),
+        ignores,
+        ignore_errors,
+    };
+    state
+        .walk_directory(&StdBackend, task)
+        .expect_err("an aborting missing root returns its first error")
+}
+
 /// Reports what one side has that the other does not.
 ///
 /// A large family holds thousands of entries, so printing both lists buries
@@ -196,9 +241,10 @@ fn difference<T: Clone + Ord + std::fmt::Debug>(native: &[T], portable: &[T]) ->
 
 /// Asserts that both backends see the same tree and fail the same way.
 ///
-/// The walk is serial and collecting: a parallel walk would compare the same
-/// backends through a different scheduler, which the parallel family below
-/// checks separately.
+/// The serial collector and stream both run against the native backend; each
+/// is compared with one portable collection. This keeps backend differences
+/// separate from the frontend while ensuring every fixture reaches both
+/// incremental and collected traversal paths.
 fn assert_parity(family: &str, root: &Path, walker: Walker) {
     let native = walker.clone().collect().expect("the native walk succeeds");
     let (portable_entries, portable_errors) = walk_portable(&walker);
@@ -222,6 +268,27 @@ fn assert_parity(family: &str, root: &Path, walker: Walker) {
         let report = difference(&native_errors, &portable_errors)
             .expect("unequal descriptions differ somewhere");
         panic!("{family}: the backends disagree on the error classes:{report}");
+    }
+
+    let mut streamed_entries = Vec::new();
+    let mut streamed_errors = Vec::new();
+    for item in walker.stream() {
+        match item {
+            Ok(entry) => streamed_entries.push(entry),
+            Err(error) => streamed_errors.push(error),
+        }
+    }
+    let streamed_entries = describe_entries(&streamed_entries, root);
+    let streamed_errors = describe_errors(&streamed_errors, root);
+    if streamed_entries != portable_entries {
+        let report = difference(&streamed_entries, &portable_entries)
+            .expect("unequal descriptions differ somewhere");
+        panic!("{family}: stream and portable entries disagree:{report}");
+    }
+    if streamed_errors != portable_errors {
+        let report = difference(&streamed_errors, &portable_errors)
+            .expect("unequal descriptions differ somewhere");
+        panic!("{family}: stream and portable errors disagree:{report}");
     }
 }
 
@@ -442,20 +509,120 @@ fn parity_over_a_named_pipe() {
     let fixture = Fixture::new("fifo");
     fixture.write("regular.txt");
     let fifo = fixture.root.join("pipe");
+    // `mkfifo` is a POSIX-required utility. Treating its absence as a failure
+    // keeps this d_type special-file family live on every supported Unix CI
+    // runner without widening the crate's audited unsafe surface for a test.
     let created = std::process::Command::new("mkfifo")
         .arg(&fifo)
         .status()
-        .is_ok_and(|status| status.success());
-    if !created {
-        eprintln!("skipping the named-pipe family: mkfifo is unavailable");
-        return;
-    }
+        .expect("the POSIX mkfifo utility is available");
+    assert!(created.success(), "create named pipe");
 
     // The native readers answer a FIFO from the directory record without a
     // stat while the portable reader asks the filesystem. Both have to reach
     // the same verdict: neither a directory nor a symlink.
     assert_parity(
         "named pipe",
+        &fixture.root,
+        collecting_walker(&fixture.root),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parity_over_a_unix_socket() {
+    use std::os::unix::net::UnixListener;
+
+    let fixture = Fixture::new_short("socket");
+    fixture.write("regular.txt");
+    let listener = match UnixListener::bind(fixture.root.join("service.sock")) {
+        Ok(listener) => listener,
+        // Sandboxed macOS test runners can forbid AF_UNIX outright. This is a
+        // capability limitation rather than an absent test dependency; CI
+        // records it explicitly while normal Unix runners execute the family.
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping Unix-socket parity: the runner forbids AF_UNIX");
+            return;
+        }
+        Err(error) => panic!("bind Unix socket: {error}"),
+    };
+
+    assert_parity(
+        "Unix socket",
+        &fixture.root,
+        collecting_walker(&fixture.root),
+    );
+    drop(listener);
+}
+
+#[test]
+fn parity_for_non_directory_and_missing_roots() {
+    let fixture = Fixture::new("error-roots");
+    let file = fixture.write("regular.txt");
+    assert_parity("regular-file root", &file, collecting_walker(&file));
+
+    let missing = fixture.root.join("missing");
+    assert_parity("missing root", &missing, collecting_walker(&missing));
+}
+
+#[test]
+fn parity_for_skip_and_abort_error_policies() {
+    let fixture = Fixture::new("error-policies");
+    let missing = fixture.root.join("missing");
+
+    // `Skip` retains a root failure while continuing other roots. On this
+    // single-root fixture the observable result is therefore the same error
+    // channel as collect, and both backends must agree through collect and
+    // stream.
+    assert_parity(
+        "skip-policy missing root",
+        &missing,
+        Walker::new(&missing)
+            .threads(1)
+            .error_policy(ErrorPolicy::Skip)
+            .options(WalkOptions::default().sort(true)),
+    );
+
+    let aborting = Walker::new(&missing)
+        .threads(1)
+        .error_policy(ErrorPolicy::Abort)
+        .options(WalkOptions::default().sort(true));
+    let native = aborting
+        .clone()
+        .collect()
+        .expect_err("the native aborting root rejects the missing directory");
+    let portable = walk_portable_abort(&aborting);
+    assert_eq!(
+        (native.operation(), native.source.kind()),
+        (portable.operation(), portable.source.kind()),
+        "abort-policy missing root: the backends return the same first error"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parity_for_a_dangling_symlink_root() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new("dangling-root");
+    let dangling = fixture.root.join("dangling");
+    symlink("absent-target", &dangling).expect("create dangling symlink root");
+    assert_parity(
+        "dangling symlink root",
+        &dangling,
+        collecting_walker(&dangling)
+            .options(WalkOptions::default().sort(true).follow_symlinks(true)),
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn parity_over_nfc_and_nfd_unicode_names() {
+    let fixture = Fixture::new("unicode-normalization");
+    fixture.write("caf\u{00e9}.txt");
+    fixture.write("cafe\u{301}.txt");
+    assert_parity(
+        "NFC and NFD Unicode names",
         &fixture.root,
         collecting_walker(&fixture.root),
     );
@@ -591,6 +758,9 @@ fn the_family_matrix_matches_this_platform() {
     families.insert("symlink cycle", cfg!(unix));
     families.insert("unreadable directory", cfg!(unix));
     families.insert("named pipe", cfg!(unix));
+    families.insert("Unix socket", cfg!(unix));
+    families.insert("error roots", true);
+    families.insert("NFC and NFD Unicode names", cfg!(target_os = "macos"));
     families.insert("names at the length limit", cfg!(unix));
     families.insert("non-UTF-8 names", cfg!(target_os = "linux"));
 
@@ -606,7 +776,7 @@ fn the_family_matrix_matches_this_platform() {
     let running = families.values().filter(|present| **present).count();
     assert_eq!(
         running,
-        11,
+        if cfg!(target_os = "macos") { 14 } else { 13 },
         "this platform runs {running} of {} parity families",
         families.len()
     );

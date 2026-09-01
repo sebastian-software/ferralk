@@ -5733,7 +5733,7 @@ mod tests {
             let fixture = Fixture::new();
             fs::write(
                 fixture.root.join(".gitignore"),
-                case.ignore_rules.join("\n").as_bytes(),
+                format!("{}\n", case.ignore_rules.join("\n")).as_bytes(),
             )
             .expect("write fixture gitignore");
             // A case may place further ignore files below the root; Git reads
@@ -5743,7 +5743,7 @@ mod tests {
                 fs::create_dir_all(&directory).expect("create nested ignore directory");
                 fs::write(
                     directory.join(".gitignore"),
-                    nested.rules.join("\n").as_bytes(),
+                    format!("{}\n", nested.rules.join("\n")).as_bytes(),
                 )
                 .expect("write nested fixture gitignore");
             }
@@ -5753,11 +5753,22 @@ mod tests {
                 fs::create_dir_all(&info).expect("create repository info directory");
                 fs::write(
                     info.join("exclude"),
-                    case.exclude_rules.join("\n").as_bytes(),
+                    format!("{}\n", case.exclude_rules.join("\n")).as_bytes(),
                 )
                 .expect("write repository excludes");
             }
-            fixture.write(&case.path);
+            if case.git_ignorecase {
+                let git = fixture.root.join(".git");
+                fs::create_dir_all(&git).expect("create repository metadata directory");
+                fs::write(git.join("config"), b"[core]\nignorecase = true\n")
+                    .expect("write repository config");
+            }
+            if case.candidate_is_dir {
+                fs::create_dir_all(fixture.root.join(&case.path))
+                    .expect("create fixture candidate directory");
+            } else {
+                fixture.write(&case.path);
+            }
 
             let result = Walker::new(&fixture.root)
                 .respect_git_ignore(true)

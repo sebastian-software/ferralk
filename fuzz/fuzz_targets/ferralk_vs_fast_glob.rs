@@ -281,6 +281,8 @@ fn corpus_candidate(pattern: &[u8], path: &[u8], ours: bool, reference: bool) ->
         ignore_rules: Vec::new(),
         nested_ignore_rules: Vec::new(),
         exclude_rules: Vec::new(),
+        candidate_is_dir: false,
+        git_ignorecase: false,
         expected: ours,
         oracle_expected: Some(reference),
         error_offset: None,

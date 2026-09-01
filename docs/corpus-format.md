@@ -26,6 +26,8 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | `ignore_rules` | no | Lines written to a synthetic `.gitignore` for an ignore case. |
 | `nested_ignore_rules` | no | Further `.gitignore` files below the root, each with its `directory` and `rules`. |
 | `exclude_rules` | no | Repository-wide rules written to `.git/info/exclude`; every ignore file overrides them. |
+| `candidate_is_dir` | no | For an ignore case, create `path` as a directory instead of a regular file. |
+| `git_ignorecase` | no | For an ignore case, set the isolated repository's `core.ignorecase` to `true`. |
 | `expected` | yes | Whether the expression accepts the candidate. |
 | `oracle_expected` | no | The external-oracle result when it deliberately differs from `expected`. |
 | `error_offset` | no | Byte offset the rejected construct must be reported at, for a `compile_error` or `absolute_pattern` case. |
@@ -47,7 +49,9 @@ explanation in `note`.
 For `ignore.jsonl`, `pattern` is the primary rule for quick review and
 `ignore_rules` is the complete ordered rule chain. The Git oracle creates an
 isolated repository, writes those lines into `.gitignore`, creates `path`, and
-uses `git check-ignore --no-index --quiet -- path`. This keeps nested/negated
+uses `git check-ignore --no-index --quiet -- path`. `candidate_is_dir` keeps
+directory-only rules tied to an actual directory entry; `git_ignorecase` opts
+into Git's repository-local ASCII case folding. This keeps nested/negated
 behaviour tied to Git rather than to ferralk implementation details.
 
 `nested_ignore_rules` adds `.gitignore` files below the root. Git consults the

@@ -36,11 +36,13 @@ fn ignore_corpus_replays_against_git_check_ignore() {
             exclude_cases += 1;
         }
         assert_eq!(
-            harness::git_check_ignore_layered(
+            harness::git_check_ignore_layered_with_options(
                 &case.ignore_rules,
                 &nested,
                 &case.exclude_rules,
-                candidate
+                candidate,
+                case.candidate_is_dir,
+                case.git_ignorecase,
             )
             .expect("run git check-ignore"),
             case.expected,
