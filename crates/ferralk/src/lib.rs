@@ -7193,7 +7193,7 @@ mod tests {
             (paths, reads)
         };
 
-        for (include, match_hidden) in [("**/*.{rs,toml}", false), ("**/*.{rs,toml}", true)] {
+        for (include, match_hidden) in [("**/*{rs,toml}", false), ("**/*{rs,toml}", true)] {
             let (paths, reads) = walk(include, match_hidden);
             assert_eq!(paths, [PathBuf::from("src/keep.rs")]);
             assert_eq!(
@@ -7216,6 +7216,57 @@ mod tests {
             reads.contains(&PathBuf::from("target/.hidden")),
             "an extglob that explicitly permits a leading period can re-admit its zero-width branch"
         );
+    }
+
+    /// A wildcard may stop immediately before a literal period, or cross a
+    /// separator and leave that period at the next component boundary. The
+    /// prune summary must retain both possibilities when a covering exclude
+    /// would otherwise hide the matching descendant.
+    #[test]
+    fn covering_excludes_keep_hidden_descendants_reachable_after_wildcards() {
+        let fixture = Fixture::new();
+        fixture.write("build/.env");
+        fixture.write("x/foo/.hidden/keep.rs");
+
+        for (label, mode, include, exclude, expected) in [
+            (
+                "zero-width star",
+                WildcardMode::ComponentScoped,
+                "**/*.env",
+                "build/**",
+                PathBuf::from("build/.env"),
+            ),
+            (
+                "separator-crossing star",
+                WildcardMode::SeparatorCrossing,
+                "x/f*.hidden/keep.rs",
+                "x/**",
+                PathBuf::from("x/foo/.hidden/keep.rs"),
+            ),
+        ] {
+            let build = || {
+                Walker::new(&fixture.root)
+                    .wildcard_mode(mode)
+                    .include(include)
+                    .expect("valid include")
+                    .exclude(exclude)
+                    .expect("valid exclude")
+                    .options(WalkOptions::default().files_only(true).sort(true))
+            };
+            assert_frontends_agree(label, &fixture.root, build);
+            assert_eq!(
+                relative_paths(
+                    build()
+                        .threads(1)
+                        .collect()
+                        .expect("walk succeeds")
+                        .entries(),
+                    &fixture.root,
+                ),
+                [expected],
+                "{label}: the covering exclude must not prune the hidden match"
+            );
+        }
     }
 
     /// With no includes, every exclude form that rejects a directory can
