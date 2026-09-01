@@ -4840,6 +4840,9 @@ struct ExtglobScratch {
     excluded: Vec<bool>,
     /// One reusable Shift-And state per sweep-enabled repetition alternative.
     sweep_states: Vec<SweepState>,
+    /// The two word rows used while a wide ordinary-group alternative reports
+    /// all matching prefix ends. Narrow alternatives need no retained state.
+    prefix_sweep_state: Option<SweepState>,
 }
 
 /// Borrows the extglob scratch buffers for one match.
@@ -4853,6 +4856,7 @@ struct ExtglobMatchState<'scratch> {
     candidate_ends: &'scratch mut Vec<usize>,
     excluded: &'scratch mut Vec<bool>,
     sweep_states: &'scratch mut Vec<SweepState>,
+    prefix_sweep_state: &'scratch mut Option<SweepState>,
 }
 
 thread_local! {
@@ -4886,6 +4890,7 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                     candidate_ends,
                     excluded,
                     sweep_states,
+                    prefix_sweep_state,
                 } = &mut *scratch;
                 visited.clear();
                 failed.clear();
@@ -4917,6 +4922,7 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                     candidate_ends,
                     excluded,
                     sweep_states,
+                    prefix_sweep_state,
                 };
                 match_extglob_from(program, path, 0, 0, options, &mut state)
             };
@@ -4950,6 +4956,11 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
             if scratch.sweep_states.capacity() > RETAINED_SCRATCH_WORDS {
                 scratch.sweep_states.shrink_to(RETAINED_SCRATCH_WORDS);
             }
+            if scratch.prefix_sweep_state.as_ref().is_some_and(|state| {
+                SweepEngine::state_exceeds_retained_words(state, RETAINED_SCRATCH_WORDS)
+            }) {
+                scratch.prefix_sweep_state = None;
+            }
             matched
         }
         Err(_) => {
@@ -4968,6 +4979,7 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                 candidate_ends,
                 excluded,
                 sweep_states,
+                prefix_sweep_state,
             } = &mut scratch;
             let mut state = ExtglobMatchState {
                 visited,
@@ -4986,6 +4998,7 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                 candidate_ends,
                 excluded,
                 sweep_states,
+                prefix_sweep_state,
             };
             match_extglob_from(program, path, 0, 0, options, &mut state)
         }
@@ -4995,7 +5008,7 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
 /// Scratch capacities after an extglob match, used to keep the retained
 /// thread-local allocation bounded without relying on process RSS.
 #[cfg(test)]
-fn extglob_scratch_capacities() -> (usize, usize, usize, usize, usize, usize, usize) {
+fn extglob_scratch_capacities() -> (usize, usize, usize, usize, usize, usize, usize, usize) {
     EXTGLOB_SCRATCH.with(|cell| {
         let scratch = cell.borrow();
         (
@@ -5007,6 +5020,10 @@ fn extglob_scratch_capacities() -> (usize, usize, usize, usize, usize, usize, us
             scratch.candidate_ends.capacity(),
             scratch.excluded.capacity(),
             scratch.sweep_states.capacity(),
+            scratch
+                .prefix_sweep_state
+                .as_ref()
+                .map_or(0, SweepEngine::retained_state_capacity),
         )
     })
 }
@@ -5335,12 +5352,26 @@ fn queue_extglob_group(
 ) {
     match group.kind {
         ExtglobKind::ExactlyOne => {
-            matching_extglob_group_ends(group, path, path_index, options, state.ends);
+            matching_extglob_group_ends(
+                group,
+                path,
+                path_index,
+                options,
+                state.prefix_sweep_state,
+                state.ends,
+            );
             queue_extglob_continuations(program, state, group.rest);
         }
         ExtglobKind::Optional => {
             queue_extglob_continuation(program, state, group.rest, path_index);
-            matching_extglob_group_ends(group, path, path_index, options, state.ends);
+            matching_extglob_group_ends(
+                group,
+                path,
+                path_index,
+                options,
+                state.prefix_sweep_state,
+                state.ends,
+            );
             queue_extglob_continuations(program, state, group.rest);
         }
         ExtglobKind::ZeroOrMore => {
@@ -5356,7 +5387,14 @@ fn queue_extglob_group(
             let component_end = extglob_component_end(path, path_index, options);
             state.excluded.resize(component_end - path_index + 1, false);
             state.excluded.fill(false);
-            matching_extglob_group_ends(group, path, path_index, options, state.ends);
+            matching_extglob_group_ends(
+                group,
+                path,
+                path_index,
+                options,
+                state.prefix_sweep_state,
+                state.ends,
+            );
             for &end in state.ends.iter() {
                 state.excluded[end - path_index] = true;
             }
@@ -5406,11 +5444,19 @@ fn matching_extglob_group_ends(
     path: &[u8],
     path_index: usize,
     options: PatternOptions,
+    prefix_sweep_state: &mut Option<SweepState>,
     output: &mut Vec<usize>,
 ) {
     output.clear();
     for alternative in &group.alternatives {
-        matching_extglob_alternative_ends(alternative, path, path_index, options, output);
+        matching_extglob_alternative_ends(
+            alternative,
+            path,
+            path_index,
+            options,
+            prefix_sweep_state,
+            output,
+        );
     }
     output.sort_unstable();
     output.dedup();
@@ -5482,6 +5528,7 @@ fn matching_extglob_repetition_ends(
                         path,
                         absolute,
                         options,
+                        state.prefix_sweep_state,
                         state.candidate_ends,
                     );
                     for &end in state.candidate_ends.iter() {
@@ -5491,6 +5538,11 @@ fn matching_extglob_repetition_ends(
                     }
                 }
             }
+            debug_assert_eq!(
+                sweep_index,
+                state.sweep_states.len(),
+                "prepared repetition sweeps must align with injected variable-width alternatives"
+            );
         }
 
         if absolute == component_end {
@@ -5517,6 +5569,11 @@ fn matching_extglob_repetition_ends(
                 }
             }
         }
+        debug_assert_eq!(
+            sweep_index,
+            state.sweep_states.len(),
+            "prepared repetition sweep count must match the advance loop"
+        );
     }
     state.ends.clear();
     state.ends.extend(
@@ -5552,6 +5609,7 @@ fn matching_extglob_alternative_ends(
     path: &[u8],
     path_index: usize,
     options: PatternOptions,
+    prefix_sweep_state: &mut Option<SweepState>,
     output: &mut Vec<usize>,
 ) {
     let component_end = extglob_component_end(path, path_index, options);
@@ -5579,7 +5637,13 @@ fn matching_extglob_alternative_ends(
     let suffix = &path[path_index..component_end];
     for compiled in alternatives {
         if let Some(sweep) = &compiled.sweep {
-            sweep.matching_prefix_ends(suffix, alternative_options, path_index, output);
+            sweep.matching_prefix_ends(
+                suffix,
+                alternative_options,
+                path_index,
+                prefix_sweep_state,
+                output,
+            );
         } else {
             for end in path_index..=component_end {
                 if Pattern::match_alternatives(
@@ -6633,8 +6697,11 @@ mod tests {
         let outer_star = Pattern::compile("*@(a)b", options).expect("extglob compiles");
         let negated = Pattern::compile("!(z)y", options).expect("extglob compiles");
         let repeated = Pattern::compile("*+(a*|b)c", options).expect("extglob compiles");
+        let wide_literal = "a".repeat(70);
+        let wide_negated = Pattern::compile(format!("*!({wide_literal}*)y"), options)
+            .expect("wide extglob compiles");
 
-        for pattern in [&outer_star, &negated, &repeated] {
+        for pattern in [&outer_star, &negated, &repeated, &wide_negated] {
             assert!(
                 pattern.alternatives[0]
                     .extglob
@@ -6646,16 +6713,19 @@ mod tests {
         assert!(outer_star.is_match("aab"));
         assert!(negated.is_match("xy"));
         assert!(repeated.is_match("aaabc"));
+        let wide_candidate = format!("{}y", "x".repeat(128));
+        assert!(wide_negated.is_match(&wide_candidate));
 
         let warmed = extglob_scratch_capacities();
         assert!(
-            warmed.3 > 0 && warmed.5 > 0 && warmed.6 > 0,
+            warmed.3 > 0 && warmed.5 > 0 && warmed.6 > 0 && warmed.7 > 0,
             "group matching populated its retained scratch: {warmed:?}"
         );
         for _ in 0..1_000 {
             assert!(outer_star.is_match("aab"));
             assert!(negated.is_match("xy"));
             assert!(repeated.is_match("aaabc"));
+            assert!(wide_negated.is_match(&wide_candidate));
         }
         assert_eq!(
             extglob_scratch_capacities(),

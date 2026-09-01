@@ -257,22 +257,50 @@ impl SweepEngine {
         path: &[u8],
         options: PatternOptions,
         base: usize,
+        retained_wide: &mut Option<SweepState>,
         output: &mut Vec<usize>,
     ) {
-        let mut state = self.empty_state();
-        self.inject_start(&mut state);
-        if self.accepts(&state) {
+        // A narrow sweep is just one register. Wide sweeps need two heap
+        // rows, so keep those on the caller's thread-local extglob scratch
+        // instead of allocating them for every group encounter. Narrow
+        // sweeps deliberately leave that retained wide state intact.
+        let mut narrow = SweepState::Narrow(0);
+        let state = match self {
+            Self::Narrow(_) => &mut narrow,
+            Self::Wide(_) => {
+                let state = retained_wide.get_or_insert_with(|| self.empty_state());
+                self.reset_state(state);
+                state
+            }
+        };
+        self.inject_start(state);
+        if self.accepts(state) {
             output.push(base);
         }
         let mut at_component_start = options.candidate_starts_component;
         for (offset, &byte) in path.iter().enumerate() {
-            if !self.advance(&mut state, byte, at_component_start, options) {
+            if !self.advance(state, byte, at_component_start, options) {
                 break;
             }
-            if self.accepts(&state) {
+            if self.accepts(state) {
                 output.push(base + offset + 1);
             }
             at_component_start = is_separator(byte);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_state_capacity(state: &SweepState) -> usize {
+        match state {
+            SweepState::Narrow(_) => 0,
+            SweepState::Wide { state, next } => state.capacity() + next.capacity(),
+        }
+    }
+
+    pub(crate) fn state_exceeds_retained_words(state: &SweepState, limit: usize) -> bool {
+        match state {
+            SweepState::Narrow(_) => false,
+            SweepState::Wide { state, next } => state.capacity() > limit || next.capacity() > limit,
         }
     }
 
