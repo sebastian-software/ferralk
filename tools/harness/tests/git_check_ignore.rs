@@ -45,6 +45,7 @@ fn ignore_corpus_replays_against_git_check_ignore() {
                 &case.exclude_rules,
                 candidate,
                 case.candidate_is_dir,
+                case.candidate_is_symlink,
                 case.git_ignorecase,
             )
             .expect("run git check-ignore"),

@@ -26,6 +26,10 @@ use std::{
 
 #[cfg(test)]
 use std::fs;
+#[cfg(test)]
+use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
 
 use super::{Listing, defer_entry_stat_error};
 
@@ -51,6 +55,66 @@ const DT_SOCK: u8 = 12;
 /// missing syscall; per-device memoization would need the device id before the
 /// first read, which costs the stat this latch exists to avoid.
 static GETDENTS_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+static GETDENTS_LATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+static FORCED_UNSUPPORTED_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Restores the test-only, root-scoped latch override after a test, including
+/// when the test unwinds. Scoping keeps unrelated native-reader tests on the
+/// real backend while this fixture exercises the latched fallback.
+#[cfg(test)]
+pub(super) struct UnsupportedLatchGuard {
+    previous: Option<PathBuf>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for UnsupportedLatchGuard {
+    fn drop(&mut self) {
+        *FORCED_UNSUPPORTED_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.previous.take();
+    }
+}
+
+#[cfg(test)]
+pub(super) fn force_unsupported_latch_for_test(root: &Path) -> UnsupportedLatchGuard {
+    let lock = GETDENTS_LATCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = FORCED_UNSUPPORTED_ROOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace(root.to_path_buf());
+    UnsupportedLatchGuard {
+        previous,
+        _lock: lock,
+    }
+}
+
+#[cfg(test)]
+fn forced_unsupported_root_for_test() -> Option<PathBuf> {
+    FORCED_UNSUPPORTED_ROOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn unsupported_is_latched_for(_path: &Path) -> bool {
+    if GETDENTS_UNSUPPORTED.load(Ordering::Relaxed) {
+        return true;
+    }
+    #[cfg(test)]
+    return FORCED_UNSUPPORTED_ROOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|root| _path.starts_with(root));
+    #[cfg(not(test))]
+    false
+}
 
 /// Process-wide ceiling for descriptors retained beyond one directory read.
 ///
@@ -128,7 +192,7 @@ pub(super) fn read_directory(
     refuse_final_symlink: bool,
     listing: &mut Listing,
 ) -> io::Result<()> {
-    if GETDENTS_UNSUPPORTED.load(Ordering::Relaxed) {
+    if unsupported_is_latched_for(path) {
         return read_portable_directory_from_path(path, relative, refuse_final_symlink, listing);
     }
     let used_portable_fallback = DIRECTORY_BUFFER.with(|buffer| {
@@ -427,6 +491,30 @@ fn descriptor_entry_kind(
     }
 }
 
+/// Builds a real directory listing while forcing every entry through the
+/// descriptor-relative `DT_UNKNOWN` classifier. Filesystems used in CI
+/// normally provide `d_type`, so the differential parity suite needs this
+/// test-only entry point to exercise the fallback deterministically.
+#[cfg(test)]
+pub(super) fn read_directory_with_unknown_types_for_test(
+    path: &Path,
+    refuse_final_symlink: bool,
+    listing: &mut Listing,
+) -> io::Result<()> {
+    let directory = open_directory(path, refuse_final_symlink)?;
+    listing.clear();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        match descriptor_entry_kind(directory.as_raw_fd(), &name, 0) {
+            Ok(Some((is_dir, is_symlink))) => listing.push(&name, is_dir, is_symlink),
+            Ok(None) => {}
+            Err(error) => defer_entry_stat_error(listing, path.join(&name), error)?,
+        }
+    }
+    Ok(())
+}
+
 fn read_batch(directory: &File, buffer: &mut [u8]) -> Result<usize, ReadBatchError> {
     #[cfg(any(
         all(target_arch = "x86_64", target_pointer_width = "64"),
@@ -616,62 +704,24 @@ mod tests {
             io::{AsRawFd, FromRawFd},
         },
         path::{Path, PathBuf},
-        sync::{
-            Mutex, MutexGuard,
-            atomic::{AtomicUsize, Ordering},
-        },
+        sync::atomic::{AtomicUsize, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use crate::{DirectoryBackend, ErrorPolicy, StdBackend, WalkEntry, WalkOptions, Walker};
 
     use super::{
-        BUFFER_SIZE, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG, DT_SOCK, GETDENTS_UNSUPPORTED,
-        Listing, NAME_OFFSET, NativeDirectoryReadError, ReadBatchError, RelativeDirectoryOpen,
-        RetainedDirectory, TYPE_OFFSET, entry_kind, for_each_record, open_directory, parse_records,
+        BUFFER_SIZE, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_REG, DT_SOCK, Listing, NAME_OFFSET,
+        NativeDirectoryReadError, ReadBatchError, RelativeDirectoryOpen, RetainedDirectory,
+        TYPE_OFFSET, entry_kind, for_each_record, force_unsupported_latch_for_test,
+        forced_unsupported_root_for_test, open_directory, parse_records,
         parse_records_from_open_directory, read_directory,
         read_directory_from_open_directory_with_read_batch,
         read_open_directory_with_portable_fallback, read_portable_directory_from_open_file,
+        unsupported_is_latched_for,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
-    static GETDENTS_LATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Serializes every test that mutates the process-wide capability latch and
-    /// restores its exact prior value even when the test panics.
-    struct GetdentsLatch<'a> {
-        previous: bool,
-        _lock: MutexGuard<'a, ()>,
-    }
-
-    impl<'a> GetdentsLatch<'a> {
-        fn unsupported() -> Self {
-            let lock = GETDENTS_LATCH_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Self {
-                previous: GETDENTS_UNSUPPORTED.swap(true, Ordering::SeqCst),
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for GetdentsLatch<'_> {
-        fn drop(&mut self) {
-            GETDENTS_UNSUPPORTED.store(self.previous, Ordering::SeqCst);
-        }
-    }
-
-    fn getdents_latch_state_for_test() -> bool {
-        // A panic drops `GetdentsLatch` before it releases its guard. Acquire
-        // the same lock again before observing the restored state so another
-        // parallel latch test cannot change it between restoration and this
-        // assertion.
-        let _lock = GETDENTS_LATCH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        GETDENTS_UNSUPPORTED.load(Ordering::SeqCst)
-    }
 
     fn record(name: &[u8], directory_type: u8) -> Vec<u8> {
         let length = (NAME_OFFSET + name.len() + 1 + 7) & !7;
@@ -1080,10 +1130,11 @@ mod tests {
             fs::write(leaf, b"fixture").expect("write descendant file");
         }
 
-        // This is the process-wide state after an injected ENOSYS. The native
-        // module must still open every scheduled no-follow descendant once and
-        // enumerate it through that descriptor, in both frontends.
-        let _latch = GetdentsLatch::unsupported();
+        // This root-scoped override reaches the same branch as the process-wide
+        // state after ENOSYS without redirecting unrelated parallel tests. The
+        // native module must still open every scheduled no-follow descendant
+        // once and enumerate it through that descriptor, in both frontends.
+        let _latch = force_unsupported_latch_for_test(&root);
         for walker in [
             Walker::new(&root)
                 .threads(1)
@@ -1115,7 +1166,7 @@ mod tests {
         fs::create_dir_all(&target).expect("create target directory");
         symlink(&target, &replaced).expect("create replacement link");
 
-        let _latch = GetdentsLatch::unsupported();
+        let _latch = force_unsupported_latch_for_test(&root);
         let mut listing = Listing::default();
         let error = read_directory(&replaced, None, true, &mut listing)
             .expect_err("a protected fallback must still reject a replacement link");
@@ -1133,18 +1184,15 @@ mod tests {
 
     #[test]
     fn capability_latch_guard_restores_after_a_panic() {
-        let mut before = None;
+        let before = forced_unsupported_root_for_test();
+        let root = PathBuf::from("/ferralk-forced-latch-guard");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let latch = GetdentsLatch::unsupported();
-            before = Some(latch.previous);
-            assert!(GETDENTS_UNSUPPORTED.load(Ordering::SeqCst));
+            let _latch = force_unsupported_latch_for_test(&root);
+            assert!(unsupported_is_latched_for(&root));
             panic!("exercise guard unwinding");
         }));
         assert!(result.is_err(), "the injected panic was caught");
-        assert_eq!(
-            getdents_latch_state_for_test(),
-            before.expect("guard recorded the prior latch state")
-        );
+        assert_eq!(forced_unsupported_root_for_test(), before);
     }
 
     #[test]

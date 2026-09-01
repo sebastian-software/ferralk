@@ -8,11 +8,11 @@
 //! only compared entries would miss the more interesting half: the two readers
 //! reach failures by different syscalls.
 //!
-//! Parser-level and single-call behaviour lives with each backend
-//! (`macos_native`, `linux_native`): rejected records, entries that vanish
-//! between the read and their stat, special types classified without a stat,
-//! and non-directories refused at open. Those are unit tests of one reader.
-//! This module only asks whether two readers agree on a whole tree.
+//! Malformed-record rejection stays in each backend module. Behaviour that can
+//! change a completed walk — unknown-type classification, latched fallback,
+//! and deferred entry errors — also has a whole-tree family here, driven by
+//! narrow test-only backend hooks when an ordinary filesystem cannot expose
+//! the path deterministically.
 //!
 //! Platform limitations are recorded at the family that carries them.
 
@@ -25,8 +25,8 @@ use std::{
 };
 
 use crate::{
-    DirectoryTask, ErrorPolicy, IgnoreScope, StdBackend, WalkEntry, WalkError, WalkOptions,
-    WalkState, Walker,
+    DirectoryBackend, DirectoryTask, ErrorPolicy, IgnoreScope, Listing, StdBackend, WalkEntry,
+    WalkError, WalkOptions, WalkState, Walker,
 };
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -156,16 +156,19 @@ fn describe_errors(errors: &[WalkError], root: &Path) -> Vec<DescribedError> {
     described
 }
 
-/// Walks the same tree through the portable backend, using the same traversal
-/// code the native walk uses so only the backend differs.
-fn walk_portable(walker: &Walker) -> (Vec<WalkEntry>, Vec<WalkError>) {
+/// Walks one root through an explicit backend, using the same traversal state
+/// as the public serial collector.
+fn walk_with_backend(
+    walker: &Walker,
+    backend: &impl DirectoryBackend,
+) -> Result<(Vec<WalkEntry>, Vec<WalkError>), WalkError> {
     let mut state = WalkState::new(walker, &crate::keep_every_entry);
     let root = walker
         .roots()
         .next()
         .expect("a walk has a root")
         .to_path_buf();
-    let (ignores, ignore_errors) = IgnoreScope::for_root(walker, &StdBackend, &root);
+    let (ignores, ignore_errors) = IgnoreScope::for_root(walker, backend, &root);
     let task = DirectoryTask {
         path: root.clone(),
         open: crate::DirectoryOpen::default(),
@@ -175,34 +178,21 @@ fn walk_portable(walker: &Walker) -> (Vec<WalkEntry>, Vec<WalkError>) {
         ignores,
         ignore_errors,
     };
-    state
-        .walk_directory(&StdBackend, task)
-        .expect("the portable walk collects rather than aborts");
-    (state.entries, state.errors)
+    state.walk_directory(backend, task)?;
+    Ok((state.entries, state.errors))
+}
+
+/// Walks the same tree through the portable backend, using the same traversal
+/// code the native walk uses so only the backend differs.
+fn walk_portable(walker: &Walker) -> (Vec<WalkEntry>, Vec<WalkError>) {
+    walk_with_backend(walker, &StdBackend).expect("the portable walk collects rather than aborts")
 }
 
 /// Runs the portable backend through the aborting root-error path. Unlike the
 /// collecting helper above, this returns the first error directly because
 /// [`ErrorPolicy::Abort`] ends the walk at that boundary.
 fn walk_portable_abort(walker: &Walker) -> WalkError {
-    let mut state = WalkState::new(walker, &crate::keep_every_entry);
-    let root = walker
-        .roots()
-        .next()
-        .expect("a walk has a root")
-        .to_path_buf();
-    let (ignores, ignore_errors) = IgnoreScope::for_root(walker, &StdBackend, &root);
-    let task = DirectoryTask {
-        path: root,
-        open: crate::DirectoryOpen::default(),
-        depth: 0,
-        root: 0,
-        ancestors: crate::AncestorChain::default(),
-        ignores,
-        ignore_errors,
-    };
-    state
-        .walk_directory(&StdBackend, task)
+    walk_with_backend(walker, &StdBackend)
         .expect_err("an aborting missing root returns its first error")
 }
 
@@ -297,6 +287,148 @@ fn collecting_walker(root: &Path) -> Walker {
         .threads(1)
         .error_policy(ErrorPolicy::Collect)
         .options(WalkOptions::default().sort(true))
+}
+
+/// Backend that makes every real entry take the native descriptor-relative
+/// unknown-type fallback, independently of the host filesystem's `d_type`.
+struct NativeUnknownTypeBackend;
+
+impl DirectoryBackend for NativeUnknownTypeBackend {
+    fn read_directory(
+        &self,
+        path: &Path,
+        _follow_symlinks: bool,
+        refuse_final_symlink: bool,
+        listing: &mut Listing,
+    ) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        return crate::linux_native::read_directory_with_unknown_types_for_test(
+            path,
+            refuse_final_symlink,
+            listing,
+        );
+        #[cfg(target_os = "macos")]
+        return crate::macos_native::read_directory_with_unknown_types_for_test(
+            path,
+            refuse_final_symlink,
+            listing,
+        );
+    }
+}
+
+/// Adds the same deterministic per-entry stat failure to either reader. This
+/// lets the whole traversal compare the deferred error channel without relying
+/// on a narrow deletion or permission race between readdir and stat.
+struct DeferredStatBackend<B> {
+    inner: B,
+    root: PathBuf,
+}
+
+impl<B: DirectoryBackend> DirectoryBackend for DeferredStatBackend<B> {
+    fn read_directory(
+        &self,
+        path: &Path,
+        follow_symlinks: bool,
+        refuse_final_symlink: bool,
+        listing: &mut Listing,
+    ) -> io::Result<()> {
+        self.inner
+            .read_directory(path, follow_symlinks, refuse_final_symlink, listing)?;
+        if path == self.root {
+            crate::defer_entry_stat_error(
+                listing,
+                self.root.join("unknown-type"),
+                io::Error::from(io::ErrorKind::PermissionDenied),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn assert_explicit_backend_parity(
+    family: &str,
+    root: &Path,
+    walker: &Walker,
+    native: &impl DirectoryBackend,
+    portable: &impl DirectoryBackend,
+) {
+    let (native_entries, native_errors) =
+        walk_with_backend(walker, native).expect("the native-like backend collects");
+    let (portable_entries, portable_errors) =
+        walk_with_backend(walker, portable).expect("the portable-like backend collects");
+    assert_eq!(
+        describe_entries(&native_entries, root),
+        describe_entries(&portable_entries, root),
+        "{family}: the explicit backends disagree on entries"
+    );
+    assert_eq!(
+        describe_errors(&native_errors, root),
+        describe_errors(&portable_errors, root),
+        "{family}: the explicit backends disagree on errors"
+    );
+}
+
+#[test]
+fn parity_through_dt_unknown_descriptor_classification() {
+    let fixture = Fixture::new("unknown-types");
+    fixture.write("before.txt");
+    fixture.write("nested/inside.txt");
+    fixture.directory("empty");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("before.txt", fixture.root.join("link"))
+        .expect("create unknown-type symlink");
+
+    let walker = collecting_walker(&fixture.root);
+    assert_explicit_backend_parity(
+        "DT_UNKNOWN descriptor classification",
+        &fixture.root,
+        &walker,
+        &NativeUnknownTypeBackend,
+        &StdBackend,
+    );
+}
+
+#[test]
+fn parity_through_the_deferred_entry_error_channel() {
+    let fixture = Fixture::new("deferred-error");
+    fixture.write("before.txt");
+    fixture.write("nested/after.txt");
+    let walker = collecting_walker(&fixture.root);
+    let native = DeferredStatBackend {
+        inner: NativeUnknownTypeBackend,
+        root: fixture.root.clone(),
+    };
+    let portable = DeferredStatBackend {
+        inner: StdBackend,
+        root: fixture.root.clone(),
+    };
+
+    assert_explicit_backend_parity(
+        "deferred entry stat error",
+        &fixture.root,
+        &walker,
+        &native,
+        &portable,
+    );
+}
+
+#[test]
+fn parity_through_the_latched_native_fallback() {
+    let fixture = Fixture::new("latched-fallback");
+    for branch in 0..8 {
+        fixture.write(format!("branch-{branch}/nested/leaf.txt"));
+    }
+
+    #[cfg(target_os = "linux")]
+    let _latch = crate::linux_native::force_unsupported_latch_for_test(&fixture.root);
+    #[cfg(target_os = "macos")]
+    let _latch = crate::macos_native::force_unsupported_latch_for_test(&fixture.root);
+
+    assert_parity(
+        "latched native fallback",
+        &fixture.root,
+        collecting_walker(&fixture.root),
+    );
 }
 
 #[test]
@@ -602,6 +734,95 @@ fn parity_for_skip_and_abort_error_policies() {
     );
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DescribedOutcome {
+    Completed {
+        entries: Vec<DescribedEntry>,
+        errors: Vec<DescribedError>,
+    },
+    Aborted(DescribedError),
+}
+
+fn described_error(error: &WalkError, root: &Path) -> DescribedError {
+    (
+        error
+            .path()
+            .strip_prefix(root)
+            .unwrap_or(error.path())
+            .to_path_buf(),
+        error.operation(),
+        error.source.kind(),
+    )
+}
+
+fn native_collect_outcome(walker: Walker, root: &Path) -> DescribedOutcome {
+    match walker.collect() {
+        Ok(result) => DescribedOutcome::Completed {
+            entries: describe_entries(result.entries(), root),
+            errors: describe_errors(result.errors(), root),
+        },
+        Err(error) => DescribedOutcome::Aborted(described_error(&error, root)),
+    }
+}
+
+fn portable_outcome(walker: &Walker, root: &Path) -> DescribedOutcome {
+    match walk_with_backend(walker, &StdBackend) {
+        Ok((entries, errors)) => DescribedOutcome::Completed {
+            entries: describe_entries(&entries, root),
+            errors: describe_errors(&errors, root),
+        },
+        Err(error) => DescribedOutcome::Aborted(described_error(&error, root)),
+    }
+}
+
+fn stream_outcome(walker: Walker, root: &Path, policy: ErrorPolicy) -> DescribedOutcome {
+    let mut entries = Vec::new();
+    let mut errors = Vec::new();
+    for item in walker.stream() {
+        match item {
+            Ok(entry) => entries.push(entry),
+            Err(error) if policy == ErrorPolicy::Abort => {
+                return DescribedOutcome::Aborted(described_error(&error, root));
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+    DescribedOutcome::Completed {
+        entries: describe_entries(&entries, root),
+        errors: describe_errors(&errors, root),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn parity_for_mid_walk_skip_and_abort_including_stream() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new("mid-walk-policy");
+    fixture.write("before.txt");
+    fixture.write("nested/after.txt");
+    symlink("missing-target", fixture.root.join("broken"))
+        .expect("create deterministic mid-walk failure");
+
+    for policy in [ErrorPolicy::Skip, ErrorPolicy::Abort] {
+        let walker = Walker::new(&fixture.root)
+            .threads(1)
+            .error_policy(policy)
+            .options(WalkOptions::default().sort(true).follow_symlinks(true));
+        let portable = portable_outcome(&walker, &fixture.root);
+        assert_eq!(
+            native_collect_outcome(walker.clone(), &fixture.root),
+            portable,
+            "mid-walk {policy:?}: native collect and portable traversal disagree"
+        );
+        assert_eq!(
+            stream_outcome(walker, &fixture.root, policy),
+            portable,
+            "mid-walk {policy:?}: stream and portable traversal disagree"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn parity_for_a_dangling_symlink_root() {
@@ -743,11 +964,11 @@ fn parity_holds_through_the_parallel_scheduler() {
 /// Records which families this platform can hold, so a build that skips one
 /// does so by a stated rule rather than by accident.
 ///
-/// The one platform limitation worth naming: APFS refuses a filename that is
-/// not valid UTF-8 with `EILSEQ`, so the non-UTF-8 family cannot exist on
-/// macOS at all. ext4 accepts any byte sequence except `/` and NUL, so Linux
-/// carries it. Byte-first path handling is still covered on macOS through the
-/// matcher corpus, which needs no filesystem.
+/// APFS refuses a filename that is not valid UTF-8 with `EILSEQ`, so the
+/// non-UTF-8 family cannot exist on macOS. Device nodes are deliberately not a
+/// runtime fixture on either CI platform: `mknod` requires elevated privilege
+/// on hosted runners. Their raw `d_type` values remain pinned in each native
+/// parser's `special_file_types_are_classified_without_a_stat` unit test.
 #[test]
 fn the_family_matrix_matches_this_platform() {
     let mut families: BTreeMap<&str, bool> = BTreeMap::new();
@@ -763,6 +984,11 @@ fn the_family_matrix_matches_this_platform() {
     families.insert("named pipe", cfg!(unix));
     families.insert("Unix socket", cfg!(unix));
     families.insert("error roots", true);
+    families.insert("mid-walk error policies", cfg!(unix));
+    families.insert("DT_UNKNOWN descriptor classification", true);
+    families.insert("latched native fallback", true);
+    families.insert("deferred entry error", true);
+    families.insert("device nodes", false);
     families.insert("NFC and NFD Unicode names", cfg!(target_os = "macos"));
     families.insert("names at the length limit", cfg!(unix));
     families.insert("non-UTF-8 names", cfg!(target_os = "linux"));
@@ -772,6 +998,10 @@ fn the_family_matrix_matches_this_platform() {
         cfg!(target_os = "linux"),
         "the non-UTF-8 family belongs to Linux only; APFS rejects such names"
     );
+    assert!(
+        !families["device nodes"],
+        "hosted CI cannot create device nodes; backend parser tests carry their d_type coverage"
+    );
     // This module only builds when a native backend is active, and every
     // supported one is a Unix. Linux carries the non-UTF-8 fixture; macOS
     // carries the PATH_MAX fixture. A future backend would land here as a
@@ -779,7 +1009,7 @@ fn the_family_matrix_matches_this_platform() {
     let running = families.values().filter(|present| **present).count();
     assert_eq!(
         running,
-        if cfg!(target_os = "macos") { 14 } else { 13 },
+        if cfg!(target_os = "macos") { 18 } else { 17 },
         "this platform runs {running} of {} parity families",
         families.len()
     );

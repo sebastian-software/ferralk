@@ -46,6 +46,11 @@ use std::{
     },
 };
 
+#[cfg(test)]
+use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
+
 use super::{Listing, defer_entry_stat_error};
 
 const BUFFER_SIZE: usize = 32 * 1024;
@@ -95,6 +100,58 @@ const ATTRIBUTE_RECORD_HEADER_SIZE: usize = std::mem::size_of::<u32>() + ATTRIBU
 /// guards is what makes an exotic filesystem a slow walk rather than a failed
 /// one, which is the semantics the bulk reader established.
 static NATIVE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+static NATIVE_LATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+static FORCED_UNSUPPORTED_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Restores the test-only, root-scoped latch override after a test, including
+/// when the test unwinds. Scoping keeps unrelated native-reader tests on the
+/// real backend while this fixture exercises the latched fallback.
+#[cfg(test)]
+pub(super) struct UnsupportedLatchGuard {
+    previous: Option<PathBuf>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for UnsupportedLatchGuard {
+    fn drop(&mut self) {
+        *FORCED_UNSUPPORTED_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.previous.take();
+    }
+}
+
+#[cfg(test)]
+pub(super) fn force_unsupported_latch_for_test(root: &Path) -> UnsupportedLatchGuard {
+    let lock = NATIVE_LATCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = FORCED_UNSUPPORTED_ROOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace(root.to_path_buf());
+    UnsupportedLatchGuard {
+        previous,
+        _lock: lock,
+    }
+}
+
+fn unsupported_is_latched_for(_path: &Path) -> bool {
+    if NATIVE_UNSUPPORTED.load(Ordering::Relaxed) {
+        return true;
+    }
+    #[cfg(test)]
+    return FORCED_UNSUPPORTED_ROOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|root| _path.starts_with(root));
+    #[cfg(not(test))]
+    false
+}
 
 /// Process-wide ceiling for descriptors retained beyond one directory read.
 ///
@@ -217,7 +274,7 @@ pub(super) fn read_directory(
     refuse_final_symlink: bool,
     listing: &mut Listing,
 ) -> NativeDirectoryReadResult {
-    if NATIVE_UNSUPPORTED.load(Ordering::Relaxed) {
+    if unsupported_is_latched_for(path) {
         read_portable_directory_from_path(path, relative, refuse_final_symlink, listing)?;
         Ok(())
     } else {
@@ -732,6 +789,29 @@ fn descriptor_entry_kind(
             Ok(Some((kind == libc::S_IFDIR, kind == libc::S_IFLNK)))
         }
     }
+}
+
+/// Builds a real directory listing while forcing every entry through the
+/// descriptor-relative `DT_UNKNOWN` classifier. APFS normally supplies a
+/// concrete `d_type`, so parity tests need this deterministic test-only path.
+#[cfg(test)]
+pub(super) fn read_directory_with_unknown_types_for_test(
+    path: &Path,
+    refuse_final_symlink: bool,
+    listing: &mut Listing,
+) -> io::Result<()> {
+    let directory = open_directory(path, refuse_final_symlink)?;
+    listing.clear();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        match descriptor_entry_kind(directory.as_raw_fd(), &name, 0) {
+            Ok(Some((is_dir, is_symlink))) => listing.push(&name, is_dir, is_symlink),
+            Ok(None) => {}
+            Err(error) => defer_entry_stat_error(listing, path.join(&name), error)?,
+        }
+    }
+    Ok(())
 }
 
 fn read_direntries_from_open_directory(

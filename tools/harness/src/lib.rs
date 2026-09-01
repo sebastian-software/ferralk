@@ -42,7 +42,7 @@ pub fn git_check_ignore_layered(
     excludes: &[String],
     candidate: &str,
 ) -> io::Result<bool> {
-    git_check_ignore_layered_with_options(rules, nested, excludes, candidate, false, false)
+    git_check_ignore_layered_with_options(rules, nested, excludes, candidate, false, false, false)
 }
 
 /// Like [`git_check_ignore_layered`], with the candidate's entry kind and the
@@ -53,8 +53,15 @@ pub fn git_check_ignore_layered_with_options(
     excludes: &[String],
     candidate: &str,
     candidate_is_dir: bool,
+    candidate_is_symlink: bool,
     git_ignorecase: bool,
 ) -> io::Result<bool> {
+    if candidate_is_dir && candidate_is_symlink {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "an ignore candidate cannot be both a directory and a symlink",
+        ));
+    }
     let repository = TemporaryRepository::create()?;
     run_git(repository.path(), ["init", "--quiet"])?;
     // `git init` turns on `core.ignorecase` when the filesystem folds case, so
@@ -90,6 +97,16 @@ pub fn git_check_ignore_layered_with_options(
     }
     if candidate_is_dir {
         fs::create_dir_all(&candidate_path)?;
+    } else if candidate_is_symlink {
+        let target = repository.path().join(".ferralk-symlink-target");
+        fs::create_dir_all(&target)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &candidate_path)?;
+        #[cfg(not(unix))]
+        return Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "symlink ignore candidates require a POSIX host",
+        ));
     } else {
         fs::write(&candidate_path, [])?;
     }
