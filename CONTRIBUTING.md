@@ -57,6 +57,12 @@ section in the release notes. Describe the old and new observable behaviour in
 the pull request as well, so the generated summary has the context consumers
 need.
 
+Every pull-request title must use `<type>[(scope)][!]: <summary>` because it can
+become the squash-merge subject that Release Please reads. CI accepts `feat`,
+`fix`, `perf`, `deps`, `chore`, `docs`, `refactor`, `test`, `build`, and `ci`;
+use `!` and the `BREAKING CHANGE:` footer described above for a consumer-facing
+contract change.
+
 ## Before opening a pull request
 
 ```sh
