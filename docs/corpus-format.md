@@ -71,6 +71,14 @@ neutralised. Without that the developer's own `core.excludesFile` decides
 corpus verdicts: a global `*.log` rule makes a case pass locally and fail in
 CI, or worse, pass in both for the wrong reason.
 
+Ignore verdicts use Git 2.52.0 as the pinned CI reference and require Git
+2.52.0 or newer for local oracle replay. Git 2.52 fixed the `X**/Y` pathname
+reading so that the separator cannot disappear and fuse the literal
+components; earlier releases therefore disagree with the version-sensitive
+`ignore-074` through `ignore-076` records. The harness reports and skips the
+Git-backed replay on those older installations instead of presenting their
+version-dependent result as a corpus regression.
+
 ## Two readings of one pattern
 
 A `matcher` case is the fnmatch reading zlob defines: an ordinary wildcard may

@@ -78,10 +78,12 @@ cargo check --manifest-path fuzz/Cargo.toml \
 ```
 
 This is the canonical portable preflight for a pull request and needs no Zig
-installation. The separate fuzz workspace is included because root-workspace
-commands do not compile it. The development-only `oracle` package links zlob;
-include it by dropping `--exclude oracle` only after installing Zig 0.16 and
-libclang.
+installation. Its Git-backed ignore test requires Git 2.52.0 or newer; on an
+older Git release that test prints a skip diagnostic, while CI replays it with
+the exact reference release, Git 2.52.0. The separate fuzz workspace is
+included because root-workspace commands do not compile it. The
+development-only `oracle` package links zlob; include it by dropping
+`--exclude oracle` only after installing Zig 0.16 and libclang.
 
 CI has additional platform, sanitizer, coverage, and policy lanes. In
 particular, coverage includes `oracle` and installs Zig itself; that CI setup

@@ -35,3 +35,16 @@ that half is unchanged, and the maintenance cost named above turned out to be
 the reason to stop paying it.
 
 Amendment only; the normative-oracle decision above is unchanged.
+
+## Amendment, 2026-09-02
+
+"Git" now means Git 2.52.0 or newer for local oracle replay, with Git 2.52.0
+as the exact CI reference. Git 2.52 corrected the `X**/Y` pathname reading:
+older releases could erase the separator and match fused literal components,
+so an unversioned oracle made the same corpus pass or fail according to the
+host distribution. The harness skips Git-backed replay with a diagnostic when
+the installed release is older than 2.52.0, while a dedicated CI lane builds
+and runs the pinned release.
+
+This amendment versions the existing normative oracle; it does not change the
+choice of Git semantics.
