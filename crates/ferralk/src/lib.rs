@@ -5727,7 +5727,7 @@ mod tests {
             .filter(|line| !line.trim().is_empty())
         {
             let case: corpus::Case = serde_json::from_str(line).expect("valid ignore corpus case");
-            if KNOWN_WALKER_GAPS.contains(&case.id.as_str()) {
+            if !case.runs_on_host() || KNOWN_WALKER_GAPS.contains(&case.id.as_str()) {
                 continue;
             }
             let fixture = Fixture::new();
