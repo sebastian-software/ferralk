@@ -63,7 +63,6 @@ const DT_FIFO: u8 = 1;
 const DT_CHR: u8 = 2;
 const DT_BLK: u8 = 6;
 const DT_SOCK: u8 = 12;
-const O_DIRECTORY: i32 = 0x0010_0000;
 const ATTR_BIT_MAP_COUNT: u16 = 5;
 const ATTR_CMN_NAME: u32 = 0x0000_0001;
 const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
@@ -240,7 +239,7 @@ fn unsupported(message: &'static str) -> io::Error {
 /// Darwin open path) instead of escaping through that link. User-supplied
 /// symlink roots retain portable semantics.
 fn open_directory(path: &Path, refuse_final_symlink: bool) -> io::Result<File> {
-    let flags = O_DIRECTORY
+    let flags = libc::O_DIRECTORY
         | if refuse_final_symlink {
             libc::O_NOFOLLOW
         } else {
@@ -271,7 +270,7 @@ fn open_scheduled_directory(
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     let flags = libc::O_RDONLY
         | libc::O_CLOEXEC
-        | O_DIRECTORY
+        | libc::O_DIRECTORY
         | if refuse_final_symlink {
             libc::O_NOFOLLOW
         } else {
@@ -658,11 +657,11 @@ fn read_portable_directory_from_open_file(
                 Err(error)
             };
         }
-        // SAFETY: a successful `readdir` result points to a valid Darwin
-        // `dirent`, whose fixed `d_name` buffer is bounded below even if a
-        // filesystem reports a malformed `d_namlen`.
+        // SAFETY: a successful `readdir` result points to a live Darwin
+        // `dirent`; `portable_dirent_name` validates its reported length
+        // against the embedded `d_name` array before constructing a slice.
         let entry = unsafe { &*entry };
-        let name = portable_dirent_name(entry);
+        let name = portable_dirent_name(entry)?;
         if name.is_empty() || name == b"." || name == b".." {
             continue;
         }
@@ -676,11 +675,14 @@ fn read_portable_directory_from_open_file(
 }
 
 /// Returns a readdir name without trusting its filesystem-provided length.
-fn portable_dirent_name(entry: &libc::dirent) -> &[u8] {
-    let length = (entry.d_namlen as usize).min(entry.d_name.len());
+fn portable_dirent_name(entry: &libc::dirent) -> io::Result<&[u8]> {
+    let length = entry.d_namlen as usize;
+    if length > entry.d_name.len() {
+        return Err(malformed_record());
+    }
     // SAFETY: `d_name` is the fixed array embedded in this live `dirent`, and
-    // `length` is clamped to that array's exact bound above.
-    unsafe { std::slice::from_raw_parts(entry.d_name.as_ptr().cast::<u8>(), length) }
+    // `length` was checked against that array's exact bound above.
+    Ok(unsafe { std::slice::from_raw_parts(entry.d_name.as_ptr().cast::<u8>(), length) })
 }
 
 /// Owns the `DIR` returned by `fdopendir`, including its directory descriptor.
@@ -958,7 +960,7 @@ fn clear_direntries_eof_tail(buffer: &mut [u8]) {
 fn malformed_record() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        "malformed getdirentries64 record",
+        "malformed macOS directory record",
     )
 }
 
@@ -966,7 +968,7 @@ fn malformed_record() -> io::Error {
 mod tests {
     use std::{
         ffi::OsString,
-        fs,
+        fs, io,
         os::unix::fs::symlink,
         path::{Path, PathBuf},
         sync::atomic::{AtomicUsize, Ordering},
@@ -1537,15 +1539,13 @@ mod tests {
     }
 
     #[test]
-    fn portable_readdir_name_never_exceeds_its_fixed_array() {
+    fn portable_readdir_rejects_a_name_beyond_its_fixed_array() {
         // `d_namlen` comes from the filesystem and can exceed the embedded
         // `d_name` array on a malformed FUSE or network-filesystem record.
         let mut entry = unsafe { std::mem::zeroed::<libc::dirent>() };
         entry.d_namlen = u16::MAX;
-        assert_eq!(
-            super::portable_dirent_name(&entry).len(),
-            entry.d_name.len()
-        );
+        let error = super::portable_dirent_name(&entry).expect_err("oversized name is malformed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
