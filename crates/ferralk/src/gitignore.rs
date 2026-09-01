@@ -25,7 +25,7 @@ use std::{
 use super::glob_path_bytes;
 use super::{
     DirectoryBackend, Listing, Walker,
-    ignore_rules::{RuleSet, RuleSetBuilder},
+    ignore_rules::{RuleSet, RuleSetBuilder, without_dot_components},
     read_bounded_file,
 };
 
@@ -151,15 +151,21 @@ impl IgnoreScope {
         };
         // Converted once for the whole chain: every set below slices its own
         // prefix off these bytes.
+        // Repository discovery and ignore-file roots use lexical path
+        // components, while a caller-supplied walk root can retain an inner
+        // `.` in every emitted path. Align the spelling once for the whole
+        // rule chain without resolving `..` or following the filesystem.
         let candidate = glob_path_bytes(path);
+        let candidate = without_dot_components(&candidate);
         node.verdict(&candidate, is_dir).unwrap_or(false)
     }
 
     #[cfg(windows)]
     pub(crate) fn is_ignored_bytes(&self, candidate: &[u8], is_dir: bool) -> bool {
+        let candidate = without_dot_components(candidate);
         self.rules
             .as_ref()
-            .and_then(|node| node.verdict(candidate, is_dir))
+            .and_then(|node| node.verdict(&candidate, is_dir))
             .unwrap_or(false)
     }
 

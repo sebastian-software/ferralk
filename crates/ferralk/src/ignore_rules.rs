@@ -224,6 +224,7 @@ pub(crate) struct RuleSetBuilder {
 impl RuleSetBuilder {
     pub(crate) fn new(root: &Path, case_insensitive: bool, precompose_unicode: bool) -> Self {
         let root = glob_path_bytes(root);
+        let root = without_dot_components(&root);
         // The separator between the directory and what follows it belongs to
         // the prefix, unless the directory already ends in one. The empty
         // root is used by the fuzz helper, where candidates are already
@@ -256,6 +257,29 @@ impl RuleSetBuilder {
             rules: self.rules,
         }
     }
+}
+
+/// Removes components that are exactly `.`, preserving every other byte and
+/// separator. Walk roots keep their caller-visible spelling; this is only the
+/// lexical view used to align ignore-file prefixes with candidate paths.
+pub(crate) fn without_dot_components(path: &[u8]) -> Cow<'_, [u8]> {
+    if !path.split(|byte| *byte == b'/').any(|part| part == b".") {
+        return Cow::Borrowed(path);
+    }
+
+    let mut normalized = Vec::with_capacity(path.len());
+    let mut wrote_component = false;
+    for component in path.split(|byte| *byte == b'/') {
+        if component == b"." {
+            continue;
+        }
+        if wrote_component {
+            normalized.push(b'/');
+        }
+        normalized.extend_from_slice(component);
+        wrote_component = true;
+    }
+    Cow::Owned(normalized)
 }
 
 /// Fuzz entry point for the rule layer.
@@ -810,9 +834,27 @@ fn collapse_partial_stars(part: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::path::{Path, PathBuf};
 
-    use super::{RuleSetBuilder, fuzz_rule, fuzz_rule_bytes, parse_rule};
+    use super::{RuleSetBuilder, fuzz_rule, fuzz_rule_bytes, parse_rule, without_dot_components};
+
+    #[test]
+    fn dot_components_are_removed_without_resolving_parents_or_separators() {
+        assert_eq!(
+            without_dot_components(b"/repo/./src").as_ref(),
+            b"/repo/src"
+        );
+        assert_eq!(without_dot_components(b"./src").as_ref(), b"src");
+        assert_eq!(
+            without_dot_components(b"a//./b/../c").as_ref(),
+            b"a//b/../c"
+        );
+        assert!(matches!(
+            without_dot_components(b"plain/path"),
+            Cow::Borrowed(_)
+        ));
+    }
 
     /// Rule shapes to compare, one per line of a synthetic ignore file.
     const RULES: &[&str] = &[
