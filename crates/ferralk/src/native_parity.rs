@@ -331,6 +331,9 @@ fn parity_beyond_path_max_holds_for_every_frontend() {
     // because its final pathname is intentionally unusable.
     let name = "d".repeat(200);
     let c_name = CString::new(name.as_bytes()).expect("component contains no NUL");
+    let file_name = "f".repeat(255);
+    let c_file_name = CString::new(file_name.as_bytes()).expect("component contains no NUL");
+    let mut boundary_file_created = false;
     while directory.as_os_str().as_bytes().len() <= libc::PATH_MAX as usize + 16 {
         // Building with pathname syscalls would itself fail at PATH_MAX. Keep
         // only the current parent descriptor and create the next component
@@ -349,50 +352,50 @@ fn parity_beyond_path_max_holds_for_every_frontend() {
         // SAFETY: openat returned a new owned descriptor on success.
         parent = unsafe { fs::File::from_raw_fd(child_fd) };
         directory.push(&name);
+
+        let directory_len = directory.as_os_str().as_bytes().len();
+        if !boundary_file_created
+            && directory_len < libc::PATH_MAX as usize
+            && directory_len + 1 + file_name.len() >= libc::PATH_MAX as usize
+        {
+            let file_fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    c_file_name.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC,
+                    0o644,
+                )
+            };
+            assert!(file_fd >= 0, "create one file with a long reported path");
+            // SAFETY: openat returned a new owned descriptor on success.
+            drop(unsafe { fs::File::from_raw_fd(file_fd) });
+            boundary_file_created = true;
+        }
     }
+    assert!(boundary_file_created, "fixture crosses the file boundary");
 
     let walker = collecting_walker(&fixture.root);
-    let serial = walker
-        .clone()
-        .collect()
-        .expect("serial walk collects errors");
+    assert_parity("beyond PATH_MAX", &fixture.root, walker.clone());
+
+    // `assert_parity` covers collected serial traversal and streaming. Keep
+    // the parallel frontend in this family too: its queued directory open is
+    // the path that originally motivated the explicit PATH_MAX guard.
     let parallel = walker
         .clone()
         .threads(4)
         .collect()
         .expect("parallel walk collects errors");
-    let mut streamed_entries = Vec::new();
-    let mut streamed_errors = Vec::new();
-    for item in walker.clone().stream() {
-        match item {
-            Ok(entry) => streamed_entries.push(entry),
-            Err(error) => streamed_errors.push(error),
-        }
-    }
-    let (_, portable_errors) = walk_portable(&walker);
-    let expected_errors = describe_errors(&portable_errors, &fixture.root);
-
-    for (frontend, entries, errors) in [
-        ("serial", serial.entries(), serial.errors()),
-        ("parallel", parallel.entries(), parallel.errors()),
-        (
-            "stream",
-            streamed_entries.as_slice(),
-            streamed_errors.as_slice(),
-        ),
-    ] {
-        assert!(
-            entries.iter().all(|entry| {
-                entry.path().as_os_str().as_bytes().len() < libc::PATH_MAX as usize
-            }),
-            "beyond PATH_MAX ({frontend}): emitted an unusable pathname"
-        );
-        assert_eq!(
-            describe_errors(errors, &fixture.root),
-            expected_errors,
-            "beyond PATH_MAX ({frontend}): error classes differ from portable"
-        );
-    }
+    let (portable_entries, portable_errors) = walk_portable(&walker);
+    assert_eq!(
+        describe_entries(parallel.entries(), &fixture.root),
+        describe_entries(&portable_entries, &fixture.root),
+        "beyond PATH_MAX: parallel and portable entries differ"
+    );
+    assert_eq!(
+        describe_errors(parallel.errors(), &fixture.root),
+        describe_errors(&portable_errors, &fixture.root),
+        "beyond PATH_MAX: parallel and portable error classes differ"
+    );
 }
 
 #[test]

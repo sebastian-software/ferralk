@@ -218,39 +218,11 @@ pub(super) fn read_directory(
     refuse_final_symlink: bool,
     listing: &mut Listing,
 ) -> NativeDirectoryReadResult {
-    let result = if NATIVE_UNSUPPORTED.load(Ordering::Relaxed) {
+    if NATIVE_UNSUPPORTED.load(Ordering::Relaxed) {
         read_portable_directory_from_path(path, relative, refuse_final_symlink, listing)?;
         Ok(())
     } else {
         read_direntries_directory(path, relative, refuse_final_symlink, listing)
-    };
-    if result.is_ok() {
-        reject_path_limited_child_directories(path, listing);
-    }
-    result
-}
-
-/// Makes descriptor-relative traversal stop where ordinary pathname traversal
-/// would. A parallel worker may otherwise emit a directory before its queued
-/// child discovers `ENAMETOOLONG`, while the depth-first frontend encounters
-/// that error before emitting the same directory.
-fn reject_path_limited_child_directories(path: &Path, listing: &mut Listing) {
-    let mut index = 0;
-    while index < listing.entries().len() {
-        let rejected = listing.entries()[index].is_dir()
-            && path
-                .join(listing.entries()[index].name())
-                .as_os_str()
-                .as_bytes()
-                .len()
-                >= libc::PATH_MAX as usize;
-        if rejected {
-            let child = path.join(listing.entries()[index].name());
-            listing.remove_entry(index);
-            listing.defer_error(child, io::Error::from_raw_os_error(libc::ENAMETOOLONG));
-        } else {
-            index += 1;
-        }
     }
 }
 
