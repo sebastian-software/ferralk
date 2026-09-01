@@ -443,7 +443,6 @@ fn parity_over_a_deep_tree() {
     assert_parity("deep tree", &fixture.root, collecting_walker(&fixture.root));
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 #[allow(unsafe_code)]
 fn parity_beyond_path_max_holds_for_every_frontend() {
@@ -973,7 +972,7 @@ fn parity_holds_through_the_parallel_scheduler() {
 fn the_family_matrix_matches_this_platform() {
     let mut families: BTreeMap<&str, bool> = BTreeMap::new();
     families.insert("deep tree", true);
-    families.insert("beyond PATH_MAX", cfg!(target_os = "macos"));
+    families.insert("beyond PATH_MAX", true);
     families.insert("large directory", true);
     families.insert("empty directories", true);
     families.insert("filters and ignore rules", true);
@@ -1003,13 +1002,13 @@ fn the_family_matrix_matches_this_platform() {
         "hosted CI cannot create device nodes; backend parser tests carry their d_type coverage"
     );
     // This module only builds when a native backend is active, and every
-    // supported one is a Unix. Linux carries the non-UTF-8 fixture; macOS
-    // carries the PATH_MAX fixture. A future backend would land here as a
-    // failing count rather than as a quiet family skip.
+    // supported one is a Unix. Linux alone carries the non-UTF-8 fixture; both
+    // current backends carry the PATH_MAX fixture. A future backend would land
+    // here as a failing count rather than as a quiet family skip.
     let running = families.values().filter(|present| **present).count();
     assert_eq!(
         running,
-        if cfg!(target_os = "macos") { 18 } else { 17 },
+        18,
         "this platform runs {running} of {} parity families",
         families.len()
     );
