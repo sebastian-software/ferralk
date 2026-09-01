@@ -18,6 +18,15 @@ The tag object and the source commit are both recorded because `v1.6.3` is an
 annotated tag. Corpus records use the source name `zlob_1_6_3` and refer to the
 peeled source commit above in their import metadata.
 
+## Live verification
+
+The pinned source commit `4bc4da2cbc823d3911b4a1436448687c398977dd`
+was last verified on 2026-09-02 by
+[oracle workflow run 33566831540](https://github.com/sebastian-software/ferralk/actions/runs/33566831540).
+That run replayed 521 checked-in corpus cases plus the generated common subset
+against zlob 1.6.3, reported 237 explicitly classified skips, and retained the
+complete replay log as a workflow artifact.
+
 ## Public Rust API inventory
 
 | Area | zlob 1.6.3 public surface | ferralk direction |
