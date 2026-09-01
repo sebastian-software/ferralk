@@ -8,12 +8,15 @@
 //! repository whose file count is dominated by `node_modules` - and puts
 //! ferralk next to those baselines on today's code.
 //!
-//! Two queries, because they exercise different parts of the walk:
+//! Three queries, because they exercise different parts of the walk:
 //!
 //! - `**/*.{ts,tsx}` traverses everything, `node_modules` included, and leans
 //!   on per-entry filtering.
 //! - `{src,packages}/**/*.{ts,tsx}` can prune whole subtrees before opening
 //!   them, which is what the RFC's "safe subtree pruning" arm did by hand.
+//! - `**/*.{ts,tsx}` plus `**/node_modules/**` as an exclude returns the same
+//!   files as the scoped query, but reaches that result through exclude
+//!   pruning. A companion arm gets the same policy from `.gitignore`.
 //!
 //! **Cache assumption:** the fixture is written once, immediately before the
 //! measurements, so its directory entries and inodes are warm. These are
@@ -48,6 +51,10 @@ use wax::walk::Entry as _;
 /// Threads for every parallel arm, so the comparison is like for like rather
 /// than a reading of whatever `available_parallelism` reports on the host.
 const THREADS: usize = 4;
+const TYPESCRIPT_PATTERN: &str = "**/*.{ts,tsx}";
+const SCOPED_TYPESCRIPT_PATTERN: &str = "{src,packages}/**/*.{ts,tsx}";
+const NODE_MODULES_EXCLUDE: &str = "**/node_modules/**";
+const NODE_MODULES_GITIGNORE: &[u8] = include_bytes!("../fixtures/palamedes.gitignore");
 
 /// A JavaScript repository whose file count sits in `node_modules`.
 ///
@@ -133,6 +140,10 @@ impl Fixture {
             }
         }
 
+        fs::write(root.join(".gitignore"), NODE_MODULES_GITIGNORE)
+            .expect("write benchmark gitignore");
+        files += 1;
+
         Self {
             root,
             files,
@@ -192,13 +203,13 @@ fn palamedes(c: &mut Criterion) {
     for (query, ferralk_pattern, override_globs, scoped_roots) in [
         (
             "unscoped",
-            "**/*.{ts,tsx}",
+            TYPESCRIPT_PATTERN,
             ["**/*.ts", "**/*.tsx"],
             &[][..],
         ),
         (
             "scoped",
-            "{src,packages}/**/*.{ts,tsx}",
+            SCOPED_TYPESCRIPT_PATTERN,
             ["{src,packages}/**/*.ts", "{src,packages}/**/*.tsx"],
             &["src", "packages"][..],
         ),
@@ -330,13 +341,82 @@ fn palamedes(c: &mut Criterion) {
             benchmark.iter(|| black_box(zlob_walk(&fixture.root, ferralk_pattern)))
         });
     }
+    bench_exclude_pruning(&mut group, &fixture);
     group.finish();
+}
+
+/// The documented include-plus-exclude configuration and its gitignore
+/// equivalent. Both must select exactly the scoped query's files before any
+/// timings run, so a pruning arm cannot appear fast by silently finding less.
+fn bench_exclude_pruning(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    fixture: &Fixture,
+) {
+    let expected = ferralk_walk(&fixture.root, SCOPED_TYPESCRIPT_PATTERN, THREADS);
+    let excluded = ferralk_excluded_walk(&fixture.root, THREADS);
+    assert_eq!(
+        excluded,
+        ferralk_excluded_walk(&fixture.root, 1),
+        "exclude-pruned: ferralk's own arms disagree"
+    );
+    assert_eq!(
+        excluded, expected,
+        "exclude-pruned and scoped queries must select the same files"
+    );
+    let gitignored = ferralk_gitignore_walk(&fixture.root, THREADS);
+    assert_eq!(
+        gitignored,
+        ferralk_gitignore_walk(&fixture.root, 1),
+        "gitignore-pruned: ferralk's own arms disagree"
+    );
+    assert_eq!(
+        gitignored, expected,
+        "gitignore-pruned and scoped queries must select the same files"
+    );
+    println!("palamedes exclude-pruned: every arm found {expected} files");
+
+    group.bench_function("exclude_pruned/ferralk_serial", |benchmark| {
+        benchmark.iter(|| black_box(ferralk_excluded_walk(&fixture.root, 1)))
+    });
+    group.bench_function("exclude_pruned/ferralk_parallel", |benchmark| {
+        benchmark.iter(|| black_box(ferralk_excluded_walk(&fixture.root, THREADS)))
+    });
+    group.bench_function("gitignore_pruned/ferralk_parallel", |benchmark| {
+        benchmark.iter(|| black_box(ferralk_gitignore_walk(&fixture.root, THREADS)))
+    });
 }
 
 fn ferralk_walk(root: &Path, pattern: &str, threads: usize) -> usize {
     Walker::new(root)
         .threads(threads)
         .include(pattern)
+        .expect("benchmark include is valid")
+        .options(WalkOptions::default())
+        .collect()
+        .expect("benchmark walk succeeds")
+        .entries()
+        .len()
+}
+
+fn ferralk_excluded_walk(root: &Path, threads: usize) -> usize {
+    Walker::new(root)
+        .threads(threads)
+        .include(TYPESCRIPT_PATTERN)
+        .expect("benchmark include is valid")
+        .exclude(NODE_MODULES_EXCLUDE)
+        .expect("benchmark exclude is valid")
+        .options(WalkOptions::default())
+        .collect()
+        .expect("benchmark walk succeeds")
+        .entries()
+        .len()
+}
+
+fn ferralk_gitignore_walk(root: &Path, threads: usize) -> usize {
+    Walker::new(root)
+        .threads(threads)
+        .respect_git_ignore(true)
+        .include(TYPESCRIPT_PATTERN)
         .expect("benchmark include is valid")
         .options(WalkOptions::default())
         .collect()
