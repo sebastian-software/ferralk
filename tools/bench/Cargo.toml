@@ -10,6 +10,7 @@ publish = false
 [features]
 native-linux = ["ferralk/native-linux"]
 native-macos = ["ferralk/native-macos"]
+thread-sweep = []
 zlob-oracle = ["dep:zlob"]
 
 [dependencies]

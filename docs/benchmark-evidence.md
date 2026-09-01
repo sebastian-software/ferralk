@@ -17,6 +17,7 @@ records the same distinction for releases.
 | Matcher, wall time | Compiled-pattern matching and compilation, against `globset`, `fast-glob`, and `wax` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
 | Walker, wall time | Warm-cache traversal of synthetic repository-shaped trees plus a 400-level chain, including an include-plus-covering-exclude pruning arm, ferralk serial and parallel against `ignore` parallel, one job per backend that ships | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request, medians in the job summary and as an artifact | No |
 | Engine comparison | One repository shape with unscoped include, scoped include, include-plus-exclude, and gitignore-pruned queries | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), run on demand | No |
+| Thread scaling | Ferralk and, when enabled, zlob over the unscoped 53k-file query at 1, 2, 4, 8, and `available_parallelism` threads | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs) with `thread-sweep`, local or manual zlob dispatch | No |
 | zlob ablations | Ferralk and zlob on one fixed fixture, split into traversal, filtering, result retention, and path-representation costs | [`walker_zlob_ablation.rs`](../tools/bench/benches/walker_zlob_ablation.rs), run on demand | No |
 | zlob context | The matcher smoke fixture and 53k-file engine comparison against zlob 1.6.5 | [`zlob-benchmark.yml`](../.github/workflows/zlob-benchmark.yml), manual dispatch on Linux only | No |
 | Node.js ecosystem context | The same matcher cases and repository-shaped walker fixture against current locked Node libraries | [`tools/bench/node`](../tools/bench/node), run on demand | No |
@@ -58,6 +59,11 @@ cargo bench -p bench --bench walker -- --warm-up-time 1 --measurement-time 5 --s
 # Engine comparison on a repository-shaped 53k-file tree. This includes
 # walkdir, jwalk, globwalk, and wax in addition to the existing arms.
 cargo bench -p bench --bench walker_palamedes -- --output-format bencher --noplot
+
+# Opt-in scaling curve. The available point is labelled with the host's actual
+# available_parallelism; it remains explicit even when it duplicates 1/2/4/8.
+cargo bench -p bench --bench walker_palamedes --features thread-sweep -- \
+  thread_sweep/ --output-format bencher --noplot
 ```
 
 Node.js ecosystem context requires Node 24 or later. Install the exact locked
@@ -93,7 +99,7 @@ zlob Rust crate 1.6.5 builds through `build.rs` and bindgen:
 brew install zig llvm
 export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
 
-cargo bench -p bench --bench walker_palamedes --features zlob-oracle
+cargo bench -p bench --bench walker_palamedes --features zlob-oracle,thread-sweep
 cargo bench -p bench --bench walker_zlob --features zlob-oracle
 cargo bench -p bench --bench walker_zlob_ablation --features native-macos,zlob-oracle
 cargo bench -p bench --bench matcher_zlob --features zlob-oracle
@@ -101,11 +107,11 @@ cargo bench -p bench --bench matcher_zlob --features zlob-oracle
 
 zlob is context, never a baseline anything depends on: its benches are behind
 the `zlob-oracle` feature, its workflow is manual dispatch only, and no
-automatic lane requires Zig. The dispatch workflow includes `walker_palamedes`,
-so its Rust and zlob arms provide same-invocation Linux ratios over the 53k-file
-tree. Ferralk's compatibility target and the recorded local macOS tables below
-remain zlob 1.6.3 evidence. The current local run used Zig 0.16.0 and libclang
-22.1.8 from Homebrew.
+automatic lane requires Zig. The dispatch workflow includes `walker_palamedes`
+with `thread-sweep`, so its Rust and zlob arms provide same-invocation Linux
+ratios and scaling curves over the 53k-file tree. Ferralk's compatibility target
+and the recorded local macOS tables below remain zlob 1.6.3 evidence. The current
+local run used Zig 0.16.0 and libclang 22.1.8 from Homebrew.
 
 The engine-comparison measurements in the next section were taken with:
 
@@ -304,6 +310,39 @@ The targeted, before/after comparisons attribute a 4.9% improvement to
 parent-relative directory opens and a further 10.3% to depth-first local
 queues. These are separate wall-time runs, not percentages that can be summed
 into a complete-table improvement.
+
+### Thread-count sweep, M1 Pro
+
+The opt-in sweep was run three times on 2026-09-01 on the 10-core (8 performance,
+2 efficiency) M1 Pro host used by the earlier adoption measurements, macOS
+26.6.2, rustc 1.97.1, Zig 0.16.0, and zlob 1.6.5. Ferralk used its portable
+backend so both rows extend the portable single-point comparison above. Each
+cell is the median of the three Criterion point estimates; parentheses give the
+range across runs, in milliseconds.
+
+| Threads | ferralk | zlob |
+| ---: | ---: | ---: |
+| 1 | **62.06** (61.26–89.59) | 68.44 (49.72–96.54) |
+| 2 | **43.08** (41.09–50.68) | 45.84 (37.02–48.56) |
+| 4 | 34.67 (34.13–34.89) | **33.66** (32.66–66.64) |
+| 8 | **33.90** (33.70–80.29) | 34.20 (31.39–71.18) |
+| available = 10 | **35.48** (35.01–38.71) | 35.84 (35.48–36.99) |
+
+The curve does **not** reproduce a zlob scaling advantage that grows with the
+host's core count. Both walkers recover nearly all of their improvement by four
+threads, remain level at eight, and regress slightly at the host's full reported
+parallelism. The four-thread median gap is 1.01 ms, not the 17.66 ms gap between
+the older M1 Ultra point estimates. That redirects the earlier anomaly away
+from per-entry work and away from a demonstrated QoS difference: the very wide
+single-run ranges at several points show host placement or load, but do not say
+which scheduler policy caused it. A production QoS change would therefore be
+speculation; it belongs in a future isolated ablation only if this paired sweep
+first reproduces a stable placement gap.
+
+The manual Linux dispatch now emits the same ten bencher lines with its actual
+`available_parallelism` embedded in the final label. The label is intentionally
+kept even when it duplicates one of 1/2/4/8, so artifacts state what the host
+reported rather than requiring that fact to be reconstructed later.
 
 The new references answer a comparison question, not an adoption question.
 `jwalk` is deprecated, `walkdir` has no matching or pruning policy, `globwalk`
