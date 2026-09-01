@@ -21,8 +21,8 @@
 //! - A trailing `/**` covers what is inside a directory, so something has to
 //!   follow it.
 //! - Asterisks inside a component are ordinary stars in Git, so `a**b`
-//!   collapses to `a*b`; a run of two or more stars at a component suffix also
-//!   gains Git's directory-spanning form.
+//!   collapses to `a*b`; only a whole `**` component spans directories. Before
+//!   an escaped slash that run must consume at least one component.
 
 use std::{borrow::Cow, path::Path};
 
@@ -140,6 +140,11 @@ impl Rule {
 enum Component {
     /// A `**` component: zero or more whole path components.
     AnyDirs,
+    /// A `**` followed by an escaped slash: one or more path components.
+    ///
+    /// Git lets that star run cross separators, but its zero-width shortcut
+    /// applies only when the following slash is unescaped.
+    AnyDirsNonEmpty,
     /// One component, matched by ferralk-glob.
     Pattern(Pattern),
 }
@@ -167,6 +172,13 @@ fn matches_components(components: &[Component], candidate: &[u8]) -> bool {
         if let Some(Component::AnyDirs) = components.get(index) {
             run = Some((index, rest));
             index += 1;
+            continue;
+        }
+        if let Some(Component::AnyDirsNonEmpty) = components.get(index) {
+            let (_, tail) = split_component(rest);
+            run = Some((index, tail));
+            index += 1;
+            rest = tail;
             continue;
         }
         if let Some(Component::Pattern(pattern)) = components.get(index) {
@@ -321,7 +333,10 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
         return None;
     }
 
-    let (directory_only, body) = match body.strip_suffix(b"/") {
+    let plain_trailing_separator = body
+        .strip_suffix(b"/")
+        .filter(|rest| trailing_backslashes(rest).is_multiple_of(2));
+    let (directory_only, body) = match plain_trailing_separator {
         Some(rest) => (true, rest),
         None => (false, body),
     };
@@ -336,65 +351,45 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
     // A single leading separator is the anchor. Any other empty component is
     // unmatchable in Git, rather than an alternate spelling of a valid rule.
     let parts = split_rule_components(body);
-    if parts.iter().any(|part| part.is_empty()) {
+    if parts.iter().any(|part| part.bytes.is_empty()) {
         return None;
     }
 
     let mut normalized = Vec::with_capacity(parts.len());
     let mut gate: Option<Vec<u8>> = None;
     for part in &parts {
-        let part = strip_bracket_separators(part)?;
-        if let Some(literal) = longest_literal_run(&part)
+        let bytes = strip_bracket_separators(part.bytes)?;
+        if let Some(literal) = longest_literal_run(&bytes)
             && gate.as_ref().is_none_or(|best| best.len() < literal.len())
         {
             gate = Some(literal);
         }
-        normalized.push(part);
-    }
-
-    let mut wildcard_seen = false;
-    let mut star_run = None;
-    for (index, part) in normalized.iter().enumerate() {
-        if !wildcard_seen
-            && (index + 1 < normalized.len() || anchored)
-            && !all_stars(part)
-            && special_suffix_prefix(part).is_some()
-        {
-            star_run = Some(index);
-        }
-        wildcard_seen |= part
-            .iter()
-            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'\\'));
+        normalized.push(NormalizedPart {
+            bytes,
+            escaped_separator_after: part.escaped_separator_after,
+        });
     }
 
     let mut components = Vec::with_capacity(normalized.len() + 2);
     if !anchored {
         components.push(Component::AnyDirs);
     }
-    for (index, part) in normalized.iter().enumerate() {
-        let component = compile_component(part, case_insensitive)?;
+    for part in &normalized {
+        let component =
+            compile_component(&part.bytes, case_insensitive, part.escaped_separator_after)?;
         if matches!(component, Component::AnyDirs)
             && matches!(components.last(), Some(Component::AnyDirs))
         {
             continue;
         }
         components.push(component);
-        if star_run == Some(index) {
-            components.push(Component::AnyDirs);
-        }
     }
     let trailing_whole_run = normalized
         .last()
-        .is_some_and(|part| all_stars(part) && part.len() >= 2);
-    let partial_reaches_trailing_runs = star_run.is_some_and(|index| {
-        normalized[index + 1..]
-            .iter()
-            .all(|part| all_stars(part) && part.len() >= 2)
-    });
-    let trailing_requires_component = trailing_whole_run && !partial_reaches_trailing_runs;
-    if trailing_requires_component {
+        .is_some_and(|part| all_stars(&part.bytes) && part.bytes.len() >= 2);
+    if trailing_whole_run {
         // `abc/**` is what is inside `abc`, so one component has to follow.
-        components.push(compile_component(b"*", case_insensitive)?);
+        components.push(compile_component(b"*", case_insensitive, false)?);
     }
     // A body of nothing but separators is not a rule.
     if components.len() == usize::from(!anchored) {
@@ -413,10 +408,21 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
     })
 }
 
+struct RulePart<'a> {
+    bytes: &'a [u8],
+    escaped_separator_after: bool,
+}
+
+struct NormalizedPart {
+    bytes: Vec<u8>,
+    escaped_separator_after: bool,
+}
+
 /// Splits a rule on path separators, keeping a slash inside a bracket class in
 /// its component. Escaped brackets do not open a class, matching the glob
-/// parser's byte-oriented escape handling.
-fn split_rule_components(body: &[u8]) -> Vec<&[u8]> {
+/// parser's byte-oriented escape handling. The separator spelling is retained
+/// because Git does not let an escaped slash activate `**`'s zero-width case.
+fn split_rule_components(body: &[u8]) -> Vec<RulePart<'_>> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut in_class = false;
@@ -428,7 +434,10 @@ fn split_rule_components(body: &[u8]) -> Vec<&[u8]> {
                 // Git's wildmatch treats an escaped slash as the same path
                 // separator. The escape is inert here and must not remain in
                 // either component handed to the glob compiler.
-                parts.push(&body[start..index]);
+                parts.push(RulePart {
+                    bytes: &body[start..index],
+                    escaped_separator_after: true,
+                });
                 start = index + 2;
                 index += 2;
             }
@@ -471,7 +480,10 @@ fn split_rule_components(body: &[u8]) -> Vec<&[u8]> {
                 index += 1;
             }
             b'/' if !in_class => {
-                parts.push(&body[start..index]);
+                parts.push(RulePart {
+                    bytes: &body[start..index],
+                    escaped_separator_after: false,
+                });
                 start = index + 1;
                 index += 1;
             }
@@ -483,13 +495,24 @@ fn split_rule_components(body: &[u8]) -> Vec<&[u8]> {
             }
         }
     }
-    parts.push(&body[start..]);
+    parts.push(RulePart {
+        bytes: &body[start..],
+        escaped_separator_after: false,
+    });
     parts
 }
 
-fn compile_component(part: &[u8], case_insensitive: bool) -> Option<Component> {
+fn compile_component(
+    part: &[u8],
+    case_insensitive: bool,
+    escaped_separator_after: bool,
+) -> Option<Component> {
     if all_stars(part) && part.len() >= 2 {
-        return Some(Component::AnyDirs);
+        return Some(if escaped_separator_after {
+            Component::AnyDirsNonEmpty
+        } else {
+            Component::AnyDirs
+        });
     }
     Pattern::compile(
         collapse_partial_stars(part),
@@ -501,56 +524,6 @@ fn compile_component(part: &[u8], case_insensitive: bool) -> Option<Component> {
 
 fn all_stars(part: &[u8]) -> bool {
     !part.is_empty() && part.iter().all(|byte| *byte == b'*')
-}
-
-/// Prefix before a special suffix star run, on Git's literal-prefix terms.
-///
-/// Escaped metacharacters stay literal. An unescaped wildcard or class before
-/// the final run means Git already handed the whole component to wildmatch, so
-/// the run is an ordinary `*` rather than a directory-spanning spelling.
-fn special_suffix_prefix(part: &[u8]) -> Option<&[u8]> {
-    let mut index = 0;
-    let mut wildcard_before_run = false;
-    let mut run_start = None;
-    let mut run_length = 0;
-    while index < part.len() {
-        match part[index] {
-            b'\\' if index + 1 < part.len() => {
-                wildcard_before_run = true;
-                run_start = None;
-                run_length = 0;
-                index += 2;
-            }
-            b'*' => {
-                let length = part[index..]
-                    .iter()
-                    .take_while(|byte| **byte == b'*')
-                    .count();
-                run_start = Some(index);
-                run_length = length;
-                if index + length < part.len() {
-                    wildcard_before_run = true;
-                }
-                index += length;
-            }
-            b'?' | b'[' => {
-                wildcard_before_run = true;
-                run_start = None;
-                run_length = 0;
-                index += 1;
-            }
-            _ => {
-                run_start = None;
-                run_length = 0;
-                index += 1;
-            }
-        }
-    }
-    if run_length >= 2 && !wildcard_before_run {
-        run_start.map(|start| &part[..start])
-    } else {
-        None
-    }
 }
 
 /// Candidate components never contain a path separator, so a slash admitted
@@ -624,13 +597,24 @@ fn strip_bracket_separators(part: &[u8]) -> Option<Vec<u8>> {
             }
             b'/' if in_class => {
                 // Slash itself is not matchable inside a candidate component,
-                // but deleting a range endpoint would change the other end
-                // into a literal `-`. Move that endpoint one byte inward to
-                // retain exactly the candidate bytes Git's range can reach.
-                if result.last() == Some(&b'-') {
-                    result.push(b'.');
+                // but Git keeps the lower endpoint of a reversed `x-/` range
+                // as a literal member. Remove that range's dash, and preserve
+                // a following dash as a literal because the slash was already
+                // consumed as the upper endpoint.
+                let member_start = class_start + 1 + usize::from(class_negated);
+                let closes_reversed_range = result.last() == Some(&b'-')
+                    && result.len() > member_start + 1
+                    && trailing_backslashes(&result[..result.len() - 1]).is_multiple_of(2);
+                if closes_reversed_range {
+                    result.pop();
+                    if part.get(index + 1) == Some(&b'-') {
+                        result.extend_from_slice(b"\\-");
+                        index += 1;
+                    }
                     class_has_member = true;
                 } else if part.get(index + 1) == Some(&b'-') {
+                    // A slash as the lower endpoint of `/-9` contributes no
+                    // candidate byte; the reachable range is exactly `0-9`.
                     result.push(b'0');
                     class_has_member = true;
                 }
@@ -647,7 +631,129 @@ fn strip_bracket_separators(part: &[u8]) -> Option<Vec<u8>> {
             }
         }
     }
-    Some(result)
+    Some(rewrite_reversed_ranges(&result))
+}
+
+/// Rewrites Git's reversed-range reading into literals the glob compiler can
+/// represent.
+///
+/// Git tests a range's lower endpoint before it discovers that the upper
+/// endpoint is smaller, then resets its range state. The generic glob matcher
+/// instead represents that range as empty. Dropping the operator and upper
+/// endpoint keeps the already-tested lower byte; escaping an immediately
+/// following dash preserves Git's reset state.
+fn rewrite_reversed_ranges(pattern: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(pattern.len());
+    let mut in_class = false;
+    let mut class_saw_member = false;
+    let mut class_start = false;
+    let mut previous = None;
+    let mut reversed_range_ended = false;
+    let mut index = 0;
+
+    while index < pattern.len() {
+        let byte = pattern[index];
+        if !in_class {
+            result.push(byte);
+            if byte == b'\\' && index + 1 < pattern.len() {
+                result.push(pattern[index + 1]);
+                index += 2;
+                continue;
+            }
+            if byte == b'[' {
+                in_class = true;
+                class_saw_member = false;
+                class_start = true;
+                previous = None;
+                reversed_range_ended = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if class_start && matches!(byte, b'!' | b'^') {
+            result.push(byte);
+            class_start = false;
+            index += 1;
+            continue;
+        }
+        class_start = false;
+
+        if byte == b']' && class_saw_member {
+            result.push(byte);
+            in_class = false;
+            previous = None;
+            reversed_range_ended = false;
+            index += 1;
+            continue;
+        }
+
+        if byte == b'[' && pattern.get(index + 1) == Some(&b':') {
+            let name_start = index + 2;
+            if let Some(end) = memmem::find(&pattern[name_start..], b":]") {
+                let end = name_start + end + 2;
+                result.extend_from_slice(&pattern[index..end]);
+                previous = None;
+                reversed_range_ended = false;
+                class_saw_member = true;
+                index = end;
+                continue;
+            }
+        }
+
+        if byte == b'\\' && index + 1 < pattern.len() {
+            result.extend_from_slice(&pattern[index..=index + 1]);
+            previous = Some(pattern[index + 1]);
+            reversed_range_ended = false;
+            class_saw_member = true;
+            index += 2;
+            continue;
+        }
+
+        if byte == b'-' && reversed_range_ended {
+            result.extend_from_slice(b"\\-");
+            previous = Some(b'-');
+            reversed_range_ended = false;
+            class_saw_member = true;
+            index += 1;
+            continue;
+        }
+
+        if byte == b'-'
+            && let Some(lower) = previous
+            && let Some((upper, endpoint_len)) = range_endpoint(pattern, index + 1)
+        {
+            if lower > upper {
+                previous = None;
+                reversed_range_ended = true;
+                class_saw_member = true;
+                index += 1 + endpoint_len;
+                continue;
+            }
+            result.extend_from_slice(&pattern[index..index + 1 + endpoint_len]);
+            previous = None;
+            reversed_range_ended = false;
+            class_saw_member = true;
+            index += 1 + endpoint_len;
+            continue;
+        }
+
+        result.push(byte);
+        previous = Some(byte);
+        reversed_range_ended = false;
+        class_saw_member = true;
+        index += 1;
+    }
+
+    result
+}
+
+fn range_endpoint(pattern: &[u8], index: usize) -> Option<(u8, usize)> {
+    match pattern.get(index)? {
+        b']' => None,
+        b'\\' => pattern.get(index + 1).map(|byte| (*byte, 2)),
+        byte => Some((*byte, 1)),
+    }
 }
 
 /// Adapts the candidate that one ignore file sees, not its raw pattern. Mac
@@ -1031,28 +1137,63 @@ mod tests {
         }
         assert_eq!(fuzz_rule_bytes(b"x[.-/]y", b"x.y", false), Some(true));
         assert_eq!(fuzz_rule_bytes(b"x[.-/]y", b"x-y", false), None);
+        assert_eq!(fuzz_rule_bytes(b"[a-/]", b"a", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"[a-/]", b"-", false), None);
+        assert_eq!(fuzz_rule_bytes(b"[!a-/]", b"a", false), None);
+        assert_eq!(fuzz_rule_bytes(b"[!a-/]", b"b", false), Some(true));
+        for candidate in [b"a".as_slice(), b"-", b"9"] {
+            assert_eq!(fuzz_rule_bytes(b"[a-/-9]", candidate, false), Some(true));
+        }
+        assert_eq!(fuzz_rule_bytes(b"[a-/-9]", b"5", false), None);
+        assert_eq!(fuzz_rule_bytes(b"[c-a]", b"c", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"[c-a]", b"a", false), None);
+        assert_eq!(fuzz_rule_bytes(b"[!c-a]", b"c", false), None);
+        assert_eq!(fuzz_rule_bytes(b"[!c-a]", b"b", false), Some(true));
+        for candidate in [b"c".as_slice(), b"-", b"z"] {
+            assert_eq!(fuzz_rule_bytes(b"[c-a-z]", candidate, false), Some(true));
+        }
+        assert_eq!(fuzz_rule_bytes(b"[c-a-z]", b"b", false), None);
     }
 
     #[test]
     fn an_escaped_slash_is_a_component_separator() {
         assert_eq!(fuzz_rule_bytes(b"a\\/b", b"a/b", false), Some(true));
-        for candidate in [b"a/y".as_slice(), b"ax/y", b"a/x/y"] {
+        for candidate in [b"a/y".as_slice(), b"ax/y"] {
             assert_eq!(fuzz_rule_bytes(b"a**\\/y", candidate, false), Some(true));
+        }
+        assert_eq!(fuzz_rule_bytes(b"a**\\/y", b"a/x/y", false), None);
+        assert_eq!(fuzz_rule_bytes(b"a/**\\/b", b"a/b", false), None);
+        for candidate in [b"a/x/b".as_slice(), b"a/x/y/b"] {
+            assert_eq!(fuzz_rule_bytes(b"a/**\\/b", candidate, false), Some(true));
+        }
+        assert_eq!(fuzz_rule_bytes(b"**\\/a", b"a", false), None);
+        assert_eq!(fuzz_rule_bytes(b"**\\/a", b"x/a", false), Some(true));
+    }
+
+    #[test]
+    fn a_trailing_escaped_slash_does_not_name_a_backslash_directory() {
+        for (rule, candidate) in [
+            (b"a\\/".as_slice(), b"a\\".as_slice()),
+            (b"**\\/", b"a\\"),
+            (b"a*\\/", b"ax\\"),
+        ] {
+            assert_eq!(fuzz_rule_bytes(rule, candidate, true), None);
         }
     }
 
     #[test]
-    fn suffix_star_runs_follow_git_s_directory_and_empty_cases() {
+    fn whole_and_attached_star_runs_follow_git() {
         for candidate in [b"b".as_slice(), b"x/y/b"] {
             assert_eq!(fuzz_rule_bytes(b"***/b", candidate, false), Some(true));
         }
-        for candidate in [b"a/y".as_slice(), b"ax/y", b"a/x/y"] {
+        for candidate in [b"a/y".as_slice(), b"ax/y"] {
             assert_eq!(fuzz_rule_bytes(b"a**/y", candidate, false), Some(true));
         }
+        assert_eq!(fuzz_rule_bytes(b"a**/y", b"a/x/y", false), None);
         assert_eq!(fuzz_rule_bytes(b"a**/y", b"ay", false), None);
-        for candidate in [b"a".as_slice(), b"ab", b"a/x"] {
-            assert_eq!(fuzz_rule_bytes(b"a**/**", candidate, false), Some(true));
-        }
+        assert_eq!(fuzz_rule_bytes(b"a**/**", b"a", false), None);
+        assert_eq!(fuzz_rule_bytes(b"a**/**", b"ab", false), None);
+        assert_eq!(fuzz_rule_bytes(b"a**/**", b"a/x", false), Some(true));
         assert_eq!(fuzz_rule_bytes(b"a**b", b"a/x/b", false), None);
     }
 
@@ -1079,12 +1220,15 @@ mod tests {
     }
 
     #[test]
-    fn final_and_repeated_special_star_runs_follow_git() {
-        for candidate in [b"a".as_slice(), b"ab", b"a/b", b"a/x/y"] {
+    fn final_attached_and_repeated_whole_star_runs_follow_git() {
+        for candidate in [b"a".as_slice(), b"ab"] {
             assert_eq!(fuzz_rule_bytes(b"/a**", candidate, false), Some(true));
         }
+        assert_eq!(fuzz_rule_bytes(b"/a**", b"a/b", false), None);
+        assert_eq!(fuzz_rule_bytes(b"/a**", b"a/x/y", false), None);
         assert_eq!(fuzz_rule_bytes(b"a**/**/y", b"ay", false), None);
         assert_eq!(fuzz_rule_bytes(b"a**/**/y", b"a/y", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"a**/**/y", b"a/x/y", false), Some(true));
     }
 
     #[test]
