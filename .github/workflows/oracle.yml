@@ -23,6 +23,10 @@ jobs:
           version: 0.16.0
       - name: Replay corpus and generated common subset against zlob
         shell: bash
+        env:
+          # zlob 1.6.3's recursive extglob matcher exceeds Rust's default
+          # test-thread stack on the checked-in stress corpus.
+          RUST_MIN_STACK: 16777216
         run: |
           cargo test -p oracle --test zlob_oracle --test generated_subset \
             -- --ignored --nocapture 2>&1 | tee oracle-replay.log
