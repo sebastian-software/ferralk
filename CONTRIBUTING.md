@@ -57,12 +57,14 @@ section in the release notes. Describe the old and new observable behaviour in
 the pull request as well, so the generated summary has the context consumers
 need.
 
-Every pull-request title and every commit subject on its head branch must use
-`<type>[(scope)][!]: <summary>`. The title can become the squash-merge subject;
-the branch subjects remain visible to Release Please when the pull request is
-merged with a merge commit. CI accepts `feat`, `fix`, `perf`, `deps`, `chore`,
-`docs`, `refactor`, `test`, `build`, and `ci`; use `!` and the `BREAKING
-CHANGE:` footer described above for a consumer-facing contract change.
+Every pull-request title and every non-merge commit subject on its head branch
+must use `<type>[(scope)][!]: <summary>`. Pull requests are squash-merged, and
+the pull-request title becomes the single subject that Release Please sees on
+the default branch. CI ignores merge commits within a head branch because
+Release Please ignores their unparsable subjects too. CI accepts `feat`, `fix`,
+`perf`, `deps`, `chore`, `docs`, `refactor`, `test`, `build`, and `ci`; use `!`
+and the `BREAKING CHANGE:` footer described above for a consumer-facing contract
+change.
 
 ## Before opening a pull request
 
