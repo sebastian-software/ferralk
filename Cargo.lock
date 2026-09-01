@@ -64,7 +64,7 @@ dependencies = [
  "jwalk",
  "walkdir",
  "wax",
- "zlob",
+ "zlob 1.6.5",
 ]
 
 [[package]]
@@ -615,7 +615,7 @@ dependencies = [
  "corpus",
  "ferralk-glob",
  "serde_json",
- "zlob",
+ "zlob 1.6.3",
 ]
 
 [[package]]
@@ -1067,6 +1067,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "zlob"
+version = "1.6.3"
+source = "git+https://github.com/dmtrKovalenko/zlob?rev=4bc4da2cbc823d3911b4a1436448687c398977dd#4bc4da2cbc823d3911b4a1436448687c398977dd"
+dependencies = [
+ "bindgen",
+ "bitflags",
 ]
 
 [[package]]

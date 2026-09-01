@@ -11,7 +11,10 @@ publish = false
 corpus = { path = "../corpus" }
 ferralk-glob = { path = "../../crates/ferralk-glob" }
 serde_json.workspace = true
-zlob = "=1.6.5"
+# This exact source commit is the semantic contract recorded in NOTICE and
+# ADR-0007. A distinct Git source also lets Cargo keep the current registry
+# release in the benchmark harness without unifying the two 1.6.x packages.
+zlob = { git = "https://github.com/dmtrKovalenko/zlob", rev = "4bc4da2cbc823d3911b4a1436448687c398977dd" }
 
 [lints]
 workspace = true

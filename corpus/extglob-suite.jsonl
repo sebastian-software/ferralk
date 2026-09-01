@@ -10,5 +10,5 @@
 {"id":"extsuite-disabled-literal","kind":"match_paths","pattern":"@(foo|bar).js","path":"","paths":["foo.js","bar.js","@(foo|bar).js"],"matches":["@(foo|bar).js"],"flags":[],"expected":true,"source":"zlob_1_6_3"}
 {"id":"extsuite-dot-mid-component-star","pattern":"a@(*)","path":"a.b","flags":["extglob"],"expected":true,"source":"zlob_1_6_3"}
 {"id":"extsuite-dot-mid-component-question","pattern":"a@(?b)","path":"a.b","flags":["extglob"],"expected":true,"source":"zlob_1_6_3"}
-{"id":"extsuite-dot-candidate-start","pattern":"@(*)","path":".b","flags":["extglob"],"expected":false,"source":"zlob_1_6_3"}
-{"id":"extsuite-dot-separator-boundary","pattern":"dir/@(*)","path":"dir/.b","flags":["extglob"],"expected":false,"source":"zlob_1_6_3"}
+{"id":"extsuite-dot-candidate-start","pattern":"@(*)","path":".b","flags":["extglob"],"expected":false,"oracle_expected":true,"source":"zlob_1_6_3","disputed":true,"note":"Ferralk preserves the documented hidden-component boundary; zlob 1.6.3's public matcher consumes the leading dot inside this extglob."}
+{"id":"extsuite-dot-separator-boundary","pattern":"dir/@(*)","path":"dir/.b","flags":["extglob"],"expected":false,"oracle_expected":true,"source":"zlob_1_6_3","disputed":true,"note":"Ferralk preserves the documented hidden-component boundary; zlob 1.6.3's public matcher consumes the leading dot inside this extglob."}

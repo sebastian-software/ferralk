@@ -2,5 +2,13 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
   "labels": ["dependencies"],
-  "rangeStrategy": "pin"
+  "rangeStrategy": "pin",
+  "packageRules": [
+    {
+      "description": "Keep the semantic oracle on the ADR-0007 frozen zlob release",
+      "matchManagers": ["cargo"],
+      "matchFileNames": ["tools/oracle/**"],
+      "enabled": false
+    }
+  ]
 }
