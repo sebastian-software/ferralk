@@ -17,6 +17,7 @@ pub struct GitVersion {
     major: u32,
     minor: u32,
     patch: u32,
+    release: bool,
 }
 
 impl GitVersion {
@@ -26,13 +27,27 @@ impl GitVersion {
             major,
             minor,
             patch,
+            release: true,
+        }
+    }
+
+    const fn prerelease(major: u32, minor: u32, patch: u32) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+            release: false,
         }
     }
 }
 
 impl fmt::Display for GitVersion {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
+        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if !self.release {
+            formatter.write_str("-prerelease")?;
+        }
+        Ok(())
     }
 }
 
@@ -70,11 +85,19 @@ fn parse_git_version(output: &str) -> io::Result<GitVersion> {
                 format!("unexpected Git version output: {output:?}"),
             )
         })?;
-    let mut components = version.split('.');
+    let mut components = version.splitn(3, '.');
     let major = parse_version_component(components.next(), output)?;
     let minor = parse_version_component(components.next(), output)?;
-    let patch = parse_version_component(components.next(), output)?;
-    Ok(GitVersion::new(major, minor, patch))
+    let patch_component = components.next();
+    let patch = parse_version_component(patch_component, output)?;
+    let patch_suffix = patch_component
+        .unwrap_or_default()
+        .trim_start_matches(|character: char| character.is_ascii_digit());
+    if patch_suffix.starts_with(".rc") || patch_suffix.starts_with("-rc") {
+        Ok(GitVersion::prerelease(major, minor, patch))
+    } else {
+        Ok(GitVersion::new(major, minor, patch))
+    }
 }
 
 fn parse_version_component(component: Option<&str>, output: &str) -> io::Result<u32> {
@@ -279,7 +302,7 @@ impl Drop for TemporaryRepository {
 
 #[cfg(test)]
 mod tests {
-    use super::{GitVersion, parse_git_version};
+    use super::{GitVersion, MINIMUM_GIT_ORACLE_VERSION, parse_git_version};
 
     #[test]
     fn git_version_parser_accepts_release_and_vendor_suffixes() {
@@ -301,5 +324,14 @@ mod tests {
     fn git_version_parser_rejects_unexpected_output() {
         let error = parse_git_version("Git version unknown\n").unwrap_err();
         assert!(error.to_string().contains("Git version"));
+    }
+
+    #[test]
+    fn git_version_parser_keeps_prereleases_below_the_final_release() {
+        let dot_rc = parse_git_version("git version 2.52.0.rc0\n").unwrap();
+        let dash_rc = parse_git_version("git version 2.52.0-rc1\n").unwrap();
+
+        assert!(dot_rc < MINIMUM_GIT_ORACLE_VERSION);
+        assert!(dash_rc < MINIMUM_GIT_ORACLE_VERSION);
     }
 }
