@@ -1561,9 +1561,16 @@ impl CompiledAlternative {
     }
 }
 
-/// Whether a plain compiled alternative explicitly starts any component with
-/// a period. Wildcards at a component boundary remain blocked by the default
-/// hidden policy, even when they could consume zero bytes before a later dot.
+/// Whether a plain compiled alternative can place a literal period at the
+/// start of any candidate component.
+///
+/// A wildcard may stop without consuming a byte, and under separator-crossing
+/// semantics it may also leave the next token immediately after a separator.
+/// A following period literal is therefore hidden-capable even when an earlier
+/// literal means the wildcard did not start at a component boundary in the
+/// token stream. This summary is deliberately conservative because walkers
+/// use it to decide whether pruning a subtree is sound under either wildcard
+/// mode.
 fn tokens_can_match_hidden_component_without_match_hidden(tokens: &[Token]) -> bool {
     let mut at_component_start = true;
     for token in tokens {
@@ -1576,7 +1583,7 @@ fn tokens_can_match_hidden_component_without_match_hidden(tokens: &[Token]) -> b
                 at_component_start = false;
             }
             Token::Any | Token::Star | Token::RecursiveStar | Token::PathStar | Token::Class(_) => {
-                at_component_start = false
+                at_component_start = true
             }
         }
     }
@@ -5867,11 +5874,12 @@ mod tests {
                 .can_match_hidden_component_without_match_hidden()
         };
 
-        assert!(!can_match_hidden("**/*.txt"));
-        assert!(!can_match_hidden("**/*.{rs,toml}"));
+        assert!(can_match_hidden("**/*.txt"));
+        assert!(can_match_hidden("**/*.{rs,toml}"));
+        assert!(can_match_hidden("x/f*.hidden/keep.rs"));
         assert!(!can_match_hidden("visible/**"));
-        assert!(!can_match_hidden("**/@(*|visible)/*.txt"));
-        assert!(!can_match_hidden("**/!(.gitignore)/*.txt"));
+        assert!(can_match_hidden("**/@(*|visible)/*.txt"));
+        assert!(can_match_hidden("**/!(.gitignore)/*.txt"));
         assert!(can_match_hidden(".hidden/keep.txt"));
         assert!(can_match_hidden("**/.hidden/keep.txt"));
         assert!(can_match_hidden("**/{visible,.hidden}/keep.txt"));
