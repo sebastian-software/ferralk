@@ -609,7 +609,7 @@ fn malformed_record() -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::{
-        ffi::OsString,
+        ffi::{OsStr, OsString},
         fs,
         os::unix::{
             fs::symlink,
@@ -848,6 +848,26 @@ mod tests {
         assert!(listing.contains("original"));
         assert!(!listing.contains("escaped"));
         fs::remove_dir_all(root).expect("remove relative-open fixture");
+    }
+
+    #[test]
+    fn path_dependent_modes_do_not_receive_a_relative_open_capability() {
+        let root = fixture_root("relative-open-policy");
+        fs::create_dir_all(root.join("child")).expect("create child directory");
+        let listing = Listing {
+            native_directory: RetainedDirectory::retain(
+                open_directory(&root, false).expect("open fixture root"),
+            ),
+            ..Listing::default()
+        };
+
+        let relative =
+            crate::SystemBackend.child_directory_open(&listing, OsStr::new("child"), true);
+        assert!(relative.relative.is_some());
+        let path_based =
+            crate::SystemBackend.child_directory_open(&listing, OsStr::new("child"), false);
+        assert!(path_based.relative.is_none());
+        fs::remove_dir_all(root).expect("remove relative-open policy fixture");
     }
 
     #[test]

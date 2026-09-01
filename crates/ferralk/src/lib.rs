@@ -1238,6 +1238,20 @@ impl Walker {
                 .any(|pattern| pattern.matches_extension(relative))
     }
 
+    /// Whether a queued directory can be consumed without resolving its
+    /// reported path for any later filesystem operation.
+    ///
+    /// Descriptor-relative opens deliberately stay out of modes that load
+    /// ignore files, identify symlink cycles, or request entry metadata. Until
+    /// those operations also accept a directory capability, mixing them with
+    /// an `openat` listing could observe two trees after an ancestor rename.
+    fn allows_descriptor_relative_descent(&self) -> bool {
+        !self.respect_git_ignore
+            && !self.options.follow_symlinks
+            && !self.options.metadata
+            && !self.options.resolve_symlink_kind
+    }
+
     /// The tasks a walk starts from: one per root, in order.
     fn root_tasks<B: DirectoryBackend + ?Sized>(&self, backend: &B) -> Vec<DirectoryTask> {
         self.roots
@@ -1753,8 +1767,13 @@ trait DirectoryBackend {
 
     /// Retains what this backend needs to open one child relative to the
     /// directory represented by `listing`.
-    fn child_directory_open(&self, listing: &Listing, name: &OsStr) -> DirectoryOpen {
-        let _ = (listing, name);
+    fn child_directory_open(
+        &self,
+        listing: &Listing,
+        name: &OsStr,
+        allow_relative: bool,
+    ) -> DirectoryOpen {
+        let _ = (listing, name, allow_relative);
         DirectoryOpen::default()
     }
 
@@ -2262,7 +2281,15 @@ impl DirectoryBackend for SystemBackend {
         self.read_directory(path, follow_symlinks, refuse_final_symlink, listing)
     }
 
-    fn child_directory_open(&self, listing: &Listing, name: &OsStr) -> DirectoryOpen {
+    fn child_directory_open(
+        &self,
+        listing: &Listing,
+        name: &OsStr,
+        allow_relative: bool,
+    ) -> DirectoryOpen {
+        if !allow_relative {
+            return DirectoryOpen::default();
+        }
         #[cfg(all(feature = "native-macos", target_os = "macos"))]
         {
             DirectoryOpen {
@@ -2294,7 +2321,7 @@ impl DirectoryBackend for SystemBackend {
             all(feature = "native-linux", target_os = "linux")
         )))]
         {
-            let _ = (listing, name);
+            let _ = (listing, name, allow_relative);
             DirectoryOpen::default()
         }
     }
@@ -2942,6 +2969,33 @@ mod tests {
             Walker::new(".").threads(usize::MAX).threads,
             super::MAX_WORKERS
         );
+    }
+
+    #[test]
+    fn descriptor_relative_descent_requires_path_independent_options() {
+        assert!(Walker::new(".").allows_descriptor_relative_descent());
+        assert!(
+            Walker::new(".")
+                .options(WalkOptions::default().files_only(true))
+                .allows_descriptor_relative_descent(),
+            "kind filters use the listing unless symlink resolution is requested"
+        );
+        assert!(
+            !Walker::new(".")
+                .respect_git_ignore(true)
+                .allows_descriptor_relative_descent()
+        );
+        for options in [
+            WalkOptions::default().follow_symlinks(true),
+            WalkOptions::default().metadata(true),
+            WalkOptions::default().resolve_symlink_kind(true),
+        ] {
+            assert!(
+                !Walker::new(".")
+                    .options(options)
+                    .allows_descriptor_relative_descent()
+            );
+        }
     }
 
     /// Compiles one walker pattern the way `include` and `exclude` do, in the
