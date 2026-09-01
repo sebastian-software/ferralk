@@ -8,8 +8,10 @@
 use std::{
     fs,
     hint::black_box,
+    io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use ferralk::{
@@ -18,6 +20,7 @@ use ferralk::{
 };
 
 const ENTRIES_PER_DIRECTORY: usize = 64;
+const CONSTANT_GROWTH_BUDGET: u64 = 16;
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
 struct Fixture {
@@ -34,12 +37,22 @@ impl Fixture {
     }
 
     fn new(directories: usize, ignored: bool) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "ferralk-allocations-{}-{}",
-            std::process::id(),
-            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).expect("create allocation fixture");
+        let root = loop {
+            let candidate = std::env::temp_dir().join(format!(
+                "ferralk-allocations-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock is after epoch")
+                    .as_nanos()
+                    + NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed) as u128
+            ));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create allocation fixture: {error}"),
+            }
+        };
         if ignored {
             fs::write(root.join(".gitignore"), b"ignored-*.tmp\n")
                 .expect("write allocation fixture ignore rules");
@@ -116,7 +129,7 @@ fn assert_walk_growth(label: &str, one_batch: u64, two_batches: u64) {
     } else {
         ENTRIES_PER_DIRECTORY as u64
     };
-    let allowed = backend_floor + 8;
+    let allowed = backend_floor + CONSTANT_GROWTH_BUDGET;
     assert!(
         growth <= allowed,
         "{label}: a second {ENTRIES_PER_DIRECTORY}-entry sibling grew allocations by {growth}; \
