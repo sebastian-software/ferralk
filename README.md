@@ -17,12 +17,12 @@ compatible with zlob and deliberately has no C ABI.
 
 Ferralk is pre-1.0. The public API and release cadence are still being refined;
 do not rely on a 1.0 stability guarantee yet. Both crates are published on
-crates.io; use the current 0.9.3 release line for applications. <!-- x-release-please-version -->
+crates.io; use the current 0.9.4 release line for applications. <!-- x-release-please-version -->
 
 ```toml
 [dependencies]
-ferralk = "0.9.3" # x-release-please-version
-ferralk-glob = "0.9.3" # x-release-please-version
+ferralk = "0.9.4" # x-release-please-version
+ferralk-glob = "0.9.4" # x-release-please-version
 ```
 
 For an unreleased Git dependency, pin a revision for repeatable builds.

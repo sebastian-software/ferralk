@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.9.4](https://github.com/sebastian-software/ferralk/compare/v0.9.3...v0.9.4) (2026-09-01)
+
+
+### Bug Fixes
+
+* align suffix star ignore rules with Git ([#263](https://github.com/sebastian-software/ferralk/issues/263)) ([4dc972b](https://github.com/sebastian-software/ferralk/commit/4dc972bcaa3a8e24e218e3e3fce008189663d6d2))
+* **deps:** update rust crate fast-glob to v1.1.1 ([#243](https://github.com/sebastian-software/ferralk/issues/243)) ([e07a260](https://github.com/sebastian-software/ferralk/commit/e07a260f34a8fe4721982fc4ed9a83dd47f8c8bd))
+* **deps:** update rust crate zlob to v1.6.5 ([#244](https://github.com/sebastian-software/ferralk/issues/244)) ([a1281a2](https://github.com/sebastian-software/ferralk/commit/a1281a26c46b76be812d74652209d113846c59e5))
+* **glob:** reuse wide extglob sweep scratch ([#270](https://github.com/sebastian-software/ferralk/issues/270)) ([ac75a25](https://github.com/sebastian-software/ferralk/commit/ac75a25ec5ae5997df5e670cc7ab228f688c3af7))
+* make scheduler wakeups observable ([#241](https://github.com/sebastian-software/ferralk/issues/241)) ([605ba99](https://github.com/sebastian-software/ferralk/commit/605ba99091d9ad69c1361bf95082c974f31a7503))
+* preserve ignore anchors for dotted roots ([#264](https://github.com/sebastian-software/ferralk/issues/264)) ([573746a](https://github.com/sebastian-software/ferralk/commit/573746add6d24bc143ee2d14cb44c3baddfb1d72))
+* preserve PATH_MAX entry parity on macOS ([#266](https://github.com/sebastian-software/ferralk/issues/266)) ([ac74c5f](https://github.com/sebastian-software/ferralk/commit/ac74c5f9c3466e571c14b2d3051b17ec24953a71))
+* re-admit includes through symlink aliases ([#265](https://github.com/sebastian-software/ferralk/issues/265)) ([8914c7a](https://github.com/sebastian-software/ferralk/commit/8914c7a244282ca40d5bce0730c85d09aba40bd0))
+* restore covering exclude pruning ([#268](https://github.com/sebastian-software/ferralk/issues/268)) ([c74220d](https://github.com/sebastian-software/ferralk/commit/c74220db085c5f6699956d6ca5036f732077d27c))
+* restore serial directory emission order ([#267](https://github.com/sebastian-software/ferralk/issues/267)) ([6278819](https://github.com/sebastian-software/ferralk/commit/62788199faa93eaa0b57aeff0cae4542d6bf7672))
+
+
+### Performance Improvements
+
+* measure include and exclude pruning ([#269](https://github.com/sebastian-software/ferralk/issues/269)) ([0a412b3](https://github.com/sebastian-software/ferralk/commit/0a412b3b0dd0296ecac83ddfaad0e30d867715ae))
+* **native-linux:** open children relative to parents ([#273](https://github.com/sebastian-software/ferralk/issues/273)) ([c7a6b2a](https://github.com/sebastian-software/ferralk/commit/c7a6b2a2eec969371c4a19e5a50f1d04dbdca4a9))
+* **walker:** gate scheduler wakeups on sleepers ([#271](https://github.com/sebastian-software/ferralk/issues/271)) ([1463097](https://github.com/sebastian-software/ferralk/commit/1463097c1c15a0a97c908c9b0d404a30e647270f))
+
 ## [0.9.3](https://github.com/sebastian-software/ferralk/compare/v0.9.2...v0.9.3) (2026-08-31)
 
 
