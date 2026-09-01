@@ -71,6 +71,10 @@ impl<T> Scheduler<T> {
 pub(crate) struct Coordinator {
     pending: CacheLine<AtomicUsize>,
     active_workers: CacheLine<AtomicUsize>,
+    /// Publication counter checked by a waiter after its optimistic queue
+    /// probe. It keeps that waiter from sleeping through work published while
+    /// it was preparing to park.
+    wake_epoch: AtomicUsize,
     /// Whether the caller is still the only worker. This state belongs beside
     /// the parking protocol because it decides whether producing work must
     /// notify a waiter.
@@ -111,6 +115,7 @@ impl Coordinator {
         Self {
             pending: CacheLine(AtomicUsize::new(0)),
             active_workers: CacheLine(AtomicUsize::new(0)),
+            wake_epoch: AtomicUsize::new(0),
             lone: AtomicBool::new(true),
             wake_lock: Mutex::new(()),
             wake: Condvar::new(),
@@ -137,9 +142,7 @@ impl Coordinator {
         if self.lone.load(Ordering::Acquire) {
             return;
         }
-        let guard = lock(&self.wake_lock);
-        self.wake.notify_one();
-        drop(guard);
+        self.announce_one();
     }
 
     /// Announces that helpers may exist. The caller invokes this before
@@ -167,6 +170,23 @@ impl Coordinator {
         drop(guard);
     }
 
+    /// Wakes one waiter after a batch steal makes the other entries in that
+    /// batch visible in the thief's local deque. Those entries were announced
+    /// before the steal, so no ordinary producer will wake for them.
+    pub(crate) fn announce_batch_handoff(&self) {
+        self.announce_one();
+    }
+
+    /// Publishes an observation point before waking one waiter. A worker that
+    /// sees this epoch change leaves the mutex and retries its queue probes,
+    /// so no potentially expensive steal scan runs while `wake_lock` is held.
+    fn announce_one(&self) {
+        self.wake_epoch.fetch_add(1, Ordering::SeqCst);
+        let guard = lock(&self.wake_lock);
+        self.wake.notify_one();
+        drop(guard);
+    }
+
     /// Parks until `try_take` yields a task, the walk is cancelled, or no task
     /// is outstanding any more.
     pub(crate) fn wait_for_task<T>(
@@ -178,6 +198,7 @@ impl Coordinator {
             if should_stop() {
                 return None;
             }
+            let observed_epoch = self.wake_epoch.load(Ordering::SeqCst);
             if let Some(task) = try_take() {
                 return Some(task);
             }
@@ -187,13 +208,15 @@ impl Coordinator {
             if self.pending.load(Ordering::Acquire) == 0 || should_stop() {
                 return None;
             }
-            if let Some(task) = try_take() {
-                return Some(task);
+            if self.wake_epoch.load(Ordering::SeqCst) != observed_epoch {
+                drop(guard);
+                continue;
             }
-            let _ = self
+            let (guard, _) = self
                 .wake
                 .wait_timeout(guard, CANCELLATION_POLL_INTERVAL)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            drop(guard);
         }
     }
 
@@ -426,6 +449,44 @@ mod loom_models {
             "widening_does_not_lose_a_concurrent_scheduled_task",
             &EXECUTIONS,
         );
+    }
+
+    /// A successful batch steal consumes one task but leaves siblings in the
+    /// thief's local queue. The handoff notification must make one of those
+    /// siblings observable to a worker that was already preparing to park.
+    #[test]
+    fn a_batch_handoff_reaches_a_parking_worker() {
+        static EXECUTIONS: AtomicUsize = AtomicUsize::new(0);
+        loom::model(|| {
+            EXECUTIONS.fetch_add(1, Ordering::Relaxed);
+            let coordinator = Arc::new(Coordinator::new());
+            let queue = Arc::new(Mutex::new(VecDeque::new()));
+            coordinator.widen();
+            coordinator.begin_task();
+
+            let thief_coordinator = Arc::clone(&coordinator);
+            let thief_queue = Arc::clone(&queue);
+            let thief = thread::spawn(move || {
+                // This is the queue state after `steal_batch_and_pop`: the
+                // first stolen task is already executing, and its sibling is
+                // now only visible through the thief's local deque.
+                push(&thief_queue, 7);
+                thief_coordinator.announce_batch_handoff();
+            });
+
+            let worker_coordinator = Arc::clone(&coordinator);
+            let worker_queue = Arc::clone(&queue);
+            let worker = thread::spawn(move || {
+                let task = worker_coordinator.wait_for_task(|| false, || pop(&worker_queue));
+                assert_eq!(task, Some(7), "the batch sibling must reach a worker");
+                drop(worker_coordinator.claim_task());
+            });
+
+            thief.join().expect("batch thief joins");
+            worker.join().expect("worker joins");
+            assert_eq!(coordinator.pending(), 0);
+        });
+        report("a_batch_handoff_reaches_a_parking_worker", &EXECUTIONS);
     }
 
     /// The task guard has to release its task while the panic unwinds, or the
