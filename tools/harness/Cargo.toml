@@ -17,4 +17,4 @@ serde_json.workspace = true
 workspace = true
 
 [dev-dependencies]
-fast-glob = "=1.1.0"
+fast-glob = "=1.1.1"
