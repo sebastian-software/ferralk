@@ -1624,6 +1624,12 @@ impl CompiledExtglob {
                     index += 2;
                 }
                 ExtglobStep::Group(group) => {
+                    // Even a zero-width branch observes the group's leading-
+                    // period guard before it reaches the continuation. If the
+                    // group opts into a leading period through an alternative,
+                    // the recursive alternative scan above has already made
+                    // this summary true; otherwise the group consumes the
+                    // component-start privilege just like a wildcard.
                     at_component_start = false;
                     index = self.groups[*group].rest;
                 }
@@ -5807,6 +5813,16 @@ mod tests {
         assert!(can_match_hidden("**/{visible,.hidden}/keep.txt"));
         assert!(can_match_hidden("**/@(visible|.hidden)/keep.txt"));
         assert!(can_match_hidden("visible/@(nested/.hidden|other)/keep.txt"));
+        assert!(!can_match_hidden("**/?(visible).hidden/keep.txt"));
+        assert!(!can_match_hidden("**/*(visible).hidden/keep.txt"));
+        assert!(can_match_hidden("**/?(.visible).hidden/keep.txt"));
+
+        let zero_width = Pattern::compile("**/?(visible).hidden/keep.txt", walker_options)
+            .expect("pattern compiles");
+        assert!(!zero_width.is_match("target/.hidden/keep.txt"));
+        let explicitly_hidden = Pattern::compile("**/?(.visible).hidden/keep.txt", walker_options)
+            .expect("pattern compiles");
+        assert!(explicitly_hidden.is_match("target/.hidden/keep.txt"));
     }
 
     #[test]

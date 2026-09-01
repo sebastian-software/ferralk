@@ -7097,6 +7097,13 @@ mod tests {
             reads.contains(&PathBuf::from("target/.hidden")),
             "an explicit hidden include still re-admits the excluded subtree's blind spot"
         );
+
+        let (paths, reads) = walk("**/?(.visible).hidden/keep.rs", false);
+        assert_eq!(paths, [PathBuf::from("target/.hidden/keep.rs")]);
+        assert!(
+            reads.contains(&PathBuf::from("target/.hidden")),
+            "an extglob that explicitly permits a leading period can re-admit its zero-width branch"
+        );
     }
 
     /// With no includes, every exclude form that rejects a directory can
