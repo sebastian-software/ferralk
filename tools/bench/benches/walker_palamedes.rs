@@ -28,6 +28,7 @@
 //!
 //! ```text
 //! cargo bench -p bench --bench walker_palamedes
+//! cargo bench -p bench --bench walker_palamedes --features thread-sweep -- thread_sweep/
 //! cargo bench -p bench --bench walker_palamedes --features zlob-oracle  # needs Zig
 //! ```
 
@@ -272,7 +273,7 @@ fn palamedes(c: &mut Criterion) {
         #[cfg(feature = "zlob-oracle")]
         assert_eq!(
             found,
-            zlob_walk(&fixture.root, ferralk_pattern),
+            zlob_walk(&fixture.root, ferralk_pattern, THREADS),
             "{query}: zlob disagrees with ferralk"
         );
         println!("palamedes {query}: every arm found {found} files");
@@ -338,11 +339,64 @@ fn palamedes(c: &mut Criterion) {
         }
         #[cfg(feature = "zlob-oracle")]
         group.bench_function(format!("{query}/zlob_parallel"), |benchmark| {
-            benchmark.iter(|| black_box(zlob_walk(&fixture.root, ferralk_pattern)))
+            benchmark.iter(|| black_box(zlob_walk(&fixture.root, ferralk_pattern, THREADS)))
         });
     }
     bench_exclude_pruning(&mut group, &fixture);
+    #[cfg(feature = "thread-sweep")]
+    bench_thread_sweep(&mut group, &fixture);
     group.finish();
+}
+
+/// Measures the scaling curve without adding ten filesystem-heavy points to
+/// the ordinary pull-request lane. Enable `thread-sweep` locally or in the
+/// manual zlob workflow; every point uses the same fixture and result gate.
+#[cfg(feature = "thread-sweep")]
+fn bench_thread_sweep(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    fixture: &Fixture,
+) {
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let points = [
+        ("threads_1".to_owned(), 1),
+        ("threads_2".to_owned(), 2),
+        ("threads_4".to_owned(), 4),
+        ("threads_8".to_owned(), 8),
+        (format!("threads_available_{available}"), available),
+    ];
+    let expected = ferralk_walk(&fixture.root, TYPESCRIPT_PATTERN, 1);
+    println!(
+        "palamedes thread sweep: available_parallelism={available}, every arm found {expected} files"
+    );
+
+    for (label, threads) in points {
+        assert_eq!(
+            ferralk_walk(&fixture.root, TYPESCRIPT_PATTERN, threads),
+            expected,
+            "thread sweep: ferralk at {threads} threads disagrees"
+        );
+        group.bench_function(
+            format!("thread_sweep/unscoped/ferralk/{label}"),
+            |benchmark| {
+                benchmark
+                    .iter(|| black_box(ferralk_walk(&fixture.root, TYPESCRIPT_PATTERN, threads)))
+            },
+        );
+
+        #[cfg(feature = "zlob-oracle")]
+        {
+            assert_eq!(
+                zlob_walk(&fixture.root, TYPESCRIPT_PATTERN, threads),
+                expected,
+                "thread sweep: zlob at {threads} threads disagrees"
+            );
+            group.bench_function(format!("thread_sweep/unscoped/zlob/{label}"), |benchmark| {
+                benchmark.iter(|| black_box(zlob_walk(&fixture.root, TYPESCRIPT_PATTERN, threads)))
+            });
+        }
+    }
 }
 
 /// The documented include-plus-exclude configuration and its gitignore
@@ -572,7 +626,7 @@ fn ignore_parallel_pruned(root: &Path, globs: &[&str; 2], scoped_roots: &[&str])
 }
 
 #[cfg(feature = "zlob-oracle")]
-fn zlob_walk(root: &Path, pattern: &str) -> usize {
+fn zlob_walk(root: &Path, pattern: &str, threads: usize) -> usize {
     use zlob::{
         ZlobFlags,
         walk::{WalkBuilder as ZlobWalkBuilder, WalkFlags},
@@ -581,7 +635,7 @@ fn zlob_walk(root: &Path, pattern: &str) -> usize {
     let mut walker = ZlobWalkBuilder::new(root).expect("benchmark root is valid");
     walker
         .options(WalkFlags::empty())
-        .threads(THREADS)
+        .threads(threads)
         .include(pattern)
         .expect("benchmark include is valid")
         .include_flags(ZlobFlags::RECOMMENDED);
