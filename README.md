@@ -156,20 +156,11 @@ single-threaded and unsorted so it can yield entries incrementally.
 
 ## Development
 
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --exclude oracle --all-targets --locked -- -D warnings
-cargo test --workspace --exclude oracle --locked
-cargo run -p harness -- corpus
-```
-
-These are the CI-gated contributor checks and do not require Zig. The optional
-`oracle` package links zlob and therefore needs Zig 0.16 and libclang; with
-those installed, run the same test and Clippy commands again without
-`--exclude oracle` to include it.
-
-See [CONTRIBUTING](CONTRIBUTING.md) for repository policy — commit signing and
-how performance claims are evidenced — and
+Run the single canonical [pull-request preflight in
+CONTRIBUTING](CONTRIBUTING.md#before-opening-a-pull-request). It includes the
+separate fuzz workspace and does not require Zig; CI installs Zig for its
+additional coverage lane. That guide also records repository policy, including
+commit signing and how performance claims are evidenced. See
 [the contributor-oriented guide](docs/usage.md#development-and-validation) for
 the corpus, fuzzing, and benchmark commands.
 
