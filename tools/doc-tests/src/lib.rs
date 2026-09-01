@@ -3,10 +3,13 @@
 
 #[cfg(test)]
 const DOCUMENTS: &[&str] = &[
+    ".github/pull_request_template.md",
     "CHANGELOG.md",
+    "CLAUDE.md",
     "CONTRIBUTING.md",
     "README.md",
     "RFC-zig-free-zlob-port.md",
+    "SECURITY.md",
     "crates/ferralk-glob/README.md",
     "crates/ferralk/README.md",
     "docs/README.md",
@@ -53,7 +56,19 @@ struct FencePolicy {
 #[cfg(test)]
 const FENCE_POLICIES: &[FencePolicy] = &[
     FencePolicy {
+        path: ".github/pull_request_template.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
         path: "CHANGELOG.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "CLAUDE.md",
         compiled_rust_fences: 0,
         ignored_rust_fences: 0,
         intentional_text_fragments: &[],
@@ -73,6 +88,12 @@ const FENCE_POLICIES: &[FencePolicy] = &[
     FencePolicy {
         path: "RFC-zig-free-zlob-port.md",
         compiled_rust_fences: 3,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "SECURITY.md",
+        compiled_rust_fences: 0,
         ignored_rust_fences: 0,
         intentional_text_fragments: &[],
     },
@@ -258,8 +279,14 @@ const FENCE_POLICIES: &[FencePolicy] = &[
     },
 ];
 
+#[doc = include_str!("../../../.github/pull_request_template.md")]
+pub mod pull_request_template {}
+
 #[doc = include_str!("../../../CHANGELOG.md")]
 pub mod changelog {}
+
+#[doc = include_str!("../../../CLAUDE.md")]
+pub mod claude {}
 
 #[doc = include_str!("../../../CONTRIBUTING.md")]
 pub mod contributing {}
@@ -269,6 +296,9 @@ pub mod repository_readme {}
 
 #[doc = include_str!("../../../RFC-zig-free-zlob-port.md")]
 pub mod rfc {}
+
+#[doc = include_str!("../../../SECURITY.md")]
+pub mod security {}
 
 #[doc = include_str!("../../../crates/ferralk-glob/README.md")]
 pub mod ferralk_glob_readme {}
