@@ -1,11 +1,11 @@
-{"id":"bytes-latin1-suffix","pattern":"*.txt","path":"caf\\xE9.txt","flags":[],"expected":true,"source":"handwritten","note":"ADR-0005: matching is byte-first, so a Latin-1 name is an ordinary candidate."}
-{"id":"bytes-latin1-literal","pattern":"caf\\xE9.txt","path":"caf\\xE9.txt","flags":[],"expected":true,"source":"handwritten"}
-{"id":"bytes-latin1-literal-nonmatch","pattern":"caf\\xE9.txt","path":"cafe.txt","flags":[],"expected":false,"source":"handwritten","note":"A raw 0xE9 pattern byte is never folded into an ASCII letter."}
-{"id":"bytes-any-matches-one-byte","pattern":"?","path":"\\xFF","flags":[],"expected":true,"source":"handwritten","note":"? consumes exactly one byte, never a decoded code point."}
-{"id":"bytes-class-member","pattern":"[\\xE9]","path":"\\xE9","flags":[],"expected":true,"source":"handwritten"}
-{"id":"bytes-class-member-nonmatch","pattern":"[\\xE9]","path":"a","flags":[],"expected":false,"source":"handwritten"}
-{"id":"bytes-literal-prefix-star","pattern":"data\\xFF*","path":"data\\xFFset.bin","flags":[],"expected":true,"source":"handwritten"}
-{"id":"bytes-hidden-invalid-component","pattern":"*","path":".\\xFF","flags":[],"expected":false,"source":"handwritten","note":"Leading-period protection is byte-wise and independent of encoding."}
-{"id":"bytes-wtf8-unpaired-surrogate","pattern":"*","path":"\\xED\\xA0\\x80","flags":[],"expected":true,"source":"handwritten","note":"ADR-0005: an unpaired surrogate survives as WTF-8 bytes on Windows."}
-{"id":"bytes-wtf8-unpaired-surrogate-any","pattern":"?","path":"\\xED\\xA0\\x80","flags":[],"expected":false,"source":"handwritten","note":"Three WTF-8 bytes need three ? tokens."}
-{"id":"bytes-recursive-invalid-component","pattern":"src/**/*.bin","path":"src/a/\\xFF.bin","flags":["recursive_double_star"],"expected":true,"source":"handwritten"}
+{"id":"bytes-latin1-suffix","kind":"matcher","pattern":"*.txt","path":"caf\\xE9.txt","flags":[],"expected":true,"source":"handwritten","note":"ADR-0005: matching is byte-first, so a Latin-1 name is an ordinary candidate."}
+{"id":"bytes-latin1-literal","kind":"matcher","pattern":"caf\\xE9.txt","path":"caf\\xE9.txt","flags":[],"expected":true,"source":"handwritten"}
+{"id":"bytes-latin1-literal-nonmatch","kind":"matcher","pattern":"caf\\xE9.txt","path":"cafe.txt","flags":[],"expected":false,"source":"handwritten","note":"A raw 0xE9 pattern byte is never folded into an ASCII letter."}
+{"id":"bytes-any-matches-one-byte","kind":"matcher","pattern":"?","path":"\\xFF","flags":[],"expected":true,"source":"handwritten","note":"? consumes exactly one byte, never a decoded code point."}
+{"id":"bytes-class-member","kind":"matcher","pattern":"[\\xE9]","path":"\\xE9","flags":[],"expected":true,"source":"handwritten"}
+{"id":"bytes-class-member-nonmatch","kind":"matcher","pattern":"[\\xE9]","path":"a","flags":[],"expected":false,"source":"handwritten"}
+{"id":"bytes-literal-prefix-star","kind":"matcher","pattern":"data\\xFF*","path":"data\\xFFset.bin","flags":[],"expected":true,"source":"handwritten"}
+{"id":"bytes-hidden-invalid-component","kind":"matcher","pattern":"*","path":".\\xFF","flags":[],"expected":false,"source":"handwritten","note":"Leading-period protection is byte-wise and independent of encoding."}
+{"id":"bytes-wtf8-unpaired-surrogate","kind":"matcher","pattern":"*","path":"\\xED\\xA0\\x80","flags":[],"expected":true,"source":"handwritten","note":"ADR-0005: an unpaired surrogate survives as WTF-8 bytes on Windows."}
+{"id":"bytes-wtf8-unpaired-surrogate-any","kind":"matcher","pattern":"?","path":"\\xED\\xA0\\x80","flags":[],"expected":false,"source":"handwritten","note":"Three WTF-8 bytes need three ? tokens."}
+{"id":"bytes-recursive-invalid-component","kind":"matcher","pattern":"src/**/*.bin","path":"src/a/\\xFF.bin","flags":["recursive_double_star"],"expected":true,"source":"handwritten"}

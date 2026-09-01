@@ -2,7 +2,7 @@
 
 use std::{fs, path::Path};
 
-use corpus::{Case, CaseKind, Source, decode_bytes};
+use corpus::{CaseKind, Source, decode_bytes, parse_case};
 use ferralk_glob::{Pattern, PatternOptions};
 
 #[test]
@@ -17,7 +17,7 @@ fn common_subset_replays_against_oxc_fast_glob() {
         if line.trim().is_empty() {
             continue;
         }
-        let case: Case = serde_json::from_str(line)
+        let case = parse_case(line)
             .unwrap_or_else(|error| panic!("{}:{}: {error}", path.display(), line_number + 1));
         assert_eq!(case.source, Source::FastGlob);
         let pattern = decode_bytes(&case.pattern).expect("decode pattern");

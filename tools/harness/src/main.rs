@@ -2,26 +2,41 @@
 
 use std::{collections::HashSet, env, fs, path::Path};
 
-use corpus::{Case, CaseKind, decode_bytes};
+use corpus::{Case, CaseKind, decode_bytes, parse_case};
 use ferralk_glob::{Pattern, PatternOptions};
+use serde_json::Value;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = env::args().nth(1).unwrap_or_else(|| "corpus".to_owned());
     let mut files = Vec::new();
     collect_jsonl(Path::new(&root), &mut files)?;
     files.sort();
+    let schema: Value = serde_json::from_str(include_str!("../../../docs/corpus.schema.json"))?;
+    let schema = jsonschema::validator_for(&schema)
+        .map_err(|error| format!("invalid corpus schema: {error}"))?;
 
     let mut ids = HashSet::new();
     let mut cases = 0_usize;
     let mut replayed = 0_usize;
-    let mut skipped = 0_usize;
+    let mut skipped = Vec::new();
+    let mut deferred_ignore = 0_usize;
     for file in files {
-        let is_ignore_topic = file.file_name().is_some_and(|name| name == "ignore.jsonl");
         for (line_number, line) in fs::read_to_string(&file)?.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            let case: Case = serde_json::from_str(line)
+            let value: Value = serde_json::from_str(line)
+                .map_err(|error| format!("{}:{}: {error}", file.display(), line_number + 1))?;
+            if let Some(error) = schema.iter_errors(&value).next() {
+                return Err(format!(
+                    "{}:{}: schema validation at {}: {error}",
+                    file.display(),
+                    line_number + 1,
+                    error.instance_path()
+                )
+                .into());
+            }
+            let case = parse_case(line)
                 .map_err(|error| format!("{}:{}: {error}", file.display(), line_number + 1))?;
             if !ids.insert((file.clone(), case.id.clone())) {
                 return Err(format!(
@@ -61,13 +76,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !case.runs_on_host() {
                 // The verdict describes another separator platform, where a
                 // different host replays it.
-                skipped += 1;
+                skipped.push(case.id.clone());
                 cases += 1;
                 continue;
             }
-            if !is_ignore_topic {
-                let options = options_from_flags(&case.flags)
+            if case.kind == CaseKind::Ignore {
+                deferred_ignore += 1;
+                cases += 1;
+                continue;
+            }
+            {
+                let (options, oracle_nocheck) = options_from_flags(&case.flags)
                     .map_err(|error| format!("{}:{}: {error}", file.display(), line_number + 1))?;
+                if oracle_nocheck
+                    && (!matches!(case.kind, CaseKind::MatchPaths | CaseKind::MatchPathsAt)
+                        || case.oracle_matches.is_none())
+                {
+                    return Err(format!(
+                        "{}:{}: nocheck belongs to a list case with oracle_matches",
+                        file.display(),
+                        line_number + 1
+                    )
+                    .into());
+                }
                 let actual = match case.kind {
                     CaseKind::Matcher => {
                         let matcher = Pattern::compile(pattern, options).map_err(|error| {
@@ -139,6 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             | CaseKind::MatchGlobPath
                             | CaseKind::MatchPathIndices
                             | CaseKind::MatchPathIndicesAt
+                            | CaseKind::Ignore
                             | CaseKind::AbsolutePattern => unreachable!(),
                         };
                         if selected
@@ -146,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .map(|path| path.as_slice())
                             .eq(expected.iter().map(Vec::as_slice))
                         {
-                            case.expected
+                            !selected.is_empty()
                         } else {
                             return Err(format!(
                                 "{}:{}: selected paths differ from corpus",
@@ -190,6 +222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             | CaseKind::MatchGlobPath
                             | CaseKind::MatchPaths
                             | CaseKind::MatchPathsAt
+                            | CaseKind::Ignore
                             | CaseKind::AbsolutePattern => unreachable!(),
                         };
                         if selected != case.indices {
@@ -200,7 +233,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .into());
                         }
-                        case.expected
+                        !selected.is_empty()
+                    }
+                    CaseKind::Ignore => {
+                        unreachable!("ignore cases are replayed by integration tests")
                     }
                 };
                 if actual != case.expected {
@@ -221,9 +257,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if !skipped.is_empty() {
+        println!(
+            "skipped platform-specific cases on this host: {}",
+            skipped.join(", ")
+        );
+    }
     println!(
         "validated {cases} corpus cases; replayed {replayed} operation cases from {root}; \
-         skipped {skipped} cases written for another platform"
+         deferred {deferred_ignore} ignore cases to Git/walker integration tests; \
+         skipped {} cases written for another platform",
+        skipped.len()
     );
     Ok(())
 }
@@ -259,7 +303,7 @@ fn replay_compile_error(
             case.pattern
         ));
     }
-    Ok(case.expected)
+    Ok(false)
 }
 
 /// Replays one absolute-pattern rewrite: the pattern the walker ends up
@@ -293,7 +337,7 @@ fn replay_absolute_pattern(case: &Case) -> Result<bool, String> {
                     case.pattern, case.base_path
                 ));
             }
-            Ok(case.expected)
+            Ok(rewritten.is_some())
         }
         Err(error) => {
             if !expects_rejection {
@@ -317,13 +361,14 @@ fn replay_absolute_pattern(case: &Case) -> Result<bool, String> {
                     case.pattern
                 ));
             }
-            Ok(case.expected)
+            Ok(false)
         }
     }
 }
 
-fn options_from_flags(flags: &[String]) -> Result<PatternOptions, String> {
+fn options_from_flags(flags: &[String]) -> Result<(PatternOptions, bool), String> {
     let mut options = PatternOptions::default();
+    let mut oracle_nocheck = false;
     for flag in flags {
         options = match flag.as_str() {
             "braces" => options.braces(true),
@@ -334,11 +379,14 @@ fn options_from_flags(flags: &[String]) -> Result<PatternOptions, String> {
             "no_escape" => options.escape(false),
             // zlob's result-shaping NOCHECK flag is recorded for the oracle;
             // Ferralk's list filter deliberately returns no synthetic path.
-            "nocheck" => options,
+            "nocheck" => {
+                oracle_nocheck = true;
+                options
+            }
             _ => return Err(format!("unknown matcher flag {flag:?}")),
         };
     }
-    Ok(options)
+    Ok((options, oracle_nocheck))
 }
 
 /// Replays one match case through every engine, so a corpus verdict also

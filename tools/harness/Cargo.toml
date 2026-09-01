@@ -11,6 +11,7 @@ publish = false
 corpus = { path = "../corpus" }
 ferralk = { path = "../../crates/ferralk" }
 ferralk-glob = { path = "../../crates/ferralk-glob" }
+jsonschema.workspace = true
 serde_json.workspace = true
 
 [lints]
