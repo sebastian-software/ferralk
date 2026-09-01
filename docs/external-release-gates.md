@@ -1,6 +1,6 @@
 # Deferred follow-up
 
-Ferralk 0.9.3 is published. <!-- x-release-please-version --> There are no
+Ferralk 0.9.4 is published. <!-- x-release-please-version --> There are no
 external release gates and no noisy wall-time thresholds. Deterministic
 allocation-count invariants run with the ordinary test suite; GitHub tracks the
 remaining follow-up work.
