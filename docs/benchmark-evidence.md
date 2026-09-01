@@ -13,7 +13,7 @@ records the same for releases.
 | Lane | What it measures | Where | Gating |
 | --- | --- | --- | --- |
 | Matcher, wall time | Compiled-pattern matching and compilation, against `globset`, `fast-glob`, and `wax` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
-| Walker, wall time | Warm-cache traversal of a synthetic tree, including an include-plus-covering-exclude pruning arm, ferralk serial and parallel against `ignore` parallel, one job per backend that ships | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request, medians in the job summary and as an artifact | No |
+| Walker, wall time | Warm-cache traversal of synthetic repository-shaped trees plus a 400-level chain, including an include-plus-covering-exclude pruning arm, ferralk serial and parallel against `ignore` parallel, one job per backend that ships | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request, medians in the job summary and as an artifact | No |
 | Engine comparison | One repository shape with unscoped include, scoped include, include-plus-exclude, and gitignore-pruned queries | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), run on demand | No |
 | zlob ablations | Ferralk and zlob on one fixed fixture, split into traversal, filtering, result retention, and path-representation costs | [`walker_zlob_ablation.rs`](../tools/bench/benches/walker_zlob_ablation.rs), run on demand | No |
 | zlob context | The same matcher and walker shapes against zlob 1.6.3 | [`zlob-benchmark.yml`](../.github/workflows/zlob-benchmark.yml), manual dispatch only | No |
@@ -322,7 +322,7 @@ lane tested the remaining plausible differences one at a time on the same
 
 | Variant | Targeted result | Decision |
 | --- | --- | --- |
-| Retain a parent directory capability and open queued children relative to it | **4.90% faster**; 95% interval 2.62–7.36%, `p < 0.01` | Kept on macOS. Retention is capped at the smaller of 256 descriptors or one quarter of `RLIMIT_NOFILE`; full-path opens remain the fallback. |
+| Retain a parent directory capability and open queued children relative to it | **4.90% faster on macOS**; 95% interval 2.62–7.36%, `p < 0.01`. The Linux lane also reports a dedicated 400-level chain so repeated full-path resolution remains visible separately from repository shape. | Kept on macOS and Linux for path-independent traversal. Retention is capped per backend at the smaller of 256 descriptors or one quarter of `RLIMIT_NOFILE`; full-path opens remain the fallback both at that limit and when ignore, cycle, or requested metadata operations still need the reported path. This prevents one task combining descriptor-relative entries with state from a replaced path. No cross-host percentage is inferred for Linux. |
 | Change only worker-local queues from FIFO to LIFO | **10.33% faster** over 53,600 files; 95% interval 6.72–13.27%, `p < 0.01` | Kept. A 5,120-file control improved 3.5%; a 128-file control regressed 0.04 ms (4%), an accepted sub-millisecond trade-off. |
 | Reset a scratch `PathBuf` by truncating its Unix bytes | 6 ns microbenchmark versus 12 ns for copying the parent and 22 ns for `pop`; no significant complete-walk change | Rejected: the isolated operation is not an end-to-end bottleneck. |
 | Store listing names in one byte vector plus offsets | Complete-walk interval −3.20% to +6.55%, `p = 0.51` | Rejected: no measurable improvement. |
@@ -330,8 +330,8 @@ lane tested the remaining plausible differences one at a time on the same
 | Start helpers at three queued directories instead of eight | 1.56% lower point estimate, inside Criterion's noise threshold | Rejected: it conflicts with the existing 36-shape startup sweep and does not establish a robust win. |
 
 The two retained changes copy zlob's useful *shape*, not its implementation.
-Ferralk uses safe queue primitives and keeps unsafe macOS handle operations
-inside the native backend. Local LIFO processing also preserves the public
+Ferralk uses safe queue primitives and keeps unsafe descriptor operations
+inside the native backends. Local LIFO processing also preserves the public
 contract: unsorted parallel result order is deliberately unspecified. The
 ablation benchmark is diagnostic rather than a headline; its collect/count and
 path microbenchmarks explain where time can go, while `walker_palamedes` remains

@@ -373,7 +373,17 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     // is one of the few places that has to own a path.
     let task = || DirectoryTask {
         path: path.to_path_buf(),
-        open: backend.child_directory_open(context.listing, entry.name()),
+        // A retained parent descriptor is safe only while every later
+        // filesystem operation for this task stays on that descriptor-backed
+        // identity. Ignore loading, cycle detection, and requested metadata
+        // still use the public path, so those modes deliberately retain the
+        // established full-path open instead of mixing two directory trees if
+        // an ancestor is replaced between scheduling and execution.
+        open: backend.child_directory_open(
+            context.listing,
+            entry.name(),
+            walker.allows_descriptor_relative_descent(),
+        ),
         depth,
         root: context.root,
         ancestors: context.ancestors.clone(),
