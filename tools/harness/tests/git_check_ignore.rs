@@ -21,6 +21,9 @@ fn ignore_corpus_replays_against_git_check_ignore() {
         let case: Case = serde_json::from_str(line)
             .unwrap_or_else(|error| panic!("{}:{}: {error}", path.display(), line_number + 1));
         assert_eq!(case.source, Source::GitCheckIgnore);
+        if !case.runs_on_host() {
+            continue;
+        }
         let candidate_bytes = decode_bytes(&case.path).expect("decode candidate path");
         let candidate = std::str::from_utf8(&candidate_bytes)
             .expect("Git oracle corpus paths must be valid UTF-8");
