@@ -1,0 +1,50 @@
+name: Bug report
+description: Report incorrect matching, walking, or platform behaviour
+title: ""
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Ferralk. For a suspected vulnerability, use the private security-reporting link instead of this public form.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observable problem and why it appears incorrect.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the pattern, fixture tree, options, and smallest Rust example that reproduces the problem.
+      render: rust
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behaviour
+      description: State both results, including entry order or errors when relevant.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Ferralk version or commit
+      placeholder: "0.9.4 or a commit SHA"
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, architecture, Rust version, filesystem, and enabled features.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add logs, related issues, Git-oracle output, or a corpus case if available.

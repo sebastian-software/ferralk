@@ -1,5 +1,11 @@
 # Ferralk
 
+[![crates.io](https://img.shields.io/crates/v/ferralk.svg)](https://crates.io/crates/ferralk)
+[![docs.rs](https://docs.rs/ferralk/badge.svg)](https://docs.rs/ferralk)
+[![CI](https://github.com/sebastian-software/ferralk/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sebastian-software/ferralk/actions/workflows/ci.yml)
+[![MSRV 1.96](https://img.shields.io/badge/MSRV-1.96-blue.svg)](docs/adr/0004-msrv-stable-minus-two.md)
+[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Ferralk is a pure-Rust toolkit for byte-first glob matching and portable,
 parallel filesystem walking. It is split into two crates so consumers that only
 need matching do not pay for traversal dependencies:
@@ -127,6 +133,14 @@ single-threaded collection. Worker budgets are clamped to `1..=256` to bound
 per-walk queues and operating-system threads. `stream()` is intentionally
 single-threaded and unsorted so it can yield entries incrementally.
 
+For a runnable, Git-ignore-aware mini-find using both crates, try:
+
+```sh
+cargo run --example find -- 'src/**/*.rs'
+```
+
+The source is in [`crates/ferralk/examples/find.rs`](crates/ferralk/examples/find.rs).
+
 ## Documentation
 
 - [Usage guide](docs/usage.md) — matching and walking semantics, defaults, and
@@ -169,4 +183,5 @@ the corpus, fuzzing, and benchmark commands.
 Ferralk is MIT licensed. It is an independent project inspired by zlob 1.6.3;
 provenance and attribution are recorded in
 [NOTICE](https://github.com/sebastian-software/ferralk/blob/main/NOTICE) and the
-[frozen reference](docs/zlob-1.6.3-reference.md).
+[frozen reference](docs/zlob-1.6.3-reference.md). Report vulnerabilities through
+the private process in [SECURITY.md](SECURITY.md).

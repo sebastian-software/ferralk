@@ -1,0 +1,51 @@
+name: Performance report
+description: Report a reproducible throughput, latency, allocation, or memory regression
+title: ""
+labels: ["type: performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Performance claims need same-host before/after evidence. Please preserve the fixture and command so the result can be reproduced.
+  - type: textarea
+    id: observation
+    attributes:
+      label: What changed?
+      description: Describe the regression or optimization opportunity and the affected operation.
+    validations:
+      required: true
+  - type: textarea
+    id: fixture
+    attributes:
+      label: Fixture and workload
+      description: Give tree shape or candidate data, pattern, match count, options, thread count, and cache state.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Reproduction command
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: measurements
+    attributes:
+      label: Before and after measurements
+      description: Include repeated same-host samples, estimator, spread, revisions, and units.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include CPU, core topology, RAM, OS, Rust version, backend, and relevant tool versions.
+    validations:
+      required: true
+  - type: textarea
+    id: limitations
+    attributes:
+      label: Scope and limitations
+      description: State what the measurement does not establish and any semantic differences between compared implementations.
+    validations:
+      required: true
