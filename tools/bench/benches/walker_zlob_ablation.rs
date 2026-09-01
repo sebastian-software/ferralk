@@ -354,7 +354,7 @@ fn path_collection_ablation(c: &mut Criterion) {
         "walker_zlob_ablation/path_collect/owned_path_bufs",
         |benchmark| {
             benchmark.iter(|| {
-                black_box(paths.iter().cloned().collect::<Vec<PathBuf>>());
+                black_box(paths.to_vec());
             })
         },
     );
