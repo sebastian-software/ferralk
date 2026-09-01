@@ -4,7 +4,7 @@ use ferralk_glob::{Pattern, PatternOptions};
 use zlob::{ZlobFlags, zlob_match_paths};
 
 #[test]
-#[ignore = "requires Zig 0.16 and libclang; run only from the manual oracle workflow"]
+#[ignore = "requires Zig 0.16 and libclang; run only from the oracle workflow"]
 fn bounded_common_core_agrees_with_zlob_1_6_3() {
     let patterns = words(b"ab*?", 4);
     let paths = words(b"ab", 4);

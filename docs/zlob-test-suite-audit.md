@@ -8,7 +8,7 @@ platform-runtime tests that are deliberately outside the two-crate Rust API
 
 | Frozen source | Current Ferralk evidence | Disposition |
 | --- | --- | --- |
-| `test_fnmatch.zig`, `test_brace.zig`, `test_edge_cases.zig` | Source-linked matcher corpus and manual oracle | Covered for direct matcher semantics. |
+| `test_fnmatch.zig`, `test_brace.zig`, `test_edge_cases.zig` | Source-linked matcher corpus and Zig-backed oracle | Covered for direct matcher semantics. |
 | `test_extglob.zig`, `test_glibc.zig`, `test_basic.zig` | Path-list corpus and matcher regressions | Covered for public in-memory forms; filesystem enumeration stays separate. |
 | `test_path_matcher.zig`, public `matchPaths` block in `test_internal.zig` | `filter_paths`, base-relative and index corpus cases | Covered; C-string chunking and fixed component buffers are excluded. |
 | `test_absolute_paths.zig` | Root-independent list corpus plus disputed C/Rust cases | Covered except the documented C iterator-only literal-hidden-brace case. |

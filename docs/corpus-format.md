@@ -157,7 +157,10 @@ list is not UTF-8, a `compile_error` case, a `match_glob_path` case, an
 `absolute_pattern` case (zlob has no walker), and a case written for another
 `platform`. It also skips two whole topics, `ignore.jsonl`
 and `fast-glob.jsonl`, whose `oracle_expected` records a different oracle's
-verdict. A skipped case is not a weaker case: it
+verdict. The empty-list `NOCHECK` case is also reported as a dedicated skip:
+zlob's Rust FFI cannot safely expose its synthetic result, so the adapter must
+not count it as replayed. A skipped case is not a weaker case: it
 still replays in normal CI through the harness, which is the ferralk
-contract. The adapter also asserts a minimum number of replayed cases, so a
-change that silently skips the whole corpus fails instead of passing quietly.
+contract. The adapter asserts the exact replayed and skipped totals and prints
+a per-file replay tally, so any corpus inventory change requires an explicit
+review instead of disappearing behind a broad skip condition.

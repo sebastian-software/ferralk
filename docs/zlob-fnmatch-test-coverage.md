@@ -15,7 +15,7 @@ Corpus IDs intentionally preserve the source line, including duplicate input
 assertions, so an import is one-to-one rather than merely behaviourally
 deduplicated.
 
-The manual oracle verifies those cases against the pinned zlob crate. The
+The Zig-backed oracle workflow verifies those cases against the pinned zlob crate. The
 normal harness verifies them without Zig.
 
 The additional direct matcher assertions in `test/test_edge_cases.zig` are
@@ -31,7 +31,7 @@ They cover ordinary and base-relative path filtering, full-path preservation,
 input-order index results, brace and recursive patterns, leading-dot policy,
 absolute paths, and `./` normalization. The harness executes the corresponding
 `Pattern::{filter_paths,filter_paths_at,filter_path_indices,filter_path_indices_at}`
-operations, and the manual oracle invokes the matching zlob Rust APIs.
+operations, and the Zig-backed oracle invokes the matching zlob Rust APIs.
 
 The root-independent compositional path-list forms from
 `test/test_absolute_paths.zig` are recorded in that same corpus: multiple
@@ -73,7 +73,7 @@ The flag-sensitive `hasWildcards` assertions are represented by
 [`corpus/preflight.jsonl`](../corpus/preflight.jsonl) records with
 `"kind":"has_wildcards"`. They cover always-active basic markers, brace
 markers only with `braces`, and extglob operators only with `extglob`. The
-harness and manual oracle run the dedicated preflight operation rather than
+harness and Zig-backed oracle run the dedicated preflight operation rather than
 pretending that an empty candidate is a full fnmatch assertion.
 
 ## Path-list cases
@@ -83,7 +83,7 @@ The five `matchPaths` assertions are represented by
 through `Pattern::filter_paths`. The empty-list `NOCHECK` result is retained as
 a disputed corpus case: Ferralk returns no caller-owned paths, while zlob's
 frozen Zig suite returns the pattern. zlob 1.6.3's Rust FFI aborts for an empty
-list and exposes corrupted string data for this synthetic result, so its manual
+list and exposes corrupted string data for this synthetic result, so its
 Rust oracle deliberately skips that one case while replaying the other four.
 Ferralk's list API intentionally preserves caller input order, while zlob's
 default `matchPaths` result is sorted; the affected edge case records both
