@@ -80,6 +80,30 @@ impl Fixture {
         }
         Self { root, files }
     }
+
+    /// Builds one very deep chain with short components, keeping the
+    /// complete path below `PATH_MAX` while making full-path directory opens
+    /// repeatedly resolve every ancestor.
+    fn deep(depth: usize) -> Self {
+        let unique = format!(
+            "ferralk-bench-deep-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+                + NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed) as u128
+        );
+        let root = std::env::temp_dir().join(unique);
+        fs::create_dir(&root).expect("create deep benchmark root");
+        let mut directory = root.clone();
+        for _ in 0..depth {
+            directory.push("d");
+            fs::create_dir(&directory).expect("create deep benchmark directory");
+            fs::write(directory.join("match.rs"), b"fixture").expect("write deep benchmark file");
+        }
+        Self { root, files: depth }
+    }
 }
 
 impl Drop for Fixture {
@@ -99,6 +123,11 @@ fn walker(c: &mut Criterion) {
         large.files >= 5000,
         "the large fixture must exceed 5k files"
     );
+    // Parent-relative opens have constant component-resolution work per
+    // level; full-path opens repeat every ancestor. This fixture isolates that
+    // asymptotic difference from the wide repository-shaped fixtures above.
+    let deep = Fixture::deep(400);
+    assert_eq!(deep.files, 400, "the deep fixture exercises 400 levels");
 
     // A tree the size of the Palamedes trial's synthetic case, where every
     // parallel arm lost to its own serial form.
@@ -116,6 +145,7 @@ fn walker(c: &mut Criterion) {
 
     bench_tree(c, "", &small);
     bench_tree(c, "large/", &large);
+    bench_tree(c, "deep/", &deep);
     bench_covering_exclude(c, "large/", &large);
     bench_caller_matching(c, "large/", &large);
     bench_caller_matching(c, "mini/", &mini);

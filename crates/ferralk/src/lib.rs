@@ -1717,6 +1717,8 @@ fn has_closing_parenthesis(pattern: &[u8], open: usize) -> bool {
 pub(crate) struct DirectoryOpen {
     #[cfg(all(feature = "native-macos", target_os = "macos"))]
     relative: Option<macos_native::RelativeDirectoryOpen>,
+    #[cfg(all(feature = "native-linux", target_os = "linux"))]
+    relative: Option<linux_native::RelativeDirectoryOpen>,
 }
 
 /// The filesystem calls that traversal and classification make, so one mock
@@ -1936,6 +1938,8 @@ pub(crate) struct Listing {
     entries: Vec<ListedEntry>,
     #[cfg(all(feature = "native-macos", target_os = "macos"))]
     native_directory: Option<Arc<macos_native::RetainedDirectory>>,
+    #[cfg(all(feature = "native-linux", target_os = "linux"))]
+    native_directory: Option<Arc<linux_native::RetainedDirectory>>,
     /// Entries in use. `entries` may be longer: the tail is buffers kept for
     /// the next directory.
     len: usize,
@@ -2003,7 +2007,10 @@ impl Listing {
     /// Drops the previous directory's entries, keeping their buffers.
     pub(crate) fn clear(&mut self) {
         self.len = 0;
-        #[cfg(all(feature = "native-macos", target_os = "macos"))]
+        #[cfg(any(
+            all(feature = "native-macos", target_os = "macos"),
+            all(feature = "native-linux", target_os = "linux")
+        ))]
         {
             self.native_directory = None;
         }
@@ -2206,7 +2213,7 @@ impl DirectoryBackend for SystemBackend {
             // a replacement race; an ordinary Unsupported after a batch must
             // also remain an ordinary walker error rather than restart it.
             let _ = follow_symlinks;
-            linux_native::read_directory(path, refuse_final_symlink, listing)
+            linux_native::read_directory(path, None, refuse_final_symlink, listing)
         }
         #[cfg(not(any(
             all(feature = "native-macos", target_os = "macos"),
@@ -2234,7 +2241,24 @@ impl DirectoryBackend for SystemBackend {
             )
             .map_err(macos_native::NativeDirectoryReadError::into_io_error)
         }
-        #[cfg(not(all(feature = "native-macos", target_os = "macos")))]
+        #[cfg(all(
+            feature = "native-linux",
+            target_os = "linux",
+            not(all(feature = "native-macos", target_os = "macos"))
+        ))]
+        {
+            let _ = follow_symlinks;
+            linux_native::read_directory(
+                path,
+                _open.relative.as_ref(),
+                refuse_final_symlink,
+                listing,
+            )
+        }
+        #[cfg(not(any(
+            all(feature = "native-macos", target_os = "macos"),
+            all(feature = "native-linux", target_os = "linux")
+        )))]
         self.read_directory(path, follow_symlinks, refuse_final_symlink, listing)
     }
 
@@ -2250,7 +2274,25 @@ impl DirectoryBackend for SystemBackend {
                 }),
             }
         }
-        #[cfg(not(all(feature = "native-macos", target_os = "macos")))]
+        #[cfg(all(
+            feature = "native-linux",
+            target_os = "linux",
+            not(all(feature = "native-macos", target_os = "macos"))
+        ))]
+        {
+            DirectoryOpen {
+                relative: listing.native_directory.as_ref().map(|directory| {
+                    linux_native::RelativeDirectoryOpen {
+                        parent: Arc::clone(directory),
+                        name: name.to_os_string(),
+                    }
+                }),
+            }
+        }
+        #[cfg(not(any(
+            all(feature = "native-macos", target_os = "macos"),
+            all(feature = "native-linux", target_os = "linux")
+        )))]
         {
             let _ = (listing, name);
             DirectoryOpen::default()
