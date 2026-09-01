@@ -116,9 +116,38 @@ fn walker(c: &mut Criterion) {
 
     bench_tree(c, "", &small);
     bench_tree(c, "large/", &large);
+    bench_covering_exclude(c, "large/", &large);
     bench_caller_matching(c, "large/", &large);
     bench_caller_matching(c, "mini/", &mini);
     bench_multi_root(c, &roots);
+}
+
+/// The cheapest per-PR guard for include-plus-exclude pruning. The include
+/// alone has to inspect the existing 5k-file fixture; the covering exclude
+/// rejects every branch before it is opened. A regression that merely filters
+/// excluded files after traversal therefore becomes a large visible wall-time
+/// jump without adding another fixture or comparison matrix.
+fn bench_covering_exclude(c: &mut Criterion, group: &str, fixture: &Fixture) {
+    let walk = |threads| {
+        Walker::new(&fixture.root)
+            .threads(threads)
+            .include("**/*.rs")
+            .expect("benchmark include is valid")
+            .exclude("**/branch-*/**")
+            .expect("benchmark exclude is valid")
+            .options(WalkOptions::default())
+            .collect()
+            .expect("benchmark walk succeeds")
+            .entries()
+            .len()
+    };
+    assert_eq!(walk(1), 0, "covering excludes reject the whole fixture");
+    assert_eq!(walk(4), 0, "serial and parallel exclusion must agree");
+
+    c.bench_function(
+        &format!("{LANE}/{group}include_exclude/parallel"),
+        |benchmark| benchmark.iter(|| black_box(walk(4))),
+    );
 }
 
 /// One walker across several roots against one walker per root.

@@ -13,8 +13,8 @@ records the same for releases.
 | Lane | What it measures | Where | Gating |
 | --- | --- | --- | --- |
 | Matcher, wall time | Compiled-pattern matching and compilation, against `globset`, `fast-glob`, and `wax` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
-| Walker, wall time | Warm-cache traversal of a synthetic tree, ferralk serial and parallel against `ignore` parallel, one job per backend that ships | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request, medians in the job summary and as an artifact | No |
-| Engine comparison | One repository shape, every engine on the same query and the same file set | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), run on demand | No |
+| Walker, wall time | Warm-cache traversal of a synthetic tree, including an include-plus-covering-exclude pruning arm, ferralk serial and parallel against `ignore` parallel, one job per backend that ships | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request, medians in the job summary and as an artifact | No |
+| Engine comparison | One repository shape with unscoped include, scoped include, include-plus-exclude, and gitignore-pruned queries | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), run on demand | No |
 | zlob ablations | Ferralk and zlob on one fixed fixture, split into traversal, filtering, result retention, and path-representation costs | [`walker_zlob_ablation.rs`](../tools/bench/benches/walker_zlob_ablation.rs), run on demand | No |
 | zlob context | The same matcher and walker shapes against zlob 1.6.3 | [`zlob-benchmark.yml`](../.github/workflows/zlob-benchmark.yml), manual dispatch only | No |
 | Node.js ecosystem context | The same matcher cases and repository-shaped walker fixture against current locked Node libraries | [`tools/bench/node`](../tools/bench/node), run on demand | No |
@@ -120,9 +120,10 @@ hand-written subtree pruning at 150 ms, zlob at 140 ms — and concluded that
 existing Rust crates already recovered nearly all of zlob's advantage. That
 measurement was made against a different codebase on different hardware and was
 never re-runnable. [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs)
-rebuilds the *shape* so the comparison can be repeated: 53,600 files, 2,600 of
+rebuilds the *shape* so the comparison can be repeated: 53,601 files, 2,600 of
 them TypeScript sources under `src/` and `packages/`, the rest a `node_modules`
-tree of 400 top-level packages and 200 nested dependency packages.
+tree of 400 top-level packages and 200 nested dependency packages, plus the
+checked-in `.gitignore` fixture copied to the benchmark root.
 
 Absolute numbers are not comparable with the RFC's; the ratios between engines
 on one host are.
@@ -139,6 +140,13 @@ must inspect the whole tree; it finds 7,400 files. The **scoped** query names
 `src` and `packages` as its only possible roots, so a pattern-aware walker can
 skip `node_modules`; it finds 2,600 files. Here, scoped describes the query's
 root constraint, not a benchmark or process isolation boundary.
+
+The harness also measures an **exclude-pruned** query: the unscoped include
+paired with `exclude("**/node_modules/**")`. It must return the same 2,600 files
+as the scoped query, but exercises covering-exclude pruning instead. A companion
+arm obtains the same policy from `respect_git_ignore(true)` and the fixture's
+`node_modules/` rule. These arms were added after the recorded tables below;
+they are reported by new runs of the reproducible command above.
 
 ### `**/*.{ts,tsx}` — nothing can be pruned
 
@@ -221,7 +229,7 @@ once outside their match loop.
 | Node toolchain | Node.js 24.19.0, npm 11.17.0; exact dependency versions are locked in `tools/bench/node/package-lock.json` |
 | Threads | 4 for every parallel ferralk, `ignore`, and `jwalk` arm |
 | Cache | Warm: the fixture is written immediately before the measurement and then reused by all arms in that invocation |
-| Fixture | 53,600 files, 2,600 TypeScript sources under `src/` and `packages/`, plus 400 top-level and 200 nested dependency packages under `node_modules/` |
+| Fixture | 53,601 files, 2,600 TypeScript sources under `src/` and `packages/`, plus 400 top-level and 200 nested dependency packages under `node_modules/` and one `.gitignore` |
 
 The complete refresh used these commands. `+stable` selects the installed 1.96.0
 toolchain explicitly because this host's default nightly predates the workspace
