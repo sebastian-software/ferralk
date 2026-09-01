@@ -22,7 +22,7 @@
 //!   follow it.
 //! - Asterisks inside a component are ordinary stars in Git, so `a**b`
 //!   collapses to `a*b`; a run of two or more stars at a component suffix also
-//!   has Git's directory-spanning and zero-width forms.
+//!   gains Git's directory-spanning form.
 
 use std::{borrow::Cow, path::Path};
 
@@ -106,11 +106,8 @@ impl RuleSet {
 
 #[derive(Debug)]
 struct Rule {
-    /// The ordinary directory-spanning spelling of the rule.
+    /// The rule's directory-spanning component spelling.
     components: Vec<Component>,
-    /// The spelling where the one partial suffix run and any adjacent whole
-    /// `**` components all take their zero-width form.
-    zero_components: Option<Vec<Component>>,
     /// A searcher for the longest run of literal bytes the rule requires.
     ///
     /// A file with a hundred rules asks every one of them about every entry,
@@ -135,11 +132,7 @@ impl Rule {
         self.gate
             .as_ref()
             .is_none_or(|gate| gate.find(candidate).is_some())
-            && (matches_components(&self.components, candidate)
-                || self
-                    .zero_components
-                    .as_ref()
-                    .is_some_and(|components| matches_components(components, candidate)))
+            && matches_components(&self.components, candidate)
     }
 }
 
@@ -408,47 +401,8 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
         return None;
     }
 
-    let zero_components = star_run.and_then(|index| {
-        let mut fused = special_suffix_prefix(&normalized[index])?.to_vec();
-        let mut next = index + 1;
-        while normalized
-            .get(next)
-            .is_some_and(|part| all_stars(part) && part.len() >= 2)
-        {
-            next += 1;
-        }
-        if let Some(part) = normalized.get(next) {
-            fused.extend_from_slice(part);
-        }
-
-        let mut zero = Vec::with_capacity(components.len());
-        if !anchored {
-            zero.push(Component::AnyDirs);
-        }
-        for (part_index, part) in normalized.iter().enumerate() {
-            if part_index == index {
-                zero.push(compile_component(&fused, case_insensitive)?);
-            } else if part_index > index && part_index <= next {
-                continue;
-            } else {
-                let component = compile_component(part, case_insensitive)?;
-                if matches!(component, Component::AnyDirs)
-                    && matches!(zero.last(), Some(Component::AnyDirs))
-                {
-                    continue;
-                }
-                zero.push(component);
-            }
-        }
-        if trailing_requires_component && next < normalized.len() - 1 {
-            zero.push(compile_component(b"*", case_insensitive)?);
-        }
-        Some(zero)
-    });
-
     Some(Rule {
         components,
-        zero_components,
         // This prefilter is byte-exact, so it would reject a case-folded
         // candidate before the rule matcher can evaluate it.
         gate: (!case_insensitive)
@@ -470,6 +424,14 @@ fn split_rule_components(body: &[u8]) -> Vec<&[u8]> {
     let mut index = 0;
     while index < body.len() {
         match body[index] {
+            b'\\' if !in_class && body.get(index + 1) == Some(&b'/') => {
+                // Git's wildmatch treats an escaped slash as the same path
+                // separator. The escape is inert here and must not remain in
+                // either component handed to the glob compiler.
+                parts.push(&body[start..index]);
+                start = index + 2;
+                index += 2;
+            }
             b'\\' => {
                 if in_class {
                     class_saw_member = true;
@@ -661,6 +623,17 @@ fn strip_bracket_separators(part: &[u8]) -> Option<Vec<u8>> {
                 index += 1;
             }
             b'/' if in_class => {
+                // Slash itself is not matchable inside a candidate component,
+                // but deleting a range endpoint would change the other end
+                // into a literal `-`. Move that endpoint one byte inward to
+                // retain exactly the candidate bytes Git's range can reach.
+                if result.last() == Some(&b'-') {
+                    result.push(b'.');
+                    class_has_member = true;
+                } else if part.get(index + 1) == Some(&b'-') {
+                    result.push(b'0');
+                    class_has_member = true;
+                }
                 class_saw_member = true;
                 index += 1;
             }
@@ -1051,13 +1024,32 @@ mod tests {
     }
 
     #[test]
+    fn slash_range_endpoints_keep_every_matchable_byte() {
+        for candidate in [b"x0y".as_slice(), b"x5y", b"x9y"] {
+            assert_eq!(fuzz_rule_bytes(b"x[/-9]y", candidate, false), Some(true));
+            assert_eq!(fuzz_rule_bytes(b"x[!/-9]y", candidate, false), None);
+        }
+        assert_eq!(fuzz_rule_bytes(b"x[.-/]y", b"x.y", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"x[.-/]y", b"x-y", false), None);
+    }
+
+    #[test]
+    fn an_escaped_slash_is_a_component_separator() {
+        assert_eq!(fuzz_rule_bytes(b"a\\/b", b"a/b", false), Some(true));
+        for candidate in [b"a/y".as_slice(), b"ax/y", b"a/x/y"] {
+            assert_eq!(fuzz_rule_bytes(b"a**\\/y", candidate, false), Some(true));
+        }
+    }
+
+    #[test]
     fn suffix_star_runs_follow_git_s_directory_and_empty_cases() {
         for candidate in [b"b".as_slice(), b"x/y/b"] {
             assert_eq!(fuzz_rule_bytes(b"***/b", candidate, false), Some(true));
         }
-        for candidate in [b"ay".as_slice(), b"a/y", b"ax/y", b"a/x/y"] {
+        for candidate in [b"a/y".as_slice(), b"ax/y", b"a/x/y"] {
             assert_eq!(fuzz_rule_bytes(b"a**/y", candidate, false), Some(true));
         }
+        assert_eq!(fuzz_rule_bytes(b"a**/y", b"ay", false), None);
         for candidate in [b"a".as_slice(), b"ab", b"a/x"] {
             assert_eq!(fuzz_rule_bytes(b"a**/**", candidate, false), Some(true));
         }
@@ -1081,7 +1073,7 @@ mod tests {
             );
         }
 
-        assert_eq!(fuzz_rule_bytes(b"a**/y", b"ay", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"a**/y", b"ay", false), None);
         assert_eq!(fuzz_rule_bytes(b"a**/y", b"axy", false), None);
         assert_eq!(fuzz_rule_bytes(b"a**/y", b"aXy", false), None);
     }
@@ -1091,7 +1083,8 @@ mod tests {
         for candidate in [b"a".as_slice(), b"ab", b"a/b", b"a/x/y"] {
             assert_eq!(fuzz_rule_bytes(b"/a**", candidate, false), Some(true));
         }
-        assert_eq!(fuzz_rule_bytes(b"a**/**/y", b"ay", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"a**/**/y", b"ay", false), None);
+        assert_eq!(fuzz_rule_bytes(b"a**/**/y", b"a/y", false), Some(true));
     }
 
     #[test]
