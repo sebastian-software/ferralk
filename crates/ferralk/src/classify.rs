@@ -158,6 +158,33 @@ fn should_emit(
             .any(|pattern| pattern.matches(bytes, is_dir, walker.wildcard_mode))
 }
 
+/// Whether an exclude is strong enough to close a directory before it is
+/// opened. Literal and directory-only matches need every include ruled out;
+/// a `/**` covering exclude already rejects every visible descendant, so only
+/// an explicitly hidden include can reach its default-policy blind spot.
+fn exclude_proves_no_re_admission(
+    walker: &Walker,
+    root: usize,
+    bytes: &[u8],
+    excluded: bool,
+    no_include_can_re_admit: bool,
+) -> bool {
+    let plan = &walker.roots[root];
+    let covers_subtree = plan
+        .excludes
+        .iter()
+        .any(|pattern| pattern.covers_subtree(bytes, walker.wildcard_mode));
+    if no_include_can_re_admit && (excluded || covers_subtree) {
+        return true;
+    }
+    covers_subtree
+        && (walker.match_hidden
+            || !plan
+                .includes
+                .iter()
+                .any(|pattern| pattern.could_match_hidden_descendant(bytes)))
+}
+
 /// Decides what one directory entry means for the walk.
 ///
 /// `path` is the frontend's scratch buffer, already holding this entry's whole
@@ -225,7 +252,15 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         // decide whether to descend.
         let no_include_can_re_admit =
             plan.includes.is_empty() || !walker.may_descend_into(context.root, bytes);
-        if ignored_as_link || (excluded_as_link && no_include_can_re_admit) {
+        if ignored_as_link
+            || exclude_proves_no_re_admission(
+                walker,
+                context.root,
+                bytes,
+                excluded_as_link,
+                no_include_can_re_admit,
+            )
+        {
             return EntryAction::Skip;
         }
 
@@ -276,12 +311,13 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     // its contents are ignored whatever the ignore files inside it say.
     let may_include_descendant = walker.may_descend_into(context.root, bytes);
     let no_include_can_re_admit = plan.includes.is_empty() || !may_include_descendant;
-    let exclude_proves_no_re_admission = no_include_can_re_admit
-        && (excluded
-            || plan
-                .excludes
-                .iter()
-                .any(|pattern| pattern.covers_subtree(bytes, walker.wildcard_mode)));
+    let exclude_proves_no_re_admission = exclude_proves_no_re_admission(
+        walker,
+        context.root,
+        bytes,
+        excluded,
+        no_include_can_re_admit,
+    );
     let descend = is_dir
         && !git_ignored
         && !exclude_proves_no_re_admission

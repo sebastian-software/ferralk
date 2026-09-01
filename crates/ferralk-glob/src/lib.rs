@@ -35,6 +35,7 @@ pub struct Pattern {
     alternatives: Vec<CompiledAlternative>,
     alternative_fast_path: Option<Box<AlternativeFastPath>>,
     path_filter_alternatives: Option<Vec<CompiledAlternative>>,
+    can_match_hidden_component_without_match_hidden: bool,
     walker_path_viability: WalkerPathViability,
     walker_path_problem_offset: Option<usize>,
     options: PatternOptions,
@@ -274,6 +275,18 @@ impl Pattern {
     #[must_use]
     pub const fn walker_path_problem_offset(&self) -> Option<usize> {
         self.walker_path_problem_offset
+    }
+
+    /// Whether an explicit literal in some compiled branch can opt a hidden
+    /// path component into matching while `match_hidden` is disabled.
+    ///
+    /// This semantic summary includes brace-expanded and nested extglob
+    /// alternatives. Walk planners use it to distinguish a wildcard's hidden
+    /// blind spot from includes that can deliberately select through it.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn can_match_hidden_component_without_match_hidden(&self) -> bool {
+        self.can_match_hidden_component_without_match_hidden
     }
 
     /// The compile every alternative shares, carrying the budget that bounds
@@ -721,6 +734,9 @@ impl Pattern {
         options: PatternOptions,
         budget: &mut IrBudget,
     ) -> Result<Self, PatternError> {
+        let can_match_hidden_component_without_match_hidden = alternatives
+            .iter()
+            .any(CompiledAlternative::can_match_hidden_component_without_match_hidden);
         let alternative_fast_path =
             AlternativeFastPath::compile(&alternatives, options, budget)?.map(Box::new);
         let path_filter_alternatives = alternatives
@@ -749,6 +765,7 @@ impl Pattern {
             alternatives,
             alternative_fast_path,
             path_filter_alternatives,
+            can_match_hidden_component_without_match_hidden,
             walker_path_viability: WalkerPathViability::Viable,
             walker_path_problem_offset: None,
             options,
@@ -1512,6 +1529,14 @@ struct CompiledAlternative {
 }
 
 impl CompiledAlternative {
+    fn can_match_hidden_component_without_match_hidden(&self) -> bool {
+        tokens_can_match_hidden_component_without_match_hidden(&self.tokens)
+            || self
+                .extglob
+                .as_ref()
+                .is_some_and(CompiledExtglob::can_match_hidden_component_without_match_hidden)
+    }
+
     /// Removes accelerated engines, descending into extglob alternatives so a
     /// differential run pins one engine for the sub-matches too.
     fn strip_engines(&mut self, fast_paths: bool, sweeps: bool, prefilters: bool) {
@@ -1533,6 +1558,86 @@ impl CompiledAlternative {
                 }
             }
         }
+    }
+}
+
+/// Whether a plain compiled alternative explicitly starts any component with
+/// a period. Wildcards at a component boundary remain blocked by the default
+/// hidden policy, even when they could consume zero bytes before a later dot.
+fn tokens_can_match_hidden_component_without_match_hidden(tokens: &[Token]) -> bool {
+    let mut at_component_start = true;
+    for token in tokens {
+        match token {
+            Token::Separator | Token::RecursivePrefix => at_component_start = true,
+            Token::Literal(literal) => {
+                if at_component_start && literal.first() == Some(&b'.') {
+                    return true;
+                }
+                at_component_start = false;
+            }
+            Token::Any | Token::Star | Token::RecursiveStar | Token::PathStar | Token::Class(_) => {
+                at_component_start = false
+            }
+        }
+    }
+    false
+}
+
+impl CompiledExtglob {
+    fn can_match_hidden_component_without_match_hidden(&self) -> bool {
+        // Positive group alternatives are complete compiled branches. Inspect
+        // them recursively so nested groups and hidden components after an
+        // alternative's separator are represented by compiler semantics too.
+        if self.groups.iter().any(|group| {
+            group.kind != ExtglobKind::Negated
+                && group.alternatives.iter().any(|alternative| {
+                    alternative.compiled.as_ref().is_some_and(|alternatives| {
+                        alternatives.iter().any(
+                            CompiledAlternative::can_match_hidden_component_without_match_hidden,
+                        )
+                    })
+                })
+        }) {
+            return true;
+        }
+
+        let mut at_component_start = true;
+        let mut index = 0;
+        while let Some(step) = self.steps.get(index) {
+            match step {
+                ExtglobStep::Byte(b'/') => {
+                    at_component_start = true;
+                    index += 1;
+                }
+                ExtglobStep::Byte(byte) => {
+                    if at_component_start && *byte == b'.' {
+                        return true;
+                    }
+                    at_component_start = false;
+                    index += 1;
+                }
+                ExtglobStep::Escape { escaped } => {
+                    if at_component_start && *escaped == b'.' {
+                        return true;
+                    }
+                    at_component_start = false;
+                    index += 2;
+                }
+                ExtglobStep::Group(group) => {
+                    at_component_start = false;
+                    index = self.groups[*group].rest;
+                }
+                ExtglobStep::Star { next } | ExtglobStep::Class { next, .. } => {
+                    at_component_start = false;
+                    index = *next;
+                }
+                ExtglobStep::Any | ExtglobStep::UnclosedGroup { .. } | ExtglobStep::NoMatch => {
+                    at_component_start = false;
+                    index += 1;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -5678,6 +5783,30 @@ mod tests {
                 .unwrap()
                 .is_match(".gitignore")
         );
+    }
+
+    #[test]
+    fn compiled_patterns_summarize_explicit_hidden_components() {
+        let walker_options = PatternOptions::default()
+            .braces(true)
+            .recursive_double_star(true)
+            .extglob(true);
+        let can_match_hidden = |pattern: &str| {
+            Pattern::compile(pattern, walker_options)
+                .expect("pattern compiles")
+                .can_match_hidden_component_without_match_hidden()
+        };
+
+        assert!(!can_match_hidden("**/*.txt"));
+        assert!(!can_match_hidden("**/*.{rs,toml}"));
+        assert!(!can_match_hidden("visible/**"));
+        assert!(!can_match_hidden("**/@(*|visible)/*.txt"));
+        assert!(!can_match_hidden("**/!(.gitignore)/*.txt"));
+        assert!(can_match_hidden(".hidden/keep.txt"));
+        assert!(can_match_hidden("**/.hidden/keep.txt"));
+        assert!(can_match_hidden("**/{visible,.hidden}/keep.txt"));
+        assert!(can_match_hidden("**/@(visible|.hidden)/keep.txt"));
+        assert!(can_match_hidden("visible/@(nested/.hidden|other)/keep.txt"));
     }
 
     #[test]
