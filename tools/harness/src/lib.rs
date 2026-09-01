@@ -2,7 +2,7 @@
 //! Shared helpers used by the corpus harness and its Git-normative tests.
 
 use std::{
-    fs,
+    fmt, fs,
     io::{self, ErrorKind},
     path::Path,
     process::Command,
@@ -10,6 +10,86 @@ use std::{
 };
 
 static TEMPORARY_REPOSITORY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A Git release version relevant to the normative ignore oracle.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct GitVersion {
+    major: u32,
+    minor: u32,
+    patch: u32,
+}
+
+impl GitVersion {
+    /// Creates a release version from its numeric components.
+    pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+impl fmt::Display for GitVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// The oldest Git release whose `check-ignore` semantics define the corpus.
+pub const MINIMUM_GIT_ORACLE_VERSION: GitVersion = GitVersion::new(2, 52, 0);
+
+/// Returns the installed Git version without reading user configuration.
+pub fn installed_git_version() -> io::Result<GitVersion> {
+    let mut command = Command::new("git");
+    isolate(&mut command);
+    let output = command.arg("--version").output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "git --version exited with {}",
+            output.status
+        )));
+    }
+    let stdout = std::str::from_utf8(&output.stdout).map_err(|error| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("Git version output is not UTF-8: {error}"),
+        )
+    })?;
+    parse_git_version(stdout)
+}
+
+fn parse_git_version(output: &str) -> io::Result<GitVersion> {
+    let version = output
+        .trim()
+        .strip_prefix("git version ")
+        .and_then(|remainder| remainder.split_whitespace().next())
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("unexpected Git version output: {output:?}"),
+            )
+        })?;
+    let mut components = version.split('.');
+    let major = parse_version_component(components.next(), output)?;
+    let minor = parse_version_component(components.next(), output)?;
+    let patch = parse_version_component(components.next(), output)?;
+    Ok(GitVersion::new(major, minor, patch))
+}
+
+fn parse_version_component(component: Option<&str>, output: &str) -> io::Result<u32> {
+    let digits = component
+        .unwrap_or_default()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    digits.parse().map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("unexpected Git version output: {output:?}"),
+        )
+    })
+}
 
 /// Evaluates a candidate path against rules with Git's own ignore matcher.
 ///
@@ -194,5 +274,32 @@ impl TemporaryRepository {
 impl Drop for TemporaryRepository {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GitVersion, parse_git_version};
+
+    #[test]
+    fn git_version_parser_accepts_release_and_vendor_suffixes() {
+        assert_eq!(
+            parse_git_version("git version 2.52.0\n").unwrap(),
+            GitVersion::new(2, 52, 0)
+        );
+        assert_eq!(
+            parse_git_version("git version 2.52.0.windows.1\n").unwrap(),
+            GitVersion::new(2, 52, 0)
+        );
+        assert_eq!(
+            parse_git_version("git version 2.52.0 (Apple Git-154)\n").unwrap(),
+            GitVersion::new(2, 52, 0)
+        );
+    }
+
+    #[test]
+    fn git_version_parser_rejects_unexpected_output() {
+        let error = parse_git_version("Git version unknown\n").unwrap_err();
+        assert!(error.to_string().contains("Git version"));
     }
 }

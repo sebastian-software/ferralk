@@ -6,6 +6,15 @@ use corpus::{CaseKind, Source, decode_bytes, parse_case};
 
 #[test]
 fn ignore_corpus_replays_against_git_check_ignore() {
+    let git_version = harness::installed_git_version().expect("read installed Git version");
+    if git_version < harness::MINIMUM_GIT_ORACLE_VERSION {
+        eprintln!(
+            "skipping Git ignore oracle: Git >= {} is required, but {git_version} is installed",
+            harness::MINIMUM_GIT_ORACLE_VERSION
+        );
+        return;
+    }
+
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
     let mut files = Vec::new();
     collect_jsonl(&root, &mut files).expect("find corpus files");
