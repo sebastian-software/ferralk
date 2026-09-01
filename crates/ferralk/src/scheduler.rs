@@ -26,6 +26,14 @@ use crossbeam_deque::{Injector, Steal, Worker};
 /// notifications that are sent while `wake_lock` is held.
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Low bits reserved for parked-worker registrations in `wake_state`.
+///
+/// Deriving the width from the walk's hard worker cap keeps the packed field's
+/// no-carry invariant tied to the budget it protects.
+const SLEEPER_BITS: u32 = usize::BITS - crate::MAX_WORKERS.leading_zeros();
+const SLEEPER_MASK: usize = (1 << SLEEPER_BITS) - 1;
+const WAKE_EPOCH_STEP: usize = 1 << SLEEPER_BITS;
+
 pub(crate) struct Scheduler<T> {
     injector: Injector<T>,
 }
@@ -74,7 +82,10 @@ pub(crate) struct Coordinator {
     /// Publication counter checked by a waiter after its optimistic queue
     /// probe. It keeps that waiter from sleeping through work published while
     /// it was preparing to park.
-    wake_epoch: AtomicUsize,
+    /// Publication epoch in the high bits and registered sleepers in the low
+    /// bits. Keeping them in one atomic makes the producer's epoch bump and
+    /// sleeper observation indivisible.
+    wake_state: AtomicUsize,
     /// Whether the caller is still the only worker. This state belongs beside
     /// the parking protocol because it decides whether producing work must
     /// notify a waiter.
@@ -115,7 +126,7 @@ impl Coordinator {
         Self {
             pending: CacheLine(AtomicUsize::new(0)),
             active_workers: CacheLine(AtomicUsize::new(0)),
-            wake_epoch: AtomicUsize::new(0),
+            wake_state: AtomicUsize::new(0),
             lone: AtomicBool::new(true),
             wake_lock: Mutex::new(()),
             wake: Condvar::new(),
@@ -181,7 +192,13 @@ impl Coordinator {
     /// sees this epoch change leaves the mutex and retries its queue probes,
     /// so no potentially expensive steal scan runs while `wake_lock` is held.
     fn announce_one(&self) {
-        self.wake_epoch.fetch_add(1, Ordering::SeqCst);
+        let previous = self.wake_state.fetch_add(WAKE_EPOCH_STEP, Ordering::SeqCst);
+        // The same RMW publishes a new epoch and observes the sleeper count.
+        // A racing waiter either registered in `previous`, or its registration
+        // observes this new epoch and it does not enter the condvar.
+        if previous & SLEEPER_MASK == 0 {
+            return;
+        }
         let guard = lock(&self.wake_lock);
         self.wake.notify_one();
         drop(guard);
@@ -198,7 +215,7 @@ impl Coordinator {
             if should_stop() {
                 return None;
             }
-            let observed_epoch = self.wake_epoch.load(Ordering::SeqCst);
+            let observed_epoch = self.wake_state.load(Ordering::SeqCst) & !SLEEPER_MASK;
             if let Some(task) = try_take() {
                 return Some(task);
             }
@@ -208,7 +225,13 @@ impl Coordinator {
             if self.pending.load(Ordering::Acquire) == 0 || should_stop() {
                 return None;
             }
-            if self.wake_epoch.load(Ordering::SeqCst) != observed_epoch {
+            // Register before the final epoch check. A producer that already
+            // skipped the notification changed the epoch first; a later
+            // producer observes this registration and takes the locked path.
+            let previous = self.wake_state.fetch_add(1, Ordering::SeqCst);
+            debug_assert_ne!(previous & SLEEPER_MASK, SLEEPER_MASK);
+            if previous & !SLEEPER_MASK != observed_epoch {
+                self.wake_state.fetch_sub(1, Ordering::SeqCst);
                 drop(guard);
                 continue;
             }
@@ -216,6 +239,7 @@ impl Coordinator {
                 .wake
                 .wait_timeout(guard, CANCELLATION_POLL_INTERVAL)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.wake_state.fetch_sub(1, Ordering::SeqCst);
             drop(guard);
         }
     }
@@ -252,6 +276,13 @@ impl Coordinator {
     #[cfg(loom)]
     pub(crate) fn active_workers(&self) -> usize {
         self.active_workers.load(Ordering::Acquire)
+    }
+
+    /// Observation point for loom: every exit from the wait protocol must
+    /// retire its sleeper registration.
+    #[cfg(loom)]
+    pub(crate) fn sleepers(&self) -> usize {
+        self.wake_state.load(Ordering::SeqCst) & SLEEPER_MASK
     }
 
     fn finish_task(&self) {
@@ -408,6 +439,46 @@ mod loom_models {
             assert_eq!(coordinator.pending(), 0);
         });
         report("a_queued_task_reaches_a_parking_worker", &EXECUTIONS);
+    }
+
+    /// The fast path may observe no sleepers just as a worker registers under
+    /// the mutex. Either the announcement sees that registration and notifies,
+    /// or the worker sees the preceding epoch change and retries without
+    /// sleeping. Loom's non-expiring timeout turns either missed edge into a
+    /// deterministic deadlock.
+    #[test]
+    fn zero_sleeper_skip_races_with_parker_registration() {
+        static EXECUTIONS: AtomicUsize = AtomicUsize::new(0);
+        loom::model(|| {
+            EXECUTIONS.fetch_add(1, Ordering::Relaxed);
+            let coordinator = Arc::new(Coordinator::new());
+            let queue = Arc::new(Mutex::new(VecDeque::new()));
+            coordinator.begin_task();
+
+            let producer_coordinator = Arc::clone(&coordinator);
+            let producer_queue = Arc::clone(&queue);
+            let producer = thread::spawn(move || {
+                push(&producer_queue, 7);
+                producer_coordinator.announce_batch_handoff();
+            });
+
+            let worker_coordinator = Arc::clone(&coordinator);
+            let worker_queue = Arc::clone(&queue);
+            let worker = thread::spawn(move || {
+                let task = worker_coordinator.wait_for_task(|| false, || pop(&worker_queue));
+                assert_eq!(task, Some(7), "the skipped notify must not lose work");
+                drop(worker_coordinator.claim_task());
+            });
+
+            producer.join().expect("producer joins");
+            worker.join().expect("worker joins");
+            assert_eq!(coordinator.pending(), 0);
+            assert_eq!(coordinator.sleepers(), 0);
+        });
+        report(
+            "zero_sleeper_skip_races_with_parker_registration",
+            &EXECUTIONS,
+        );
     }
 
     /// A producer may publish work just as the caller turns its lone walk into
