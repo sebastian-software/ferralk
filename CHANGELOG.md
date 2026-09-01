@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.10.0](https://github.com/sebastian-software/ferralk/compare/v0.9.4...v0.10.0) (2026-09-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **walker:** Git ignore rules now treat escaped slashes as separators, preserve matchable bracket-range bytes around slash endpoints, and no longer fuse literals across a special star-run separator.
+* **walker:** Linux native walks now stop at the portable PATH_MAX boundary with ENAMETOOLONG instead of exposing deeper paths based on frontend scheduling or the process descriptor limit.
+* **walker:** Walks rooted at ., ./, or a single relative component now inherit repository ignore rules exactly like equivalent absolute and multi-component roots; those rules could previously be skipped.
+
+### Bug Fixes
+
+* preserve hidden matches beneath excludes ([f66e481](https://github.com/sebastian-software/ferralk/commit/f66e4818fbf86abb12b467d82f557f592203f2af))
+* preserve hidden matches beneath excludes ([b4fa811](https://github.com/sebastian-software/ferralk/commit/b4fa81142835dd1d083dadfe189c2b120ce89a25))
+* restore the frozen zlob oracle ([a755d83](https://github.com/sebastian-software/ferralk/commit/a755d830e2916f1fe942264a34d9bf54593157ea))
+* restore the frozen zlob oracle ([2be07f5](https://github.com/sebastian-software/ferralk/commit/2be07f54981f2fda2f34b5d8c6e37c4013216ffc))
+* skip excluded symlink loops ([7a783aa](https://github.com/sebastian-software/ferralk/commit/7a783aa5429945a11b486b607abd4d20388acf0a))
+* skip excluded symlink loops ([91ed805](https://github.com/sebastian-software/ferralk/commit/91ed805d0d4d539620800ac97cc90be701d4ea05))
+* **walker:** align slash wildmatch rules with Git ([#295](https://github.com/sebastian-software/ferralk/issues/295)) ([7917410](https://github.com/sebastian-software/ferralk/commit/7917410b74e93fb2e0092b7d446fa8abaa62a41c))
+* **walker:** bound Linux native paths ([5817730](https://github.com/sebastian-software/ferralk/commit/581773019c172b568c9ff450f360a116d9e1e5a4))
+* **walker:** inherit ignores for relative roots ([1ec54c9](https://github.com/sebastian-software/ferralk/commit/1ec54c9c27c461a67bfc0b10b66e13f4d7e3e1fa))
+
 ## [0.9.4](https://github.com/sebastian-software/ferralk/compare/v0.9.3...v0.9.4) (2026-09-01)
 
 
