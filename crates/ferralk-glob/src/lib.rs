@@ -179,6 +179,9 @@ pub enum WalkerPathViability {
     ParentComponent,
     /// Every compiled arm names only the walk root.
     Root,
+    /// Every compiled arm has an empty leading or interior component: a
+    /// repeated separator, a leading `/`, or an empty alternative.
+    EmptyComponent,
     /// Every compiled arm ends in a literal `.` component.
     TrailingDot,
     /// Every compiled arm contains a non-final literal `.` component.
@@ -1613,17 +1616,21 @@ impl CompiledAlternative {
 /// not: their zero-width branch is forbidden immediately before a leading
 /// period, so a following period literal is not an implicit hidden opt-in.
 /// The syntactic `**/` prefix is different because it explicitly advances to
-/// a component boundary without consuming candidate bytes.
+/// a component boundary without consuming candidate bytes. An escaped
+/// separator is folded into its literal run, and the byte behind it starts a
+/// component for the matcher just as one behind a separator token does.
 fn tokens_can_match_hidden_component_without_match_hidden(tokens: &[Token]) -> bool {
     let mut at_component_start = true;
     for token in tokens {
         match token {
             Token::Separator | Token::RecursivePrefix => at_component_start = true,
             Token::Literal(literal) => {
-                if at_component_start && literal.first() == Some(&b'.') {
-                    return true;
+                for &byte in literal {
+                    if at_component_start && byte == b'.' {
+                        return true;
+                    }
+                    at_component_start = is_separator(byte);
                 }
-                at_component_start = false;
             }
             Token::Any | Token::Class(_) => at_component_start = true,
             Token::Star | Token::RecursiveStar => at_component_start = false,
@@ -1668,7 +1675,8 @@ impl CompiledExtglob {
                     if at_component_start && *escaped == b'.' {
                         return true;
                     }
-                    at_component_start = false;
+                    // An escaped separator still ends a component.
+                    at_component_start = is_separator(*escaped);
                     index += 2;
                 }
                 ExtglobStep::Group(group) => {
@@ -3166,7 +3174,7 @@ impl WalkerPathEvaluation {
     fn complete_problem(self) -> Option<WalkerPathProblem> {
         self.problem.or_else(|| {
             (!self.selects_candidate).then_some(WalkerPathProblem {
-                viability: WalkerPathViability::Root,
+                viability: WalkerPathViability::EmptyComponent,
                 offset: None,
             })
         })
@@ -3363,7 +3371,7 @@ impl CompiledExtglob {
         }
         Ok(first_problem.or_else(|| {
             saw_unselectable.then_some(WalkerPathProblem {
-                viability: WalkerPathViability::Root,
+                viability: WalkerPathViability::EmptyComponent,
                 offset: None,
             })
         }))
@@ -4339,9 +4347,10 @@ enum ExtglobStep {
     Any,
     /// A bracket class, resuming at the offset after it.
     Class { class: Class, next: usize },
-    /// A backslash with a byte to escape. The escaped byte matches and skips
-    /// both offsets; a literal backslash matches and skips only this one,
-    /// which leaves the walk on the escaped byte as ordinary text.
+    /// A backslash with a byte to escape. Only the escaped byte matches, and
+    /// the walk skips both offsets: the backslash is never read as a literal
+    /// with the escaped byte as syntax, exactly as in the plain engines and
+    /// in Bash.
     Escape { escaped: u8 },
     /// An ordinary byte.
     Byte(u8),
@@ -4514,28 +4523,10 @@ impl PositiveExtglobNfa {
                     ExtglobStep::Star { .. } => {
                         unreachable!("outer stars keep the compatible interpreter")
                     }
-                    ExtglobStep::Escape { escaped } => {
-                        let mut targets = Vec::new();
-                        if let Some(target) = suffixes[index + 2] {
-                            targets.push(builder.push(
-                                PositiveExtglobState::Consume {
-                                    matcher: PositiveExtglobMatcher::Literal(*escaped),
-                                    next: target,
-                                },
-                                1,
-                            )?);
-                        }
-                        if let Some(target) = suffixes[index + 1] {
-                            targets.push(builder.push(
-                                PositiveExtglobState::Consume {
-                                    matcher: PositiveExtglobMatcher::Literal(b'\\'),
-                                    next: target,
-                                },
-                                1,
-                            )?);
-                        }
-                        builder.epsilon(targets, false)?
-                    }
+                    ExtglobStep::Escape { escaped } => builder.consume(
+                        PositiveExtglobMatcher::Literal(*escaped),
+                        suffixes[index + 2],
+                    )?,
                     ExtglobStep::Group(group) => {
                         let group = &groups[*group];
                         builder.group(group, suffixes[group.rest])?
@@ -4951,12 +4942,9 @@ fn compile_extglob(
         match &step {
             ExtglobStep::Group(group) => pending.push(groups[*group].rest),
             ExtglobStep::Star { next, .. } | ExtglobStep::Class { next, .. } => pending.push(*next),
-            // A literal backslash consumes one offset and leaves the walk on
-            // the escaped byte, which is read as ordinary text from there.
-            ExtglobStep::Escape { .. } => {
-                pending.push(index + 1);
-                pending.push(index + 2);
-            }
+            // The escaped byte is consumed together with its backslash; the
+            // offset between them is never where a walk stands.
+            ExtglobStep::Escape { .. } => pending.push(index + 2),
             ExtglobStep::Any | ExtglobStep::Byte(_) | ExtglobStep::UnclosedGroup { .. } => {
                 pending.push(index + 1);
             }
@@ -5685,14 +5673,6 @@ fn match_extglob_task(
                         path_index += 1;
                         continue;
                     }
-                    if path
-                        .get(path_index)
-                        .is_some_and(|&byte| bytes_equal(b'\\', byte, options.case_insensitive))
-                    {
-                        pattern_index += 1;
-                        path_index += 1;
-                        continue;
-                    }
                 }
                 ExtglobStep::Byte(expected) | ExtglobStep::UnclosedGroup { byte: expected } => {
                     if path.get(path_index).is_some_and(|&actual| {
@@ -6261,6 +6241,93 @@ mod tests {
         );
     }
 
+    /// An escape has only its escaped reading in both extglob engines: a
+    /// literal backslash followed by the escaped byte read as syntax is not
+    /// a second branch. Bash 5.2 with `extglob` gives every verdict below.
+    #[test]
+    fn extglob_escapes_match_only_the_escaped_byte() {
+        let options = PatternOptions::default().extglob(true);
+        // `Some(true)` is the positive NFA, `Some(false)` the retained
+        // interpreter, `None` a pattern whose only group opener is escaped
+        // and which therefore stays with the plain engines.
+        for (pattern, candidate, expected, positive_nfa) in [
+            ("\\*@(a)", "*a", true, Some(true)),
+            ("\\*@(a)", "\\xa", false, Some(true)),
+            ("\\*@(a)", "xa", false, Some(true)),
+            ("*(a)\\*", "aa*", true, Some(true)),
+            ("*(a)\\*", "*", true, Some(true)),
+            ("*(a)\\*", "\\x)\\", false, Some(true)),
+            ("@(a)\\/b", "a/b", true, Some(true)),
+            ("@(a)\\/b", "a\\/b", false, Some(true)),
+            // An outer star or a negated group keeps the retained
+            // interpreter.
+            ("*\\*@(a)", "x*a", true, Some(false)),
+            ("*\\*@(a)", "*a", true, Some(false)),
+            ("*\\*@(a)", "x\\xa", false, Some(false)),
+            ("!(b)\\*", "a*", true, Some(false)),
+            ("!(b)\\*", "\\x", false, Some(false)),
+            ("!(b)\\*", "a\\x", false, Some(false)),
+            ("\\*(a)", "*(a)", true, None),
+            ("\\*(a)", "\\a", false, None),
+        ] {
+            let compiled = Pattern::compile(pattern, options).expect("pattern compiles");
+            assert_eq!(
+                compiled.alternatives[0]
+                    .extglob
+                    .as_ref()
+                    .map(|program| program.positive_nfa.is_some()),
+                positive_nfa,
+                "{pattern}: engine selection"
+            );
+            assert_eq!(
+                compiled.is_match(candidate),
+                expected,
+                "{pattern} against {candidate}"
+            );
+            assert!(
+                compiled.engines_agree(candidate),
+                "{pattern} against {candidate}: engines disagree"
+            );
+        }
+    }
+
+    /// zlob's list filter makes a wildcard component-local only when it
+    /// stands directly behind an explicit separator. A later wildcard in the
+    /// same component, the star of `?*`, a star behind a class or a literal,
+    /// or the second star of a non-recursive `**`, crosses separators again;
+    /// the zlob oracle lane replays these verdicts from the corpus. `is_match`
+    /// crosses throughout and `is_match_glob_path` is component-local
+    /// throughout, so the three entry points stay distinguishable.
+    #[test]
+    fn only_a_wildcard_directly_behind_a_separator_is_component_local() {
+        let options = PatternOptions::default();
+        let local = Pattern::compile("a/*/z", options).unwrap();
+        assert!(local.is_match_path("a/b/z"));
+        assert!(
+            !local.is_match_path("a/b/c/z"),
+            "a/*/z stays inside one component"
+        );
+        for pattern in ["a/**/z", "a/?*/z", "a/*[a-z]*/z", "a/b*/z"] {
+            let compiled = Pattern::compile(pattern, options).unwrap();
+            assert!(compiled.is_match("a/b/c/z"), "{pattern}: is_match crosses");
+            assert!(compiled.is_match_path("a/b/z"), "{pattern}: one component");
+            assert!(
+                compiled.is_match_path("a/b/c/z"),
+                "{pattern}: the wildcard behind the first one crosses under is_match_path, as in zlob's matchPaths"
+            );
+            assert!(
+                !compiled.is_match_glob_path("a/b/c/z"),
+                "{pattern}: the glob-path reading is component-local throughout"
+            );
+            for candidate in ["a/b/z", "a/b/c/z"] {
+                assert!(
+                    compiled.engines_agree(candidate),
+                    "{pattern}: engines disagree on {candidate}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn compiled_patterns_summarize_explicit_hidden_components() {
         let walker_options = PatternOptions::default()
@@ -6287,6 +6354,14 @@ mod tests {
         assert!(!can_match_hidden("**/?(visible).hidden/keep.txt"));
         assert!(!can_match_hidden("**/*(visible).hidden/keep.txt"));
         assert!(can_match_hidden("**/?(.visible).hidden/keep.txt"));
+        // An escaped separator is folded into the literal run, and the
+        // period behind it starts a component for the matcher.
+        assert!(can_match_hidden("x/f*\\/.hidden/keep"));
+        assert!(can_match_hidden("x/*\\/.hidden/keep"));
+        assert!(can_match_hidden("**/f*\\/.hidden/keep"));
+        assert!(can_match_hidden("x/@(f*)\\/.hidden/keep"));
+        assert!(!can_match_hidden("x/f*\\.hidden/keep"));
+        assert!(!can_match_hidden("x/@(f*)\\.hidden/keep"));
 
         let zero_width = Pattern::compile("**/?(visible).hidden/keep.txt", walker_options)
             .expect("pattern compiles");
@@ -6608,7 +6683,7 @@ mod tests {
                 Pattern::compile(source, options)
                     .expect("empty extglob arm compiles")
                     .walker_path_viability(),
-                WalkerPathViability::Root,
+                WalkerPathViability::EmptyComponent,
                 "{source} has only an empty leading or interior component"
             );
         }
@@ -6617,8 +6692,19 @@ mod tests {
                 Pattern::compile(source, options)
                     .expect("empty plain or brace arm compiles")
                     .walker_path_viability(),
-                WalkerPathViability::Root,
+                WalkerPathViability::EmptyComponent,
                 "{source} has no selectable complete walker alternative"
+            );
+        }
+        // Only a pattern made of nothing but empty and `.` components names
+        // the root itself.
+        for source in ["", ".", "./", "//"] {
+            assert_eq!(
+                Pattern::compile(source, options)
+                    .expect("root spelling compiles")
+                    .walker_path_viability(),
+                WalkerPathViability::Root,
+                "{source} names only the walk root"
             );
         }
         for source in ["src/?(x)/bar", "src/?()bar", "?(x)/bar"] {

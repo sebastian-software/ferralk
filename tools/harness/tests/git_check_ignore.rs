@@ -4,14 +4,46 @@ use std::{fs, path::Path};
 
 use corpus::{CaseKind, Source, decode_bytes, parse_case};
 
-#[test]
-fn ignore_corpus_replays_against_git_check_ignore() {
+/// Set to `1` to turn a too-old Git into a failure instead of a skip. CI's
+/// Git oracle job sets it, so a replay that silently did not happen cannot
+/// pass there.
+const REQUIRE_GIT_ORACLE: &str = "FERRALK_REQUIRE_GIT_ORACLE";
+
+/// Reports the installed Git and whether it can serve as the ignore oracle.
+///
+/// Printed to stdout rather than only to stderr, because test-output capture
+/// swallows a passing test's diagnostics either way and `--show-output` or
+/// `--nocapture` reveals stdout.
+fn git_oracle_replays() -> bool {
     let git_version = harness::installed_git_version().expect("read installed Git version");
-    if git_version < harness::MINIMUM_GIT_ORACLE_VERSION {
-        eprintln!(
-            "skipping Git ignore oracle: Git >= {} is required, but {git_version} is installed",
+    let replays = git_version >= harness::MINIMUM_GIT_ORACLE_VERSION;
+    if replays {
+        println!("Git ignore oracle: replayed with Git {git_version}");
+    } else {
+        println!(
+            "Git ignore oracle: skipped, Git >= {} is required but {git_version} is installed",
             harness::MINIMUM_GIT_ORACLE_VERSION
         );
+    }
+    if !replays && std::env::var_os(REQUIRE_GIT_ORACLE).is_some_and(|value| value == "1") {
+        panic!(
+            "{REQUIRE_GIT_ORACLE}=1 requires Git >= {}, but {git_version} is installed",
+            harness::MINIMUM_GIT_ORACLE_VERSION
+        );
+    }
+    replays
+}
+
+/// Always runs, so the preflight output names the Git it found and says
+/// whether the corpus was replayed or skipped.
+#[test]
+fn git_ignore_oracle_version_is_reported() {
+    git_oracle_replays();
+}
+
+#[test]
+fn ignore_corpus_replays_against_git_check_ignore() {
+    if !git_oracle_replays() {
         return;
     }
 

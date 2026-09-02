@@ -128,6 +128,13 @@ fn walker(c: &mut Criterion) {
     // asymptotic difference from the wide repository-shaped fixtures above.
     let deep = Fixture::deep(400);
     assert_eq!(deep.files, 400, "the deep fixture exercises 400 levels");
+    // Two thousand shallow directories: the shape on which the serial native
+    // walk suspends and resumes a frame per directory. The repository-shaped
+    // fixtures above are dominated by their parallel arms, which never
+    // suspend, so a per-directory cost on the serial route was invisible here
+    // until this arm existed.
+    let wide = Fixture::new(2000, 1, 4);
+    assert_eq!(wide.files, 8000, "the wide fixture holds 2,000 directories");
 
     // A tree the size of the Palamedes trial's synthetic case, where every
     // parallel arm lost to its own serial form.
@@ -146,6 +153,7 @@ fn walker(c: &mut Criterion) {
     bench_tree(c, "", &small);
     bench_tree(c, "large/", &large);
     bench_tree(c, "deep/", &deep);
+    bench_tree(c, "wide/", &wide);
     bench_covering_exclude(c, "large/", &large);
     bench_caller_matching(c, "large/", &large);
     bench_caller_matching(c, "mini/", &mini);

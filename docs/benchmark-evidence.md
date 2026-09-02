@@ -552,6 +552,39 @@ directory-read syscall is removed for directories that fit their final batch.
 This is a syscall-count observation, not a new wall-time benchmark; cache,
 tree shape, filesystem and concurrent work determine the realised speedup.
 
+### Serial descriptor retention, 2026-09-02
+
+0.11.0 made every suspended serial frame release its retained directory
+descriptor and reopen the directory by full path when it resumed, so a deep
+tree no longer pinned one descriptor per ancestor. On the far more common wide
+shapes that cost one open, one close and two identity `fstat` calls per child
+directory: `strace -c` on the medium fixture below counted 3,247 `openat`
+calls against 1,648 for the release before, and the serial native walk fell
+behind the portable backend. A suspended frame now keeps its descriptor while
+fewer than half of the retention budget is in use and releases it only past
+that threshold, where a deep chain would otherwise crowd out the directories
+below it and the other walkers sharing the budget.
+
+Serial `collect`, `--features native-linux`, Linux x86_64 container on tmpfs,
+warm cache; medians of 20 iterations, three rounds interleaved between the two
+binaries so host noise lands on both. Before is 0.11.0 (`f287a96`).
+
+| Fixture | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| medium: 1,641 directories, 9,640 entries | 16.9–17.3 ms | 11.8–12.2 ms | **−28%** |
+| wide: 4,000 subdirectories, 16,000 entries | 40.3–42.0 ms | 27.8–29.4 ms | **−31%** |
+| deep-wide: 1,260 entries | 12.6–14.3 ms | 6.2–7.5 ms | **−46%** |
+| deep chain: 500 levels, 1,000 entries | 5.0–8.4 ms | 4.8–6.5 ms | within noise |
+| medium, 4 threads | 10.0–11.7 ms | 10.6–11.6 ms | within noise |
+
+The deep chain keeps the 0.11.0 result because it is the shape the release
+threshold exists for: past 128 retained descriptors the walk releases and
+reopens exactly as before. The parallel arm never suspends and is unchanged.
+The descriptor high-water mark of a serial walk over a 300-level chain moves
+from one to 128 above the baseline, the threshold, and stays there. The
+`wide/` arm of the `walker` bench lane was added with this change so a
+per-directory cost on the serial route shows up per pull request.
+
 ## Selecting without a caller-side matcher
 
 The `caller_match` arms in [`walker.rs`](../tools/bench/benches/walker.rs) model

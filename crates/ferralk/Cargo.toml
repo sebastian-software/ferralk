@@ -10,6 +10,10 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# The Git-verified ignore corpus replay needs the unpublished `corpus`
+# package, a path-only dev-dependency that Cargo strips when packaging. Keep
+# that test out of the tarball so `cargo test` builds from the published crate.
+exclude = ["tests/git_ignore_corpus.rs"]
 
 [features]
 native-linux = []

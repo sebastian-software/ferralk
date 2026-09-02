@@ -458,6 +458,28 @@ mod tests {
         );
     }
 
+    /// Cargo does not package the repository root's license text, so each
+    /// published crate carries its own copy. The copies are kept identical to
+    /// the root files rather than maintained twice.
+    #[test]
+    fn published_crates_ship_the_repository_license_and_notice() {
+        let repository_root = repository_root();
+        for crate_directory in ["crates/ferralk-glob", "crates/ferralk"] {
+            for file in ["LICENSE", "NOTICE"] {
+                let expected =
+                    fs::read(repository_root.join(file)).expect("repository file is readable");
+                let actual = fs::read(repository_root.join(crate_directory).join(file))
+                    .unwrap_or_else(|error| {
+                        panic!("{crate_directory}/{file} is packaged: {error}")
+                    });
+                assert!(
+                    actual == expected,
+                    "{crate_directory}/{file} must be a byte-for-byte copy of the repository {file}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn release_please_versioned_consumer_docs_match_the_workspace() {
         let repository_root = repository_root();

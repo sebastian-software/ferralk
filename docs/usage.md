@@ -13,11 +13,16 @@ operators stay within one component, while an explicitly enabled `**` crosses
 components.
 
 `is_match_path` preserves the zlob list-filter convention instead: a wildcard
-in the root component may cross separators, while a wildcard after an explicit
-separator is component-local. Both path entry points ignore one conventional
-leading `./` on the pattern and candidate; `is_match` compares those bytes
-literally. With `recursive_double_star` disabled, any consecutive `**` has the
-same ordinary-star semantics as `*` through all three entry points.
+in the root component may cross separators, and a wildcard standing directly
+behind an explicit separator is component-local. That is zlob's exact rule and
+it stops there: a later wildcard in the same component, the star of `a/?*` or
+`a/b*`, may cross separators again, so `a/?*/z` accepts `a/b/c/z` while `a/*/z`
+does not, exactly as zlob's `matchPaths` answers. Both path entry points ignore
+one conventional leading `./` on the pattern and candidate; `is_match` compares
+those bytes literally. With `recursive_double_star` disabled a consecutive `**`
+is two ordinary stars: through `is_match` and `is_match_glob_path` that equals
+`*`, while through `is_match_path` the second star stands behind the first
+rather than behind the separator and follows the rule above.
 
 ```rust
 use ferralk_glob::{Pattern, PatternOptions};
@@ -147,7 +152,8 @@ Important defaults:
   wildcard at or above the root, a `..`, and a pattern naming the root itself
   are rejected. Relative patterns receive the same guardrails: `.` and `./`
   name the root, and a `.` component after the conventional leading `./`
-  (such as `src/./main.rs`) or a real `..` component is rejected with guidance
+  (such as `src/./main.rs`), a real `..` component, or an empty component
+  left by a repeated separator (`src//*.ts`) is rejected with guidance
   instead of silently selecting nothing. See the
   [compatibility guide](compatibility-guide.md#absolute-patterns-and-the-caller-side-rewrite-they-replace).
 
@@ -205,6 +211,14 @@ Important defaults:
   aliases — start independent chains. A root that is itself a directory
   symlink is opened regardless, because the caller supplied it as the tree to
   walk.
+- Repository discovery and ignore-rule anchoring resolve the root once, the
+  way Git resolves its working directory: `.` and `..` are folded and every
+  symlink is followed, so a root reached through a link belongs to the
+  repository that physically contains it whether it is spelled `link`,
+  `./link` or `work/../link`. Directories below the root derive their
+  discovery spelling from that resolved root lexically, so an ignore file
+  inside a followed symlinked directory anchors where its entries are
+  spelled. Entry paths keep the caller's spelling throughout.
 - `files_only(true)` and `directories_only(true)` filter on the kind a
   directory listing reports, and a listing reports a symlink as a symlink and
   nothing about its target. So by default `files_only` keeps every symlink -
@@ -309,14 +323,28 @@ survive differs.
   and must be `Sync`. Per-worker state belongs in a thread-local.
 
 Below a small tree size the walk stays on one thread whatever `threads()` says:
-starting workers costs more than a handful of directories does.
+starting workers costs more than a handful of directories does. `threads()` is
+a ceiling in the other direction too: a helper the operating system refuses to
+start, because the process is at its thread or memory limit, leaves the walk
+to the workers already running and is reported as one recoverable
+`spawn_worker` error under `ErrorPolicy::Collect`.
+
+A long-running host should know one allocator effect of parallel walks. Each
+helper thread lands in its own glibc malloc arena, and the result vectors a
+large walk frees raise glibc's dynamic trim threshold, so after a parallel
+walk of a few hundred thousand entries the process can keep tens of megabytes
+of freed heap resident with almost nothing live; serial and `stream()` walks
+show no such retention. This is glibc's behaviour, not a leak. A daemon or
+language server that measures it can cap the arenas with `MALLOC_ARENA_MAX`
+or install a different global allocator.
 
 ### Hidden paths: two separate switches
 
 An ordinary wildcard does not cover a leading period, so `**/*.ts` skips
 `.react-router/routes.ts` — the period belongs to a directory component, and
-the whole subtree stays out of the result. `Walker::match_hidden(true)` opts in
-for include and exclude patterns alike:
+the whole subtree stays out of the result. The rule holds inside one component
+too: `*.rs` matches `.rs` only with `match_hidden(true)`.
+`Walker::match_hidden(true)` opts in for include and exclude patterns alike:
 
 ```rust,no_run
 use ferralk::{WalkOptions, Walker};

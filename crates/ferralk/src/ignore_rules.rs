@@ -273,6 +273,14 @@ pub(crate) fn without_dot_components(path: &[u8]) -> Cow<'_, [u8]> {
     }
 
     let mut normalized = Vec::with_capacity(path.len());
+    without_dot_components_into(path, &mut normalized);
+    Cow::Owned(normalized)
+}
+
+/// The same lexical view, written into a caller-owned buffer so a walk that
+/// spells every candidate pays no allocation per entry.
+pub(crate) fn without_dot_components_into(path: &[u8], normalized: &mut Vec<u8>) {
+    normalized.clear();
     let mut wrote_component = false;
     for component in path.split(|byte| *byte == b'/') {
         if component == b"." {
@@ -284,7 +292,6 @@ pub(crate) fn without_dot_components(path: &[u8]) -> Cow<'_, [u8]> {
         normalized.extend_from_slice(component);
         wrote_component = true;
     }
-    Cow::Owned(normalized)
 }
 
 /// Fuzz entry point for the rule layer.
@@ -358,7 +365,7 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
     let mut normalized = Vec::with_capacity(parts.len());
     let mut gate: Option<Vec<u8>> = None;
     for part in &parts {
-        let bytes = strip_bracket_separators(part.bytes)?;
+        let bytes = normalize_bracket_classes(part.bytes)?;
         if let Some(literal) = longest_literal_run(&bytes)
             && gate.as_ref().is_none_or(|best| best.len() < literal.len())
         {
@@ -526,234 +533,169 @@ fn all_stars(part: &[u8]) -> bool {
     !part.is_empty() && part.iter().all(|byte| *byte == b'*')
 }
 
-/// Candidate components never contain a path separator, so a slash admitted
-/// by Git inside a bracket class cannot affect matching. ferralk-glob rejects
-/// it as a separator; drop just that dead class member before compiling.
-fn strip_bracket_separators(part: &[u8]) -> Option<Vec<u8>> {
-    let mut result = Vec::with_capacity(part.len());
-    let mut in_class = false;
-    let mut class_start = 0;
-    let mut class_negated = false;
-    let mut class_has_member = false;
-    let mut class_saw_member = false;
+/// Rewrites each bracket class of one component the way Git's wildmatch reads
+/// it, in a spelling ferralk-glob compiles to the same members.
+///
+/// Git walks a class with one piece of state: the previous literal byte. A dash
+/// is the range operator only after such a byte and before something other
+/// than the closing bracket; a completed range or POSIX class clears that
+/// state, so the dash after either is literal. Git also tests a range's lower
+/// endpoint as a literal before it compares the range, so a reversed range
+/// still admits that byte. Every literal dash is emitted escaped, which keeps
+/// the compiler's grouping identical to Git's even next to a dropped member.
+///
+/// Candidate components never contain a path separator, so a slash inside a
+/// class is a dead member. ferralk-glob rejects it as a separator, so it is
+/// dropped: as the upper endpoint of an ascending range its reachable
+/// neighbour `.` stands in, as the lower endpoint `0` does.
+///
+/// A class left without a matchable member matches nothing, or any byte when
+/// negated. An unclosed class matches nothing, as in Git.
+fn normalize_bracket_classes(part: &[u8]) -> Option<Vec<u8>> {
+    // Escaping literal dashes and endpoints grows the class by at most one
+    // byte per member.
+    let mut result = Vec::with_capacity(part.len() * 2);
     let mut index = 0;
     while index < part.len() {
         match part[index] {
             b'\\' if index + 1 < part.len() => {
                 result.extend_from_slice(&part[index..=index + 1]);
-                if in_class {
-                    class_has_member = true;
-                    class_saw_member = true;
-                }
                 index += 2;
             }
-            b'[' if in_class && part.get(index + 1) == Some(&b':') => {
-                let start = index + 2;
-                if let Some(end) = memmem::find(&part[start..], b":]") {
-                    result.extend_from_slice(&part[index..start + end + 2]);
-                    class_has_member = true;
-                    class_saw_member = true;
-                    index = start + end + 2;
-                } else {
-                    result.push(b'[');
-                    class_has_member = true;
-                    class_saw_member = true;
-                    index += 1;
-                }
-            }
-            b'[' if !in_class => {
-                in_class = true;
-                class_start = result.len();
-                class_negated = matches!(part.get(index + 1), Some(b'!' | b'^'));
-                class_has_member = false;
-                class_saw_member = false;
-                result.push(b'[');
-                index += 1;
-                if class_negated {
-                    result.push(part[index]);
-                    index += 1;
-                }
-            }
-            b']' if in_class => {
-                if class_saw_member {
-                    in_class = false;
-                    if class_has_member {
-                        result.push(b']');
-                    } else if class_negated {
-                        result.truncate(class_start);
-                        result.push(b'?');
-                    } else {
-                        return None;
-                    }
-                } else {
-                    // Like Git's wildmatch and the glob compiler, a closing
-                    // bracket in the first member position is literal. A
-                    // second bracket is required to close `[]]` or `[!]]`.
-                    result.push(b']');
-                    class_has_member = true;
-                    class_saw_member = true;
-                }
-                index += 1;
-            }
-            b'/' if in_class => {
-                // Slash itself is not matchable inside a candidate component,
-                // but Git keeps the lower endpoint of a reversed `x-/` range
-                // as a literal member. Remove that range's dash, and preserve
-                // a following dash as a literal because the slash was already
-                // consumed as the upper endpoint.
-                let member_start = class_start + 1 + usize::from(class_negated);
-                let closes_reversed_range = result.last() == Some(&b'-')
-                    && result.len() > member_start + 1
-                    && trailing_backslashes(&result[..result.len() - 1]).is_multiple_of(2);
-                if closes_reversed_range {
-                    result.pop();
-                    if part.get(index + 1) == Some(&b'-') {
-                        result.extend_from_slice(b"\\-");
-                        index += 1;
-                    }
-                    class_has_member = true;
-                } else if part.get(index + 1) == Some(&b'-') {
-                    // A slash as the lower endpoint of `/-9` contributes no
-                    // candidate byte; the reachable range is exactly `0-9`.
-                    result.push(b'0');
-                    class_has_member = true;
-                }
-                class_saw_member = true;
-                index += 1;
-            }
+            b'[' => index = normalize_bracket_class(part, index, &mut result)?,
             byte => {
                 result.push(byte);
-                if in_class {
-                    class_has_member = true;
-                    class_saw_member = true;
-                }
                 index += 1;
             }
         }
     }
-    Some(rewrite_reversed_ranges(&result))
+    Some(result)
 }
 
-/// Rewrites Git's reversed-range reading into literals the glob compiler can
-/// represent.
-///
-/// Git tests a range's lower endpoint before it discovers that the upper
-/// endpoint is smaller, then resets its range state. The generic glob matcher
-/// instead represents that range as empty. Dropping the operator and upper
-/// endpoint keeps the already-tested lower byte; escaping an immediately
-/// following dash preserves Git's reset state.
-fn rewrite_reversed_ranges(pattern: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(pattern.len());
-    let mut in_class = false;
-    let mut class_saw_member = false;
-    let mut class_start = false;
-    let mut previous = None;
-    let mut reversed_range_ended = false;
-    let mut index = 0;
-
-    while index < pattern.len() {
-        let byte = pattern[index];
-        if !in_class {
-            result.push(byte);
-            if byte == b'\\' && index + 1 < pattern.len() {
-                result.push(pattern[index + 1]);
-                index += 2;
-                continue;
+/// Rewrites the class opening at `start` into `result` and returns the index
+/// after its closing bracket.
+fn normalize_bracket_class(part: &[u8], start: usize, result: &mut Vec<u8>) -> Option<usize> {
+    let class_start = result.len();
+    result.push(b'[');
+    let mut index = start + 1;
+    let negated = matches!(part.get(index), Some(b'!' | b'^'));
+    if negated {
+        result.push(part[index]);
+        index += 1;
+    }
+    // Git's `prev_ch`: the literal byte a range operator may follow.
+    let mut previous: Option<u8> = None;
+    // Git closes the class at a `]` only after one member, so a leading `]`
+    // is a literal.
+    let mut saw_member = false;
+    // Whether the compiler will find a member. Dropped slashes and reversed
+    // ranges contribute none.
+    let mut has_member = false;
+    while index < part.len() {
+        let byte = part[index];
+        if byte == b']' && saw_member {
+            if has_member {
+                result.push(b']');
+            } else if negated {
+                result.truncate(class_start);
+                result.push(b'?');
+            } else {
+                return None;
             }
-            if byte == b'[' {
-                in_class = true;
-                class_saw_member = false;
-                class_start = true;
-                previous = None;
-                reversed_range_ended = false;
-            }
-            index += 1;
-            continue;
+            return Some(index + 1);
         }
-
-        if class_start && matches!(byte, b'!' | b'^') {
-            result.push(byte);
-            class_start = false;
-            index += 1;
-            continue;
-        }
-        class_start = false;
-
-        if byte == b']' && class_saw_member {
-            result.push(byte);
-            in_class = false;
-            previous = None;
-            reversed_range_ended = false;
-            index += 1;
-            continue;
-        }
-
-        if byte == b'[' && pattern.get(index + 1) == Some(&b':') {
-            let name_start = index + 2;
-            if let Some(end) = memmem::find(&pattern[name_start..], b":]") {
-                let end = name_start + end + 2;
-                result.extend_from_slice(&pattern[index..end]);
-                previous = None;
-                reversed_range_ended = false;
-                class_saw_member = true;
-                index = end;
-                continue;
-            }
-        }
-
-        if byte == b'\\' && index + 1 < pattern.len() {
-            result.extend_from_slice(&pattern[index..=index + 1]);
-            previous = Some(pattern[index + 1]);
-            reversed_range_ended = false;
-            class_saw_member = true;
-            index += 2;
-            continue;
-        }
-
-        if byte == b'-' && reversed_range_ended {
-            result.extend_from_slice(b"\\-");
-            previous = Some(b'-');
-            reversed_range_ended = false;
-            class_saw_member = true;
-            index += 1;
-            continue;
-        }
+        saw_member = true;
 
         if byte == b'-'
             && let Some(lower) = previous
-            && let Some((upper, endpoint_len)) = range_endpoint(pattern, index + 1)
+            && let Some(&next) = part.get(index + 1)
+            && next != b']'
         {
-            if lower > upper {
-                previous = None;
-                reversed_range_ended = true;
-                class_saw_member = true;
-                index += 1 + endpoint_len;
-                continue;
+            let (upper, endpoint_len) = if next == b'\\' {
+                (*part.get(index + 2)?, 2)
+            } else {
+                (next, 1)
+            };
+            // A reversed range admits only its lower endpoint, which is
+            // already in place as a literal.
+            if lower <= upper {
+                match (lower, upper) {
+                    (b'/', b'/') => {}
+                    (b'/', _) => {
+                        result.extend_from_slice(b"0-");
+                        push_range_endpoint(result, upper);
+                        has_member = true;
+                    }
+                    (_, b'/') => {
+                        result.extend_from_slice(b"-.");
+                        has_member = true;
+                    }
+                    _ => {
+                        result.push(b'-');
+                        push_range_endpoint(result, upper);
+                        has_member = true;
+                    }
+                }
             }
-            result.extend_from_slice(&pattern[index..index + 1 + endpoint_len]);
             previous = None;
-            reversed_range_ended = false;
-            class_saw_member = true;
             index += 1 + endpoint_len;
             continue;
         }
 
-        result.push(byte);
-        previous = Some(byte);
-        reversed_range_ended = false;
-        class_saw_member = true;
-        index += 1;
+        match byte {
+            b'\\' => {
+                let escaped = *part.get(index + 1)?;
+                if escaped != b'/' {
+                    result.extend_from_slice(&part[index..=index + 1]);
+                    has_member = true;
+                }
+                previous = Some(escaped);
+                index += 2;
+            }
+            b'[' if part.get(index + 1) == Some(&b':') => {
+                let name_start = index + 2;
+                if let Some(end) = memmem::find(&part[name_start..], b":]") {
+                    let end = name_start + end + 2;
+                    result.extend_from_slice(&part[index..end]);
+                    previous = None;
+                    index = end;
+                } else {
+                    result.push(b'[');
+                    previous = Some(b'[');
+                    index += 1;
+                }
+                has_member = true;
+            }
+            b'/' => {
+                previous = Some(b'/');
+                index += 1;
+            }
+            b'-' | b'!' | b'^' => {
+                // A literal dash must not group a range, and a dropped slash
+                // must not move a literal negation marker into first place.
+                result.push(b'\\');
+                result.push(byte);
+                previous = Some(byte);
+                has_member = true;
+                index += 1;
+            }
+            byte => {
+                result.push(byte);
+                previous = Some(byte);
+                has_member = true;
+                index += 1;
+            }
+        }
     }
-
-    result
+    None
 }
 
-fn range_endpoint(pattern: &[u8], index: usize) -> Option<(u8, usize)> {
-    match pattern.get(index)? {
-        b']' => None,
-        b'\\' => pattern.get(index + 1).map(|byte| (*byte, 2)),
-        byte => Some((*byte, 1)),
+/// Writes a range's upper endpoint so the compiler cannot read it as syntax.
+fn push_range_endpoint(result: &mut Vec<u8>, upper: u8) {
+    if matches!(upper, b'\\' | b'-' | b'[') {
+        result.push(b'\\');
     }
+    result.push(upper);
 }
 
 /// Adapts the candidate that one ignore file sees, not its raw pattern. Mac
@@ -1153,6 +1095,47 @@ mod tests {
             assert_eq!(fuzz_rule_bytes(b"[c-a-z]", candidate, false), Some(true));
         }
         assert_eq!(fuzz_rule_bytes(b"[c-a-z]", b"b", false), None);
+    }
+
+    #[test]
+    fn slash_endpoints_keep_git_s_range_state() {
+        // An ascending range that ends in a slash keeps the bytes below it.
+        assert_eq!(fuzz_rule_bytes(b"x[--/]y", b"x.y", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"x[--/]y", b"x-y", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"x[--/]y", b"x0y", false), None);
+        assert_eq!(fuzz_rule_bytes(b"x[+-/]y", b"x,y", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"x[!--/]y", b"x.y", false), None);
+        assert_eq!(fuzz_rule_bytes(b"x[\\!-/]y", b"x#y", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"x[--/-9]y", b"x.y", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"x[--/-9]y", b"x9y", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"x[--/-9]y", b"x5y", false), None);
+        // A completed range or POSIX class resets Git's range state, so the
+        // dash before the slash is a literal member, not a reversed range.
+        for rule in [b"x[a-c-/]y".as_slice(), b"x[[:alpha:]-/]y", b"x[z-a-/]y"] {
+            assert_eq!(
+                fuzz_rule_bytes(rule, b"x-y", false),
+                Some(true),
+                "{}",
+                String::from_utf8_lossy(rule)
+            );
+        }
+        assert_eq!(fuzz_rule_bytes(b"x[a-c-/]y", b"xby", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"x[z-a-/]y", b"xby", false), None);
+        // A slash after a literal dash is itself a literal, so it may open
+        // the following range.
+        for candidate in [b"xay".as_slice(), b"x-y", b"xmy", b"x0y"] {
+            assert_eq!(
+                fuzz_rule_bytes(b"x[a-c-/-z]y", candidate, false),
+                Some(true)
+            );
+        }
+        assert_eq!(fuzz_rule_bytes(b"x[a-c-/-z]y", b"x.y", false), None);
+        // A dropped slash does not move a literal negation marker into the
+        // first position.
+        assert_eq!(fuzz_rule_bytes(b"x[/^a]y", b"x^y", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"x[/^a]y", b"xby", false), None);
+        assert_eq!(fuzz_rule_bytes(b"x[/!a]y", b"x!y", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"x[/!a]y", b"xby", false), None);
     }
 
     #[test]

@@ -23,9 +23,13 @@ peeled source commit above in their import metadata.
 The pinned source commit `4bc4da2cbc823d3911b4a1436448687c398977dd`
 was last verified on 2026-09-02 by
 [oracle workflow run 33566831540](https://github.com/sebastian-software/ferralk/actions/runs/33566831540).
-That run replayed 521 checked-in corpus cases plus the generated common subset
-against zlob 1.6.3, reported 237 explicitly classified skips, and retained the
-complete replay log as a workflow artifact.
+That run is a point-in-time record, not the current inventory: it replayed
+the 521 checked-in corpus cases of that revision plus the generated common
+subset against zlob 1.6.3, reported 237 explicitly classified skips, and
+retained the complete replay log as a workflow artifact. The corpus has grown
+since; the replayed and skipped totals every oracle run asserts are the
+`EXPECTED_REPLAYED` and `EXPECTED_SKIPPED` constants in
+`tools/oracle/tests/zlob_oracle.rs`.
 
 ## Public Rust API inventory
 

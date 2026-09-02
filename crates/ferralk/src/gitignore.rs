@@ -25,7 +25,7 @@ use std::{
 use super::glob_path_bytes;
 use super::{
     DirectoryBackend, Listing, Walker,
-    ignore_rules::{RuleSet, RuleSetBuilder, without_dot_components},
+    ignore_rules::{RuleSet, RuleSetBuilder, without_dot_components, without_dot_components_into},
     read_bounded_file,
 };
 
@@ -78,47 +78,79 @@ pub(crate) struct IgnoreScope {
     /// that has any; directories without ignore files never appear.
     rules: Option<Arc<IgnoreNode>>,
     adaptation: GitIgnoreAdaptation,
-    candidate_root: Option<CandidateRoot>,
+    /// Behind an `Arc`: every queued directory carries a clone of its scope,
+    /// and the two spellings inside are the same for the whole walk.
+    candidate_root: Option<Arc<CandidateRoot>>,
 }
 
+/// The walk root as the caller spelled it and as repository discovery
+/// resolved it, so candidates and ignore-file directories spelled below the
+/// former can be matched against rules anchored below the latter.
 #[derive(Debug, Clone)]
 struct CandidateRoot {
     walk: Vec<u8>,
     discovery: Vec<u8>,
+    walk_path: PathBuf,
+    discovery_path: PathBuf,
 }
 
 impl CandidateRoot {
     fn between(walk: &Path, discovery: &Path) -> Option<Self> {
-        let mut walk = without_dot_components(&glob_path_bytes(walk)).into_owned();
-        while walk.len() > 1 && walk.ends_with(b"/") {
-            walk.pop();
+        let mut walk_bytes = without_dot_components(&glob_path_bytes(walk)).into_owned();
+        while walk_bytes.len() > 1 && walk_bytes.ends_with(b"/") {
+            walk_bytes.pop();
         }
-        let discovery = without_dot_components(&glob_path_bytes(discovery)).into_owned();
-        (walk != discovery).then_some(Self { walk, discovery })
+        let discovery_bytes = without_dot_components(&glob_path_bytes(discovery)).into_owned();
+        (walk_bytes != discovery_bytes).then(|| Self {
+            walk: walk_bytes,
+            discovery: discovery_bytes,
+            walk_path: walk.to_path_buf(),
+            discovery_path: discovery.to_path_buf(),
+        })
     }
 
-    fn map<'a>(&self, candidate: &'a [u8]) -> Cow<'a, [u8]> {
-        let candidate = without_dot_components(candidate);
-        let relative = if self.walk.is_empty() {
-            candidate.as_ref()
-        } else if candidate.as_ref() == self.walk {
-            &[]
-        } else if candidate.as_ref().starts_with(&self.walk)
-            && candidate.get(self.walk.len()) == Some(&b'/')
-        {
-            &candidate[self.walk.len() + 1..]
-        } else {
-            return candidate;
-        };
-        let mut mapped = Vec::with_capacity(self.discovery.len() + 1 + relative.len());
-        mapped.extend_from_slice(&self.discovery);
-        if !relative.is_empty() {
-            if !mapped.ends_with(b"/") {
-                mapped.push(b'/');
-            }
-            mapped.extend_from_slice(relative);
+    /// The discovery spelling of a directory the walk entered.
+    ///
+    /// Derived lexically: the walk appended the directory's relative path to
+    /// the root it was given, so the same relative path below the resolved
+    /// root names it for discovery. Resolving each directory through the
+    /// filesystem instead would follow a symlink at the directory itself and
+    /// anchor its ignore rules somewhere the candidates below it are never
+    /// spelled.
+    fn map_directory(&self, directory: &Path) -> PathBuf {
+        match directory.strip_prefix(&self.walk_path) {
+            Ok(relative) => self.discovery_path.join(relative),
+            Err(_) => directory.to_path_buf(),
         }
-        Cow::Owned(mapped)
+    }
+
+    /// Spells a candidate given in the walk spelling in the discovery
+    /// spelling, into `scratch`, which the caller keeps for the whole walk so
+    /// that this costs one copy per entry and no allocation.
+    fn spell_into<'a>(&self, candidate: &[u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        without_dot_components_into(candidate, scratch);
+        let relative_start = if self.walk.is_empty() {
+            Some(0)
+        } else if scratch.as_slice() == self.walk {
+            Some(scratch.len())
+        } else if scratch.starts_with(&self.walk) && scratch.get(self.walk.len()) == Some(&b'/') {
+            Some(self.walk.len() + 1)
+        } else {
+            None
+        };
+        if let Some(relative_start) = relative_start {
+            let separator: &[u8] =
+                if relative_start < scratch.len() && !self.discovery.ends_with(b"/") {
+                    b"/"
+                } else {
+                    b""
+                };
+            scratch.splice(
+                ..relative_start,
+                self.discovery.iter().chain(separator).copied(),
+            );
+        }
+        scratch
     }
 }
 
@@ -146,7 +178,7 @@ impl IgnoreScope {
         let mut scope = Self {
             rules: None,
             adaptation,
-            candidate_root: CandidateRoot::between(root, &discovery_root),
+            candidate_root: CandidateRoot::between(root, &discovery_root).map(Arc::new),
         };
         let Some((repository_root, layout)) = repository else {
             return (scope, Vec::new());
@@ -186,7 +218,7 @@ impl IgnoreScope {
         }
         let match_directory = self.candidate_root.as_ref().map_or_else(
             || Cow::Borrowed(directory),
-            |_| Cow::Owned(discovery_path(directory)),
+            |root| Cow::Owned(root.map_directory(directory)),
         );
         let (rules, errors) = read_rules(
             backend,
@@ -203,8 +235,11 @@ impl IgnoreScope {
     /// The deepest ignore file with an opinion decides, which is Git's
     /// precedence. An entry below an ignored directory never reaches this: the
     /// walk does not enter such a directory.
+    ///
+    /// `scratch` is the walk's buffer for the candidate in the discovery
+    /// spelling; see [`CandidateRoot::spell_into`].
     #[cfg(not(windows))]
-    pub(crate) fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+    pub(crate) fn is_ignored(&self, path: &Path, is_dir: bool, scratch: &mut Vec<u8>) -> bool {
         let Some(node) = self.rules.as_ref() else {
             return false;
         };
@@ -215,23 +250,28 @@ impl IgnoreScope {
         // `.` in every emitted path. Align the spelling once for the whole
         // rule chain without resolving `..` or following the filesystem.
         let candidate = glob_path_bytes(path);
-        let candidate = self.candidate_root.as_ref().map_or_else(
-            || without_dot_components(&candidate),
-            |root| root.map(&candidate),
-        );
-        node.verdict(&candidate, is_dir).unwrap_or(false)
+        match self.candidate_root.as_ref() {
+            Some(root) => node.verdict(root.spell_into(&candidate, scratch), is_dir),
+            None => node.verdict(&without_dot_components(&candidate), is_dir),
+        }
+        .unwrap_or(false)
     }
 
     #[cfg(windows)]
-    pub(crate) fn is_ignored_bytes(&self, candidate: &[u8], is_dir: bool) -> bool {
-        let candidate = self.candidate_root.as_ref().map_or_else(
-            || without_dot_components(candidate),
-            |root| root.map(candidate),
-        );
-        self.rules
-            .as_ref()
-            .and_then(|node| node.verdict(&candidate, is_dir))
-            .unwrap_or(false)
+    pub(crate) fn is_ignored_bytes(
+        &self,
+        candidate: &[u8],
+        is_dir: bool,
+        scratch: &mut Vec<u8>,
+    ) -> bool {
+        let Some(node) = self.rules.as_ref() else {
+            return false;
+        };
+        match self.candidate_root.as_ref() {
+            Some(root) => node.verdict(root.spell_into(candidate, scratch), is_dir),
+            None => node.verdict(&without_dot_components(candidate), is_dir),
+        }
+        .unwrap_or(false)
     }
 
     /// Puts `rules` on the chain, unless they are empty: an empty matcher can
@@ -252,23 +292,24 @@ impl IgnoreScope {
     }
 }
 
-/// Resolves a relative spelling against the current directory, then removes
-/// lexical `.` components. A spelling containing `..` is canonicalized when
-/// possible so a preceding symlink is followed before its parent is selected,
-/// matching the filesystem lookup the walker performs.
+/// Resolves the walk root to the one spelling repository discovery and
+/// ignore anchoring use: absolute, with `.` and `..` resolved and every
+/// symlink followed, which is the directory Git reports as its working
+/// directory there. One policy for every spelling: a root reached through a
+/// symlink belongs to the repository that physically contains it, whether
+/// the caller wrote `link`, `./link` or `work/../link`. A root that cannot
+/// be canonicalized, because it does not exist, is normalized lexically so
+/// the walk can still report its own error.
 ///
-/// Repository discovery and ignore anchoring need one canonical spelling of
-/// the path, while the walker deliberately retains the caller's spelling for
-/// filesystem operations and returned [`crate::WalkEntry`] paths.
+/// Called once per walk. The walker deliberately retains the caller's
+/// spelling for filesystem operations and returned [`crate::WalkEntry`]
+/// paths, and directories below the root derive their discovery spelling
+/// from this one lexically, see [`CandidateRoot::map_directory`].
 fn discovery_path(path: &Path) -> PathBuf {
     let Ok(absolute) = std::path::absolute(path) else {
         return path.to_path_buf();
     };
-    if absolute
-        .components()
-        .any(|component| component == Component::ParentDir)
-        && let Ok(canonical) = fs::canonicalize(&absolute)
-    {
+    if let Ok(canonical) = fs::canonicalize(&absolute) {
         return canonical;
     }
     let mut normalized = PathBuf::new();

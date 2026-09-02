@@ -125,6 +125,16 @@ mod retained_directory_test {
     }
 
     /// Returns `None` without an active override, or whether the test budget
+    /// has reached the release threshold when one is active.
+    pub(super) fn under_pressure() -> Option<bool> {
+        STATE.with(|state| {
+            let state = state.borrow();
+            let state = state.as_ref()?;
+            Some(state.current >= super::retention_release_threshold(state.limit))
+        })
+    }
+
+    /// Returns `None` without an active override, or whether the test budget
     /// granted a permit when one is active.
     pub(super) fn try_acquire() -> Option<bool> {
         let granted = STATE.with(|state| {
@@ -233,7 +243,14 @@ pub struct CancellationToken {
 }
 
 impl CancellationToken {
-    /// Requests that the walker stop before its next filesystem operation.
+    /// Requests that the walker stop.
+    ///
+    /// The request is observed at a bounded granularity, not before the very
+    /// next filesystem operation. `collect()` reads the token when a worker
+    /// takes a directory and then once every 64 entries of that listing, so
+    /// each worker classifies at most that many more entries before stopping
+    /// and never opens another directory. `stream()` reads it before every
+    /// entry it yields.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
@@ -870,7 +887,8 @@ impl Walker {
     ///
     /// Separators, repeated or trailing, and `.` components are ignored on
     /// both sides, so `/repo//src/*.ts` against a root of `/repo/` rewrites the
-    /// same as the tidy spelling.
+    /// same as the tidy spelling. Below the root they are not: `src//*.ts` has
+    /// an empty component and is rejected, like `src/./main.rs`.
     ///
     /// # Patterns are written with `/`
     ///
@@ -1200,7 +1218,10 @@ impl Walker {
     /// Limits `collect()` to this many workers. Values are clamped to
     /// `1..=256`; `stream()` remains single-threaded to preserve incremental
     /// delivery. The upper bound caps the queues, scratch buffers, and
-    /// potential operating-system threads one walk can reserve.
+    /// potential operating-system threads one walk can reserve. It is a
+    /// ceiling, not a promise: a helper the operating system refuses to start
+    /// leaves the walk to the workers already running, see
+    /// [`Walker::collect`].
     #[must_use]
     pub const fn threads(mut self, threads: usize) -> Self {
         self.threads = if threads == 0 {
@@ -1217,6 +1238,14 @@ impl Walker {
     ///
     /// A panic inside a worker stops the sibling workers and is resumed on the
     /// calling thread after they have been joined.
+    ///
+    /// Helpers are an optimization. A helper thread the operating system
+    /// refuses to start, because the process is at its thread or memory
+    /// limit, does not fail the walk: the pool stays at the workers already
+    /// running, the calling thread included, and the refusal is a recoverable
+    /// `spawn_worker` error on the first root. It is returned in
+    /// [`WalkResult::errors`] under [`ErrorPolicy::Collect`], dropped under
+    /// [`ErrorPolicy::Skip`], and ends the walk under [`ErrorPolicy::Abort`].
     pub fn collect(self) -> Result<WalkResult, WalkError> {
         self.collect_with(&SystemBackend)
     }
@@ -1280,6 +1309,7 @@ impl Walker {
         backend: &B,
         visitor: EntryVisitor<'_>,
     ) -> Result<WalkResult, WalkError> {
+        backend.begin_walk();
         if self.threads > 1 {
             return parallel::collect(self, backend, visitor);
         }
@@ -1312,6 +1342,7 @@ impl Walker {
     /// is intentionally a collect-only global operation.
     #[must_use]
     pub fn stream(self) -> WalkStream {
+        SystemBackend.begin_walk();
         // Reversed, because the stream pops from the back and the roots are
         // walked in the order the caller added them.
         let mut pending_directories = self.root_tasks(&SystemBackend);
@@ -1321,6 +1352,7 @@ impl Walker {
             walker: self,
             listing: Listing::default(),
             glob_bytes: Vec::new(),
+            ignore_bytes: Vec::new(),
             next_entry: 0,
             path: PathBuf::new(),
             directory: PathBuf::new(),
@@ -1552,7 +1584,8 @@ fn pattern_without_directory_marker(pattern: &[u8]) -> &[u8] {
 /// A leading `./` remains the conventional harmless spelling for a pattern
 /// below the root, but `.` and `./` name the root itself, which a walk never
 /// emits. Any other real `.` component (`src/./x` or `src/.`) likewise names
-/// a spelling no root-relative candidate uses. Brace alternatives are expanded
+/// a spelling no root-relative candidate uses, and so does an empty component
+/// (`src//x`, `/x`, or `src/{}/x`). Brace alternatives are expanded
 /// and reject every arm containing `..`, including mixed forms such as
 /// `{src,..}`, while an extglob-only
 /// component such as `@(.)` remains deliberately opaque matcher text and
@@ -1576,6 +1609,9 @@ fn reject_unwalkable_relative_pattern(
         }
         WalkerPathViability::DotComponent => {
             "a walker-relative pattern with a `.` component is not normalized; remove `/.` to name the entry below that directory"
+        }
+        WalkerPathViability::EmptyComponent => {
+            "a walker-relative pattern with an empty path component selects nothing; remove the repeated separator, leading `/`, or empty alternative that produces it"
         }
     };
     // Brace expansion can create several equally valid source locations. The
@@ -1905,6 +1941,31 @@ type DirectoryIdentity = (u64, u64);
 )))]
 type DirectoryIdentity = ();
 
+/// Retained descriptors at which a serial frame that is being suspended
+/// releases its own instead of keeping it across its subtree. Half of the
+/// budget stays free for the directories below it and for the other walkers
+/// sharing the process-wide budget.
+#[cfg(any(
+    all(feature = "native-macos", target_os = "macos"),
+    all(feature = "native-linux", target_os = "linux")
+))]
+const fn retention_release_threshold(limit: usize) -> usize {
+    limit / 2
+}
+
+/// The error a resumed serial frame reports when its path no longer reaches
+/// the directory whose listing it holds.
+#[cfg(any(
+    all(feature = "native-macos", target_os = "macos"),
+    all(feature = "native-linux", target_os = "linux")
+))]
+fn directory_replaced_while_suspended() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "directory replaced while its listing was suspended; its remaining entries were not walked",
+    )
+}
+
 impl DirectoryOpen {
     fn suspended(_identity: DirectoryIdentity) -> Self {
         #[cfg(any(
@@ -1975,26 +2036,35 @@ trait DirectoryBackend {
         DirectoryOpen::default()
     }
 
-    /// Identity of the retained directory capability, when this backend has
-    /// one. Serial suspension records it before releasing the descriptor.
-    fn directory_identity(&self, listing: &Listing) -> Option<DirectoryIdentity> {
+    /// Prepares process-wide backend state for one walk. The system backend
+    /// re-reads the descriptor limit here, so a walk runs under the limit in
+    /// force when it starts rather than the one an earlier walk measured.
+    fn begin_walk(&self) {}
+
+    /// Releases the directory capability of a serial frame that is being
+    /// suspended when holding it across the subtree would crowd the backend's
+    /// retention budget. Returns the identity `restore_directory_open` must
+    /// find again; `None` keeps the capability in the frame.
+    fn suspend_directory_open(&self, listing: &mut Listing) -> Option<DirectoryIdentity> {
         let _ = listing;
         None
     }
 
-    /// Reacquires the current directory capability after a serial frame
-    /// resumes and verifies it still names the directory that was suspended.
-    /// `false` means the mutable path now reaches a different identity, so its
-    /// cached entries must not be used as names below that replacement.
+    /// Reacquires a suspended serial frame's directory capability and verifies
+    /// it still names the directory that was suspended. An error means the
+    /// rest of the cached listing cannot be walked: the path can no longer be
+    /// opened, or it reaches a different identity, whose cached entries must
+    /// not be used as names below that replacement. The caller reports it
+    /// like any other directory read failure.
     fn restore_directory_open(
         &self,
         path: &Path,
         expected: Option<DirectoryIdentity>,
         refuse_final_symlink: bool,
         listing: &mut Listing,
-    ) -> bool {
+    ) -> std::io::Result<()> {
         let _ = (path, expected, refuse_final_symlink, listing);
-        true
+        Ok(())
     }
 
     /// Follows symlinks; decides whether a link points at a directory.
@@ -2254,18 +2324,6 @@ impl Listing {
             self.native_directory = None;
         }
         self.deferred_errors.clear();
-    }
-
-    /// Releases the native handle while a serial listing is suspended. The
-    /// queued child already owns the clone it needs for its one relative open.
-    fn release_directory_open(&mut self) {
-        #[cfg(any(
-            all(feature = "native-macos", target_os = "macos"),
-            all(feature = "native-linux", target_os = "linux")
-        ))]
-        {
-            self.native_directory = None;
-        }
     }
 
     /// Adds one entry, reusing the buffer left by the directory before.
@@ -2559,15 +2617,26 @@ impl DirectoryBackend for SystemBackend {
         }
     }
 
-    fn directory_identity(&self, listing: &Listing) -> Option<DirectoryIdentity> {
+    fn begin_walk(&self) {
         #[cfg(all(feature = "native-macos", target_os = "macos"))]
-        return macos_native::retained_directory_identity(listing);
+        macos_native::refresh_retained_directory_limit();
         #[cfg(all(
             feature = "native-linux",
             target_os = "linux",
             not(all(feature = "native-macos", target_os = "macos"))
         ))]
-        return linux_native::retained_directory_identity(listing);
+        linux_native::refresh_retained_directory_limit();
+    }
+
+    fn suspend_directory_open(&self, listing: &mut Listing) -> Option<DirectoryIdentity> {
+        #[cfg(all(feature = "native-macos", target_os = "macos"))]
+        return macos_native::suspend_retained_directory(listing);
+        #[cfg(all(
+            feature = "native-linux",
+            target_os = "linux",
+            not(all(feature = "native-macos", target_os = "macos"))
+        ))]
+        return linux_native::suspend_retained_directory(listing);
         #[cfg(not(any(
             all(feature = "native-macos", target_os = "macos"),
             all(feature = "native-linux", target_os = "linux")
@@ -2584,7 +2653,7 @@ impl DirectoryBackend for SystemBackend {
         expected: Option<DirectoryIdentity>,
         refuse_final_symlink: bool,
         listing: &mut Listing,
-    ) -> bool {
+    ) -> std::io::Result<()> {
         #[cfg(all(feature = "native-macos", target_os = "macos"))]
         return macos_native::restore_retained_directory(
             path,
@@ -2609,7 +2678,7 @@ impl DirectoryBackend for SystemBackend {
         )))]
         {
             let _ = (path, expected, refuse_final_symlink, listing);
-            true
+            Ok(())
         }
     }
 }
@@ -2622,6 +2691,7 @@ pub struct WalkStream {
     /// The directory being delivered and how far through it the stream is.
     listing: Listing,
     glob_bytes: Vec<u8>,
+    ignore_bytes: Vec<u8>,
     next_entry: usize,
     /// That directory's path, with the entry being classified pushed onto it.
     path: PathBuf,
@@ -2798,6 +2868,7 @@ impl WalkStream {
                 ancestors: &self.ancestors,
                 listing: &self.listing,
                 glob_bytes_scratch: &mut self.glob_bytes,
+                ignore_bytes_scratch: &mut self.ignore_bytes,
             },
         );
         // Only an emitted entry needs a path of its own, and the stream hands
@@ -2855,11 +2926,24 @@ impl Iterator for WalkStream {
                 continue;
             }
             let task = self.pending_directories.pop()?;
+            release_drained_capacity(&mut self.pending_directories);
             if let Some(result) = self.prepare_directory(task) {
                 return Some(result);
             }
         }
         None
+    }
+}
+
+/// Gives back the capacity a wide listing left behind once most of it has
+/// drained, so a stream over a tree with one huge directory does not hold that
+/// directory's worth of task buffers until the stream ends. Shrinking only
+/// past a quarter keeps the copies amortized: a buffer is moved at most once
+/// per halving.
+fn release_drained_capacity<T>(pending: &mut Vec<T>) {
+    const RETAINED_CAPACITY: usize = 64;
+    if pending.capacity() > RETAINED_CAPACITY && pending.len() <= pending.capacity() / 4 {
+        pending.shrink_to((pending.len() * 2).max(RETAINED_CAPACITY));
     }
 }
 
@@ -2884,14 +2968,16 @@ struct DirectoryScratch {
     listing: Listing,
     path: PathBuf,
     glob_bytes: Vec<u8>,
+    ignore_bytes: Vec<u8>,
 }
 
 /// One suspended serial-directory listing. A child directory is scheduled
 /// separately, then this frame resumes at the next entry, which retains the
 /// serial walk's depth-first order without borrowing a call-stack frame. The
-/// listing keeps its entry buffers while suspended but releases its native
-/// handle after handing one clone to the child; resume reacquires an optional
-/// handle instead of pinning one descriptor per ancestor.
+/// listing keeps its entry buffers while suspended. It keeps its native
+/// handle too while the backend's retention budget has room, and otherwise
+/// hands one clone to the child and releases it, so that a deep tree does not
+/// pin one descriptor per ancestor; resume then reacquires a verified handle.
 struct DirectoryFrame {
     task: DirectoryTask,
     ignores: IgnoreScope,
@@ -2901,12 +2987,8 @@ struct DirectoryFrame {
 
 impl DirectoryFrame {
     fn suspend(&mut self, backend: &impl DirectoryBackend) {
-        let identity = backend.directory_identity(&self.scratch.listing);
-        // If identity capture failed, keep the rare descriptor rather than
-        // reopening an identity we could not later verify.
-        if let Some(identity) = identity {
+        if let Some(identity) = backend.suspend_directory_open(&mut self.scratch.listing) {
             self.task.open = DirectoryOpen::suspended(identity);
-            self.scratch.listing.release_directory_open();
         }
     }
 }
@@ -3094,14 +3176,20 @@ impl<'walker> WalkState<'walker> {
         let depth = frame.task.depth;
         let suspended_identity = frame.task.open.suspended_identity();
         if frame.next_entry < frame.scratch.listing.entries().len()
-            && !backend.restore_directory_open(
+            && let Err(source) = backend.restore_directory_open(
                 path,
                 suspended_identity,
                 !self.walker.options.follow_symlinks && depth > 0,
                 &mut frame.scratch.listing,
             )
         {
-            return self.finish_directory(frame);
+            // The rest of this listing is unreachable. That is a directory
+            // read failure like any other and goes through the error policy;
+            // ending the directory quietly would truncate the walk without
+            // a trace, even under `ErrorPolicy::Abort`.
+            let result = self.handle_error("read_dir", path.to_path_buf(), source, depth == 0);
+            self.finish_directory(frame)?;
+            return result;
         }
         frame.task.open = DirectoryOpen::default();
         while frame.next_entry < frame.scratch.listing.entries().len() {
@@ -3135,6 +3223,7 @@ impl<'walker> WalkState<'walker> {
                     ancestors: &frame.task.ancestors,
                     listing: &frame.scratch.listing,
                     glob_bytes_scratch: &mut frame.scratch.glob_bytes,
+                    ignore_bytes_scratch: &mut frame.scratch.ignore_bytes,
                 },
             );
             match action {
@@ -3679,6 +3768,33 @@ mod tests {
                 PathBuf::from("a/f1.txt"),
                 PathBuf::from("a"),
             ]
+        );
+    }
+
+    /// A stream over one wide directory queues every child before it yields
+    /// the first of them. The queue's buffer used to stay at that size until
+    /// the stream ended; now it is given back as the queue drains.
+    #[test]
+    fn stream_releases_task_capacity_as_a_wide_listing_drains() {
+        let fixture = Fixture::new();
+        for child in 0..300 {
+            fs::create_dir_all(fixture.root.join(format!("child-{child:03}")))
+                .expect("create child directory");
+        }
+        let mut stream = Walker::new(&fixture.root).stream();
+        let mut peak_capacity = 0;
+        while let Some(item) = stream.next() {
+            item.expect("fixture walk succeeds");
+            peak_capacity = peak_capacity.max(stream.pending_directories.capacity());
+        }
+        assert!(
+            peak_capacity >= 300,
+            "the wide listing was queued at once: {peak_capacity}"
+        );
+        assert!(
+            stream.pending_directories.capacity() <= 64,
+            "the drained queue keeps only a small buffer: {}",
+            stream.pending_directories.capacity()
         );
     }
 
@@ -5287,6 +5403,116 @@ mod tests {
         );
     }
 
+    /// A `..` in the root used to canonicalize every directory the walk
+    /// entered, which followed a symlinked directory to its target and
+    /// anchored the target's own ignore file where no candidate below the
+    /// link is ever spelled. The root is resolved once; directories below it
+    /// derive their discovery spelling lexically.
+    #[cfg(unix)]
+    #[test]
+    fn anchored_rules_inside_a_followed_symlink_survive_a_parent_component_in_the_root() {
+        let fixture = Fixture::new();
+        fixture.write("src/realdir/secret.txt");
+        fixture.write("src/realdir/keep.txt");
+        fs::write(
+            fixture.root.join("src/realdir/.gitignore"),
+            b"/secret.txt\n",
+        )
+        .expect("write anchored ignore rule inside the link target");
+        fs::create_dir(fixture.root.join(".git")).expect("create repository metadata directory");
+        std::os::unix::fs::symlink("realdir", fixture.root.join("src/lnk"))
+            .expect("create directory symlink");
+
+        for root in [
+            fixture.root.join("src"),
+            fixture.root.join("src/../src"),
+            fixture.root.join("src/./realdir/.."),
+        ] {
+            for threads in [1, 4] {
+                let walked = Walker::new(&root)
+                    .threads(threads)
+                    .respect_git_ignore(true)
+                    .options(
+                        WalkOptions::default()
+                            .sort(true)
+                            .files_only(true)
+                            .follow_symlinks(true),
+                    )
+                    .collect()
+                    .expect("walk through the followed link succeeds");
+                let paths = relative_paths(walked.entries(), &root);
+                assert!(
+                    paths.contains(&PathBuf::from("lnk/keep.txt")),
+                    "root {root:?} with {threads} threads: {paths:?}"
+                );
+                assert!(
+                    !paths.contains(&PathBuf::from("lnk/secret.txt")),
+                    "root {root:?} with {threads} threads must apply the link target's \
+                     anchored rule below the link: {paths:?}"
+                );
+            }
+        }
+    }
+
+    /// One policy for a symlinked root, whatever its spelling: the root is
+    /// attributed to the repository that physically contains it, as Git does
+    /// for a working directory reached through a link. Before, `link` chose
+    /// the lexical repository and `work/../link` the physical one.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_uses_the_physical_repository_under_every_spelling() {
+        let fixture = Fixture::new();
+        fixture.write("physical/repository/sub/secret.txt");
+        fixture.write("physical/repository/sub/keep.txt");
+        fs::create_dir(fixture.root.join("physical/repository/.git"))
+            .expect("create physical repository metadata directory");
+        fs::write(
+            fixture.root.join("physical/repository/.gitignore"),
+            b"/sub/secret.txt\n",
+        )
+        .expect("write physical repository ignore rule");
+        fs::create_dir_all(fixture.root.join("lexical/work"))
+            .expect("create lexical working directory");
+        fs::create_dir(fixture.root.join("lexical/.git"))
+            .expect("create lexical repository metadata directory");
+        fs::write(
+            fixture.root.join("lexical/.gitignore"),
+            b"/work/link/keep.txt\n",
+        )
+        .expect("write lexical repository ignore rule");
+        std::os::unix::fs::symlink(
+            fixture.root.join("physical/repository/sub"),
+            fixture.root.join("lexical/work/link"),
+        )
+        .expect("create directory symlink");
+
+        for root in [
+            fixture.root.join("lexical/work/link"),
+            fixture.root.join("lexical/work/./link"),
+            fixture.root.join("lexical/work/link/."),
+            fixture.root.join("lexical/work/../work/link"),
+            fixture.root.join("lexical/./work/link"),
+        ] {
+            let walked = Walker::new(&root)
+                .respect_git_ignore(true)
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("symlinked-root walk succeeds");
+            assert_eq!(
+                relative_paths(walked.entries(), &root),
+                vec![PathBuf::from("keep.txt")],
+                "root {root:?} must use the physical repository's rules"
+            );
+            assert!(
+                walked
+                    .entries()
+                    .iter()
+                    .all(|entry| entry.path().starts_with(&root)),
+                "entry paths keep the caller's spelling under {root:?}"
+            );
+        }
+    }
+
     /// Starts a Git oracle process that is independent of the developer's
     /// global and system configuration, just like the corpus harness.
     fn git_command() -> Command {
@@ -6507,148 +6733,6 @@ mod tests {
         assert!(!paths.contains(&PathBuf::from("src/nested/deep.log")));
     }
 
-    /// Git-verified ignore cases the walker does not reproduce yet.
-    ///
-    /// Empty since ADR-0014: the last entry was `ignore-034`, a POSIX class
-    /// name in a rule, which the borrowed matcher could not read and the
-    /// walker's own rule layer does. A case belongs here only while Git and
-    /// the walker are known to disagree, never as a way to quiet a failure.
-    const KNOWN_WALKER_GAPS: &[&str] = &[];
-
-    fn corpus_cases(kind: corpus::CaseKind) -> Vec<corpus::Case> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
-        let mut files = fs::read_dir(root)
-            .expect("read corpus directory")
-            .map(|entry| entry.expect("read corpus entry").path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "jsonl")
-            })
-            .collect::<Vec<_>>();
-        files.sort();
-
-        let mut cases = Vec::new();
-        for file in files {
-            for (line_number, line) in fs::read_to_string(&file)
-                .expect("read corpus file")
-                .lines()
-                .enumerate()
-            {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let case = corpus::parse_case(line).unwrap_or_else(|error| {
-                    panic!("{}:{}: {error}", file.display(), line_number + 1)
-                });
-                if case.kind == kind {
-                    cases.push(case);
-                }
-            }
-        }
-        cases
-    }
-
-    #[test]
-    fn git_ignore_corpus_replays_through_the_walker() {
-        for case in corpus_cases(corpus::CaseKind::Ignore) {
-            if !case.runs_on_host() || KNOWN_WALKER_GAPS.contains(&case.id.as_str()) {
-                continue;
-            }
-            let fixture = Fixture::new();
-            fs::write(
-                fixture.root.join(".gitignore"),
-                format!("{}\n", case.ignore_rules.join("\n")).as_bytes(),
-            )
-            .expect("write fixture gitignore");
-            // A case may place further ignore files below the root; Git reads
-            // the one closest to the candidate last, and so does the walker.
-            for nested in &case.nested_ignore_rules {
-                let directory = fixture.root.join(&nested.directory);
-                fs::create_dir_all(&directory).expect("create nested ignore directory");
-                fs::write(
-                    directory.join(".gitignore"),
-                    format!("{}\n", nested.rules.join("\n")).as_bytes(),
-                )
-                .expect("write nested fixture gitignore");
-            }
-            // Repository-wide excludes live outside the ignore file chain.
-            if !case.exclude_rules.is_empty() {
-                let info = fixture.root.join(".git/info");
-                fs::create_dir_all(&info).expect("create repository info directory");
-                fs::write(
-                    info.join("exclude"),
-                    format!("{}\n", case.exclude_rules.join("\n")).as_bytes(),
-                )
-                .expect("write repository excludes");
-            }
-            if case.git_ignorecase {
-                let git = fixture.root.join(".git");
-                fs::create_dir_all(&git).expect("create repository metadata directory");
-                fs::write(git.join("config"), b"[core]\nignorecase = true\n")
-                    .expect("write repository config");
-            }
-            if case.candidate_is_dir && case.candidate_is_symlink {
-                panic!(
-                    "corpus case {} cannot be both a directory and a symlink",
-                    case.id
-                );
-            } else if case.candidate_is_dir {
-                fs::create_dir_all(fixture.root.join(&case.path))
-                    .expect("create fixture candidate directory");
-            } else if case.candidate_is_symlink {
-                #[cfg(unix)]
-                {
-                    let target = fixture.root.join(".ferralk-symlink-target");
-                    fs::create_dir_all(&target).expect("create symlink target directory");
-                    std::os::unix::fs::symlink(target, fixture.root.join(&case.path))
-                        .expect("create fixture candidate symlink");
-                }
-                #[cfg(not(unix))]
-                panic!("symlink corpus case {} ran on a non-POSIX host", case.id);
-            } else {
-                fixture.write(&case.path);
-            }
-
-            let candidate = PathBuf::from(&case.path);
-            let serial = Walker::new(&fixture.root)
-                .respect_git_ignore(true)
-                .threads(1)
-                .collect()
-                .expect("serial walk succeeds");
-            let parallel = Walker::new(&fixture.root)
-                .respect_git_ignore(true)
-                .threads(4)
-                .collect()
-                .expect("parallel walk succeeds");
-            let streamed = Walker::new(&fixture.root)
-                .respect_git_ignore(true)
-                .threads(4)
-                .stream()
-                .collect::<Result<Vec<_>, _>>()
-                .expect("streaming walk succeeds");
-            for (frontend, returned) in [
-                (
-                    "serial collect",
-                    relative_paths(serial.entries(), &fixture.root).contains(&candidate),
-                ),
-                (
-                    "parallel collect",
-                    relative_paths(parallel.entries(), &fixture.root).contains(&candidate),
-                ),
-                (
-                    "stream",
-                    relative_paths(&streamed, &fixture.root).contains(&candidate),
-                ),
-            ] {
-                assert_eq!(
-                    !returned, case.expected,
-                    "{frontend} verdict for corpus case {}",
-                    case.id
-                );
-            }
-        }
-    }
-
     /// Both prefilters are derived from the expanded alternatives, and both go
     /// quiet as soon as one alternative cannot contribute a value.
     #[test]
@@ -7124,6 +7208,40 @@ mod tests {
         assert!(!outside.roots[0].includes[0].could_match_descendant(b"src"));
         assert!(
             !outside.roots[0].includes[0].covers_subtree(b"src", WildcardMode::ComponentScoped)
+        );
+    }
+
+    /// A repeated separator below the root is an empty component, not a
+    /// spelling of the root, and the rejection has to say so whether the
+    /// pattern is relative or absolute (#331). At the junction of root and
+    /// pattern the doubled separator is still ignored.
+    #[test]
+    fn a_repeated_separator_below_the_root_is_reported_as_an_empty_component() {
+        let fixture = Fixture::new();
+        fixture.write("src/a.ts");
+
+        for pattern in ["src//*.ts", &fixture.absolute("/src//*.ts")] {
+            for add in [Walker::include, Walker::exclude] {
+                let error = add(Walker::new(&fixture.root), pattern)
+                    .expect_err("an empty component below the root is rejected");
+                assert!(
+                    error
+                        .message()
+                        .starts_with("a walker-relative pattern with an empty path component"),
+                    "{pattern}: {error}"
+                );
+            }
+        }
+
+        let joined = Walker::new(&fixture.root)
+            .include(fixture.absolute("//src/*.ts"))
+            .expect("a doubled separator at the root junction is ignored")
+            .options(WalkOptions::default().sort(true).files_only(true))
+            .collect()
+            .expect("walk succeeds");
+        assert_eq!(
+            relative_paths(joined.entries(), &fixture.root),
+            vec![PathBuf::from("src/a.ts")]
         );
     }
 
@@ -7916,6 +8034,45 @@ mod tests {
                 ),
                 Vec::<PathBuf>::new(),
                 "{label}: the covering exclude may prune an unreachable hidden match"
+            );
+        }
+    }
+
+    /// An escaped separator is folded into a literal run, and the period
+    /// behind it starts a component for the matcher. The pruning summary has
+    /// to see that period too, or a covering exclude prunes a subtree the
+    /// include reaches through the exclude's hidden blind spot.
+    #[test]
+    fn covering_excludes_keep_hidden_descendants_behind_an_escaped_separator() {
+        let fixture = Fixture::new();
+        fixture.write("x/foo/.hidden/keep");
+        fixture.write("x/foo/visible/keep");
+
+        for include in [
+            "x/f*\\/.hidden/keep",
+            "x/*\\/.hidden/keep",
+            "**/f*\\/.hidden/keep",
+        ] {
+            let build = || {
+                Walker::new(&fixture.root)
+                    .include(include)
+                    .expect("valid include")
+                    .exclude("x/**")
+                    .expect("valid exclude")
+                    .options(WalkOptions::default().files_only(true).sort(true))
+            };
+            assert_frontends_agree(include, &fixture.root, build);
+            assert_eq!(
+                relative_paths(
+                    build()
+                        .threads(1)
+                        .collect()
+                        .expect("walk succeeds")
+                        .entries(),
+                    &fixture.root,
+                ),
+                [PathBuf::from("x/foo/.hidden/keep")],
+                "{include}: the include reaches the excluded subtree's hidden blind spot"
             );
         }
     }
