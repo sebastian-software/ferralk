@@ -21,6 +21,7 @@ const DOCUMENTS: &[&str] = &[
     "docs/external-release-gates.md",
     "docs/fast-glob-reference.md",
     "docs/palamedes-adoption.md",
+    "docs/stability.md",
     "docs/zlob-1.6.3-reference.md",
     "docs/zlob-fnmatch-test-coverage.md",
     "docs/zlob-test-suite-audit.md",
@@ -39,6 +40,9 @@ const DOCUMENTS: &[&str] = &[
     "docs/adr/0012-ferroni-repository-blueprint.md",
     "docs/adr/0013-no-glob-to-regex-translation.md",
     "docs/adr/0014-own-gitignore-rule-matching.md",
+    "docs/adr/0015-posix-escapes-in-bracket-classes.md",
+    "docs/adr/0016-shell-star-runs-before-extglobs.md",
+    "docs/adr/0017-caller-owned-list-api-conventions.md",
     "fuzz/README.md",
 ];
 
@@ -164,6 +168,12 @@ const FENCE_POLICIES: &[FencePolicy] = &[
         intentional_text_fragments: &["Walker::new(first)"],
     },
     FencePolicy {
+        path: "docs/stability.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
         path: "docs/zlob-1.6.3-reference.md",
         compiled_rust_fences: 0,
         ignored_rust_fences: 0,
@@ -272,6 +282,24 @@ const FENCE_POLICIES: &[FencePolicy] = &[
         intentional_text_fragments: &[],
     },
     FencePolicy {
+        path: "docs/adr/0015-posix-escapes-in-bracket-classes.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0016-shell-star-runs-before-extglobs.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0017-caller-owned-list-api-conventions.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
         path: "fuzz/README.md",
         compiled_rust_fences: 0,
         ignored_rust_fences: 0,
@@ -333,6 +361,9 @@ pub mod fast_glob_reference {}
 #[doc = include_str!("../../../docs/palamedes-adoption.md")]
 pub mod palamedes_adoption {}
 
+#[doc = include_str!("../../../docs/stability.md")]
+pub mod stability {}
+
 #[doc = include_str!("../../../docs/zlob-1.6.3-reference.md")]
 pub mod zlob_1_6_3_reference {}
 
@@ -386,6 +417,15 @@ pub mod adr_0013 {}
 
 #[doc = include_str!("../../../docs/adr/0014-own-gitignore-rule-matching.md")]
 pub mod adr_0014 {}
+
+#[doc = include_str!("../../../docs/adr/0015-posix-escapes-in-bracket-classes.md")]
+pub mod adr_0015 {}
+
+#[doc = include_str!("../../../docs/adr/0016-shell-star-runs-before-extglobs.md")]
+pub mod adr_0016 {}
+
+#[doc = include_str!("../../../docs/adr/0017-caller-owned-list-api-conventions.md")]
+pub mod adr_0017 {}
 
 #[doc = include_str!("../../../fuzz/README.md")]
 pub mod fuzzing {}
@@ -822,15 +862,17 @@ mod tests {
     fn is_excluded_directory(root: &Path, directory: &Path) -> bool {
         // Git metadata and generated/build trees are not repository
         // documentation. Every other Markdown file is inventory-controlled.
-        directory
+        let relative = directory
             .strip_prefix(root)
-            .expect("repository directory is below the repository root")
-            .components()
-            .any(|component| {
-                matches!(
-                    component.as_os_str().to_str(),
-                    Some(".git" | "target" | "vendor")
-                )
-            })
+            .expect("repository directory is below the repository root");
+        if relative.starts_with(Path::new(".claude").join("worktrees")) {
+            return true;
+        }
+        relative.components().any(|component| {
+            matches!(
+                component.as_os_str().to_str(),
+                Some(".git" | "target" | "vendor")
+            )
+        })
     }
 }

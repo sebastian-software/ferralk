@@ -255,7 +255,7 @@ fn collect_retains_a_disappearing_root_error() {
         .collect()
         .expect("collect returns partial result");
     assert_eq!(result.errors().len(), 1);
-    assert_eq!(result.errors()[0].operation(), "read_dir");
+    assert_eq!(result.errors()[0].operation().as_str(), "read_dir");
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn stream_yields_a_disappearing_root_error() {
         .next()
         .expect("stream yields the error")
         .expect_err("missing root is an error event");
-    assert_eq!(error.operation(), "read_dir");
+    assert_eq!(error.operation().as_str(), "read_dir");
     assert!(stream.next().is_none());
 }
 
@@ -644,7 +644,7 @@ fn collect_retains_an_unreadable_directory_error() {
         result
             .errors()
             .iter()
-            .any(|error| error.operation() == "read_dir" && error.path() == locked)
+            .any(|error| error.operation().as_str() == "read_dir" && error.path() == locked)
     );
 }
 
@@ -914,7 +914,7 @@ fn a_broken_link_errors_when_followed_and_is_merely_dropped_when_resolved() {
             .expect("collect retains errors rather than aborting")
             .errors()
             .iter()
-            .map(|error| error.operation())
+            .map(|error| error.operation().as_str())
             .collect::<Vec<_>>()
     };
 

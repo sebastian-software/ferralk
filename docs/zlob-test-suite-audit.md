@@ -11,7 +11,7 @@ platform-runtime tests that are deliberately outside the two-crate Rust API
 | `test_fnmatch.zig`, `test_brace.zig`, `test_edge_cases.zig` | Source-linked matcher corpus and Zig-backed oracle | Covered for direct matcher semantics. |
 | `test_extglob.zig`, `test_glibc.zig`, `test_basic.zig` | Path-list corpus and matcher regressions | Covered for public in-memory forms; filesystem enumeration stays separate. |
 | `test_path_matcher.zig`, public `matchPaths` block in `test_internal.zig` | `filter_paths`, base-relative and index corpus cases | Covered; C-string chunking and fixed component buffers are excluded. |
-| `test_absolute_paths.zig` | Root-independent list corpus plus disputed C/Rust cases | Covered except the documented C iterator-only literal-hidden-brace case. |
+| `test_absolute_paths.zig` | Root-independent list corpus plus provenance-marked C/Rust differences | Covered except the documented C iterator-only literal-hidden-brace case. |
 | `test_gitignore.zig`, `test_gitignore_e2e.zig` | `ignore.jsonl`, Git oracle, Walker fixtures | Git is normative under ADR-0006; zlob's private parser is provenance. |
 | `test_walk.zig` | Walker fixtures for filtering, depth, kind, basename, symlinks, Gitignore allowlisting, `.ignore` precedence, scoped-unreadable pruning, serial/parallel equivalence | Public Rust-shaped traversal contract is being ported incrementally; visitor callbacks and C error callbacks have no equivalent API. |
 | `test_rust_glob.zig` | Walker regression fixture for literal, wildcard, class, nested, special-character, `./`, trailing-slash, and root-component patterns | Covered for root-relative traversal filtering; zlob's C-shaped result buffer plus `.`/`..` root entries remain outside the Walker API. |

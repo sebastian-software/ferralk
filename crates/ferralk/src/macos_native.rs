@@ -680,6 +680,7 @@ fn parse_bulk_record(record: &[u8]) -> io::Result<Option<(Range<usize>, Option<u
 /// Validates one raw Darwin bulk-attribute record without touching the
 /// filesystem. This is exposed only for the feature-gated cargo-fuzz target.
 #[doc(hidden)]
+#[cfg(feature = "unstable-test-hooks")]
 pub fn fuzz_validate_bulk_record(record: &[u8]) {
     let _ = parse_bulk_record(record);
 }
@@ -1043,6 +1044,7 @@ fn parse_records_with_entry_kind(
 /// This is exposed only for the feature-gated cargo-fuzz target; normal walker
 /// callers never observe raw records.
 #[doc(hidden)]
+#[cfg(feature = "unstable-test-hooks")]
 pub fn fuzz_validate_records(records: &[u8]) {
     let _ = for_each_record(records, |_, _| Ok(()));
 }

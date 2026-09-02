@@ -24,7 +24,8 @@ use std::{
 #[cfg(not(windows))]
 use super::glob_bytes;
 use super::{
-    AncestorChain, DirectoryBackend, DirectoryOpen, ListedEntry, Listing, WalkEntry, Walker,
+    AncestorChain, DirectoryBackend, DirectoryOpen, ListedEntry, Listing, WalkEntry, WalkOperation,
+    Walker,
     gitignore::{IgnoreReadError, IgnoreScope},
     has_hidden_component, should_skip_git_directory,
 };
@@ -123,7 +124,7 @@ pub(crate) struct TraversalContext<'a> {
 
 /// A filesystem call that failed while classifying one entry.
 pub(crate) struct EntryFailure {
-    pub(crate) operation: &'static str,
+    pub(crate) operation: WalkOperation,
     pub(crate) path: PathBuf,
     pub(crate) source: std::io::Error,
 }
@@ -306,7 +307,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
             Err(source) => {
                 return EntryAction::Failed {
                     failure: EntryFailure {
-                        operation: "metadata",
+                        operation: WalkOperation::Metadata,
                         path: path.to_path_buf(),
                         source,
                     },
@@ -374,7 +375,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
             Err(source) => {
                 return EntryAction::Failed {
                     failure: EntryFailure {
-                        operation: "metadata",
+                        operation: WalkOperation::Metadata,
                         path: path.to_path_buf(),
                         source,
                     },
@@ -432,7 +433,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
                 return EntryAction::Failed {
                     descend: descend.then(task),
                     failure: EntryFailure {
-                        operation: "symlink_metadata",
+                        operation: WalkOperation::SymlinkMetadata,
                         path: path.to_path_buf(),
                         source,
                     },

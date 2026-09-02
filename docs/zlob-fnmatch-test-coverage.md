@@ -80,8 +80,8 @@ pretending that an empty candidate is a full fnmatch assertion.
 
 The five `matchPaths` assertions are represented by
 [`corpus/match-paths.jsonl`](../corpus/match-paths.jsonl) records and replayed
-through `Pattern::filter_paths`. The empty-list `NOCHECK` result is retained as
-a disputed corpus case: Ferralk returns no caller-owned paths, while zlob's
+through `Pattern::filter_paths`. The empty-list `NOCHECK` result is retained
+with ADR-0017 provenance: Ferralk returns no caller-owned paths, while zlob's
 frozen Zig suite returns the pattern. zlob 1.6.3's Rust FFI aborts for an empty
 list and exposes corrupted string data for this synthetic result, so its
 Rust oracle deliberately skips that one case while replaying the other four.

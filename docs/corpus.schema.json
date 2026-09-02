@@ -43,7 +43,8 @@
     "error_message": { "type": "string" },
     "platform": { "enum": ["posix", "windows"] },
     "source": { "enum": ["zlob_1_6_3", "fast_glob", "git_check_ignore", "handwritten"] },
-    "disputed": { "type": "boolean", "default": false },
+    "adr": { "type": "string", "pattern": "^[0-9]{4}$" },
+    "oracle_defect": { "type": "boolean", "default": false },
     "note": { "type": "string" }
   },
   "allOf": [

@@ -97,3 +97,28 @@ does not add Zig to this local contributor preflight.
 Changes to the native backends also need `--features native-macos` or
 `--features native-linux` on the platform that has them; the corresponding CI
 jobs are the gate for the other one.
+
+## 1.0 release checklist
+
+Use this checklist for the 1.0 release train; the compatibility promise it
+protects is defined in [`docs/stability.md`](docs/stability.md).
+
+- [ ] Every child of epic #342 is closed, and every external-oracle divergence
+  in the corpus has exactly one `adr` or `oracle_defect` marker.
+- [ ] Two consecutive adversarial review rounds have completed without a
+  consumer-visible breaking change.
+- [ ] Run the canonical preflight above on the release candidate commit and
+  verify all platform, oracle, semver, and policy CI jobs.
+- [ ] Using `cargo-public-api` 0.52.0, regenerate `docs/api/ferralk.txt` and
+  `docs/api/ferralk-glob.txt` with `cargo public-api -p <crate> --simplified
+  --color never`; review every changed line as API rather than accepting
+  generated output mechanically.
+- [ ] Confirm the README still links the stability contract and that the
+  contract covers the public API, corpus semantics, matcher entry points,
+  Windows tier, MSRV policy, and explicit exclusions.
+- [ ] Audit every `!` change since 0.9.0 against the
+  [compatibility guide](docs/compatibility-guide.md#contract-change-audit-since-090)
+  and usage guide, then check the release notes describe the final behaviour.
+- [ ] Cut `1.0.0-rc.1` only after the two clean rounds. Keep the release
+  candidate for one further adversarial round; cut `1.0.0` only if that round
+  also produces no consumer-visible breaking change.

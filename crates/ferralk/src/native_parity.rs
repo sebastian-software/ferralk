@@ -150,7 +150,7 @@ fn describe_errors(errors: &[WalkError], root: &Path) -> Vec<DescribedError> {
                     .strip_prefix(root)
                     .unwrap_or(error.path())
                     .to_path_buf(),
-                error.operation(),
+                error.operation().as_str(),
                 error.source.kind(),
             )
         })
@@ -685,7 +685,9 @@ fn released_serial_frame_reports_a_replacement_instead_of_truncating() {
         let stats = retention.stats();
         assert_eq!(stats.current, 0, "{case}: {stats:?}");
         let (operation, path) = match (policy, outcome) {
-            (ErrorPolicy::Abort, Err(error)) => (error.operation(), error.path().to_path_buf()),
+            (ErrorPolicy::Abort, Err(error)) => {
+                (error.operation().as_str(), error.path().to_path_buf())
+            }
             (ErrorPolicy::Abort, Ok(result)) => {
                 panic!("{case}: Abort must surface the lost remainder, got {result:?}")
             }
@@ -713,7 +715,10 @@ fn released_serial_frame_reports_a_replacement_instead_of_truncating() {
                     1,
                     "{case}: the lost remainder is reported exactly once: {errors:?}"
                 );
-                (errors[0].operation(), errors[0].path().to_path_buf())
+                (
+                    errors[0].operation().as_str(),
+                    errors[0].path().to_path_buf(),
+                )
             }
         };
         assert_eq!(
@@ -834,7 +839,7 @@ fn resume_budget_denial_never_falls_back_to_a_replacement_symlink() {
     );
     let errors = result.errors();
     assert_eq!(errors.len(), 1, "{errors:?}");
-    assert_eq!(errors[0].operation(), "read_dir");
+    assert_eq!(errors[0].operation().as_str(), "read_dir");
     assert_eq!(errors[0].path(), fixture.root.join("parent"));
     let stats = retention.stats();
     assert_eq!(stats.current, 0);
@@ -1128,8 +1133,8 @@ fn parity_for_skip_and_abort_error_policies() {
         .expect_err("the native aborting root rejects the missing directory");
     let portable = walk_portable_abort(&aborting);
     assert_eq!(
-        (native.operation(), native.source.kind()),
-        (portable.operation(), portable.source.kind()),
+        (native.operation().as_str(), native.source.kind()),
+        (portable.operation().as_str(), portable.source.kind()),
         "abort-policy missing root: the backends return the same first error"
     );
 }
@@ -1150,7 +1155,7 @@ fn described_error(error: &WalkError, root: &Path) -> DescribedError {
             .strip_prefix(root)
             .unwrap_or(error.path())
             .to_path_buf(),
-        error.operation(),
+        error.operation().as_str(),
         error.source.kind(),
     )
 }

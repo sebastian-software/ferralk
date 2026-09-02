@@ -299,6 +299,7 @@ pub(crate) fn without_dot_components_into(path: &[u8], normalized: &mut Vec<u8>)
 /// Reads one rule line and asks it about one candidate, which is the whole
 /// surface the harness needs: parsing and matching are the two halves that must
 /// stay total, whatever bytes arrive.
+#[cfg(any(test, feature = "unstable-test-hooks"))]
 pub fn fuzz_rule(line: &str, candidate: &[u8], is_dir: bool) -> Option<bool> {
     fuzz_rule_bytes(line.as_bytes(), candidate, is_dir)
 }
@@ -308,6 +309,7 @@ pub fn fuzz_rule(line: &str, candidate: &[u8], is_dir: bool) -> Option<bool> {
 /// Ignore files are bytes, so this also reaches patterns that are not valid
 /// UTF-8. It shares the same empty-root setup as [`fuzz_rule`].
 #[doc(hidden)]
+#[cfg(any(test, feature = "unstable-test-hooks"))]
 pub fn fuzz_rule_bytes(line: &[u8], candidate: &[u8], is_dir: bool) -> Option<bool> {
     let mut builder = RuleSetBuilder::new(Path::new(""), false, false);
     builder.add_line(line);

@@ -7,6 +7,7 @@ working examples. This directory contains the durable technical record.
 | --- | --- |
 | [Contributing](../CONTRIBUTING.md) | Repository policy: commit signing, and how a performance claim is evidenced. |
 | [Usage guide](usage.md) | Matcher and walker defaults, options, errors, and validation commands. |
+| [1.x stability contract](stability.md) | Public API, behavioural, MSRV, platform, and explicit non-contract guarantees. |
 | [Compatibility guide](compatibility-guide.md) | Migrating supported zlob 1.6.3 behaviour to the Ferralk API. |
 | [Compatibility matrix](compatibility-matrix.md) | A precise capability-by-capability status. |
 | [Corpus format](corpus-format.md) | Maintaining or reviewing JSONL behavioural cases. |

@@ -22,8 +22,12 @@ compatible with zlob and deliberately has no C ABI.
 ## Status
 
 Ferralk is pre-1.0. The public API and release cadence are still being refined;
-do not rely on a 1.0 stability guarantee yet. Both crates are published on
-crates.io; use the current 0.11.0 release line for applications. <!-- x-release-please-version -->
+do not rely on a 1.0 stability guarantee yet. The proposed
+[1.x stability contract](docs/stability.md) states exactly which public API,
+corpus semantics, entry-point rules, platform tier, and MSRV policy become
+stable at 1.0—and which implementation details and feature flags do not. Both
+crates are published on crates.io; use the current
+0.11.0 release line for applications. <!-- x-release-please-version -->
 
 ```toml
 [dependencies]
@@ -145,6 +149,8 @@ The source is in [`crates/ferralk/examples/find.rs`](crates/ferralk/examples/fin
 
 - [Usage guide](docs/usage.md) — matching and walking semantics, defaults, and
   operational guidance.
+- [1.x stability contract](docs/stability.md) — the semver-covered surface,
+  MSRV policy, and explicit exclusions.
 - [Migration guide](docs/compatibility-guide.md) — mapping from zlob 1.6.3 and
   deliberate differences.
 - [Compatibility matrix](docs/compatibility-matrix.md) — feature-level status.
@@ -167,6 +173,11 @@ The source is in [`crates/ferralk/examples/find.rs`](crates/ferralk/examples/fin
   sorting, error handling, and cancellation all have documented controls.
 - Keep matching byte-first and portable. On Windows, the public API preserves
   native paths while normalizing only the matcher input representation.
+
+The default portable backend is the stable target. The `native-linux` and
+`native-macos` features are experimental and may be renamed or removed in a
+1.x minor release; everything behind them is outside the 1.x compatibility
+contract.
 
 ## Development
 

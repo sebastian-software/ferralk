@@ -11,15 +11,15 @@ cargo-fuzz = true
 [dependencies]
 corpus = { path = "../tools/corpus" }
 fast-glob = "=1.1.1"
-ferralk-glob = { path = "../crates/ferralk-glob" }
+ferralk-glob = { path = "../crates/ferralk-glob", features = ["unstable-test-hooks"] }
 libfuzzer-sys = "=0.4.13"
 serde_json = "=1.0.151"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-ferralk = { path = "../crates/ferralk", features = ["native-macos"] }
+ferralk = { path = "../crates/ferralk", features = ["native-macos", "unstable-test-hooks"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-ferralk = { path = "../crates/ferralk", features = ["native-linux"] }
+ferralk = { path = "../crates/ferralk", features = ["native-linux", "unstable-test-hooks"] }
 
 [[bin]]
 name = "ignore_rule_parser"

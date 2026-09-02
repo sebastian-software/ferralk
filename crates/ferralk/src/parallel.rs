@@ -18,7 +18,7 @@ use crossbeam_deque::{Steal, Stealer, Worker};
 
 use super::{
     AncestorChain, CANCELLATION_STRIDE, CYCLE_KEY_OPERATION, DirectoryBackend, EntryVisitor,
-    ErrorPolicy, Listing, Verdict, WalkEntry, WalkError, WalkResult, Walker,
+    ErrorPolicy, Listing, Verdict, WalkEntry, WalkError, WalkOperation, WalkResult, Walker,
     classify::{DirectoryTask, EmittedEntry, EntryAction, TraversalContext, classify_entry},
     own_path, reset_to_directory,
     scheduler::{CacheLine, Coordinator, Scheduler, WorkerSlot},
@@ -394,7 +394,7 @@ impl<'backend> Shared<'backend> {
 
     fn record_error(
         &self,
-        operation: &'static str,
+        operation: WalkOperation,
         path: PathBuf,
         source: std::io::Error,
         is_root: bool,
@@ -421,7 +421,7 @@ impl<'backend> Shared<'backend> {
     fn record_spawn_failure(&self, source: std::io::Error) {
         self.helpers_capped.store(true, Ordering::Release);
         self.record_error(
-            "spawn_worker",
+            WalkOperation::SpawnWorker,
             self.walker
                 .roots()
                 .next()
@@ -695,7 +695,7 @@ fn process_directory(
                 !shared.walker.options.follow_symlinks && depth > 0,
                 &mut worker.listing,
             ) {
-                shared.record_error("read_dir", path, source, is_root);
+                shared.record_error(WalkOperation::ReadDir, path, source, is_root);
                 return;
             }
             // One add for the whole listing: the entries it returned, and the listing
@@ -791,7 +791,12 @@ fn process_directory(
         reset_to_directory(&mut worker.path, &path);
     }
     while let Some(error) = worker.listing.take_deferred_error() {
-        shared.record_error("read_dir", error.path, error.source.into_io_error(), false);
+        shared.record_error(
+            WalkOperation::ReadDir,
+            error.path,
+            error.source.into_io_error(),
+            false,
+        );
     }
 }
 
@@ -1641,7 +1646,7 @@ mod tests {
                 ErrorPolicy::Collect => {
                     let errors = result.errors();
                     assert_eq!(errors.len(), 1, "{errors:?}");
-                    assert_eq!(errors[0].operation(), "spawn_worker");
+                    assert_eq!(errors[0].operation().as_str(), "spawn_worker");
                     assert_eq!(errors[0].path(), PathBuf::from(&root));
                 }
                 _ => assert!(
@@ -1691,7 +1696,7 @@ mod tests {
             .error_policy(ErrorPolicy::Abort)
             .collect()
             .expect_err("under Abort the refused helper ends the walk");
-        assert_eq!(error.operation(), "spawn_worker");
+        assert_eq!(error.operation().as_str(), "spawn_worker");
         assert_eq!(error.path(), PathBuf::from(&root));
         assert!(
             !cancellation.is_cancelled(),

@@ -35,7 +35,8 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | `error_message` | no | Stable error text a `compile_error` or `absolute_pattern` case must produce. Its presence is what makes an `absolute_pattern` case a rejection. |
 | `platform` | no | `posix` or `windows`; restricts a separator-dependent verdict to one host. |
 | `source` | yes | `zlob_1_6_3`, `fast_glob`, `git_check_ignore`, or `handwritten`. |
-| `disputed` | no | `true` if evidence is recorded but ferralk policy is unsettled. |
+| `adr` | no | Four-digit ADR number that adopts Ferralk's deliberate divergence from the recorded oracle. |
+| `oracle_defect` | no | `true` when the disagreement is an oracle defect or documented limit of a secondary oracle. |
 | `note` | no | Short explanation or cross-oracle disagreement. |
 
 The topic files are `basic.jsonl`, `braces.jsonl`, `bytes.jsonl`,
@@ -148,11 +149,26 @@ errors are validation failures, never silently interpreted as paths.
 `zlob_1_6_3` cases originate from the pinned oracle. `fast_glob` is used only
 where its syntax overlaps. `git_check_ignore` is normative for ignore topics.
 Handwritten records are allowed for a documented policy decision or a reduced
-regression case. A disagreement is retained with `disputed: true` until an ADR
-or compatibility-guide entry resolves it. `expected` is always the ferralk
-contract and still runs in the harness; `oracle_expected` holds the diverging
-reference result and runs only in the appropriate oracle adapter. Neither the
-harness nor a future matcher may discard disputed cases.
+regression case. A disagreement must carry exactly one provenance marker:
+`adr` for a deliberate Ferralk policy or `oracle_defect: true` for a defect or
+documented limit in the reference implementation. `expected` is always the
+Ferralk contract and still runs in the harness; `oracle_expected` holds the
+diverging reference result and runs only in the appropriate oracle adapter.
+The harness rejects a divergence without provenance, so neither it nor a
+future matcher can silently discard a known difference.
+
+The zlob 1.6.3 public API disagrees with its own frozen source assertions for
+`fnmatch-l0092` and `fnmatch-l0097`, and with its filesystem tests for the
+empty branch of a leading repeating extglob in
+`path-matcher-repeating-extglob-hidden-on` and
+`absolute-path-repeating-extglob-hidden-off`. Those four records are oracle
+defects rather than Ferralk policy decisions.
+
+`fast-glob` 1.1 is a secondary differential oracle, not Ferralk's semantic
+authority. Its nine recorded disagreements cover recursive-`**` shape,
+backslash and POSIX-class syntax, separator handling in classes, leading `./`
+normalization, and its brace-group limit. They carry `oracle_defect: true` to
+state that no Ferralk contract decision is pending on their result.
 
 ## What the zlob oracle skips
 

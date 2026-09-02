@@ -38,6 +38,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let case = parse_case(line)
                 .map_err(|error| format!("{}:{}: {error}", file.display(), line_number + 1))?;
+            let has_oracle_difference = case.oracle_expected.is_some()
+                || case.oracle_matches.is_some()
+                || case.oracle_indices.is_some();
+            let provenance_count =
+                usize::from(case.adr.is_some()) + usize::from(case.oracle_defect);
+            if has_oracle_difference && provenance_count != 1 {
+                return Err(format!(
+                    "{}:{}: an oracle divergence requires exactly one of adr or oracle_defect",
+                    file.display(),
+                    line_number + 1
+                )
+                .into());
+            }
+            if !has_oracle_difference && provenance_count != 0 {
+                return Err(format!(
+                    "{}:{}: adr and oracle_defect belong to an oracle divergence",
+                    file.display(),
+                    line_number + 1
+                )
+                .into());
+            }
             if !ids.insert((file.clone(), case.id.clone())) {
                 return Err(format!(
                     "{}:{}: duplicate case id {}",

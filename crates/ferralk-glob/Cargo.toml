@@ -11,6 +11,11 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# Development-only differential hooks. No item enabled by this feature is
+# covered by the 1.x semver contract.
+unstable-test-hooks = []
+
 [dependencies]
 memchr = "=2.8.3"
 

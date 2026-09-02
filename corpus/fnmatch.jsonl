@@ -18,8 +18,8 @@
 {"id":"fnmatch-l0082","kind":"matcher","pattern":"\\x5C[","path":"[","flags":[],"expected":true,"source":"zlob_1_6_3"}
 {"id":"fnmatch-l0083","kind":"matcher","pattern":"\\x5C[","path":"a","flags":[],"expected":false,"source":"zlob_1_6_3"}
 {"id":"fnmatch-l0088","kind":"matcher","pattern":"foo\\x5C","path":"foo\\x5C","flags":[],"expected":true,"source":"zlob_1_6_3"}
-{"id":"fnmatch-l0092","kind":"matcher","pattern":"\\x5C\\x5C","path":"\\x5C","flags":[],"expected":true,"oracle_expected":false,"source":"zlob_1_6_3","disputed":true,"note":"zlob's public zlob_match_paths API differs from its tested internal fnmatchFull helper for an escaped backslash; the source assertion remains the primary expected result."}
-{"id":"fnmatch-l0097","kind":"matcher","pattern":"\\x5Ca","path":"a","flags":[],"expected":true,"oracle_expected":false,"source":"zlob_1_6_3","disputed":true,"note":"zlob's public zlob_match_paths API differs from its tested internal fnmatchFull helper for an escape before a literal character; the source assertion remains the primary expected result."}
+{"id":"fnmatch-l0092","kind":"matcher","pattern":"\\x5C\\x5C","path":"\\x5C","flags":[],"expected":true,"oracle_expected":false,"source":"zlob_1_6_3","note":"zlob's public zlob_match_paths API differs from its tested internal fnmatchFull helper for an escaped backslash; the source assertion remains the primary expected result.","oracle_defect":true}
+{"id":"fnmatch-l0097","kind":"matcher","pattern":"\\x5Ca","path":"a","flags":[],"expected":true,"oracle_expected":false,"source":"zlob_1_6_3","note":"zlob's public zlob_match_paths API differs from its tested internal fnmatchFull helper for an escape before a literal character; the source assertion remains the primary expected result.","oracle_defect":true}
 {"id":"fnmatch-l0101","kind":"matcher","pattern":"foo\\x5C*bar","path":"foo*bar","flags":[],"expected":true,"source":"zlob_1_6_3"}
 {"id":"fnmatch-l0102","kind":"matcher","pattern":"foo\\x5C*bar","path":"fooXbar","flags":[],"expected":false,"source":"zlob_1_6_3"}
 {"id":"fnmatch-l0187","kind":"matcher","pattern":"**","path":"hello","flags":[],"expected":true,"source":"zlob_1_6_3"}
