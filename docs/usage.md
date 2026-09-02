@@ -14,7 +14,9 @@ components.
 
 `is_match_path` preserves the zlob list-filter convention instead: a wildcard
 in the root component may cross separators, while a wildcard after an explicit
-separator is component-local. Both path entry points ignore one conventional
+separator is component-local. That holds for every wildcard behind the first
+separator, including the second one of a run such as `a/?*/z` and one that
+follows a literal such as `a/b*`. Both path entry points ignore one conventional
 leading `./` on the pattern and candidate; `is_match` compares those bytes
 literally. With `recursive_double_star` disabled, any consecutive `**` has the
 same ordinary-star semantics as `*` through all three entry points.

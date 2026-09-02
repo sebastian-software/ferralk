@@ -79,7 +79,7 @@ pub(crate) struct NarrowSweepEngine {
     /// Positions that repeat and may be skipped: every star-like token.
     stars: u64,
     /// Positions a separator byte never reaches under `component_wildcards`
-    /// without `root_component_wildcards`: wildcards directly after an
+    /// without `root_component_wildcards`: every wildcard behind the first
     /// explicit separator.
     sep_block_component: u64,
     /// Positions a separator byte never reaches under both component options:
@@ -142,14 +142,13 @@ impl SweepEngine {
         let mut wildcards = 0_u64;
         let mut consume_any = 0_u64;
         let mut position = 0_usize;
-        for (token_index, token) in tokens.iter().enumerate() {
+        // The component policy asks whether an explicit separator stands
+        // *anywhere before* this token; a wildcard in the root component
+        // stays free to cross separators under `component_wildcards` alone.
+        // Mirrors `Pattern::component_wildcard`.
+        let mut after_separator = false;
+        for token in tokens {
             let bit = 1_u64 << position;
-            // The component policy asks whether the *token before this one*
-            // is an explicit separator; a wildcard elsewhere in the pattern
-            // stays free to cross separators under `component_wildcards`
-            // alone. Mirrors `Pattern::component_wildcard`.
-            let after_separator =
-                token_index > 0 && matches!(tokens[token_index - 1], Token::Separator);
             match token {
                 Token::Literal(literal) => {
                     for &expected in literal {
@@ -167,6 +166,7 @@ impl SweepEngine {
                     continue;
                 }
                 Token::Separator => {
+                    after_separator = true;
                     engine.table[usize::from(b'/')] |= bit;
                     if cfg!(windows) {
                         engine.table[usize::from(b'\\')] |= bit;
@@ -491,9 +491,8 @@ impl WideSweepEngine {
         let mut wildcards = vec![0_u64; word_count];
         let mut consume_any = vec![0_u64; word_count];
         let mut position = 0_usize;
-        for (token_index, token) in tokens.iter().enumerate() {
-            let after_separator =
-                token_index > 0 && matches!(tokens[token_index - 1], Token::Separator);
+        let mut after_separator = false;
+        for token in tokens {
             match token {
                 Token::Literal(literal) => {
                     for &expected in literal {
@@ -507,6 +506,7 @@ impl WideSweepEngine {
                     continue;
                 }
                 Token::Separator => {
+                    after_separator = true;
                     engine.set_table(b'/', position);
                     if cfg!(windows) {
                         engine.set_table(b'\\', position);
