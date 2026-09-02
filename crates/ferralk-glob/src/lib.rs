@@ -4772,7 +4772,7 @@ fn compile_extglob_step(
             ExtglobStep::Star {
                 next,
                 blocks_leading_period: !(options.recursive_double_star
-                    && next - index >= 2
+                    && next - index == 2
                     && pattern.get(next) == Some(&b'/')),
             }
         }
@@ -5859,9 +5859,10 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     use super::LiteralSuffix;
     use super::{
-        AlternativeFastPath, FailedStates, FastPath, Pattern, PatternOptions, Prefilter, Token,
-        WalkerPathViability, extglob_failed_len, extglob_failed_stats, extglob_pending_peak,
-        extglob_scratch_capacities, positive_extglob_scratch_capacities, scratch_capacities,
+        AlternativeFastPath, ExtglobStep, FailedStates, FastPath, Pattern, PatternOptions,
+        Prefilter, Token, WalkerPathViability, extglob_failed_len, extglob_failed_stats,
+        extglob_pending_peak, extglob_scratch_capacities, positive_extglob_scratch_capacities,
+        scratch_capacities,
     };
 
     fn compile(pattern: &str) -> Pattern {
@@ -6949,6 +6950,40 @@ mod tests {
                 .expect("period-enabled group star compiles")
                 .is_match("xvisible/.c")
         );
+    }
+
+    #[test]
+    fn extglob_recursive_prefix_exemption_requires_exactly_two_stars() {
+        let options = PatternOptions::default()
+            .extglob(true)
+            .recursive_double_star(true);
+
+        let recursive = Pattern::compile("**/@(foo)", options).expect("extglob compiles");
+        assert!(matches!(
+            recursive.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("the pattern carries an extglob program")
+                .steps[0],
+            ExtglobStep::Star {
+                next: 2,
+                blocks_leading_period: false
+            }
+        ));
+
+        let ordinary = Pattern::compile("***/@(foo)", options).expect("extglob compiles");
+        assert!(matches!(
+            ordinary.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("the pattern carries an extglob program")
+                .steps[0],
+            ExtglobStep::Star {
+                next: 3,
+                blocks_leading_period: true
+            }
+        ));
+        assert!(!ordinary.is_match(".hidden/foo"));
     }
 
     #[test]
