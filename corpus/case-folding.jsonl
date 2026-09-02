@@ -3,6 +3,8 @@
 {"id":"fold-star-suffix","kind":"matcher","pattern":"*.TXT","path":"notes.txt","flags":["case_insensitive"],"expected":true,"source":"handwritten"}
 {"id":"fold-class-range","kind":"matcher","pattern":"[a-f]oo","path":"Foo","flags":["case_insensitive"],"expected":true,"source":"handwritten","note":"Both ends of a range and the candidate byte are folded."}
 {"id":"fold-posix-class","kind":"matcher","pattern":"[[:lower:]]bc","path":"Abc","flags":["case_insensitive"],"expected":true,"source":"handwritten","note":"A POSIX class also folds, so [[:lower:]] accepts an uppercase byte."}
+{"id":"fold-posix-upper-class","kind":"matcher","pattern":"[[:upper:]]bc","path":"abc","flags":["case_insensitive"],"expected":true,"source":"handwritten","note":"Case folding makes the complementary upper class accept lowercase ASCII letters too."}
+{"id":"fold-posix-upper-negated","kind":"matcher","pattern":"[![:upper:]]","path":"A","flags":["case_insensitive"],"expected":false,"source":"handwritten","note":"Negating the folded upper class still rejects ASCII letters instead of becoming a universal class."}
 {"id":"fold-recursive-double-star","kind":"matcher","pattern":"src/**/*.RS","path":"src/a/b/main.rs","flags":["case_insensitive","recursive_double_star"],"expected":true,"source":"handwritten"}
 {"id":"fold-brace-alternative","kind":"matcher","pattern":"{FOO,BAR}.md","path":"bar.md","flags":["case_insensitive","braces"],"expected":true,"source":"handwritten"}
 {"id":"fold-extglob-alternative","kind":"matcher","pattern":"@(FOO|BAR).md","path":"foo.md","flags":["case_insensitive","extglob"],"expected":true,"source":"handwritten"}
