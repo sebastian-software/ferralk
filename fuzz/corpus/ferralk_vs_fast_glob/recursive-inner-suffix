@@ -1,0 +1,2 @@
+src/**/*.rs*
+src/bin/main.rs

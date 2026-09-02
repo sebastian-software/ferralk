@@ -95,6 +95,9 @@ jobs:
           cargo check --manifest-path fuzz/Cargo.toml
           --bin pattern_parser --bin pattern_matcher --bin ferralk_vs_fast_glob
           --locked
+      # The differential support library owns the executable subset and seed
+      # invariants; keep every checked-in seed on the real comparison path.
+      - run: cargo test --manifest-path fuzz/Cargo.toml --lib --locked
 
   test:
     name: test (${{ matrix.os }})

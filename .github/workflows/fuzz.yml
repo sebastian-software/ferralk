@@ -38,6 +38,18 @@ jobs:
       # cargo-fuzz defaults to the target it was itself built for, and the
       # prebuilt binary is musl, where the sanitizer cannot link against a
       # static libc. Name this runner's host target instead.
-      - run: >-
+      - name: Run ${{ inputs.target }}
+        env:
+          FERRALK_FUZZ_SUBSET_STATS: ${{ runner.temp }}/ferralk-fast-glob-subset.txt
+        run: >-
           cargo fuzz run --target x86_64-unknown-linux-gnu ${{ inputs.target }}
-          -- -max_total_time=${{ inputs.max_total_time }}
+          -- -max_total_time=${{ inputs.max_total_time }} -print_final_stats=1
+      - name: Report differential subset hit rate
+        if: always() && inputs.target == 'ferralk_vs_fast_glob'
+        run: |
+          stats="$RUNNER_TEMP/ferralk-fast-glob-subset.txt"
+          if [[ -f "$stats" ]]; then
+            cat "$stats"
+          else
+            echo 'No differential subset checkpoint was produced.'
+          fi

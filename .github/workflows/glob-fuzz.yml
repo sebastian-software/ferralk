@@ -49,9 +49,22 @@ jobs:
       # quarantine can retain several of those temporary allocations, so keep
       # the RSS limit above that retained peak while bounding any one input's
       # live allocation budget.
-      - run: >-
+      - name: Run ${{ matrix.target }}
+        env:
+          FERRALK_FUZZ_SUBSET_STATS: ${{ runner.temp }}/ferralk-fast-glob-subset.txt
+        run: >-
           cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }}
           -- -max_total_time=$MAX_TOTAL_TIME -rss_limit_mb=4096 -malloc_limit_mb=256
+          -print_final_stats=1
+      - name: Report differential subset hit rate
+        if: always() && matrix.target == 'ferralk_vs_fast_glob'
+        run: |
+          stats="$RUNNER_TEMP/ferralk-fast-glob-subset.txt"
+          if [[ -f "$stats" ]]; then
+            cat "$stats"
+          else
+            echo 'No differential subset checkpoint was produced.'
+          fi
       # A failing run writes its input under fuzz/artifacts; without this
       # upload the reproducer only exists in the log (PR #43 taught us that).
       - name: Upload crash artifacts

@@ -23,6 +23,18 @@ divergence by the shape of the pattern, so a failure is a new finding rather
 than a known difference. The divergences and their exclusions are tabulated in
 [`docs/fast-glob-reference.md`](../docs/fast-glob-reference.md). A disagreement
 is reported as a ready-to-paste `corpus/fast-glob.jsonl` line.
+Filtered or unparseable inputs return libFuzzer's rejected-corpus verdict, so
+they cannot displace comparable inputs in the evolving corpus. The shared
+globstar subset includes bare `**` and complete `**/` components followed by
+an ordinary component-leading `*`, such as `src/**/*.rs`; other positions keep
+the documented structural exclusion.
+
+`cargo test --manifest-path fuzz/Cargo.toml --lib --locked` checks the subset
+boundary and replays every checked-in differential seed through both matchers.
+The automated and manual differential jobs also print a shared-subset hit-rate
+checkpoint after fuzzing. The checkpoint is updated every 4,096 executions, so
+the displayed numerator and denominator omit at most 4,095 final inputs; the
+adjacent libFuzzer final statistics retain its exact execution count.
 
 The glob targets used to skip patterns whose brace expansion was too large,
 because `Pattern::compile` expanded braces eagerly with no budget and about a
