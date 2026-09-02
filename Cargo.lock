@@ -72,7 +72,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bench"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "criterion",
  "fast-glob",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "corpus"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -382,7 +382,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "doc-tests"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "ferralk",
  "ferralk-glob",
@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "ferralk"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "allocation-counter",
  "corpus",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "ferralk-glob"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "memchr",
 ]
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "harness"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "corpus",
  "fast-glob",
@@ -900,7 +900,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "oracle"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "corpus",
  "ferralk-glob",
