@@ -127,7 +127,8 @@ fn corpus_candidate(pattern: &[u8], path: &[u8], ours: bool, reference: bool) ->
         error_message: None,
         platform: None,
         source: Source::FastGlob,
-        disputed: true,
+        adr: None,
+        oracle_defect: false,
         note: Some(
             "Found by the ferralk_vs_fast_glob differential target; review before adopting."
                 .to_owned(),

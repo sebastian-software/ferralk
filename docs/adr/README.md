@@ -19,6 +19,9 @@ Decisions from the end-to-end design review of 2026-08-18 (see
 | [0012](0012-ferroni-repository-blueprint.md) | Ferroni repository blueprint for tooling |
 | [0013](0013-no-glob-to-regex-translation.md) | Dedicated glob matcher — no glob-to-regex translation |
 | [0014](0014-own-gitignore-rule-matching.md) | Own gitignore rule matching over ferralk-glob (engine half of 0006) |
+| [0015](0015-posix-escapes-in-bracket-classes.md) | POSIX escape processing inside bracket classes |
+| [0016](0016-shell-star-runs-before-extglobs.md) | Shell grammar for star runs before extglobs |
+| [0017](0017-caller-owned-list-api-conventions.md) | Caller-owned list API conventions |
 
 Convention: [Nygard-style ADRs](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions),
 numbered sequentially, never rewritten once accepted — superseding decisions

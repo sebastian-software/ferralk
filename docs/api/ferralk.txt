@@ -1,0 +1,270 @@
+pub mod ferralk
+pub use ferralk::ferralk_glob
+pub enum ferralk::ErrorPolicy
+pub ferralk::ErrorPolicy::Abort
+pub ferralk::ErrorPolicy::Collect
+pub ferralk::ErrorPolicy::Skip
+impl core::clone::Clone for ferralk::ErrorPolicy
+pub fn ferralk::ErrorPolicy::clone(&self) -> ferralk::ErrorPolicy
+impl core::cmp::Eq for ferralk::ErrorPolicy
+impl core::cmp::PartialEq for ferralk::ErrorPolicy
+pub fn ferralk::ErrorPolicy::eq(&self, &ferralk::ErrorPolicy) -> bool
+impl core::default::Default for ferralk::ErrorPolicy
+pub fn ferralk::ErrorPolicy::default() -> ferralk::ErrorPolicy
+impl core::fmt::Debug for ferralk::ErrorPolicy
+pub fn ferralk::ErrorPolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for ferralk::ErrorPolicy
+impl core::marker::StructuralPartialEq for ferralk::ErrorPolicy
+impl core::marker::Freeze for ferralk::ErrorPolicy
+impl core::marker::Send for ferralk::ErrorPolicy
+impl core::marker::Sync for ferralk::ErrorPolicy
+impl core::marker::Unpin for ferralk::ErrorPolicy
+impl core::marker::UnsafeUnpin for ferralk::ErrorPolicy
+impl core::panic::unwind_safe::RefUnwindSafe for ferralk::ErrorPolicy
+impl core::panic::unwind_safe::UnwindSafe for ferralk::ErrorPolicy
+#[non_exhaustive] pub enum ferralk::Verdict
+pub ferralk::Verdict::Keep
+pub ferralk::Verdict::Skip
+pub ferralk::Verdict::Stop
+impl core::clone::Clone for ferralk::Verdict
+pub fn ferralk::Verdict::clone(&self) -> ferralk::Verdict
+impl core::cmp::Eq for ferralk::Verdict
+impl core::cmp::PartialEq for ferralk::Verdict
+pub fn ferralk::Verdict::eq(&self, &ferralk::Verdict) -> bool
+impl core::fmt::Debug for ferralk::Verdict
+pub fn ferralk::Verdict::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for ferralk::Verdict
+impl core::marker::StructuralPartialEq for ferralk::Verdict
+impl core::marker::Freeze for ferralk::Verdict
+impl core::marker::Send for ferralk::Verdict
+impl core::marker::Sync for ferralk::Verdict
+impl core::marker::Unpin for ferralk::Verdict
+impl core::marker::UnsafeUnpin for ferralk::Verdict
+impl core::panic::unwind_safe::RefUnwindSafe for ferralk::Verdict
+impl core::panic::unwind_safe::UnwindSafe for ferralk::Verdict
+#[non_exhaustive] pub enum ferralk::WalkEntryKind
+pub ferralk::WalkEntryKind::Directory
+pub ferralk::WalkEntryKind::File
+pub ferralk::WalkEntryKind::Symlink
+impl core::clone::Clone for ferralk::WalkEntryKind
+pub fn ferralk::WalkEntryKind::clone(&self) -> ferralk::WalkEntryKind
+impl core::cmp::Eq for ferralk::WalkEntryKind
+impl core::cmp::PartialEq for ferralk::WalkEntryKind
+pub fn ferralk::WalkEntryKind::eq(&self, &ferralk::WalkEntryKind) -> bool
+impl core::fmt::Debug for ferralk::WalkEntryKind
+pub fn ferralk::WalkEntryKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for ferralk::WalkEntryKind
+impl core::marker::StructuralPartialEq for ferralk::WalkEntryKind
+impl core::marker::Freeze for ferralk::WalkEntryKind
+impl core::marker::Send for ferralk::WalkEntryKind
+impl core::marker::Sync for ferralk::WalkEntryKind
+impl core::marker::Unpin for ferralk::WalkEntryKind
+impl core::marker::UnsafeUnpin for ferralk::WalkEntryKind
+impl core::panic::unwind_safe::RefUnwindSafe for ferralk::WalkEntryKind
+impl core::panic::unwind_safe::UnwindSafe for ferralk::WalkEntryKind
+#[non_exhaustive] pub enum ferralk::WalkOperation
+pub ferralk::WalkOperation::Canonicalize
+pub ferralk::WalkOperation::Metadata
+pub ferralk::WalkOperation::ReadDir
+pub ferralk::WalkOperation::ReadIgnore
+pub ferralk::WalkOperation::SpawnWorker
+pub ferralk::WalkOperation::SymlinkMetadata
+impl ferralk::WalkOperation
+pub const fn ferralk::WalkOperation::as_str(self) -> &'static str
+impl core::clone::Clone for ferralk::WalkOperation
+pub fn ferralk::WalkOperation::clone(&self) -> ferralk::WalkOperation
+impl core::cmp::Eq for ferralk::WalkOperation
+impl core::cmp::Ord for ferralk::WalkOperation
+pub fn ferralk::WalkOperation::cmp(&self, &ferralk::WalkOperation) -> core::cmp::Ordering
+impl core::cmp::PartialEq for ferralk::WalkOperation
+pub fn ferralk::WalkOperation::eq(&self, &ferralk::WalkOperation) -> bool
+impl core::cmp::PartialOrd for ferralk::WalkOperation
+pub fn ferralk::WalkOperation::partial_cmp(&self, &ferralk::WalkOperation) -> core::option::Option<core::cmp::Ordering>
+impl core::fmt::Debug for ferralk::WalkOperation
+pub fn ferralk::WalkOperation::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for ferralk::WalkOperation
+pub fn ferralk::WalkOperation::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for ferralk::WalkOperation
+pub fn ferralk::WalkOperation::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for ferralk::WalkOperation
+impl core::marker::StructuralPartialEq for ferralk::WalkOperation
+impl core::marker::Freeze for ferralk::WalkOperation
+impl core::marker::Send for ferralk::WalkOperation
+impl core::marker::Sync for ferralk::WalkOperation
+impl core::marker::Unpin for ferralk::WalkOperation
+impl core::marker::UnsafeUnpin for ferralk::WalkOperation
+impl core::panic::unwind_safe::RefUnwindSafe for ferralk::WalkOperation
+impl core::panic::unwind_safe::UnwindSafe for ferralk::WalkOperation
+#[non_exhaustive] pub enum ferralk::WildcardMode
+pub ferralk::WildcardMode::ComponentScoped
+pub ferralk::WildcardMode::SeparatorCrossing
+impl core::clone::Clone for ferralk::WildcardMode
+pub fn ferralk::WildcardMode::clone(&self) -> ferralk::WildcardMode
+impl core::cmp::Eq for ferralk::WildcardMode
+impl core::cmp::PartialEq for ferralk::WildcardMode
+pub fn ferralk::WildcardMode::eq(&self, &ferralk::WildcardMode) -> bool
+impl core::default::Default for ferralk::WildcardMode
+pub fn ferralk::WildcardMode::default() -> ferralk::WildcardMode
+impl core::fmt::Debug for ferralk::WildcardMode
+pub fn ferralk::WildcardMode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for ferralk::WildcardMode
+impl core::marker::StructuralPartialEq for ferralk::WildcardMode
+impl core::marker::Freeze for ferralk::WildcardMode
+impl core::marker::Send for ferralk::WildcardMode
+impl core::marker::Sync for ferralk::WildcardMode
+impl core::marker::Unpin for ferralk::WildcardMode
+impl core::marker::UnsafeUnpin for ferralk::WildcardMode
+impl core::panic::unwind_safe::RefUnwindSafe for ferralk::WildcardMode
+impl core::panic::unwind_safe::UnwindSafe for ferralk::WildcardMode
+pub struct ferralk::CancellationToken
+impl ferralk::CancellationToken
+pub fn ferralk::CancellationToken::cancel(&self)
+pub fn ferralk::CancellationToken::is_cancelled(&self) -> bool
+impl core::clone::Clone for ferralk::CancellationToken
+pub fn ferralk::CancellationToken::clone(&self) -> ferralk::CancellationToken
+impl core::default::Default for ferralk::CancellationToken
+pub fn ferralk::CancellationToken::default() -> ferralk::CancellationToken
+impl core::fmt::Debug for ferralk::CancellationToken
+pub fn ferralk::CancellationToken::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferralk::CancellationToken
+impl core::marker::Send for ferralk::CancellationToken
+impl core::marker::Sync for ferralk::CancellationToken
+impl core::marker::Unpin for ferralk::CancellationToken
+impl core::marker::UnsafeUnpin for ferralk::CancellationToken
+impl core::panic::unwind_safe::RefUnwindSafe for ferralk::CancellationToken
+impl core::panic::unwind_safe::UnwindSafe for ferralk::CancellationToken
+pub struct ferralk::WalkEntry
+impl ferralk::WalkEntry
+pub fn ferralk::WalkEntry::basename(&self) -> core::option::Option<&std::ffi::os_str::OsStr>
+pub const fn ferralk::WalkEntry::depth(&self) -> usize
+pub const fn ferralk::WalkEntry::is_dir(&self) -> bool
+pub const fn ferralk::WalkEntry::is_symlink(&self) -> bool
+pub const fn ferralk::WalkEntry::kind(&self) -> ferralk::WalkEntryKind
+pub fn ferralk::WalkEntry::metadata(&self) -> core::option::Option<&std::fs::Metadata>
+pub fn ferralk::WalkEntry::path(&self) -> &std::path::Path
+pub fn ferralk::WalkEntry::path_bytes(&self) -> &[u8]
+pub fn ferralk::WalkEntry::root(&self) -> &std::path::Path
+impl core::clone::Clone for ferralk::WalkEntry
+pub fn ferralk::WalkEntry::clone(&self) -> ferralk::WalkEntry
+impl core::fmt::Debug for ferralk::WalkEntry
+pub fn ferralk::WalkEntry::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferralk::WalkEntry
+impl core::marker::Send for ferralk::WalkEntry
+impl core::marker::Sync for ferralk::WalkEntry
+impl core::marker::Unpin for ferralk::WalkEntry
+impl core::marker::UnsafeUnpin for ferralk::WalkEntry
+impl core::panic::unwind_safe::RefUnwindSafe for ferralk::WalkEntry
+impl core::panic::unwind_safe::UnwindSafe for ferralk::WalkEntry
+pub struct ferralk::WalkError
+impl ferralk::WalkError
+pub const fn ferralk::WalkError::operation(&self) -> ferralk::WalkOperation
+pub fn ferralk::WalkError::path(&self) -> &std::path::Path
+impl core::error::Error for ferralk::WalkError
+pub fn ferralk::WalkError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for ferralk::WalkError
+pub fn ferralk::WalkError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for ferralk::WalkError
+pub fn ferralk::WalkError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferralk::WalkError
+impl core::marker::Send for ferralk::WalkError
+impl core::marker::Sync for ferralk::WalkError
+impl core::marker::Unpin for ferralk::WalkError
+impl core::marker::UnsafeUnpin for ferralk::WalkError
+impl !core::panic::unwind_safe::RefUnwindSafe for ferralk::WalkError
+impl !core::panic::unwind_safe::UnwindSafe for ferralk::WalkError
+pub struct ferralk::WalkOptions
+impl ferralk::WalkOptions
+pub const fn ferralk::WalkOptions::directories_only(self, bool) -> Self
+pub const fn ferralk::WalkOptions::files_only(self, bool) -> Self
+pub const fn ferralk::WalkOptions::follow_symlinks(self, bool) -> Self
+pub const fn ferralk::WalkOptions::keep_git_dir(self, bool) -> Self
+pub const fn ferralk::WalkOptions::max_depth(self, usize) -> Self
+pub const fn ferralk::WalkOptions::metadata(self, bool) -> Self
+pub const fn ferralk::WalkOptions::resolve_symlink_kind(self, bool) -> Self
+pub const fn ferralk::WalkOptions::skip_hidden(self, bool) -> Self
+pub const fn ferralk::WalkOptions::sort(self, bool) -> Self
+impl core::clone::Clone for ferralk::WalkOptions
+pub fn ferralk::WalkOptions::clone(&self) -> ferralk::WalkOptions
+impl core::cmp::Eq for ferralk::WalkOptions
+impl core::cmp::PartialEq for ferralk::WalkOptions
+pub fn ferralk::WalkOptions::eq(&self, &ferralk::WalkOptions) -> bool
+impl core::default::Default for ferralk::WalkOptions
+pub fn ferralk::WalkOptions::default() -> ferralk::WalkOptions
+impl core::fmt::Debug for ferralk::WalkOptions
+pub fn ferralk::WalkOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for ferralk::WalkOptions
+impl core::marker::StructuralPartialEq for ferralk::WalkOptions
+impl core::marker::Freeze for ferralk::WalkOptions
+impl core::marker::Send for ferralk::WalkOptions
+impl core::marker::Sync for ferralk::WalkOptions
+impl core::marker::Unpin for ferralk::WalkOptions
+impl core::marker::UnsafeUnpin for ferralk::WalkOptions
+impl core::panic::unwind_safe::RefUnwindSafe for ferralk::WalkOptions
+impl core::panic::unwind_safe::UnwindSafe for ferralk::WalkOptions
+pub struct ferralk::WalkResult
+impl ferralk::WalkResult
+pub fn ferralk::WalkResult::entries(&self) -> &[ferralk::WalkEntry]
+pub fn ferralk::WalkResult::errors(&self) -> &[ferralk::WalkError]
+pub fn ferralk::WalkResult::into_parts(self) -> (alloc::vec::Vec<ferralk::WalkEntry>, alloc::vec::Vec<ferralk::WalkError>)
+pub const fn ferralk::WalkResult::was_cancelled(&self) -> bool
+impl core::fmt::Debug for ferralk::WalkResult
+pub fn ferralk::WalkResult::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferralk::WalkResult
+impl core::marker::Send for ferralk::WalkResult
+impl core::marker::Sync for ferralk::WalkResult
+impl core::marker::Unpin for ferralk::WalkResult
+impl core::marker::UnsafeUnpin for ferralk::WalkResult
+impl !core::panic::unwind_safe::RefUnwindSafe for ferralk::WalkResult
+impl !core::panic::unwind_safe::UnwindSafe for ferralk::WalkResult
+pub struct ferralk::WalkStream
+impl ferralk::WalkStream
+pub const fn ferralk::WalkStream::was_cancelled(&self) -> bool
+impl core::fmt::Debug for ferralk::WalkStream
+pub fn ferralk::WalkStream::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::iter::traits::iterator::Iterator for ferralk::WalkStream
+pub type ferralk::WalkStream::Item = core::result::Result<ferralk::WalkEntry, ferralk::WalkError>
+pub fn ferralk::WalkStream::next(&mut self) -> core::option::Option<Self::Item>
+impl core::marker::Freeze for ferralk::WalkStream
+impl core::marker::Send for ferralk::WalkStream
+impl core::marker::Sync for ferralk::WalkStream
+impl core::marker::Unpin for ferralk::WalkStream
+impl core::marker::UnsafeUnpin for ferralk::WalkStream
+impl core::panic::unwind_safe::RefUnwindSafe for ferralk::WalkStream
+impl core::panic::unwind_safe::UnwindSafe for ferralk::WalkStream
+pub struct ferralk::Walker
+impl ferralk::Walker
+pub fn ferralk::Walker::add_root(self, impl core::convert::Into<std::path::PathBuf>) -> core::result::Result<Self, ferralk_glob::PatternError>
+pub fn ferralk::Walker::add_roots<P: core::convert::Into<std::path::PathBuf>>(self, impl core::iter::traits::collect::IntoIterator<Item = P>) -> core::result::Result<Self, ferralk_glob::PatternError>
+pub fn ferralk::Walker::cancellation(self, ferralk::CancellationToken) -> Self
+pub const fn ferralk::Walker::clear_git_ignore_case(self) -> Self
+pub const fn ferralk::Walker::clear_git_precompose_unicode(self) -> Self
+pub fn ferralk::Walker::collect(self) -> core::result::Result<ferralk::WalkResult, ferralk::WalkError>
+pub const fn ferralk::Walker::error_policy(self, ferralk::ErrorPolicy) -> Self
+pub fn ferralk::Walker::exclude(self, impl core::convert::AsRef<[u8]>) -> core::result::Result<Self, ferralk_glob::PatternError>
+pub const fn ferralk::Walker::git_ignore_case(self, bool) -> Self
+pub const fn ferralk::Walker::git_precompose_unicode(self, bool) -> Self
+pub fn ferralk::Walker::include(self, impl core::convert::AsRef<[u8]>) -> core::result::Result<Self, ferralk_glob::PatternError>
+pub fn ferralk::Walker::match_hidden(self, bool) -> Self
+pub fn ferralk::Walker::new(impl core::convert::Into<std::path::PathBuf>) -> Self
+pub const fn ferralk::Walker::options(self, ferralk::WalkOptions) -> Self
+pub const fn ferralk::Walker::respect_git_ignore(self, bool) -> Self
+pub fn ferralk::Walker::roots(&self) -> impl core::iter::traits::exact_size::ExactSizeIterator<Item = &std::path::Path>
+pub fn ferralk::Walker::stream(self) -> ferralk::WalkStream
+pub const fn ferralk::Walker::threads(self, usize) -> Self
+pub fn ferralk::Walker::try_add_root(&mut self, impl core::convert::Into<std::path::PathBuf>) -> core::result::Result<&mut Self, ferralk_glob::PatternError>
+pub fn ferralk::Walker::try_exclude(&mut self, impl core::convert::AsRef<[u8]>) -> core::result::Result<&mut Self, ferralk_glob::PatternError>
+pub fn ferralk::Walker::try_include(&mut self, impl core::convert::AsRef<[u8]>) -> core::result::Result<&mut Self, ferralk_glob::PatternError>
+pub fn ferralk::Walker::visit<V>(self, V) -> core::result::Result<ferralk::WalkResult, ferralk::WalkError> where V: core::ops::function::Fn(&ferralk::WalkEntry) -> ferralk::Verdict + core::marker::Sync
+pub const fn ferralk::Walker::wildcard_mode(self, ferralk::WildcardMode) -> Self
+impl core::clone::Clone for ferralk::Walker
+pub fn ferralk::Walker::clone(&self) -> ferralk::Walker
+impl core::fmt::Debug for ferralk::Walker
+pub fn ferralk::Walker::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferralk::Walker
+impl core::marker::Send for ferralk::Walker
+impl core::marker::Sync for ferralk::Walker
+impl core::marker::Unpin for ferralk::Walker
+impl core::marker::UnsafeUnpin for ferralk::Walker
+impl core::panic::unwind_safe::RefUnwindSafe for ferralk::Walker
+impl core::panic::unwind_safe::UnwindSafe for ferralk::Walker
+pub const ferralk::VERSION: &str

@@ -84,8 +84,20 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-public-api@0.52.0
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --exclude oracle --all-targets --locked -- -D warnings
+      - name: Install nightly rustdoc toolchain
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+      - name: Check the reviewed public API snapshots
+        shell: bash
+        run: |
+          cargo public-api -p ferralk --simplified --color never > "$RUNNER_TEMP/ferralk.txt"
+          cargo public-api -p ferralk-glob --simplified --color never > "$RUNNER_TEMP/ferralk-glob.txt"
+          diff --unified docs/api/ferralk.txt "$RUNNER_TEMP/ferralk.txt"
+          diff --unified docs/api/ferralk-glob.txt "$RUNNER_TEMP/ferralk-glob.txt"
       # The fuzz crate is a separate workspace, so `--workspace` never sees
       # it; a corpus::Case schema change once broke its hand-built struct
       # literal invisibly. Check the three platform-neutral glob bins here —
@@ -146,6 +158,22 @@ jobs:
           FERRALK_REQUIRE_GIT_ORACLE: "1"
         run: |
           test "$(git --version)" = "git version $GIT_ORACLE_VERSION"
+          cargo test -p harness --test git_check_ignore --locked -- --show-output
+
+  git-oracle-windows:
+    name: Git ignore and root-spelling oracle (Windows)
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Replay ignore corpus and root spellings with Git for Windows
+        shell: pwsh
+        env:
+          FERRALK_REQUIRE_GIT_ORACLE: "1"
+        run: |
+          git --version
           cargo test -p harness --test git_check_ignore --locked -- --show-output
 
   macos-native:
@@ -264,11 +292,36 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - name: Check published crate APIs against the PR base
+      - name: Detect the checked-in contract baseline
+        id: contract-baseline
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        shell: bash
+        run: |
+          if git cat-file -e "$BASE_SHA:docs/api/ferralk.txt" && \
+             git cat-file -e "$BASE_SHA:docs/api/ferralk-glob.txt"; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'exists=false' >> "$GITHUB_OUTPUT"
+          fi
+      # The PR that first checks in the reviewed 1.0 API snapshots is the
+      # one-time pre-1.0 breaking baseline reset. Once those files exist on
+      # main, every later PR takes the ordinary compatibility path below.
+      - name: Establish the reviewed pre-1.0 API baseline
+        if: steps.contract-baseline.outputs.exists == 'false'
         uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
         with:
           package: ferralk-glob,ferralk
           baseline-rev: ${{ github.event.pull_request.base.sha }}
+          feature-group: default-features
+          release-type: major
+      - name: Check published crate APIs against the PR base
+        if: steps.contract-baseline.outputs.exists == 'true'
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
+        with:
+          package: ferralk-glob,ferralk
+          baseline-rev: ${{ github.event.pull_request.base.sha }}
+          feature-group: default-features
 
   security-audit:
     name: dependency and unsafe audit

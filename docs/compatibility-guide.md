@@ -41,6 +41,11 @@ assert!(pattern.is_match("src/lib.rs"));
 Ferralk accepts raw bytes (`AsRef<[u8]>`) for patterns and candidate paths, so
 callers do not need lossy UTF-8 conversion.
 
+Extglob groups use the same root and component rule as the selected entry
+point; enabling extglob never changes which ordinary wildcard positions may
+cross a separator. With recursive double stars enabled, `**/@(x)` matches at
+depth zero (`x`) as well as below a directory (`a/x`).
+
 ## Walking
 
 `Walker` replaces zlob's output-buffer-oriented traversal with owned entries,
@@ -329,6 +334,22 @@ The mode governs excludes as well as includes, so a walk reads every pattern the
 same way. It is a matching policy, independent of `match_hidden` and of
 `WalkOptions::skip_hidden`.
 
+## Windows verification
+
+Windows is a tier-2 target for the portable backend. CI replays the complete
+Git-ignore corpus with Git for Windows and compares the walker with `git
+ls-files --others --exclude-standard` for 21 root spellings from three working
+directories. Those spellings include `.`, `./`, trailing and repeated
+separators, nested roots, and lexical `.`/`..` components. The same
+differential runs on Linux and macOS; symlink spellings remain Unix-only.
+
+The currently unverified Windows filesystem shapes are junction-based
+repository discovery, drive-relative paths such as `C:src`, and repositories
+whose result depends on a case-insensitive filesystem rather than Git's
+explicit `core.ignoreCase` setting. Pattern matching itself remains byte-first
+and covered by the cross-platform corpus. See the
+[stability contract](stability.md#windows-evidence-and-limits).
+
 ## Deliberate differences
 
 - Ferralk has no C ABI and no zlob-Rust migration facade. It exposes the two
@@ -374,15 +395,26 @@ same way. It is a matching policy, independent of `match_hidden` and of
   `fnmatch`: an escaped `-` is a literal member and never a range operator
   (`[a\-z]` is exactly `{a, -, z}`). zlob 1.6.3 performs no escape processing
   inside classes and reads the backslash as an ordinary range endpoint. The
-  diverging verdicts are recorded as `disputed` corpus cases with
-  `oracle_expected` (`class-006/008/009/012/016/024/025`, issue #16).
+  deliberate divergence is adopted by ADR-0015 and recorded with the
+  `adr: "0015"` marker beside the external verdict
+  (`class-006/008/009/012/016/024/025/047/048`).
 - A star run immediately before a `*(` extglob follows bash and ksh grammar:
   the final star opens the zero-or-more group, while any earlier stars remain
   an ordinary wildcard. Thus `**(a)` is `*` followed by `*(a)`, and matches
   `x`; zlob 1.6.3 greedily collapses both stars before checking for a group and
   reads the suffix as literal `(a)`. The shell-compatible reading is recorded
-  as disputed corpus cases with zlob verdicts in
+  with ADR-0016 provenance beside the zlob verdicts in
   `extsuite-*star-run-before-zero-or-more` (issue #305).
+- Ferralk list APIs preserve caller order, normalize one leading `./` on the
+  pattern and candidates, and never synthesize a `NOCHECK` result that the
+  caller did not supply. ADR-0017 records these Rust API conventions.
+- Four zlob verdicts contradict its own frozen tests: the public matcher's two
+  escape results and the list matcher's two leading repeating-extglob results.
+  Nine fast-glob differences reflect defects or documented limits in that
+  secondary oracle. These records carry `oracle_defect: true`; the exact IDs
+  and rationale are listed in the
+  [corpus format](corpus-format.md#evidence-and-disputes), so none represents
+  unsettled Ferralk policy.
 - Brace expansion is budgeted. A pattern that would expand to more than 4096
   alternatives is rejected with `too many brace alternatives` at the offset of
   the brace group that starts the expansion. Brace groups multiply, so ten
@@ -413,6 +445,35 @@ same way. It is a matching policy, independent of `match_hidden` and of
   `pattern compiles to too much`. The dimension is reachable with and without
   extglob syntax, and the boundary is recorded as `error-compiled-ir-*` corpus
   cases (issue #74).
+
+## Contract-change audit since 0.9.0
+
+This table maps every consumer-visible `!` change from 0.9.0 through the final
+0.x contract work to the documentation that states the resulting behaviour.
+It is an audit of the current contract, not a second changelog.
+
+| Release / change | Resulting documented behaviour |
+| --- | --- |
+| 0.9.0: matcher and walker resource limits | Compile budgets are described under [deliberate differences](#deliberate-differences); ignore-file and thread limits are in the [usage guide](usage.md#walk-filesystems-with-explicit-policy). |
+| 0.9.3: traverse every acyclic symlink alias | Each supplied or discovered acyclic alias remains independently traversable; see [several roots](#several-roots-in-one-walk) and the usage guide's symlink policy. |
+| 0.9.3: includes below excluded directories | An exclude prunes only when no include can re-admit a descendant; see [walker defaults](usage.md#walk-filesystems-with-explicit-policy). |
+| 0.10.0: Git slash wildmatch rules | Escaped separators, attached star runs, and bracket ranges follow the normative Git oracle; see [Git filesystem adaptations](#git-filesystem-adaptations). |
+| 0.10.0: Linux native `PATH_MAX` boundary | Native and portable paths share the portable length boundary; native implementation details remain [experimental](usage.md#platform-support). |
+| 0.10.0: ignore inheritance for relative roots | `.`, `./`, and relative subtree roots discover and inherit repository rules; see [Git filesystem adaptations](#git-filesystem-adaptations). |
+| 0.11.0: extglob star-run grammar | The final star before `*(` opens the group, per [ADR-0016](adr/0016-shell-star-runs-before-extglobs.md) and [deliberate differences](#deliberate-differences). |
+| 0.11.0: path entry-point alignment | Path entry points normalize one leading `./`; disabled recursive `**` is an ordinary star run. The [matcher table](#matcher) and [usage guide](usage.md#match-paths-deliberately) define the position rule. |
+| 0.11.0: strict leading-period stars | Without `match_hidden`, an ordinary star cannot stop before a component-leading period; see [deliberate differences](#deliberate-differences). |
+| 0.11.0: excluded followed-link failures | A terminal excluded followed link keeps the path-exclusion shortcut rather than producing metadata work; see the usage guide's symlink policy. |
+| 0.11.0: normalized ignore roots | Trailing separators and parent-relative spellings resolve to the same repository while caller-visible entry spelling is preserved; see [Git filesystem adaptations](#git-filesystem-adaptations). |
+| 0.11.0: caller-source error offsets | `PatternError::offset()` identifies original pattern bytes after brace expansion or absolute-root rewriting; see [absolute patterns](#absolute-patterns-and-the-caller-side-rewrite-they-replace). |
+| 0.11.0: case-insensitive POSIX upper class | `upper` and `lower` fold symmetrically under `case_insensitive`; see [deliberate differences](#deliberate-differences). |
+| 0.11.0: Git 2.52 ignore behaviour | Attached star runs, escaped separators, and reversed ranges follow the pinned Git oracle; see [Git filesystem adaptations](#git-filesystem-adaptations). |
+| Final 0.x: resumed native listing failures | A native serial listing that cannot be reopened or changed identity reports typed `ReadDir` through `ErrorPolicy`; see the usage guide's error policy and [platform support](usage.md#platform-support). |
+| Final 0.x: refused helper thread | `Collect`/`Skip` finish on existing workers; `Collect` records `SpawnWorker`, while `Abort` fails. See the usage guide's parallel-walk notes. |
+| Final 0.x: physical repository for symlink roots | Every spelling of a symlinked root is attributed to the repository physically containing the target; see [Git filesystem adaptations](#git-filesystem-adaptations). |
+| Final 0.x: extglob escape reading | An extglob escape has only its escaped-byte reading, matching Bash and zlob; see the [matcher entry-point contract](#matcher). |
+| Final 0.x: Git bracket classes at slash endpoints | Slash endpoints preserve Git's range state and verdict; see [Git filesystem adaptations](#git-filesystem-adaptations). |
+| Final 0.x: settle the 1.0 contract | `WalkError::operation()` is typed; the extensible enums require fallback match arms; compiled `Pattern` values have no representation equality; and extglobs obey the same entry-point rules as plain patterns, including depth-zero `**/@(x)`. See the [stability contract](stability.md#public-enum-policy), [usage guide](usage.md#match-paths-deliberately), and [matcher table](#matcher). |
 
 ## Defaults to review
 

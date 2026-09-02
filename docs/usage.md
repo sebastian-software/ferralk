@@ -23,6 +23,10 @@ those bytes literally. With `recursive_double_star` disabled a consecutive `**`
 is two ordinary stars: through `is_match` and `is_match_glob_path` that equals
 `*`, while through `is_match_path` the second star stands behind the first
 rather than behind the separator and follows the rule above.
+Extglob groups do not introduce a fourth policy: their outer wildcards and
+their alternatives use the same root and component rule selected by the entry
+point. A recursive `**/` prefix may consume zero directories before a group,
+so `**/@(x)` matches both `x` and `a/x` when both options are enabled.
 
 ```rust
 use ferralk_glob::{Pattern, PatternOptions};
@@ -257,6 +261,11 @@ Important defaults:
 - `stream()` yields entries and recoverable errors incrementally. It is
   single-threaded and cannot provide global sorting.
 
+Recoverable failures expose a typed `WalkOperation`; match it with a fallback
+arm because the enum is non-exhaustive. `as_str()` provides the stable
+machine-readable operation name. Human-readable `WalkError` and underlying
+I/O error messages are diagnostic text, not a programmatic interface.
+
 `CancellationToken::cancel` requests a cooperative stop. It is safe to clone the
 token and keep it outside the walker; walkers only observe it, so their own
 abort errors, worker-start failures, visitor stops, and panics do not cancel a
@@ -380,9 +389,12 @@ ferralk = { version = "0.11.0", features = ["native-linux"] } # x-release-please
 ```
 
 `native-linux` applies only on Linux and `native-macos` only on macOS; other
-platforms retain the portable backend. These backends are not a stability or
-performance promise while Ferralk remains pre-1.0. See ADR-0010 for the
-rollout policy. `native-macos` links Darwin's private `__getdirentries64`
+platforms retain the portable backend. The feature names and everything they
+select are experimental and explicitly outside the 1.x semver contract: they
+may be renamed or removed in a minor release. See the
+[stability contract](stability.md) and ADR-0010 for the rollout policy. The
+default portable backend remains the stable target. `native-macos` links
+Darwin's private `__getdirentries64`
 stub: it is what libc's `readdir` uses today, but it is not an Apple public API
 and can be rejected by App Store private-symbol checks. App-Store-distributed
 applications should keep the default portable backend. If a filesystem or a

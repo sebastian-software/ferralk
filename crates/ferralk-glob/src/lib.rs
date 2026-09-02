@@ -30,7 +30,7 @@ mod sweep;
 use sweep::{SweepEngine, SweepState};
 
 /// A compiled glob pattern.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Pattern {
     alternatives: Vec<CompiledAlternative>,
     alternative_fast_path: Option<Box<AlternativeFastPath>>,
@@ -52,6 +52,9 @@ pub struct PatternOptions {
     escape: bool,
     component_wildcards: bool,
     root_component_wildcards: bool,
+    /// Whether the first wildcard of a compiled subpattern occupies a
+    /// component-local position in its enclosing pattern.
+    candidate_root_component_wildcard: bool,
     /// Whether byte zero of this candidate starts a path component.
     ///
     /// Extglob alternatives borrow a range from their enclosing candidate.
@@ -71,6 +74,7 @@ impl Default for PatternOptions {
             escape: true,
             component_wildcards: false,
             root_component_wildcards: false,
+            candidate_root_component_wildcard: false,
             candidate_starts_component: true,
         }
     }
@@ -150,7 +154,10 @@ impl PatternError {
         self.offset
     }
 
-    /// Stable description of the invalid construct.
+    /// Description of the invalid construct.
+    ///
+    /// This text is intended for diagnostics and is not a stable interface;
+    /// use [`Self::offset`] for programmatic handling.
     pub const fn message(&self) -> &'static str {
         self.message
     }
@@ -171,6 +178,7 @@ impl Error for PatternError {}
 /// rather than by parsing the source expression again.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WalkerPathViability {
     /// At least one compiled arm avoids root-only and `.` components, and no
     /// brace-expanded arm contains a literal `..` component.
@@ -498,6 +506,7 @@ impl Pattern {
     /// stripped so the sweep engine answers, and with the sweep stripped too
     /// so the memoized matcher answers.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "unstable-test-hooks"))]
     #[must_use]
     pub fn engines_agree(&self, path: impl AsRef<[u8]>) -> bool {
         let path = path.as_ref();
@@ -521,6 +530,7 @@ impl Pattern {
     /// `prefilters` neutralises the fixed-ends prefilter as well, which turns
     /// the stripped pattern into the bare memoized engine — the oracle the
     /// prefilter and the sweep are both held against.
+    #[cfg(any(test, feature = "unstable-test-hooks"))]
     fn strip_engines(&mut self, fast_paths: bool, sweeps: bool, prefilters: bool) {
         if fast_paths {
             self.alternative_fast_path = None;
@@ -951,6 +961,7 @@ impl Pattern {
     fn component_wildcard(tokens: &[Token], token_index: usize, options: PatternOptions) -> bool {
         options.component_wildcards
             && (options.root_component_wildcards
+                || token_index == 0 && options.candidate_root_component_wildcard
                 || token_index > 0 && matches!(tokens[token_index - 1], Token::Separator))
     }
 
@@ -1586,6 +1597,7 @@ impl CompiledAlternative {
 
     /// Removes accelerated engines, descending into extglob alternatives so a
     /// differential run pins one engine for the sub-matches too.
+    #[cfg(any(test, feature = "unstable-test-hooks"))]
     fn strip_engines(&mut self, fast_paths: bool, sweeps: bool, prefilters: bool) {
         if fast_paths {
             self.fast_path = None;
@@ -4320,7 +4332,8 @@ struct CompiledExtglob {
     /// explicit worklist below.
     positive_nfa: Option<PositiveExtglobNfa>,
     /// Dense memo state for every interpreter offset that participates in the
-    /// recurrence: the entry point plus each group start and continuation.
+    /// recurrence: the entry point, each group start and continuation, plus
+    /// the zero-directory continuation after a recursive `**/` prefix.
     /// The byte-indexed step table remains the interpreter's address space.
     memo_state_indices: Vec<usize>,
     memo_state_count: usize,
@@ -4396,13 +4409,15 @@ enum PositiveExtglobMatcher {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WildcardScope {
-    /// The outer extglob interpreter keeps ordinary wildcards component-local
-    /// whenever component matching is enabled.
-    Extglob,
-    /// Every byte of a group alternative is constrained to the current
-    /// component when component matching is enabled, including literal
-    /// separators and recursively spelled stars.
-    Group,
+    /// An outer-program wildcard and whether its source position follows an
+    /// explicit separator.
+    Extglob(bool),
+    /// A group-alternative wildcard and whether its source position is the
+    /// component-local root of that alternative or follows its own separator.
+    Group(bool),
+    /// An explicit recursive wildcard, which crosses separators under every
+    /// entry point.
+    Recursive,
 }
 
 struct PositiveExtglobBuilder<'budget> {
@@ -4478,6 +4493,9 @@ struct ExtglobGroup {
     start: usize,
     /// Offset just past the closing parenthesis.
     rest: usize,
+    /// Whether the group operator follows an explicit separator in the outer
+    /// program. Its alternatives inherit that position at their root.
+    component_local: bool,
 }
 
 impl PositiveExtglobNfa {
@@ -4513,11 +4531,16 @@ impl PositiveExtglobNfa {
                     ExtglobStep::Byte(byte) => builder
                         .consume(PositiveExtglobMatcher::Literal(*byte), suffixes[index + 1])?,
                     ExtglobStep::Any => builder.consume(
-                        PositiveExtglobMatcher::Wildcard(WildcardScope::Extglob),
+                        PositiveExtglobMatcher::Wildcard(WildcardScope::Extglob(
+                            extglob_step_component_local(steps, index),
+                        )),
                         suffixes[index + 1],
                     )?,
                     ExtglobStep::Class { class, next } => builder.consume(
-                        PositiveExtglobMatcher::Class(class.clone(), WildcardScope::Extglob),
+                        PositiveExtglobMatcher::Class(
+                            class.clone(),
+                            WildcardScope::Extglob(extglob_step_component_local(steps, index)),
+                        ),
                         suffixes[*next],
                     )?,
                     ExtglobStep::Star { .. } => {
@@ -4535,7 +4558,9 @@ impl PositiveExtglobNfa {
                         unreachable!("unclosed outer stars keep the compatible interpreter")
                     }
                     ExtglobStep::UnclosedGroup { byte: b'?' } => builder.consume(
-                        PositiveExtglobMatcher::Wildcard(WildcardScope::Extglob),
+                        PositiveExtglobMatcher::Wildcard(WildcardScope::Extglob(
+                            extglob_step_component_local(steps, index),
+                        )),
                         suffixes[index + 1],
                     )?,
                     ExtglobStep::UnclosedGroup { byte } => builder
@@ -4702,11 +4727,8 @@ impl PositiveExtglobMatcher {
     fn matches(&self, byte: u8, at_component_start: bool, options: PatternOptions) -> bool {
         match self {
             Self::Literal(expected) => bytes_equal(*expected, byte, options.case_insensitive),
-            Self::GroupLiteral(expected) => {
-                (!options.component_wildcards || !is_separator(byte))
-                    && bytes_equal(*expected, byte, options.case_insensitive)
-            }
-            Self::GroupSeparator => !options.component_wildcards && is_separator(byte),
+            Self::GroupLiteral(expected) => bytes_equal(*expected, byte, options.case_insensitive),
+            Self::GroupSeparator => is_separator(byte),
             Self::Wildcard(scope) => scope.accepts(byte, at_component_start, options),
             Self::Class(class, scope) => {
                 scope.accepts(byte, at_component_start, options)
@@ -4718,12 +4740,28 @@ impl PositiveExtglobMatcher {
 
 impl WildcardScope {
     fn accepts(self, byte: u8, at_component_start: bool, options: PatternOptions) -> bool {
-        let crosses_separator = match self {
-            Self::Extglob | Self::Group => !options.component_wildcards,
+        let component_local = match self {
+            Self::Extglob(position_local) | Self::Group(position_local) => {
+                options.component_wildcards && (options.root_component_wildcards || position_local)
+            }
+            Self::Recursive => false,
         };
-        (!is_separator(byte) || crosses_separator)
+        (!is_separator(byte) || !component_local)
             && (options.match_hidden || byte != b'.' || !at_component_start)
     }
+}
+
+fn token_position_component_local(
+    tokens: &[Token],
+    token_index: usize,
+    root_component_local: bool,
+) -> bool {
+    token_index == 0 && root_component_local
+        || token_index > 0 && matches!(tokens[token_index - 1], Token::Separator)
+}
+
+fn extglob_step_component_local(steps: &[ExtglobStep], step_index: usize) -> bool {
+    step_index > 0 && matches!(steps[step_index - 1], ExtglobStep::Byte(byte) if is_separator(byte))
 }
 
 impl PositiveExtglobBuilder<'_> {
@@ -4847,7 +4885,9 @@ impl PositiveExtglobBuilder<'_> {
         let mut starts = Vec::new();
         for alternative in &group.alternatives {
             for alternative in &alternative.compiled {
-                if let Some(start) = self.tokens(&alternative.tokens, next)? {
+                if let Some(start) =
+                    self.tokens(&alternative.tokens, next, group.component_local)?
+                {
                     starts.push(start);
                 }
             }
@@ -4855,7 +4895,12 @@ impl PositiveExtglobBuilder<'_> {
         Ok(starts)
     }
 
-    fn tokens(&mut self, tokens: &[Token], next: usize) -> Result<Option<usize>, PatternError> {
+    fn tokens(
+        &mut self,
+        tokens: &[Token],
+        next: usize,
+        root_component_local: bool,
+    ) -> Result<Option<usize>, PatternError> {
         let mut start = Some(next);
         for (token_index, token) in tokens.iter().enumerate().rev() {
             start = match token {
@@ -4869,25 +4914,36 @@ impl PositiveExtglobBuilder<'_> {
                 }
                 Token::Separator => self.consume(PositiveExtglobMatcher::GroupSeparator, start)?,
                 Token::Any => self.consume(
-                    PositiveExtglobMatcher::Wildcard(WildcardScope::Group),
+                    PositiveExtglobMatcher::Wildcard(WildcardScope::Group(
+                        token_position_component_local(tokens, token_index, root_component_local),
+                    )),
                     start,
                 )?,
                 Token::Class(class) => self.consume(
-                    PositiveExtglobMatcher::Class(class.clone(), WildcardScope::Group),
+                    PositiveExtglobMatcher::Class(
+                        class.clone(),
+                        WildcardScope::Group(token_position_component_local(
+                            tokens,
+                            token_index,
+                            root_component_local,
+                        )),
+                    ),
                     start,
                 )?,
                 Token::Star => self.star(
-                    PositiveExtglobMatcher::Wildcard(WildcardScope::Group),
+                    PositiveExtglobMatcher::Wildcard(WildcardScope::Group(
+                        token_position_component_local(tokens, token_index, root_component_local),
+                    )),
                     start,
                     true,
                 )?,
                 Token::RecursiveStar => self.star(
-                    PositiveExtglobMatcher::Wildcard(WildcardScope::Group),
+                    PositiveExtglobMatcher::Wildcard(WildcardScope::Recursive),
                     start,
                     true,
                 )?,
                 Token::RecursivePrefix => self.star(
-                    PositiveExtglobMatcher::Wildcard(WildcardScope::Group),
+                    PositiveExtglobMatcher::Wildcard(WildcardScope::Recursive),
                     start,
                     false,
                 )?,
@@ -4968,6 +5024,18 @@ fn compile_extglob(
         add_memo_state(group.start);
         add_memo_state(group.rest);
     }
+    for step in &steps {
+        if let ExtglobStep::Star {
+            next,
+            blocks_leading_period: false,
+        } = step
+            && steps
+                .get(*next)
+                .is_some_and(|step| matches!(step, ExtglobStep::Byte(byte) if is_separator(*byte)))
+        {
+            add_memo_state(*next + 1);
+        }
+    }
     let positive_nfa = PositiveExtglobNfa::compile(&steps, &groups, budget)?;
     Ok(Some(CompiledExtglob {
         steps,
@@ -5020,6 +5088,7 @@ fn compile_extglob_step(
             alternatives,
             start: index,
             rest: close + 1,
+            component_local: index > 0 && is_separator(pattern[index - 1]),
         });
         return Ok(ExtglobStep::Group(groups.len() - 1));
     }
@@ -5571,6 +5640,7 @@ fn match_extglob_task(
     let mut star_pattern_index = 0_usize;
     let mut star_path_index = 0_usize;
     let mut has_star = false;
+    let mut star_component_local = false;
 
     while path_index < path.len() || pattern_index < steps.len() {
         if pattern_index < steps.len() {
@@ -5599,6 +5669,14 @@ fn match_extglob_task(
                         state,
                     );
                     if has_star && star_path_index < path.len() {
+                        if !extglob_star_can_consume(
+                            path,
+                            star_path_index,
+                            options,
+                            star_component_local,
+                        ) {
+                            return false;
+                        }
                         pattern_index = star_pattern_index;
                         star_path_index += 1;
                         path_index = star_path_index;
@@ -5615,8 +5693,23 @@ fn match_extglob_task(
                         && path.get(path_index) == Some(&b'.')
                         && at_component_start(path, path_index, options);
                     if !blocked {
+                        if !*blocks_leading_period
+                            && steps
+                                .get(*next)
+                                .is_some_and(|step| matches!(step, ExtglobStep::Byte(byte) if is_separator(*byte)))
+                        {
+                            queue_extglob_continuation(
+                                program,
+                                state,
+                                *next + 1,
+                                path_index,
+                            );
+                        }
                         star_pattern_index = *next;
                         star_path_index = path_index;
+                        star_component_local =
+                            !extglob_step_is_recursive_star(steps, pattern_index, options)
+                                && extglob_wildcard_component_local(steps, pattern_index, options);
                         has_star = true;
                         pattern_index = *next;
                         continue;
@@ -5625,13 +5718,16 @@ fn match_extglob_task(
                 ExtglobStep::UnclosedGroup { byte: b'*' } => {
                     star_pattern_index = pattern_index + 1;
                     star_path_index = path_index;
+                    star_component_local =
+                        extglob_wildcard_component_local(steps, pattern_index, options);
                     has_star = true;
                     pattern_index += 1;
                     continue;
                 }
                 ExtglobStep::Any | ExtglobStep::UnclosedGroup { byte: b'?' } => {
                     if path.get(path_index).is_some_and(|&byte| {
-                        (!options.component_wildcards || !is_separator(byte))
+                        (!extglob_wildcard_component_local(steps, pattern_index, options)
+                            || !is_separator(byte))
                             && (options.match_hidden
                                 || byte != b'.'
                                 || !at_component_start(path, path_index, options))
@@ -5653,7 +5749,8 @@ fn match_extglob_task(
                 }
                 ExtglobStep::Class { class, next } => {
                     if path.get(path_index).is_some_and(|&byte| {
-                        (!options.component_wildcards || !is_separator(byte))
+                        (!extglob_wildcard_component_local(steps, pattern_index, options)
+                            || !is_separator(byte))
                             && (options.match_hidden
                                 || byte != b'.'
                                 || !at_component_start(path, path_index, options))
@@ -5688,17 +5785,11 @@ fn match_extglob_task(
         }
 
         if has_star && star_path_index < path.len() {
-            if options.component_wildcards && is_separator(path[star_path_index]) {
+            if !extglob_star_can_consume(path, star_path_index, options, star_component_local) {
                 pattern_index = star_pattern_index;
                 path_index = star_path_index;
                 has_star = false;
                 continue;
-            }
-            if !options.match_hidden
-                && path.get(star_path_index) == Some(&b'.')
-                && at_component_start(path, star_path_index, options)
-            {
-                return false;
             }
             pattern_index = star_pattern_index;
             star_path_index += 1;
@@ -5708,6 +5799,38 @@ fn match_extglob_task(
         return false;
     }
     true
+}
+
+fn extglob_wildcard_component_local(
+    steps: &[ExtglobStep],
+    step_index: usize,
+    options: PatternOptions,
+) -> bool {
+    options.component_wildcards
+        && (options.root_component_wildcards || extglob_step_component_local(steps, step_index))
+}
+
+fn extglob_step_is_recursive_star(
+    steps: &[ExtglobStep],
+    step_index: usize,
+    options: PatternOptions,
+) -> bool {
+    options.recursive_double_star
+        && matches!(
+            steps.get(step_index),
+            Some(ExtglobStep::Star { next, .. }) if *next - step_index == 2
+        )
+}
+
+fn extglob_star_can_consume(
+    path: &[u8],
+    path_index: usize,
+    options: PatternOptions,
+    component_local: bool,
+) -> bool {
+    let byte = path[path_index];
+    (!component_local || !is_separator(byte))
+        && (options.match_hidden || byte != b'.' || !at_component_start(path, path_index, options))
 }
 
 /// Whether a group can explicitly consume the leading period of a component.
@@ -5772,7 +5895,8 @@ fn queue_extglob_group(
             queue_extglob_continuations(program, state, group.rest);
         }
         ExtglobKind::Negated => {
-            let component_end = extglob_component_end(path, path_index, options);
+            let component_end =
+                extglob_component_end(path, path_index, options, group.component_local);
             state.excluded.resize(component_end - path_index + 1, false);
             state.excluded.fill(false);
             matching_extglob_group_ends(
@@ -5842,6 +5966,7 @@ fn matching_extglob_group_ends(
             path,
             path_index,
             options,
+            group.component_local,
             prefix_sweep_state,
             output,
         );
@@ -5863,7 +5988,7 @@ fn matching_extglob_repetition_ends(
     options: PatternOptions,
     state: &mut ExtglobMatchState<'_>,
 ) {
-    let component_end = extglob_component_end(path, path_index, options);
+    let component_end = extglob_component_end(path, path_index, options, group.component_local);
     let position_count = component_end - path_index + 1;
     state.visited.clear();
     let reachable_base = push_visited(state.visited, position_count);
@@ -5885,6 +6010,7 @@ fn matching_extglob_repetition_ends(
                             &path[absolute..end],
                             at_component_start(path, absolute, options),
                             options,
+                            group.component_local,
                         )
                     {
                         let reached = end - path_index;
@@ -5913,6 +6039,7 @@ fn matching_extglob_repetition_ends(
                         path,
                         absolute,
                         options,
+                        group.component_local,
                         state.prefix_sweep_state,
                         state.candidate_ends,
                     );
@@ -5943,7 +6070,9 @@ fn matching_extglob_repetition_ends(
                 };
                 let sweep_state = &mut state.sweep_states[sweep_index];
                 sweep_index += 1;
-                if sweep.advance(sweep_state, byte, starts_component, options)
+                let alternative_options =
+                    extglob_alternative_options(path, absolute, options, group.component_local);
+                if sweep.advance(sweep_state, byte, starts_component, alternative_options)
                     && sweep.accepts(sweep_state)
                 {
                     visit(state.visited, reachable_base, offset + 1);
@@ -5988,10 +6117,11 @@ fn matching_extglob_alternative_ends(
     path: &[u8],
     path_index: usize,
     options: PatternOptions,
+    root_component_local: bool,
     prefix_sweep_state: &mut Option<SweepState>,
     output: &mut Vec<usize>,
 ) {
-    let component_end = extglob_component_end(path, path_index, options);
+    let component_end = extglob_component_end(path, path_index, options, root_component_local);
     if let Some(width) = alternative.width {
         let Some(end) = path_index.checked_add(width) else {
             return;
@@ -6002,6 +6132,7 @@ fn matching_extglob_alternative_ends(
                 &path[path_index..end],
                 at_component_start(path, path_index, options),
                 options,
+                root_component_local,
             )
         {
             output.push(end);
@@ -6009,7 +6140,8 @@ fn matching_extglob_alternative_ends(
         return;
     }
 
-    let alternative_options = extglob_alternative_options(path, path_index, options);
+    let alternative_options =
+        extglob_alternative_options(path, path_index, options, root_component_local);
     let suffix = &path[path_index..component_end];
     for compiled in &alternative.compiled {
         if let Some(sweep) = &compiled.sweep {
@@ -6038,17 +6170,15 @@ fn extglob_alternative_options(
     path: &[u8],
     path_index: usize,
     options: PatternOptions,
+    root_component_local: bool,
 ) -> PatternOptions {
-    let mut options = PatternOptions {
+    PatternOptions {
         braces: false,
         extglob: false,
         candidate_starts_component: at_component_start(path, path_index, options),
+        candidate_root_component_wildcard: root_component_local,
         ..options
-    };
-    if options.root_component_wildcards {
-        options.component_wildcards = true;
     }
-    options
 }
 
 /// Matches one compiled alternative against the whole of `path`.
@@ -6061,17 +6191,24 @@ fn match_extglob_alternative_exact(
     path: &[u8],
     candidate_starts_component: bool,
     options: PatternOptions,
+    root_component_local: bool,
 ) -> bool {
     if alternative.width.is_some_and(|width| width != path.len()) {
         return false;
     }
-    let mut options = extglob_alternative_options(path, 0, options);
+    let mut options = extglob_alternative_options(path, 0, options, root_component_local);
     options.candidate_starts_component = candidate_starts_component;
     Pattern::match_alternatives(&alternative.compiled, options, path)
 }
 
-fn extglob_component_end(path: &[u8], path_index: usize, options: PatternOptions) -> usize {
-    if options.component_wildcards {
+fn extglob_component_end(
+    path: &[u8],
+    path_index: usize,
+    options: PatternOptions,
+    position_component_local: bool,
+) -> usize {
+    if options.component_wildcards && (options.root_component_wildcards || position_component_local)
+    {
         path_index
             + path[path_index..]
                 .iter()
@@ -7547,7 +7684,7 @@ mod tests {
     }
 
     #[test]
-    fn outer_stars_keep_extglobs_legacy_backtracking_semantics() {
+    fn outer_stars_honor_the_selected_path_component_policy() {
         let options = PatternOptions::default()
             .extglob(true)
             .recursive_double_star(true);
@@ -7558,7 +7695,9 @@ mod tests {
                 .as_ref()
                 .is_some_and(|program| program.positive_nfa.is_none())
         );
-        assert!(star_before_group.is_match_glob_path("/ab"));
+        assert!(star_before_group.is_match("/ab"));
+        assert!(star_before_group.is_match_path("/ab"));
+        assert!(!star_before_group.is_match_glob_path("/ab"));
 
         let retained = Pattern::compile("a@(b|[a-c])*/?(.x|y)", options)
             .expect("backtracking extglob compiles");
@@ -8255,6 +8394,49 @@ mod tests {
             Pattern::compile("@(foo)/*/bar", PatternOptions::default().extglob(true)).unwrap();
         assert!(nested_extglob.is_match_glob_path("foo/a/bar"));
         assert!(!nested_extglob.is_match_glob_path("foo/a/deep/bar"));
+    }
+
+    #[test]
+    fn extglobs_share_each_entry_points_component_policy() {
+        let options = PatternOptions::default().extglob(true);
+        let mixed = Pattern::compile("*/x/b*@(y)", options).unwrap();
+        assert!(mixed.is_match("a/b/x/bzy"));
+        assert!(mixed.is_match_path("a/b/x/bzy"));
+        assert!(!mixed.is_match_glob_path("a/b/x/bzy"));
+
+        let root = Pattern::compile("*@(y)", options).unwrap();
+        assert!(root.is_match("a/b/zy"));
+        assert!(root.is_match_path("a/b/zy"));
+        assert!(!root.is_match_glob_path("a/b/zy"));
+
+        for pattern in [&mixed, &root] {
+            assert!(pattern.engines_agree("a/b/x/bzy"));
+            assert!(pattern.engines_agree("a/b/zy"));
+        }
+    }
+
+    #[test]
+    fn recursive_prefix_before_extglob_matches_at_depth_zero() {
+        let options = PatternOptions::default()
+            .extglob(true)
+            .recursive_double_star(true);
+        let pattern = Pattern::compile("**/@(x)", options).unwrap();
+        for candidate in ["x", "a/x"] {
+            assert!(pattern.is_match(candidate), "is_match: {candidate}");
+            assert!(
+                pattern.is_match_path(candidate),
+                "is_match_path: {candidate}"
+            );
+            assert!(
+                pattern.is_match_glob_path(candidate),
+                "is_match_glob_path: {candidate}"
+            );
+            assert!(pattern.engines_agree(candidate), "engines: {candidate}");
+        }
+
+        let negated_suffix = Pattern::compile("**/*.!(js)", options).unwrap();
+        assert!(negated_suffix.is_match_path("src/app.ts"));
+        assert!(!negated_suffix.is_match_path("src/app.js"));
     }
 
     #[test]

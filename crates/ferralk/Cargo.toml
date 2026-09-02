@@ -16,8 +16,13 @@ categories.workspace = true
 exclude = ["tests/git_ignore_corpus.rs"]
 
 [features]
+# Experimental native backends. Their names and selected implementations are
+# outside the 1.x semver contract and may change in a minor release.
 native-linux = []
 native-macos = []
+# Development-only corpus and fuzz hooks. No item enabled by this feature is
+# covered by the 1.x semver contract.
+unstable-test-hooks = ["ferralk-glob/unstable-test-hooks"]
 
 [dependencies]
 crossbeam-deque = "=0.8.7"

@@ -167,12 +167,15 @@ mod retained_directory_test {
     }
 }
 #[cfg(all(feature = "native-linux", target_os = "linux"))]
+#[cfg(feature = "unstable-test-hooks")]
 #[doc(hidden)]
 pub use linux_native::fuzz_validate_records as fuzz_validate_linux_dirent_records;
 #[cfg(all(feature = "native-macos", target_os = "macos"))]
+#[cfg(feature = "unstable-test-hooks")]
 #[doc(hidden)]
 pub use macos_native::fuzz_validate_bulk_record as fuzz_validate_macos_bulk_record;
 #[cfg(all(feature = "native-macos", target_os = "macos"))]
+#[cfg(feature = "unstable-test-hooks")]
 #[doc(hidden)]
 pub use macos_native::fuzz_validate_records as fuzz_validate_macos_dirent_records;
 mod absolute;
@@ -189,6 +192,7 @@ mod absolute;
 /// that only apply to Windows, which would otherwise be recorded where nothing
 /// replays them.
 #[doc(hidden)]
+#[cfg(feature = "unstable-test-hooks")]
 pub fn corpus_rewrite_absolute_pattern(
     pattern: &[u8],
     root: &[u8],
@@ -208,8 +212,10 @@ mod ignore_rules;
 /// Fuzz entry point for the gitignore rule layer (ADR-0014), exported the way
 /// the native dirent parsers are: for the harness in `fuzz/`, not for consumers.
 #[doc(hidden)]
+#[cfg(feature = "unstable-test-hooks")]
 pub use ignore_rules::fuzz_rule as fuzz_ignore_rule;
 #[doc(hidden)]
+#[cfg(feature = "unstable-test-hooks")]
 pub use ignore_rules::fuzz_rule_bytes as fuzz_ignore_rule_bytes;
 mod parallel;
 mod scheduler;
@@ -218,6 +224,9 @@ use classify::{DirectoryTask, EmittedEntry, EntryAction, TraversalContext, class
 use gitignore::{IgnoreReadError, IgnoreScope};
 
 /// Controls what a walk does after a recoverable filesystem error.
+///
+/// This enum is intentionally exhaustive: these are the complete policy
+/// outcomes, and callers may match all of them without a fallback arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ErrorPolicy {
     /// Stop immediately and return the first error.
@@ -282,6 +291,7 @@ impl CancellationToken {
 /// # Ok::<(), ferralk::ferralk_glob::PatternError>(())
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum WildcardMode {
     /// A wildcard stays inside one path component: `*.ts` matches `main.ts`
     /// and not `src/main.ts`. Filesystem-glob semantics, and the default.
@@ -433,6 +443,7 @@ impl WalkOptions {
 
 /// Filesystem kind observed for one walked entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WalkEntryKind {
     /// A regular non-directory, non-symlink entry.
     File,
@@ -563,16 +574,56 @@ impl WalkEntry {
     }
 }
 
+/// Filesystem operation associated with a recoverable walking error.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum WalkOperation {
+    /// Opening or advancing a directory listing.
+    ReadDir,
+    /// Reading metadata for traversal, filtering, or cycle detection.
+    Metadata,
+    /// Canonicalizing a path for cycle detection on platforms without Unix
+    /// device/inode keys.
+    Canonicalize,
+    /// Reading an ignore file.
+    ReadIgnore,
+    /// Starting an optional helper worker.
+    SpawnWorker,
+    /// Reading metadata without following a symbolic link.
+    SymlinkMetadata,
+}
+
+impl WalkOperation {
+    /// Stable machine-readable spelling of this operation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadDir => "read_dir",
+            Self::Metadata => "metadata",
+            Self::Canonicalize => "canonicalize",
+            Self::ReadIgnore => "read_ignore",
+            Self::SpawnWorker => "spawn_worker",
+            Self::SymlinkMetadata => "symlink_metadata",
+        }
+    }
+}
+
+impl fmt::Display for WalkOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// A recoverable I/O failure observed while walking.
 #[derive(Debug)]
 pub struct WalkError {
-    operation: &'static str,
+    operation: WalkOperation,
     path: PathBuf,
     source: std::io::Error,
 }
 
 impl WalkError {
-    fn new(operation: &'static str, path: PathBuf, source: std::io::Error) -> Self {
+    fn new(operation: WalkOperation, path: PathBuf, source: std::io::Error) -> Self {
         Self {
             operation,
             path,
@@ -580,9 +631,9 @@ impl WalkError {
         }
     }
 
-    /// Operation that produced the error.
+    /// Typed operation that produced the error.
     #[must_use]
-    pub const fn operation(&self) -> &'static str {
+    pub const fn operation(&self) -> WalkOperation {
         self.operation
     }
 
@@ -616,6 +667,7 @@ impl Error for WalkError {
 /// The visitor runs on the thread that produced the entry, so a caller with a
 /// matcher of its own filters in parallel instead of over the returned list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Verdict {
     /// Keep the entry in the result.
     Keep,
@@ -1530,6 +1582,7 @@ fn rebase_pattern_error(error: PatternError, source_start: usize) -> PatternErro
 /// harness. Walker construction adds the compiled root-relative candidate
 /// validation afterwards; the corpus records absolute rewrite semantics even
 /// for synthetic platform spellings that do not describe this host's walker.
+#[cfg(feature = "unstable-test-hooks")]
 fn rewrite_pattern_for_root(
     pattern: &[u8],
     root: &[u8],
@@ -1613,6 +1666,7 @@ fn reject_unwalkable_relative_pattern(
         WalkerPathViability::EmptyComponent => {
             "a walker-relative pattern with an empty path component selects nothing; remove the repeated separator, leading `/`, or empty alternative that produces it"
         }
+        _ => "a walker-relative pattern has a shape this ferralk version cannot consume",
     };
     // Brace expansion can create several equally valid source locations. The
     // compiler carries an offset whenever it is determinate and uses this
@@ -2224,11 +2278,11 @@ impl AncestorChain {
 /// Names the call whose failure ends a directory in follow mode, so the
 /// reported operation stays the one that actually ran.
 #[cfg(unix)]
-const CYCLE_KEY_OPERATION: &str = "metadata";
+const CYCLE_KEY_OPERATION: WalkOperation = WalkOperation::Metadata;
 #[cfg(not(unix))]
-const CYCLE_KEY_OPERATION: &str = "canonicalize";
+const CYCLE_KEY_OPERATION: WalkOperation = WalkOperation::Canonicalize;
 
-const IGNORE_FILE_OPERATION: &str = "read_ignore";
+const IGNORE_FILE_OPERATION: WalkOperation = WalkOperation::ReadIgnore;
 
 /// One directory's entries, held in buffers the walk reuses.
 ///
@@ -2717,7 +2771,7 @@ pub struct WalkStream {
 /// historically guaranteed the standard unwind auto traits.
 #[derive(Debug)]
 struct PendingWalkError {
-    operation: &'static str,
+    operation: WalkOperation,
     path: PathBuf,
     kind: std::io::ErrorKind,
     message: String,
@@ -2761,7 +2815,7 @@ impl WalkStream {
 
     fn error(
         &mut self,
-        operation: &'static str,
+        operation: WalkOperation,
         path: PathBuf,
         source: std::io::Error,
         is_root: bool,
@@ -2845,7 +2899,7 @@ impl WalkStream {
                 // the directory the stream delivered previously.
                 self.listing.clear();
                 self.next_entry = 0;
-                self.error("read_dir", path, source, depth == 0)
+                self.error(WalkOperation::ReadDir, path, source, depth == 0)
             }
         }
     }
@@ -2918,9 +2972,12 @@ impl Iterator for WalkStream {
                 continue;
             }
             if let Some(error) = self.listing.take_deferred_error() {
-                if let Some(result) =
-                    self.error("read_dir", error.path, error.source.into_io_error(), false)
-                {
+                if let Some(result) = self.error(
+                    WalkOperation::ReadDir,
+                    error.path,
+                    error.source.into_io_error(),
+                    false,
+                ) {
                     return Some(result);
                 }
                 continue;
@@ -3135,7 +3192,8 @@ impl<'walker> WalkState<'walker> {
         // the rest of the depth-first subtree.
         task.open = DirectoryOpen::default();
         if let Err(source) = read_result {
-            let result = self.handle_error("read_dir", path.to_path_buf(), source, is_root);
+            let result =
+                self.handle_error(WalkOperation::ReadDir, path.to_path_buf(), source, is_root);
             scratch.listing.clear();
             self.scratch.push(scratch);
             return result;
@@ -3187,7 +3245,12 @@ impl<'walker> WalkState<'walker> {
             // read failure like any other and goes through the error policy;
             // ending the directory quietly would truncate the walk without
             // a trace, even under `ErrorPolicy::Abort`.
-            let result = self.handle_error("read_dir", path.to_path_buf(), source, depth == 0);
+            let result = self.handle_error(
+                WalkOperation::ReadDir,
+                path.to_path_buf(),
+                source,
+                depth == 0,
+            );
             self.finish_directory(frame)?;
             return result;
         }
@@ -3269,9 +3332,12 @@ impl<'walker> WalkState<'walker> {
             }
         }
         while let Some(error) = frame.scratch.listing.take_deferred_error() {
-            if let Err(error) =
-                self.handle_error("read_dir", error.path, error.source.into_io_error(), false)
-            {
+            if let Err(error) = self.handle_error(
+                WalkOperation::ReadDir,
+                error.path,
+                error.source.into_io_error(),
+                false,
+            ) {
                 self.finish_directory(frame)?;
                 return Err(error);
             }
@@ -3308,7 +3374,7 @@ impl<'walker> WalkState<'walker> {
 
     fn handle_error(
         &mut self,
-        operation: &'static str,
+        operation: WalkOperation,
         path: PathBuf,
         source: std::io::Error,
         is_root: bool,
@@ -3484,7 +3550,7 @@ mod tests {
             .iter()
             .map(|error| {
                 (
-                    error.operation(),
+                    error.operation().as_str(),
                     error
                         .path()
                         .strip_prefix(root)
@@ -3510,7 +3576,7 @@ mod tests {
                     errors: error_multiset(result.errors(), root),
                 }
             }
-            Err(error) => FrontendOutcome::Aborted(error.operation()),
+            Err(error) => FrontendOutcome::Aborted(error.operation().as_str()),
         }
     }
 
@@ -3532,7 +3598,7 @@ mod tests {
                 ),
                 Err(error) => {
                     if policy == ErrorPolicy::Abort {
-                        return FrontendOutcome::Aborted(error.operation());
+                        return FrontendOutcome::Aborted(error.operation().as_str());
                     }
                     errors.push(error);
                 }
@@ -3819,7 +3885,7 @@ mod tests {
             .prepare_directory(task)
             .expect("the failed root produces an error")
             .expect_err("a missing root cannot yield an entry");
-        assert_eq!(error.operation(), "read_dir");
+        assert_eq!(error.operation().as_str(), "read_dir");
         assert!(stream.listing.entries().is_empty());
         assert!(stream.next().is_none(), "partial entries must not leak");
     }
@@ -4216,7 +4282,7 @@ mod tests {
             (
                 "@(dead/../branch|src/main.rs)",
                 &["src/main.rs"][..],
-                &[][..],
+                &["src/main.rs"][..],
             ),
             (
                 "src/[[:alpha:]/../].rs",
@@ -4232,10 +4298,18 @@ mod tests {
             (
                 "@(dead/{),x}/../branch|src/main.rs)",
                 &["src/main.rs"][..],
-                &[][..],
+                &["src/main.rs"][..],
             ),
-            ("prefix@(../bar)", &["prefix../bar"][..], &[][..]),
-            ("@(foo/..)suffix/bar", &["foo/..suffix/bar"][..], &[][..]),
+            (
+                "prefix@(../bar)",
+                &["prefix../bar"][..],
+                &["prefix../bar"][..],
+            ),
+            (
+                "@(foo/..)suffix/bar",
+                &["foo/..suffix/bar"][..],
+                &["foo/..suffix/bar"][..],
+            ),
         ] {
             let matcher = Pattern::compile(pattern, traversal_pattern_options(false))
                 .expect("the reviewer regression is valid matcher syntax");
@@ -4247,6 +4321,12 @@ mod tests {
                     &[][..]
                 } else {
                     matching_paths
+                };
+            let component_scoped_paths_on_disk =
+                if cfg!(windows) && matches!(pattern, "prefix@(../bar)" | "@(foo/..)suffix/bar") {
+                    &[][..]
+                } else {
+                    component_scoped_paths
                 };
             for mode in [
                 WildcardMode::ComponentScoped,
@@ -4266,7 +4346,7 @@ mod tests {
                         .collect()
                         .expect("walk succeeds");
                     let mut expected = if mode == WildcardMode::ComponentScoped {
-                        component_scoped_paths
+                        component_scoped_paths_on_disk
                     } else {
                         matching_paths_on_disk
                     }
@@ -4291,7 +4371,7 @@ mod tests {
                 let mut actual = relative_paths(&streamed, &fixture.root);
                 actual.sort();
                 let mut expected = if mode == WildcardMode::ComponentScoped {
-                    component_scoped_paths
+                    component_scoped_paths_on_disk
                 } else {
                     matching_paths_on_disk
                 }
@@ -6589,7 +6669,7 @@ mod tests {
                 .collect()
                 .expect("collect policy keeps walking");
             assert_eq!(result.errors().len(), 1);
-            assert_eq!(result.errors()[0].operation(), "read_ignore");
+            assert_eq!(result.errors()[0].operation().as_str(), "read_ignore");
             assert_eq!(result.errors()[0].path(), ignore_path);
             assert!(
                 relative_paths(result.entries(), &fixture.root)
@@ -6612,7 +6692,7 @@ mod tests {
             .error_policy(ErrorPolicy::Abort)
             .collect()
             .expect_err("abort policy reports the ignore failure immediately");
-        assert_eq!(aborted.operation(), "read_ignore");
+        assert_eq!(aborted.operation().as_str(), "read_ignore");
         assert_eq!(aborted.path(), ignore_path);
 
         let streamed = Walker::new(&fixture.root)
@@ -7324,7 +7404,7 @@ mod tests {
             let mut errors = result
                 .errors()
                 .iter()
-                .map(|error| (error.operation(), error.path().to_path_buf()))
+                .map(|error| (error.operation().as_str(), error.path().to_path_buf()))
                 .collect::<Vec<_>>();
             entries.sort_unstable();
             errors.sort_unstable();
@@ -7718,7 +7798,7 @@ mod tests {
                 "the readable roots are walked on {threads} threads"
             );
             assert_eq!(result.errors().len(), 1);
-            assert_eq!(result.errors()[0].operation(), "read_dir");
+            assert_eq!(result.errors()[0].operation().as_str(), "read_dir");
             assert_eq!(result.errors()[0].path(), missing);
         }
     }
@@ -8554,7 +8634,7 @@ mod tests {
             "the parallel walker has to read through the injected backend"
         );
         assert_eq!(result.errors().len(), 1);
-        assert_eq!(result.errors()[0].operation(), "symlink_metadata");
+        assert_eq!(result.errors()[0].operation().as_str(), "symlink_metadata");
         assert_eq!(result.errors()[0].path(), failing_stat);
         assert!(
             !result
@@ -8647,7 +8727,7 @@ mod tests {
             [PathBuf::from("before"), PathBuf::from("after")]
         );
         assert_eq!(state.errors.len(), 1);
-        assert_eq!(state.errors[0].operation(), "read_dir");
+        assert_eq!(state.errors[0].operation().as_str(), "read_dir");
         assert_eq!(state.errors[0].path(), fixture.root.join("unknown"));
         assert_eq!(
             state.errors[0].source.kind(),
@@ -8722,7 +8802,7 @@ mod tests {
                     .expect("entry belongs to fixture")
                     .to_path_buf()),
                 Err(error) => Err((
-                    error.operation(),
+                    error.operation().as_str(),
                     error.path().to_path_buf(),
                     error.source.kind(),
                 )),
@@ -8841,7 +8921,7 @@ mod tests {
 
         assert!(state.entries.is_empty());
         assert_eq!(state.errors.len(), 1);
-        assert_eq!(state.errors[0].operation(), "symlink_metadata");
+        assert_eq!(state.errors[0].operation().as_str(), "symlink_metadata");
         assert_eq!(state.errors[0].path(), disappeared);
     }
 
@@ -8916,7 +8996,7 @@ mod tests {
             .expect("the collect policy retains the metadata error");
         assert!(state.entries.is_empty());
         assert_eq!(state.errors.len(), 1);
-        assert_eq!(state.errors[0].operation(), "metadata");
+        assert_eq!(state.errors[0].operation().as_str(), "metadata");
         assert_eq!(state.errors[0].path(), fixture.root.join("link"));
     }
 
@@ -9194,7 +9274,7 @@ mod tests {
                         .strip_prefix(root)
                         .expect("error belongs to fixture")
                         .to_path_buf(),
-                    error.operation(),
+                    error.operation().as_str(),
                 )
             })
             .collect()
@@ -9218,7 +9298,7 @@ mod tests {
                 .collect()
                 .expect("Skip keeps walking after a caller-supplied root failure");
             assert_eq!(skipped.errors().len(), 1);
-            assert_eq!(skipped.errors()[0].operation(), "read_dir");
+            assert_eq!(skipped.errors()[0].operation().as_str(), "read_dir");
             assert_eq!(skipped.errors()[0].path(), missing);
         }
         let streamed = Walker::new(&missing)
@@ -9226,7 +9306,7 @@ mod tests {
             .stream()
             .collect::<Result<Vec<_>, _>>()
             .expect_err("stream reports a failed caller-supplied root under Skip");
-        assert_eq!(streamed.operation(), "read_dir");
+        assert_eq!(streamed.operation().as_str(), "read_dir");
         assert_eq!(streamed.path(), missing);
         assert!(
             Walker::new(&missing)
@@ -9250,7 +9330,7 @@ mod tests {
                 .expect("root error is collected while the walk completes");
             assert!(result.entries().is_empty());
             assert_eq!(result.errors().len(), 1);
-            assert_eq!(result.errors()[0].operation(), "read_dir");
+            assert_eq!(result.errors()[0].operation().as_str(), "read_dir");
             assert_eq!(result.errors()[0].path(), file);
         }
     }
@@ -9588,7 +9668,7 @@ mod tests {
             .error_policy(ErrorPolicy::Abort)
             .collect()
             .expect_err("an unexcluded ENOTDIR link remains a metadata error");
-        assert_eq!(error.operation(), "metadata");
+        assert_eq!(error.operation().as_str(), "metadata");
         assert_eq!(error.path(), fixture.root.join("notdir"));
         assert_eq!(error.source.kind(), std::io::ErrorKind::NotADirectory);
     }
@@ -9723,7 +9803,7 @@ mod tests {
                 .iter()
                 .map(|error| {
                     (
-                        error.operation(),
+                        error.operation().as_str(),
                         error
                             .path()
                             .strip_prefix(&fixture.root)
@@ -9770,8 +9850,11 @@ mod tests {
             .collect()
             .expect_err("abort policy returns the first metadata error");
 
-        assert_eq!(error.operation(), "metadata");
-        assert_eq!(serial_error.operation(), error.operation());
+        assert_eq!(error.operation().as_str(), "metadata");
+        assert_eq!(
+            serial_error.operation().as_str(),
+            error.operation().as_str()
+        );
         assert!(
             !serial_cancellation.is_cancelled(),
             "serial abort leaves the caller-owned token alone"

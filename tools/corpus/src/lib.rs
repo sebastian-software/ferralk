@@ -110,9 +110,13 @@ pub struct Case {
     pub oracle_expected: Option<bool>,
     /// Evidence used to establish the expected result.
     pub source: Source,
-    /// Marks a recorded behaviour that has not been adopted as ferralk policy.
-    #[serde(default)]
-    pub disputed: bool,
+    /// ADR that adopts ferralk's deliberate divergence from an external oracle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adr: Option<String>,
+    /// Marks a disagreement caused by an oracle defect or a documented limit
+    /// of a secondary oracle rather than an unsettled ferralk policy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub oracle_defect: bool,
     /// Human-readable context, especially for disagreements between oracles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -244,7 +248,16 @@ fn required_fields(kind: CaseKind) -> &'static [&'static str] {
 
 fn field_is_allowed(kind: CaseKind, field: &str) -> bool {
     const COMMON: &[&str] = &[
-        "id", "kind", "pattern", "path", "expected", "platform", "source", "disputed", "note",
+        "id",
+        "kind",
+        "pattern",
+        "path",
+        "expected",
+        "platform",
+        "source",
+        "adr",
+        "oracle_defect",
+        "note",
     ];
     if COMMON.contains(&field) {
         return true;
