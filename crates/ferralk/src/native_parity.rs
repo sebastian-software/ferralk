@@ -559,18 +559,28 @@ fn resume_budget_denial_never_falls_back_to_a_replacement_symlink() {
     use std::os::unix::fs::symlink;
 
     let fixture = Fixture::new("serial-resume-budget-original");
-    fixture.write("parent/first/trigger.txt");
-    fixture.write("parent/second/safe.txt");
+    fixture.write("parent/cached-child/safe.txt");
     let replacement = Fixture::new("serial-resume-budget-replacement");
-    replacement.write("second/escaped.txt");
-    let armed = AtomicBool::new(false);
+    replacement.write("cached-child/escaped.txt");
     let swapped = Arc::new(AtomicBool::new(false));
     let retention = crate::retained_directory_test::Guard::new(64);
+    let backend = crate::SystemBackend;
+    let mut listing = Listing::default();
 
     let original_parent = fixture.root.join("parent");
     let moved_parent = fixture.root.join("moved-parent");
     let fixture_root = fixture.root.clone();
     let replacement_root = replacement.root.clone();
+    backend
+        .read_directory(&original_parent, false, true, &mut listing)
+        .expect("read the directory before suspension");
+    let expected = backend.directory_identity(&listing);
+    assert!(
+        expected.is_some(),
+        "the native listing retains its identity"
+    );
+    listing.release_directory_open();
+
     let hook_swapped = Arc::clone(&swapped);
     retention.on_next_denial(move || {
         fs::rename(original_parent, moved_parent)
@@ -579,30 +589,20 @@ fn resume_budget_denial_never_falls_back_to_a_replacement_symlink() {
             .expect("replace the verified path during retention denial");
         hook_swapped.store(true, Ordering::Release);
     });
+    retention.set_limit(0);
 
-    let result = collecting_walker(&fixture.root)
-        .visit(|entry| {
-            if entry.path().ends_with("parent/first/trigger.txt")
-                && !armed.swap(true, Ordering::AcqRel)
-            {
-                retention.set_limit(0);
-            }
-            crate::Verdict::Keep
-        })
-        .expect("retention denial stays recoverable");
+    let restored =
+        backend.restore_directory_open(&fixture.root.join("parent"), expected, true, &mut listing);
 
-    assert!(armed.load(Ordering::Acquire), "fixture armed the denial");
     assert!(
         swapped.load(Ordering::Acquire),
         "the replacement happened after identity verification"
     );
     assert!(
-        !result
-            .entries()
-            .iter()
-            .any(|entry| entry.path().ends_with("parent/second/escaped.txt")),
-        "a denied verified handle must not fall back to mutable child paths"
+        !restored,
+        "a denied verified handle must invalidate the cached listing"
     );
+    assert!(listing.native_directory.is_none());
     let stats = retention.stats();
     assert_eq!(stats.current, 0);
     assert!(stats.denied > 0, "the fixture denied resume retention");
