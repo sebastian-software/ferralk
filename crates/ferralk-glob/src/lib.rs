@@ -4743,7 +4743,18 @@ fn compile_extglob_step(
     Ok(match pattern[index] {
         b'*' => {
             let mut next = index + 1;
+            // Shell extglob grammar gives the final star in a run to a closed
+            // `*(` group. Keep the preceding stars as one ordinary wildcard,
+            // but leave that last offset for the group compiler instead of
+            // greedily swallowing it into the run. An unclosed opener keeps
+            // the compatible literal-suffix fallback and remains part of the
+            // ordinary star run.
             while pattern.get(next) == Some(&b'*') {
+                let closed_group_starts_here = detect_extglob_at(pattern, next).is_some()
+                    && closing_extglob_parenthesis(pattern, next + 1, options.escape).is_some();
+                if closed_group_starts_here {
+                    break;
+                }
                 next += 1;
             }
             ExtglobStep::Star {
@@ -7118,6 +7129,64 @@ mod tests {
             .expect("backtracking extglob compiles");
         assert!(retained.is_match_path("aa//"));
         assert!(!retained.is_match("aa/./"));
+    }
+
+    #[test]
+    fn last_star_in_a_run_opens_an_extglob_group() {
+        let options = PatternOptions::default().extglob(true).match_hidden(true);
+
+        for pattern in ["**(a)", "***(a)", "a**(b)"] {
+            let compiled = Pattern::compile(pattern, options).expect("extglob compiles");
+            assert!(
+                compiled.alternatives[0]
+                    .extglob
+                    .as_ref()
+                    .is_some_and(|program| !program.groups.is_empty()),
+                "{pattern:?} must retain its final `*(` as an extglob opener"
+            );
+        }
+
+        let leading = Pattern::compile("**(a)", options).expect("extglob compiles");
+        for candidate in ["", "ab", "x", "(a)", "x(a)"] {
+            assert!(
+                leading.is_match(candidate),
+                "the outer star may consume {candidate:?} before the zero-width group"
+            );
+        }
+
+        let embedded = Pattern::compile("a**(b)", options).expect("extglob compiles");
+        for candidate in ["a", "ab", "ax"] {
+            assert!(
+                embedded.is_match(candidate),
+                "expected {candidate:?} to match"
+            );
+        }
+
+        let disabled = Pattern::compile("**(a)", PatternOptions::default())
+            .expect("literal parenthesized suffix compiles");
+        assert!(disabled.is_match("x(a)"));
+        assert!(!disabled.is_match("x"));
+    }
+
+    #[test]
+    fn unclosed_extglob_after_a_star_run_keeps_its_literal_suffix() {
+        let options = PatternOptions::default().extglob(true).match_hidden(true);
+
+        let leading = Pattern::compile("**(a", options).expect("fallback pattern compiles");
+        let leading_program = leading.alternatives[0]
+            .extglob
+            .as_ref()
+            .expect("extglob interpreter is retained");
+        assert!(matches!(
+            leading_program.steps[0],
+            ExtglobStep::Star { next: 2, .. }
+        ));
+        assert!(leading.is_match("x(a"));
+        assert!(!leading.is_match("x"));
+
+        let embedded = Pattern::compile("a**(b", options).expect("fallback pattern compiles");
+        assert!(embedded.is_match("ax(b"));
+        assert!(!embedded.is_match("ax"));
     }
 
     #[test]

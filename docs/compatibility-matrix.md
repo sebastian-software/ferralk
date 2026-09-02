@@ -14,7 +14,7 @@ read the [compatibility guide](compatibility-guide.md).
 | `**` | `PatternOptions::recursive_double_star` | Implemented (M1) | Explicit option; while disabled, consecutive stars have ordinary `*` semantics through every entry point. |
 | bracket classes, ranges, `[!...]`, `[^...]` | `Pattern::compile` | Implemented (M1) | Byte-first, including ASCII POSIX classes. |
 | `ZLOB_BRACE` | `PatternOptions::braces` | Implemented (M1) | Nested and empty alternatives; source-backed corpus import continues. |
-| `ZLOB_EXTGLOB` | `PatternOptions::extglob` | Implemented (M1) | `@()`, `?()`, `*()`, `+()`, `!()`; matches zlob's non-nested scope. |
+| `ZLOB_EXTGLOB` | `PatternOptions::extglob` | Implemented (M1) | `@()`, `?()`, `*()`, `+()`, `!()` with zlob's non-nested scope. Deliberate shell-compatible divergence: before `*(`, the final star in a run opens the group instead of being greedily collapsed (`extsuite-*star-run-before-zero-or-more`, issue #305). |
 | `ZLOB_PERIOD` | `PatternOptions::match_hidden` | Implemented (M1) | Deliberate in-memory divergence: Ferralk defaults to off; zlob's direct matcher accepts leading periods by default. |
 | `ZLOB_NOESCAPE` | `PatternOptions::escape` | Implemented (M1) | Higher-level boolean, not a bitflag. |
 | case folding | `PatternOptions::case_insensitive` | Implemented (M1) | Explicit opt-in on every platform. |

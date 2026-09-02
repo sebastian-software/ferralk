@@ -370,6 +370,13 @@ same way. It is a matching policy, independent of `match_hidden` and of
   inside classes and reads the backslash as an ordinary range endpoint. The
   diverging verdicts are recorded as `disputed` corpus cases with
   `oracle_expected` (`class-006/008/009/012/016/024/025`, issue #16).
+- A star run immediately before a `*(` extglob follows bash and ksh grammar:
+  the final star opens the zero-or-more group, while any earlier stars remain
+  an ordinary wildcard. Thus `**(a)` is `*` followed by `*(a)`, and matches
+  `x`; zlob 1.6.3 greedily collapses both stars before checking for a group and
+  reads the suffix as literal `(a)`. The shell-compatible reading is recorded
+  as disputed corpus cases with zlob verdicts in
+  `extsuite-*star-run-before-zero-or-more` (issue #305).
 - Brace expansion is budgeted. A pattern that would expand to more than 4096
   alternatives is rejected with `too many brace alternatives` at the offset of
   the brace group that starts the expansion. Brace groups multiply, so ten
