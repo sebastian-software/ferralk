@@ -5,6 +5,8 @@
 //! distinguish buffers created during a walk from fixture and test-harness
 //! allocations that happen to be freed while the workers run.
 
+#![cfg(not(miri))]
+
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     fs, io,
