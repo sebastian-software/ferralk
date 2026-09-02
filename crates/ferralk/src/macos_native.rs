@@ -205,21 +205,37 @@ pub(super) struct RelativeDirectoryOpen {
 }
 
 #[derive(Debug)]
-pub(super) struct RetainedDirectory(File);
+enum RetentionPermit {
+    Global,
+    #[cfg(test)]
+    Test,
+}
+
+#[derive(Debug)]
+pub(super) struct RetainedDirectory(File, RetentionPermit);
 
 impl RetainedDirectory {
     fn retain(directory: File) -> Option<Arc<Self>> {
+        #[cfg(test)]
+        if let Some(granted) = super::retained_directory_test::try_acquire() {
+            return granted.then(|| Arc::new(Self(directory, RetentionPermit::Test)));
+        }
         RETAINED_DIRECTORIES
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
                 (retained < retained_directory_limit()).then_some(retained + 1)
             })
             .ok()
-            .map(|_| Arc::new(Self(directory)))
+            .map(|_| Arc::new(Self(directory, RetentionPermit::Global)))
     }
 }
 
 impl Drop for RetainedDirectory {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if matches!(self.1, RetentionPermit::Test) {
+            super::retained_directory_test::release();
+            return;
+        }
         RETAINED_DIRECTORIES.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -303,6 +319,17 @@ fn open_directory(path: &Path, refuse_final_symlink: bool) -> io::Result<File> {
             0
         };
     OpenOptions::new().read(true).custom_flags(flags).open(path)
+}
+
+/// Reacquires an optional descriptor for a serial frame after its child has
+/// completed. Failure only disables the relative-open optimization: the next
+/// child still takes the ordinary full-path route.
+pub(super) fn restore_retained_directory(path: &Path, listing: &mut Listing) {
+    if listing.native_directory.is_none() {
+        listing.native_directory = open_directory(path, false)
+            .ok()
+            .and_then(RetainedDirectory::retain);
+    }
 }
 
 /// Opens a queued child relative to the still-open parent that named it.

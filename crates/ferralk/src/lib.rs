@@ -39,6 +39,96 @@ mod macos_native;
     )
 ))]
 mod native_parity;
+#[cfg(all(
+    test,
+    any(
+        all(feature = "native-macos", target_os = "macos"),
+        all(feature = "native-linux", target_os = "linux")
+    )
+))]
+mod retained_directory_test {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Stats {
+        pub(super) current: usize,
+        pub(super) high_water: usize,
+        pub(super) denied: usize,
+    }
+
+    #[derive(Debug)]
+    struct State {
+        limit: usize,
+        current: usize,
+        high_water: usize,
+        denied: usize,
+    }
+
+    std::thread_local! {
+        static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    }
+
+    pub(super) struct Guard;
+
+    impl Guard {
+        pub(super) fn new(limit: usize) -> Self {
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                assert!(state.is_none(), "retention test override is already active");
+                *state = Some(State {
+                    limit,
+                    current: 0,
+                    high_water: 0,
+                    denied: 0,
+                });
+            });
+            Self
+        }
+
+        pub(super) fn stats(&self) -> Stats {
+            STATE.with(|state| {
+                let state = state.borrow();
+                let state = state.as_ref().expect("retention test override is active");
+                Stats {
+                    current: state.current,
+                    high_water: state.high_water,
+                    denied: state.denied,
+                }
+            })
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            STATE.with(|state| *state.borrow_mut() = None);
+        }
+    }
+
+    /// Returns `None` without an active override, or whether the test budget
+    /// granted a permit when one is active.
+    pub(super) fn try_acquire() -> Option<bool> {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let state = state.as_mut()?;
+            if state.current == state.limit {
+                state.denied += 1;
+                return Some(false);
+            }
+            state.current += 1;
+            state.high_water = state.high_water.max(state.current);
+            Some(true)
+        })
+    }
+
+    pub(super) fn release() {
+        STATE.with(|state| {
+            if let Some(state) = state.borrow_mut().as_mut() {
+                debug_assert!(state.current > 0);
+                state.current -= 1;
+            }
+        });
+    }
+}
 #[cfg(all(feature = "native-linux", target_os = "linux"))]
 #[doc(hidden)]
 pub use linux_native::fuzz_validate_records as fuzz_validate_linux_dirent_records;
@@ -1811,6 +1901,13 @@ trait DirectoryBackend {
         DirectoryOpen::default()
     }
 
+    /// Opportunistically reacquires the current directory capability after a
+    /// serial frame resumes. A path backend, or a failed native reopen, simply
+    /// leaves later children on the ordinary full-path route.
+    fn restore_directory_open(&self, path: &Path, listing: &mut Listing) {
+        let _ = (path, listing);
+    }
+
     /// Follows symlinks; decides whether a link points at a directory.
     fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
         fs::metadata(path)
@@ -2068,6 +2165,18 @@ impl Listing {
             self.native_directory = None;
         }
         self.deferred_errors.clear();
+    }
+
+    /// Releases the native handle while a serial listing is suspended. The
+    /// queued child already owns the clone it needs for its one relative open.
+    fn release_directory_open(&mut self) {
+        #[cfg(any(
+            all(feature = "native-macos", target_os = "macos"),
+            all(feature = "native-linux", target_os = "linux")
+        ))]
+        {
+            self.native_directory = None;
+        }
     }
 
     /// Adds one entry, reusing the buffer left by the directory before.
@@ -2360,6 +2469,24 @@ impl DirectoryBackend for SystemBackend {
             DirectoryOpen::default()
         }
     }
+
+    fn restore_directory_open(&self, path: &Path, listing: &mut Listing) {
+        #[cfg(all(feature = "native-macos", target_os = "macos"))]
+        macos_native::restore_retained_directory(path, listing);
+        #[cfg(all(
+            feature = "native-linux",
+            target_os = "linux",
+            not(all(feature = "native-macos", target_os = "macos"))
+        ))]
+        linux_native::restore_retained_directory(path, listing);
+        #[cfg(not(any(
+            all(feature = "native-macos", target_os = "macos"),
+            all(feature = "native-linux", target_os = "linux")
+        )))]
+        {
+            let _ = (path, listing);
+        }
+    }
 }
 
 /// Incremental portable traversal produced by Walker stream.
@@ -2636,7 +2763,10 @@ struct DirectoryScratch {
 
 /// One suspended serial-directory listing. A child directory is scheduled
 /// separately, then this frame resumes at the next entry, which retains the
-/// serial walk's depth-first order without borrowing a call-stack frame.
+/// serial walk's depth-first order without borrowing a call-stack frame. The
+/// listing keeps its entry buffers while suspended but releases its native
+/// handle after handing one clone to the child; resume reacquires an optional
+/// handle instead of pinning one descriptor per ancestor.
 struct DirectoryFrame {
     task: DirectoryTask,
     ignores: IgnoreScope,
@@ -2774,13 +2904,18 @@ impl<'walker> WalkState<'walker> {
         let path = task.path.as_path();
         let depth = task.depth;
         let is_root = depth == 0;
-        if let Err(source) = backend.read_scheduled_directory(
+        let read_result = backend.read_scheduled_directory(
             path,
             &task.open,
             self.walker.options.follow_symlinks,
             !self.walker.options.follow_symlinks && depth > 0,
             &mut scratch.listing,
-        ) {
+        );
+        // The capability has done its one job: opening this scheduled child.
+        // Keeping it in the child's suspended frame would pin its parent for
+        // the rest of the depth-first subtree.
+        task.open = DirectoryOpen::default();
+        if let Err(source) = read_result {
             let result = self.handle_error("read_dir", path.to_path_buf(), source, is_root);
             scratch.listing.clear();
             self.scratch.push(scratch);
@@ -2820,6 +2955,9 @@ impl<'walker> WalkState<'walker> {
     ) -> Result<(), WalkError> {
         let path = frame.task.path.as_path();
         let depth = frame.task.depth;
+        if frame.next_entry < frame.scratch.listing.entries().len() {
+            backend.restore_directory_open(path, &mut frame.scratch.listing);
+        }
         while frame.next_entry < frame.scratch.listing.entries().len() {
             // A `Verdict::Stop` is this walk's own decision, already on a local
             // field, and is honoured on the very next entry. The caller's token
@@ -2861,6 +2999,7 @@ impl<'walker> WalkState<'walker> {
                 }
                 EntryAction::Descend(task) => {
                     reset_to_directory(&mut frame.scratch.path, path);
+                    frame.scratch.listing.release_directory_open();
                     pending.push(SerialTask::Resume(frame));
                     pending.push(SerialTask::Directory(task));
                     return Ok(());
@@ -2871,6 +3010,7 @@ impl<'walker> WalkState<'walker> {
                 EntryAction::DescendAndEmit(entry, task) => {
                     let entry = entry.with_path(own_path(&mut self.spare, &frame.scratch.path));
                     reset_to_directory(&mut frame.scratch.path, path);
+                    frame.scratch.listing.release_directory_open();
                     pending.push(SerialTask::Resume(frame));
                     pending.push(SerialTask::Emit(entry));
                     pending.push(SerialTask::Directory(task));
@@ -2885,6 +3025,7 @@ impl<'walker> WalkState<'walker> {
                         return Err(error);
                     }
                     if let Some(task) = descend {
+                        frame.scratch.listing.release_directory_open();
                         pending.push(SerialTask::Resume(frame));
                         pending.push(SerialTask::Directory(task));
                         return Ok(());
@@ -9104,6 +9245,45 @@ mod tests {
             assert!(result.entries().is_empty(), "threads={threads}");
             assert!(result.errors().is_empty(), "threads={threads}");
         }
+    }
+
+    /// A target path that crosses a regular file cannot contain the descendant
+    /// an include was trying to re-admit. It is the same terminal resolution
+    /// class as a dangling or looped target, but only after the unresolved
+    /// link itself was already excluded.
+    #[cfg(unix)]
+    #[test]
+    fn an_excluded_link_through_a_file_has_no_re_admittable_descendant() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        fixture.write("plain.txt");
+        symlink("plain.txt/inner", fixture.root.join("notdir"))
+            .expect("create link whose target crosses a file");
+        let follow = WalkOptions::default().follow_symlinks(true);
+
+        for threads in [1, 4] {
+            let result = Walker::new(&fixture.root)
+                .threads(threads)
+                .exclude("notdir")
+                .expect("valid link exclusion")
+                .include("notdir/keep.txt")
+                .expect("valid descendant include")
+                .options(follow)
+                .error_policy(ErrorPolicy::Abort)
+                .collect()
+                .expect("an excluded ENOTDIR link cannot reach a descendant");
+            assert!(result.entries().is_empty(), "threads={threads}");
+        }
+
+        let error = Walker::new(&fixture.root)
+            .options(follow)
+            .error_policy(ErrorPolicy::Abort)
+            .collect()
+            .expect_err("an unexcluded ENOTDIR link remains a metadata error");
+        assert_eq!(error.operation(), "metadata");
+        assert_eq!(error.path(), fixture.root.join("notdir"));
+        assert_eq!(error.source.kind(), std::io::ErrorKind::NotADirectory);
     }
 
     #[cfg(unix)]

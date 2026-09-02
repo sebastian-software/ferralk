@@ -188,7 +188,10 @@ fn exclude_proves_no_re_admission(
 /// Whether resolving a path-excluded link proves that it has no reachable
 /// descendant for an include to re-admit.
 fn excluded_link_has_no_reachable_target(error: &std::io::Error) -> bool {
-    if error.kind() == std::io::ErrorKind::NotFound {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    ) {
         return true;
     }
     #[cfg(unix)]

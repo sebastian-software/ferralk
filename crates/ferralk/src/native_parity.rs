@@ -444,6 +444,71 @@ fn parity_over_a_deep_tree() {
 }
 
 #[test]
+fn serial_suspension_keeps_native_descriptor_high_water_bounded() {
+    let fixture = Fixture::new("serial-retained-fd");
+    let mut directory = PathBuf::new();
+    for level in 0..32 {
+        directory.push(format!("level-{level}"));
+        fixture.write(directory.join("file.txt"));
+    }
+    let walker = collecting_walker(&fixture.root);
+    let (portable_entries, portable_errors) = walk_portable(&walker);
+
+    let retention = crate::retained_directory_test::Guard::new(64);
+    let native = walker.collect().expect("native serial walk succeeds");
+    let stats = retention.stats();
+
+    assert_eq!(
+        describe_entries(native.entries(), &fixture.root),
+        describe_entries(&portable_entries, &fixture.root)
+    );
+    assert_eq!(
+        describe_errors(native.errors(), &fixture.root),
+        describe_errors(&portable_errors, &fixture.root)
+    );
+    assert_eq!(stats.current, 0, "the completed walk releases every permit");
+    assert!(
+        stats.high_water <= 2,
+        "a parent-to-child handoff needs at most two descriptors: {stats:?}"
+    );
+    assert_eq!(
+        stats.denied, 0,
+        "a 64-descriptor budget covers a one-at-a-time serial walk"
+    );
+}
+
+#[test]
+fn retained_directory_budget_exhaustion_uses_full_path_fallback() {
+    let fixture = Fixture::new("retained-fd-fallback");
+    let mut directory = PathBuf::new();
+    for level in 0..8 {
+        directory.push(format!("level-{level}"));
+        fixture.write(directory.join("file.txt"));
+    }
+    let walker = collecting_walker(&fixture.root);
+    let (portable_entries, portable_errors) = walk_portable(&walker);
+
+    let retention = crate::retained_directory_test::Guard::new(1);
+    let native = walker.collect().expect("budget fallback keeps walking");
+    let stats = retention.stats();
+
+    assert_eq!(
+        describe_entries(native.entries(), &fixture.root),
+        describe_entries(&portable_entries, &fixture.root)
+    );
+    assert_eq!(
+        describe_errors(native.errors(), &fixture.root),
+        describe_errors(&portable_errors, &fixture.root)
+    );
+    assert_eq!(stats.current, 0, "the completed walk releases its permit");
+    assert_eq!(stats.high_water, 1);
+    assert!(
+        stats.denied > 0,
+        "the fixture must exercise retention-budget exhaustion: {stats:?}"
+    );
+}
+
+#[test]
 #[allow(unsafe_code)]
 fn parity_beyond_path_max_holds_for_every_frontend() {
     use std::{
