@@ -8129,6 +8129,45 @@ mod tests {
         }
     }
 
+    /// An escaped separator is folded into a literal run, and the period
+    /// behind it starts a component for the matcher. The pruning summary has
+    /// to see that period too, or a covering exclude prunes a subtree the
+    /// include reaches through the exclude's hidden blind spot.
+    #[test]
+    fn covering_excludes_keep_hidden_descendants_behind_an_escaped_separator() {
+        let fixture = Fixture::new();
+        fixture.write("x/foo/.hidden/keep");
+        fixture.write("x/foo/visible/keep");
+
+        for include in [
+            "x/f*\\/.hidden/keep",
+            "x/*\\/.hidden/keep",
+            "**/f*\\/.hidden/keep",
+        ] {
+            let build = || {
+                Walker::new(&fixture.root)
+                    .include(include)
+                    .expect("valid include")
+                    .exclude("x/**")
+                    .expect("valid exclude")
+                    .options(WalkOptions::default().files_only(true).sort(true))
+            };
+            assert_frontends_agree(include, &fixture.root, build);
+            assert_eq!(
+                relative_paths(
+                    build()
+                        .threads(1)
+                        .collect()
+                        .expect("walk succeeds")
+                        .entries(),
+                    &fixture.root,
+                ),
+                [PathBuf::from("x/foo/.hidden/keep")],
+                "{include}: the include reaches the excluded subtree's hidden blind spot"
+            );
+        }
+    }
+
     /// With no includes, every exclude form that rejects a directory can
     /// prune it: a literal, a directory-only pattern, or an explicit subtree.
     #[test]

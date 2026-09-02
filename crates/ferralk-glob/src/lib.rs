@@ -1645,17 +1645,21 @@ impl CompiledAlternative {
 /// not: their zero-width branch is forbidden immediately before a leading
 /// period, so a following period literal is not an implicit hidden opt-in.
 /// The syntactic `**/` prefix is different because it explicitly advances to
-/// a component boundary without consuming candidate bytes.
+/// a component boundary without consuming candidate bytes. An escaped
+/// separator is folded into its literal run, and the byte behind it starts a
+/// component for the matcher just as one behind a separator token does.
 fn tokens_can_match_hidden_component_without_match_hidden(tokens: &[Token]) -> bool {
     let mut at_component_start = true;
     for token in tokens {
         match token {
             Token::Separator | Token::RecursivePrefix => at_component_start = true,
             Token::Literal(literal) => {
-                if at_component_start && literal.first() == Some(&b'.') {
-                    return true;
+                for &byte in literal {
+                    if at_component_start && byte == b'.' {
+                        return true;
+                    }
+                    at_component_start = is_separator(byte);
                 }
-                at_component_start = false;
             }
             Token::Any | Token::Class(_) => at_component_start = true,
             Token::Star | Token::RecursiveStar => at_component_start = false,
@@ -1700,7 +1704,8 @@ impl CompiledExtglob {
                     if at_component_start && *escaped == b'.' {
                         return true;
                     }
-                    at_component_start = false;
+                    // An escaped separator still ends a component.
+                    at_component_start = is_separator(*escaped);
                     index += 2;
                 }
                 ExtglobStep::Group(group) => {
@@ -6320,6 +6325,14 @@ mod tests {
         assert!(!can_match_hidden("**/?(visible).hidden/keep.txt"));
         assert!(!can_match_hidden("**/*(visible).hidden/keep.txt"));
         assert!(can_match_hidden("**/?(.visible).hidden/keep.txt"));
+        // An escaped separator is folded into the literal run, and the
+        // period behind it starts a component for the matcher.
+        assert!(can_match_hidden("x/f*\\/.hidden/keep"));
+        assert!(can_match_hidden("x/*\\/.hidden/keep"));
+        assert!(can_match_hidden("**/f*\\/.hidden/keep"));
+        assert!(can_match_hidden("x/@(f*)\\/.hidden/keep"));
+        assert!(!can_match_hidden("x/f*\\.hidden/keep"));
+        assert!(!can_match_hidden("x/@(f*)\\.hidden/keep"));
 
         let zero_width = Pattern::compile("**/?(visible).hidden/keep.txt", walker_options)
             .expect("pattern compiles");
