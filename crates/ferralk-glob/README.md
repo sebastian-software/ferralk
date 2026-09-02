@@ -19,10 +19,13 @@ assert!(!source_file.is_match_glob_path("src/generated/lib.rs.bak"));
 # Ok::<(), ferralk_glob::PatternError>(())
 ```
 
-`*`, `?`, and character classes are component-local by default. Enable
-`recursive_double_star` for `**` to cross separators, and opt into braces,
-extglobs, hidden-name matching, ASCII case folding, or changed escaping only
-when those semantics are required.
+Wildcard scope comes from the matching entry point. `is_match` is
+separator-agnostic; `is_match_path` keeps zlob's list-filter rule where a root
+wildcard may cross separators but wildcards after an explicit separator are
+component-local; `is_match_glob_path` keeps every ordinary wildcard in one
+component. With `recursive_double_star` disabled, `**` is equivalent to `*`;
+enable it for recursive separator crossing. Braces, extglobs, hidden-name
+matching, ASCII case folding, and changed escaping remain explicit opt-ins.
 
 For the full syntax, error contract, and compatibility notes, see the
 [crate documentation](https://docs.rs/ferralk-glob) and the

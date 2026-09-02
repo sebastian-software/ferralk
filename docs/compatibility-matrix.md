@@ -11,7 +11,7 @@ read the [compatibility guide](compatibility-guide.md).
 | zlob capability / flag | ferralk API | Status | Notes |
 |---|---|---|---|
 | `*`, `?`, separators | `Pattern::compile` / `Pattern::is_match` | Implemented | In-memory `*`/`?` are separator-agnostic; leading periods remain opt-in. |
-| `**` | `PatternOptions::recursive_double_star` | Implemented (M1) | Explicit option; corpus import continues. |
+| `**` | `PatternOptions::recursive_double_star` | Implemented (M1) | Explicit option; while disabled, consecutive stars have ordinary `*` semantics through every entry point. |
 | bracket classes, ranges, `[!...]`, `[^...]` | `Pattern::compile` | Implemented (M1) | Byte-first, including ASCII POSIX classes. |
 | `ZLOB_BRACE` | `PatternOptions::braces` | Implemented (M1) | Nested and empty alternatives; source-backed corpus import continues. |
 | `ZLOB_EXTGLOB` | `PatternOptions::extglob` | Implemented (M1) | `@()`, `?()`, `*()`, `+()`, `!()`; matches zlob's non-nested scope. |
@@ -19,7 +19,7 @@ read the [compatibility guide](compatibility-guide.md).
 | `ZLOB_NOESCAPE` | `PatternOptions::escape` | Implemented (M1) | Higher-level boolean, not a bitflag. |
 | case folding | `PatternOptions::case_insensitive` | Implemented (M1) | Explicit opt-in on every platform. |
 | `has_wildcards` | `Pattern::has_wildcards` | Implemented (M1) | Byte-first, flag-sensitive preflight matching zlob's active syntax markers. |
-| `zlob_match_paths` / `_at` and index variants | `Pattern::{filter_paths,filter_paths_at,filter_path_indices,filter_path_indices_at}` | Implemented (M1) | Path APIs preserve caller order rather than zlob's default sort; index APIs return input positions. `_at` matches after stripping a component-boundary base path while returning original full paths or indices. Wildcard tokens after an explicit separator stay in that component, while `**` remains recursive. |
+| `zlob_match_paths` / `_at` and index variants | `Pattern::{filter_paths,filter_paths_at,filter_path_indices,filter_path_indices_at}` | Implemented (M1) | Path APIs preserve caller order rather than zlob's default sort; index APIs return input positions. `_at` matches after stripping a component-boundary base path while returning original full paths or indices. One leading `./` is normalized on both pattern and candidate. Wildcards after an explicit separator stay in that component; `**` is recursive only when enabled. |
 | `ZLOB_NOCHECK`, `ZLOB_NOMAGIC` | Walker no-match policy | Deferred (M4 review) | These are C/glob result-shaping semantics, not matcher semantics. |
 | `ZLOB_TILDE`, `ZLOB_TILDE_CHECK` | — | Deliberate divergence | Out of scope per RFC non-goals. |
 

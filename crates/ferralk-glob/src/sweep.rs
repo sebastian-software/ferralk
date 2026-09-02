@@ -80,7 +80,7 @@ pub(crate) struct NarrowSweepEngine {
     stars: u64,
     /// Positions a separator byte never reaches under `component_wildcards`
     /// without `root_component_wildcards`: wildcards directly after an
-    /// explicit separator, and `PathStar` wherever it stands.
+    /// explicit separator.
     sep_block_component: u64,
     /// Positions a separator byte never reaches under both component options:
     /// every wildcard except the recursive stars.
@@ -202,19 +202,6 @@ impl SweepEngine {
                     if after_separator {
                         engine.sep_block_component |= bit;
                     }
-                    engine.sep_block_glob |= bit;
-                }
-                // A non-recursive `**` in a path filter is component-local
-                // wherever it stands, not only after a separator; see
-                // `Token::PathStar` in `matches_from`.
-                Token::PathStar => {
-                    engine.stars |= bit;
-                    if !options.match_hidden {
-                        engine.dot_stop_block |= bit << 1;
-                    }
-                    wildcards |= bit;
-                    consume_any |= bit;
-                    engine.sep_block_component |= bit;
                     engine.sep_block_glob |= bit;
                 }
                 // Recursive stars cross separators under every policy; only
@@ -555,16 +542,6 @@ impl WideSweepEngine {
                     if after_separator {
                         set_bit(&mut engine.sep_block_component, position);
                     }
-                    set_bit(&mut engine.sep_block_glob, position);
-                }
-                Token::PathStar => {
-                    set_bit(&mut engine.stars, position);
-                    if !options.match_hidden {
-                        set_bit(&mut engine.dot_stop_block, position + 1);
-                    }
-                    set_bit(&mut wildcards, position);
-                    set_bit(&mut consume_any, position);
-                    set_bit(&mut engine.sep_block_component, position);
                     set_bit(&mut engine.sep_block_glob, position);
                 }
                 Token::RecursiveStar => {
