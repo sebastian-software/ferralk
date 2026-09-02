@@ -379,7 +379,15 @@ impl Pattern {
                 }
                 b'[' => {
                     flush_literals(&mut tokens, &mut literals);
-                    let (class, next) = parse_class(pattern, index, options.escape)?;
+                    let (class, next) =
+                        parse_class(pattern, index, options.escape).map_err(|mut error| {
+                            if let Some(source_offset) = walker_source_provenance
+                                .and_then(|provenance| provenance.offset_at(error.offset))
+                            {
+                                error.offset = source_offset;
+                            }
+                            error
+                        })?;
                     // A class token owns its member list, so it costs more than
                     // the one unit the loop charges for the token itself.
                     budget.charge(class.members.len(), 0)?;
@@ -7807,6 +7815,22 @@ mod tests {
         assert_eq!(error.offset(), 0);
         assert_eq!(error.message(), "unclosed character class");
         assert!(compile("foo\\").is_match("foo\\"));
+    }
+
+    #[test]
+    fn brace_expansion_errors_keep_source_offsets() {
+        let options = PatternOptions::default().braces(true);
+        for (pattern, offset) in [("abc{d,[}", 6), ("{a,b}[", 5), ("x{a,b}{c,[d}", 9)] {
+            let error = Pattern::compile(pattern, options)
+                .expect_err("the expanded alternative contains an unclosed class");
+            assert_eq!(error.message(), "unclosed character class");
+            assert_eq!(error.offset(), offset);
+            assert_eq!(
+                pattern.as_bytes().get(error.offset()),
+                Some(&b'['),
+                "{pattern} points into the caller's source"
+            );
+        }
     }
 
     #[test]
