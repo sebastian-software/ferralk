@@ -253,7 +253,9 @@ impl IgnoreScope {
 }
 
 /// Resolves a relative spelling against the current directory, then removes
-/// lexical `.` and `..` components without following a symlink.
+/// lexical `.` components. A spelling containing `..` is canonicalized when
+/// possible so a preceding symlink is followed before its parent is selected,
+/// matching the filesystem lookup the walker performs.
 ///
 /// Repository discovery and ignore anchoring need one canonical spelling of
 /// the path, while the walker deliberately retains the caller's spelling for
@@ -262,6 +264,13 @@ fn discovery_path(path: &Path) -> PathBuf {
     let Ok(absolute) = std::path::absolute(path) else {
         return path.to_path_buf();
     };
+    if absolute
+        .components()
+        .any(|component| component == Component::ParentDir)
+        && let Ok(canonical) = fs::canonicalize(&absolute)
+    {
+        return canonical;
+    }
     let mut normalized = PathBuf::new();
     for component in absolute.components() {
         match component {

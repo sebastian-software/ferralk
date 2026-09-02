@@ -2992,6 +2992,8 @@ mod tests {
     const PARENT_ROOT_IGNORE_FIXTURE: &str = "FERRALK_PARENT_ROOT_IGNORE_FIXTURE";
     const RELATIVE_ROOT_IGNORE_FIXTURE: &str = "FERRALK_RELATIVE_ROOT_IGNORE_FIXTURE";
     const RELATIVE_ROOT_SPELLING: &str = "FERRALK_RELATIVE_ROOT_SPELLING";
+    #[cfg(unix)]
+    const SYMLINK_PARENT_ROOT_FIXTURE: &str = "FERRALK_SYMLINK_PARENT_ROOT_FIXTURE";
 
     #[test]
     fn walk_stream_keeps_its_unwind_auto_traits() {
@@ -4931,6 +4933,64 @@ mod tests {
                 "parent-relative-root child failed for {spelling:?}: {status}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_components_after_symlinks_use_the_physical_repository() {
+        if std::env::var_os(SYMLINK_PARENT_ROOT_FIXTURE).is_some() {
+            let root = Path::new("portal/..");
+            let walked = Walker::new(root)
+                .respect_git_ignore(true)
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("symlink-parent-root walk succeeds");
+            assert_eq!(
+                relative_paths(walked.entries(), root),
+                vec![PathBuf::from("keep.txt")],
+                "ignore discovery must resolve `..` after following `portal`"
+            );
+            return;
+        }
+
+        let fixture = Fixture::new();
+        fixture.write("physical/repository/sub/secret.txt");
+        fixture.write("physical/repository/sub/keep.txt");
+        fs::create_dir_all(fixture.root.join("physical/repository/sub/nested"))
+            .expect("create symlink target directory");
+        fs::create_dir(fixture.root.join("physical/repository/.git"))
+            .expect("create physical repository metadata directory");
+        fs::write(
+            fixture.root.join("physical/repository/.gitignore"),
+            b"/sub/secret.txt\n",
+        )
+        .expect("write physical repository ignore rule");
+
+        fs::create_dir_all(fixture.root.join("lexical/work"))
+            .expect("create lexical working directory");
+        fs::create_dir(fixture.root.join("lexical/.git"))
+            .expect("create lexical repository metadata directory");
+        fs::write(fixture.root.join("lexical/.gitignore"), b"/work/keep.txt\n")
+            .expect("write lexical repository ignore rule");
+        std::os::unix::fs::symlink(
+            fixture.root.join("physical/repository/sub/nested"),
+            fixture.root.join("lexical/work/portal"),
+        )
+        .expect("create directory symlink");
+
+        let status = Command::new(std::env::current_exe().expect("locate test binary"))
+            .args([
+                "tests::parent_components_after_symlinks_use_the_physical_repository",
+                "--exact",
+            ])
+            .current_dir(fixture.root.join("lexical/work"))
+            .env(SYMLINK_PARENT_ROOT_FIXTURE, "1")
+            .status()
+            .expect("run isolated symlink-parent-root regression test");
+        assert!(
+            status.success(),
+            "symlink-parent-root child failed: {status}"
+        );
     }
 
     /// Starts a Git oracle process that is independent of the developer's
