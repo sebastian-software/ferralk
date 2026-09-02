@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.11.0](https://github.com/sebastian-software/ferralk/compare/v0.10.0...v0.11.0) (2026-09-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* **glob:** parse star runs before extglobs ([#324](https://github.com/sebastian-software/ferralk/issues/324))
+* **glob:** align path entry point semantics ([#323](https://github.com/sebastian-software/ferralk/issues/323))
+* **glob:** Without match_hidden, ordinary stars no longer match a hidden component by stopping immediately before its leading period (for example, *.rs no longer matches .rs).
+* **walker:** close native traversal residuals ([#321](https://github.com/sebastian-software/ferralk/issues/321))
+* **walker:** Relative roots with trailing separators or parent components now apply anchored repository ignore rules like their equivalent normalized filesystem roots, which can change emitted entries.
+* **glob:** PatternError offsets from brace-expanded and absolute walker patterns now identify the original input bytes instead of intermediate rewritten patterns.
+* **glob:** Case-insensitive POSIX upper classes now match ASCII letters instead of matching none, which can change glob and walker results.
+* **walker:** Git-ignore matching now follows Git 2.52 for attached star runs, escaped separators, and reversed ranges, which can change which entries a walk includes.
+
+### Bug Fixes
+
+* **fuzz:** prevent matcher OOM regressions ([#326](https://github.com/sebastian-software/ferralk/issues/326)) ([2edeabd](https://github.com/sebastian-software/ferralk/commit/2edeabd608320b9b25d537524e4ee06b243fe6d0))
+* **glob:** align path entry point semantics ([#323](https://github.com/sebastian-software/ferralk/issues/323)) ([fe71ce8](https://github.com/sebastian-software/ferralk/commit/fe71ce80857c6a3c30b5669d2c068bb87bd45675))
+* **glob:** fold POSIX upper class symmetrically ([#318](https://github.com/sebastian-software/ferralk/issues/318)) ([638f369](https://github.com/sebastian-software/ferralk/commit/638f369a39616dd1c878a06c6c3ad76b2982c813)), closes [#299](https://github.com/sebastian-software/ferralk/issues/299)
+* **glob:** parse star runs before extglobs ([#324](https://github.com/sebastian-software/ferralk/issues/324)) ([08e95df](https://github.com/sebastian-software/ferralk/commit/08e95dff940b722c24d257f5a0f8c2f20d77cd37))
+* **glob:** preserve caller pattern error offsets ([#319](https://github.com/sebastian-software/ferralk/issues/319)) ([d39b9f5](https://github.com/sebastian-software/ferralk/commit/d39b9f596a5af5702077f06bb985103eadb83c90)), closes [#300](https://github.com/sebastian-software/ferralk/issues/300)
+* **glob:** restore strict hidden-star pruning ([#322](https://github.com/sebastian-software/ferralk/issues/322)) ([29eca65](https://github.com/sebastian-software/ferralk/commit/29eca65d30ac027e1892ec655cffb9f11be22845)), closes [#298](https://github.com/sebastian-software/ferralk/issues/298)
+* **walker:** align ignore wildmatch with Git 2.52 ([#316](https://github.com/sebastian-software/ferralk/issues/316)) ([f210f10](https://github.com/sebastian-software/ferralk/commit/f210f102dfa3f246d0067e8f409577bf4c473813)), closes [#311](https://github.com/sebastian-software/ferralk/issues/311)
+* **walker:** close native traversal residuals ([#321](https://github.com/sebastian-software/ferralk/issues/321)) ([bd267c2](https://github.com/sebastian-software/ferralk/commit/bd267c28f3459a4fde2e6aa964711cdc03db8335))
+* **walker:** normalize relative ignore roots ([#320](https://github.com/sebastian-software/ferralk/issues/320)) ([9b59191](https://github.com/sebastian-software/ferralk/commit/9b59191acdd0d16304e4261cb0a29b9fc04861e9))
+
 ## [0.10.0](https://github.com/sebastian-software/ferralk/compare/v0.9.4...v0.10.0) (2026-09-01)
 
 
