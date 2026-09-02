@@ -4743,11 +4743,18 @@ fn compile_extglob_step(
     Ok(match pattern[index] {
         b'*' => {
             let mut next = index + 1;
-            // Shell extglob grammar gives the final star in a run to a `*(`
-            // opener. Keep the preceding stars as one ordinary wildcard, but
-            // leave that last offset for the group compiler instead of
-            // greedily swallowing it into the run.
-            while pattern.get(next) == Some(&b'*') && detect_extglob_at(pattern, next).is_none() {
+            // Shell extglob grammar gives the final star in a run to a closed
+            // `*(` group. Keep the preceding stars as one ordinary wildcard,
+            // but leave that last offset for the group compiler instead of
+            // greedily swallowing it into the run. An unclosed opener keeps
+            // the compatible literal-suffix fallback and remains part of the
+            // ordinary star run.
+            while pattern.get(next) == Some(&b'*') {
+                let closed_group_starts_here = detect_extglob_at(pattern, next).is_some()
+                    && closing_extglob_parenthesis(pattern, next + 1, options.escape).is_some();
+                if closed_group_starts_here {
+                    break;
+                }
                 next += 1;
             }
             ExtglobStep::Star {
@@ -7159,6 +7166,27 @@ mod tests {
             .expect("literal parenthesized suffix compiles");
         assert!(disabled.is_match("x(a)"));
         assert!(!disabled.is_match("x"));
+    }
+
+    #[test]
+    fn unclosed_extglob_after_a_star_run_keeps_its_literal_suffix() {
+        let options = PatternOptions::default().extglob(true).match_hidden(true);
+
+        let leading = Pattern::compile("**(a", options).expect("fallback pattern compiles");
+        let leading_program = leading.alternatives[0]
+            .extglob
+            .as_ref()
+            .expect("extglob interpreter is retained");
+        assert!(matches!(
+            leading_program.steps[0],
+            ExtglobStep::Star { next: 2, .. }
+        ));
+        assert!(leading.is_match("x(a"));
+        assert!(!leading.is_match("x"));
+
+        let embedded = Pattern::compile("a**(b", options).expect("fallback pattern compiles");
+        assert!(embedded.is_match("ax(b"));
+        assert!(!embedded.is_match("ax"));
     }
 
     #[test]
