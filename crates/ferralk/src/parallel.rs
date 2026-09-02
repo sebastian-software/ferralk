@@ -207,6 +207,12 @@ impl<'scope, 'env> HelperPool<'scope, 'env> {
     /// directory: a full pool costs the two atomic loads that reject the claim.
     fn grow(self) {
         while !self.shared.should_stop() {
+            // A helper the operating system refused to start capped the pool
+            // for this walk: the workers that exist finish it, and no
+            // directory boundary retries the refused spawn.
+            if self.shared.helpers_capped.load(Ordering::Acquire) {
+                return;
+            }
             if !self.shared.tree_is_worth_helpers() {
                 return;
             }
@@ -230,9 +236,11 @@ impl<'scope, 'env> HelperPool<'scope, 'env> {
     /// Reports whether the pool may keep growing after this attempt.
     fn spawn(self, slot: WorkerSlot<'env>, scratch: WorkerScratch) -> bool {
         #[cfg(test)]
+        count_worker_spawn_attempt();
+        #[cfg(test)]
         if should_fail_next_worker_spawn() {
             self.shared
-                .record_startup_error(std::io::Error::other("injected worker start failure"));
+                .record_spawn_failure(std::io::Error::other("injected worker start failure"));
             lock(self.idle).push(scratch);
             return false;
         }
@@ -251,7 +259,7 @@ impl<'scope, 'env> HelperPool<'scope, 'env> {
             Ok(_) => true,
             // The closure, and with it the slot, is dropped on failure.
             Err(source) => {
-                self.shared.record_startup_error(source);
+                self.shared.record_spawn_failure(source);
                 false
             }
         }
@@ -261,9 +269,6 @@ impl<'scope, 'env> HelperPool<'scope, 'env> {
 fn finish(shared: Arc<Shared>, mut entries: Vec<WalkEntry>) -> Result<WalkResult, WalkError> {
     if let Some(payload) = lock(&shared.panic).take() {
         resume_unwind(payload);
-    }
-    if let Some(error) = lock(&shared.startup_error).take() {
-        return Err(error);
     }
     if let Some(error) = lock(&shared.abort_error).take() {
         return Err(error);
@@ -307,7 +312,10 @@ struct Shared<'backend> {
     cancellation: Option<super::CancellationToken>,
     errors: Mutex<Vec<WalkError>>,
     abort_error: Mutex<Option<WalkError>>,
-    startup_error: Mutex<Option<WalkError>>,
+    /// Set once a helper could not be started. Helpers are an optimization
+    /// (ADR-0009), so the walk goes on with the workers it has; this stops
+    /// every later directory boundary from asking the operating system again.
+    helpers_capped: AtomicBool,
     panic: Mutex<Option<Box<dyn Any + Send + 'static>>>,
 }
 
@@ -329,7 +337,7 @@ impl<'backend> Shared<'backend> {
             cancellation,
             errors: Mutex::new(Vec::new()),
             abort_error: Mutex::new(None),
-            startup_error: Mutex::new(None),
+            helpers_capped: AtomicBool::new(false),
             panic: Mutex::new(None),
         }
     }
@@ -405,20 +413,23 @@ impl<'backend> Shared<'backend> {
         }
     }
 
-    fn record_startup_error(&self, source: std::io::Error) {
-        let mut startup_error = lock(&self.startup_error);
-        if startup_error.is_none() {
-            *startup_error = Some(WalkError::new(
-                "spawn_worker",
-                self.walker
-                    .roots()
-                    .next()
-                    .expect("a walk has a root")
-                    .into(),
-                source,
-            ));
-            self.stop();
-        }
+    /// A helper the operating system refused to start is a recoverable
+    /// `spawn_worker` error on the first root, not the walk's failure: the
+    /// caller thread is always one worker, so the walk completes on whatever
+    /// pool exists. Under `ErrorPolicy::Abort` the error ends the walk like
+    /// any other.
+    fn record_spawn_failure(&self, source: std::io::Error) {
+        self.helpers_capped.store(true, Ordering::Release);
+        self.record_error(
+            "spawn_worker",
+            self.walker
+                .roots()
+                .next()
+                .expect("a walk has a root")
+                .into(),
+            source,
+            false,
+        );
     }
 
     fn record_panic(&self, payload: Box<dyn Any + Send + 'static>) {
@@ -802,6 +813,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 std::thread_local! {
     static FAIL_NEXT_WORKER_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Spawn attempts made from this thread, so a test can tell one refused
+    /// spawn from a walk that keeps asking at every directory boundary.
+    static WORKER_SPAWN_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -812,6 +826,16 @@ fn fail_next_worker_spawn() {
 #[cfg(test)]
 fn should_fail_next_worker_spawn() -> bool {
     FAIL_NEXT_WORKER_SPAWN.with(std::cell::Cell::take)
+}
+
+#[cfg(test)]
+fn count_worker_spawn_attempt() {
+    WORKER_SPAWN_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+}
+
+#[cfg(test)]
+fn take_worker_spawn_attempts() -> usize {
+    WORKER_SPAWN_ATTEMPTS.with(std::cell::Cell::take)
 }
 
 /// Directory whose traversal panics once, on whichever worker picks it up.
@@ -951,8 +975,9 @@ mod tests {
     use super::{
         Shared, WORKER_RENDEZVOUS_GUARD, Walker, catch_worker_panic, expect_worker_threads,
         fail_next_worker_spawn, finish, lock, observed_worker_threads, panic_in_directory,
+        take_worker_spawn_attempts,
     };
-    use crate::{CancellationToken, WalkOptions, WalkResult};
+    use crate::{CancellationToken, ErrorPolicy, WalkOptions, WalkResult};
 
     /// A hung `collect()` is the regression under test, so the assertion has to
     /// time out instead of blocking the suite forever.
@@ -1564,11 +1589,68 @@ mod tests {
         }
     }
 
+    /// A helper the operating system refuses is not the walk's failure: the
+    /// workers that exist finish the tree, the refusal is one recoverable
+    /// `spawn_worker` error under `Collect` and nothing under `Skip`, and the
+    /// pool stops asking instead of retrying at every directory boundary.
     #[test]
-    fn worker_start_failure_returns_a_structured_error_without_cancelling_the_token() {
-        let root = unique_root("worker-start");
+    fn worker_start_failure_caps_the_pool_and_completes_the_walk() {
+        let root = unique_root("worker-start-capped");
         // Wide enough to reach the size floor, or no helper is ever attempted
         // and there is nothing for the injected failure to land on.
+        create_wide_fixture(&root);
+        let expected = Walker::new(&root)
+            .threads(1)
+            .collect()
+            .expect("serial reference walk")
+            .entries()
+            .len();
+        let cancellation = CancellationToken::default();
+
+        for policy in [ErrorPolicy::Collect, ErrorPolicy::Skip] {
+            fail_next_worker_spawn();
+            let _ = take_worker_spawn_attempts();
+            let result = Walker::new(&root)
+                .threads(4)
+                .cancellation(cancellation.clone())
+                .error_policy(policy)
+                .collect()
+                .expect("a refused helper leaves the walk to the workers that exist");
+            assert_eq!(
+                result.entries().len(),
+                expected,
+                "{policy:?}: the walk completes on the caller thread"
+            );
+            assert!(!result.was_cancelled(), "{policy:?}");
+            assert!(
+                !cancellation.is_cancelled(),
+                "{policy:?}: a refused helper must not cancel a caller-owned token"
+            );
+            match policy {
+                ErrorPolicy::Collect => {
+                    let errors = result.errors();
+                    assert_eq!(errors.len(), 1, "{errors:?}");
+                    assert_eq!(errors[0].operation(), "spawn_worker");
+                    assert_eq!(errors[0].path(), PathBuf::from(&root));
+                }
+                _ => assert!(
+                    result.errors().is_empty(),
+                    "{policy:?} drops the recoverable spawn error: {:?}",
+                    result.errors()
+                ),
+            }
+            assert_eq!(
+                take_worker_spawn_attempts(),
+                1,
+                "{policy:?}: one refusal caps the pool for the rest of the walk"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worker_start_failure_aborts_under_abort_without_cancelling_the_token() {
+        let root = unique_root("worker-start-abort");
         create_wide_fixture(&root);
         let cancellation = CancellationToken::default();
         fail_next_worker_spawn();
@@ -1576,8 +1658,9 @@ mod tests {
         let error = Walker::new(&root)
             .threads(4)
             .cancellation(cancellation.clone())
+            .error_policy(ErrorPolicy::Abort)
             .collect()
-            .expect_err("injected worker start failure is returned");
+            .expect_err("under Abort the refused helper ends the walk");
         assert_eq!(error.operation(), "spawn_worker");
         assert_eq!(error.path(), PathBuf::from(&root));
         assert!(

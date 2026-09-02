@@ -1210,7 +1210,10 @@ impl Walker {
     /// Limits `collect()` to this many workers. Values are clamped to
     /// `1..=256`; `stream()` remains single-threaded to preserve incremental
     /// delivery. The upper bound caps the queues, scratch buffers, and
-    /// potential operating-system threads one walk can reserve.
+    /// potential operating-system threads one walk can reserve. It is a
+    /// ceiling, not a promise: a helper the operating system refuses to start
+    /// leaves the walk to the workers already running, see
+    /// [`Walker::collect`].
     #[must_use]
     pub const fn threads(mut self, threads: usize) -> Self {
         self.threads = if threads == 0 {
@@ -1227,6 +1230,14 @@ impl Walker {
     ///
     /// A panic inside a worker stops the sibling workers and is resumed on the
     /// calling thread after they have been joined.
+    ///
+    /// Helpers are an optimization. A helper thread the operating system
+    /// refuses to start, because the process is at its thread or memory
+    /// limit, does not fail the walk: the pool stays at the workers already
+    /// running, the calling thread included, and the refusal is a recoverable
+    /// `spawn_worker` error on the first root. It is returned in
+    /// [`WalkResult::errors`] under [`ErrorPolicy::Collect`], dropped under
+    /// [`ErrorPolicy::Skip`], and ends the walk under [`ErrorPolicy::Abort`].
     pub fn collect(self) -> Result<WalkResult, WalkError> {
         self.collect_with(&SystemBackend)
     }

@@ -309,7 +309,11 @@ survive differs.
   and must be `Sync`. Per-worker state belongs in a thread-local.
 
 Below a small tree size the walk stays on one thread whatever `threads()` says:
-starting workers costs more than a handful of directories does.
+starting workers costs more than a handful of directories does. `threads()` is
+a ceiling in the other direction too: a helper the operating system refuses to
+start, because the process is at its thread or memory limit, leaves the walk
+to the workers already running and is reported as one recoverable
+`spawn_worker` error under `ErrorPolicy::Collect`.
 
 ### Hidden paths: two separate switches
 
