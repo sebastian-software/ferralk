@@ -1852,11 +1852,57 @@ fn has_closing_parenthesis(pattern: &[u8], open: usize) -> bool {
 
 /// A backend-specific capability retained when a child directory is queued.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct DirectoryOpen {
+pub(crate) enum DirectoryOpen {
+    #[default]
+    None,
     #[cfg(all(feature = "native-macos", target_os = "macos"))]
-    relative: Option<macos_native::RelativeDirectoryOpen>,
+    MacosRelative(macos_native::RelativeDirectoryOpen),
     #[cfg(all(feature = "native-linux", target_os = "linux"))]
-    relative: Option<linux_native::RelativeDirectoryOpen>,
+    LinuxRelative(linux_native::RelativeDirectoryOpen),
+    #[cfg(any(
+        all(feature = "native-macos", target_os = "macos"),
+        all(feature = "native-linux", target_os = "linux")
+    ))]
+    Suspended(DirectoryIdentity),
+}
+
+#[cfg(any(
+    all(feature = "native-macos", target_os = "macos"),
+    all(feature = "native-linux", target_os = "linux")
+))]
+type DirectoryIdentity = (u64, u64);
+#[cfg(not(any(
+    all(feature = "native-macos", target_os = "macos"),
+    all(feature = "native-linux", target_os = "linux")
+)))]
+type DirectoryIdentity = ();
+
+impl DirectoryOpen {
+    fn suspended(_identity: DirectoryIdentity) -> Self {
+        #[cfg(any(
+            all(feature = "native-macos", target_os = "macos"),
+            all(feature = "native-linux", target_os = "linux")
+        ))]
+        return Self::Suspended(_identity);
+        #[cfg(not(any(
+            all(feature = "native-macos", target_os = "macos"),
+            all(feature = "native-linux", target_os = "linux")
+        )))]
+        {
+            Self::None
+        }
+    }
+
+    fn suspended_identity(&self) -> Option<DirectoryIdentity> {
+        #[cfg(any(
+            all(feature = "native-macos", target_os = "macos"),
+            all(feature = "native-linux", target_os = "linux")
+        ))]
+        if let Self::Suspended(identity) = self {
+            return Some(*identity);
+        }
+        None
+    }
 }
 
 /// The filesystem calls that traversal and classification make, so one mock
@@ -1901,11 +1947,26 @@ trait DirectoryBackend {
         DirectoryOpen::default()
     }
 
-    /// Opportunistically reacquires the current directory capability after a
-    /// serial frame resumes. A path backend, or a failed native reopen, simply
-    /// leaves later children on the ordinary full-path route.
-    fn restore_directory_open(&self, path: &Path, listing: &mut Listing) {
-        let _ = (path, listing);
+    /// Identity of the retained directory capability, when this backend has
+    /// one. Serial suspension records it before releasing the descriptor.
+    fn directory_identity(&self, listing: &Listing) -> Option<DirectoryIdentity> {
+        let _ = listing;
+        None
+    }
+
+    /// Reacquires the current directory capability after a serial frame
+    /// resumes and verifies it still names the directory that was suspended.
+    /// `false` means the mutable path now reaches a different identity, so its
+    /// cached entries must not be used as names below that replacement.
+    fn restore_directory_open(
+        &self,
+        path: &Path,
+        expected: Option<DirectoryIdentity>,
+        refuse_final_symlink: bool,
+        listing: &mut Listing,
+    ) -> bool {
+        let _ = (path, expected, refuse_final_symlink, listing);
+        true
     }
 
     /// Follows symlinks; decides whether a link points at a directory.
@@ -2396,13 +2457,12 @@ impl DirectoryBackend for SystemBackend {
         #[cfg(all(feature = "native-macos", target_os = "macos"))]
         {
             let _ = follow_symlinks;
-            macos_native::read_directory(
-                path,
-                _open.relative.as_ref(),
-                refuse_final_symlink,
-                listing,
-            )
-            .map_err(macos_native::NativeDirectoryReadError::into_io_error)
+            let relative = match _open {
+                DirectoryOpen::MacosRelative(relative) => Some(relative),
+                _ => None,
+            };
+            macos_native::read_directory(path, relative, refuse_final_symlink, listing)
+                .map_err(macos_native::NativeDirectoryReadError::into_io_error)
         }
         #[cfg(all(
             feature = "native-linux",
@@ -2411,12 +2471,11 @@ impl DirectoryBackend for SystemBackend {
         ))]
         {
             let _ = follow_symlinks;
-            linux_native::read_directory(
-                path,
-                _open.relative.as_ref(),
-                refuse_final_symlink,
-                listing,
-            )
+            let relative = match _open {
+                DirectoryOpen::LinuxRelative(relative) => Some(relative),
+                _ => None,
+            };
+            linux_native::read_directory(path, relative, refuse_final_symlink, listing)
         }
         #[cfg(not(any(
             all(feature = "native-macos", target_os = "macos"),
@@ -2436,14 +2495,15 @@ impl DirectoryBackend for SystemBackend {
         }
         #[cfg(all(feature = "native-macos", target_os = "macos"))]
         {
-            DirectoryOpen {
-                relative: listing.native_directory.as_ref().map(|directory| {
-                    macos_native::RelativeDirectoryOpen {
+            listing
+                .native_directory
+                .as_ref()
+                .map_or_else(DirectoryOpen::default, |directory| {
+                    DirectoryOpen::MacosRelative(macos_native::RelativeDirectoryOpen {
                         parent: Arc::clone(directory),
                         name: name.to_os_string(),
-                    }
-                }),
-            }
+                    })
+                })
         }
         #[cfg(all(
             feature = "native-linux",
@@ -2451,14 +2511,15 @@ impl DirectoryBackend for SystemBackend {
             not(all(feature = "native-macos", target_os = "macos"))
         ))]
         {
-            DirectoryOpen {
-                relative: listing.native_directory.as_ref().map(|directory| {
-                    linux_native::RelativeDirectoryOpen {
+            listing
+                .native_directory
+                .as_ref()
+                .map_or_else(DirectoryOpen::default, |directory| {
+                    DirectoryOpen::LinuxRelative(linux_native::RelativeDirectoryOpen {
                         parent: Arc::clone(directory),
                         name: name.to_os_string(),
-                    }
-                }),
-            }
+                    })
+                })
         }
         #[cfg(not(any(
             all(feature = "native-macos", target_os = "macos"),
@@ -2470,21 +2531,57 @@ impl DirectoryBackend for SystemBackend {
         }
     }
 
-    fn restore_directory_open(&self, path: &Path, listing: &mut Listing) {
+    fn directory_identity(&self, listing: &Listing) -> Option<DirectoryIdentity> {
         #[cfg(all(feature = "native-macos", target_os = "macos"))]
-        macos_native::restore_retained_directory(path, listing);
+        return macos_native::retained_directory_identity(listing);
         #[cfg(all(
             feature = "native-linux",
             target_os = "linux",
             not(all(feature = "native-macos", target_os = "macos"))
         ))]
-        linux_native::restore_retained_directory(path, listing);
+        return linux_native::retained_directory_identity(listing);
         #[cfg(not(any(
             all(feature = "native-macos", target_os = "macos"),
             all(feature = "native-linux", target_os = "linux")
         )))]
         {
-            let _ = (path, listing);
+            let _ = listing;
+            None
+        }
+    }
+
+    fn restore_directory_open(
+        &self,
+        path: &Path,
+        expected: Option<DirectoryIdentity>,
+        refuse_final_symlink: bool,
+        listing: &mut Listing,
+    ) -> bool {
+        #[cfg(all(feature = "native-macos", target_os = "macos"))]
+        return macos_native::restore_retained_directory(
+            path,
+            expected,
+            refuse_final_symlink,
+            listing,
+        );
+        #[cfg(all(
+            feature = "native-linux",
+            target_os = "linux",
+            not(all(feature = "native-macos", target_os = "macos"))
+        ))]
+        return linux_native::restore_retained_directory(
+            path,
+            expected,
+            refuse_final_symlink,
+            listing,
+        );
+        #[cfg(not(any(
+            all(feature = "native-macos", target_os = "macos"),
+            all(feature = "native-linux", target_os = "linux")
+        )))]
+        {
+            let _ = (path, expected, refuse_final_symlink, listing);
+            true
         }
     }
 }
@@ -2774,6 +2871,18 @@ struct DirectoryFrame {
     next_entry: usize,
 }
 
+impl DirectoryFrame {
+    fn suspend(&mut self, backend: &impl DirectoryBackend) {
+        let identity = backend.directory_identity(&self.scratch.listing);
+        // If identity capture failed, keep the rare descriptor rather than
+        // reopening an identity we could not later verify.
+        if let Some(identity) = identity {
+            self.task.open = DirectoryOpen::suspended(identity);
+            self.scratch.listing.release_directory_open();
+        }
+    }
+}
+
 /// Work the serial frontend has yet to carry out. The LIFO order models the
 /// former recursive calls while keeping arbitrarily deep trees off the Rust
 /// call stack.
@@ -2955,9 +3064,18 @@ impl<'walker> WalkState<'walker> {
     ) -> Result<(), WalkError> {
         let path = frame.task.path.as_path();
         let depth = frame.task.depth;
-        if frame.next_entry < frame.scratch.listing.entries().len() {
-            backend.restore_directory_open(path, &mut frame.scratch.listing);
+        let suspended_identity = frame.task.open.suspended_identity();
+        if frame.next_entry < frame.scratch.listing.entries().len()
+            && !backend.restore_directory_open(
+                path,
+                suspended_identity,
+                !self.walker.options.follow_symlinks && depth > 0,
+                &mut frame.scratch.listing,
+            )
+        {
+            return self.finish_directory(frame);
         }
+        frame.task.open = DirectoryOpen::default();
         while frame.next_entry < frame.scratch.listing.entries().len() {
             // A `Verdict::Stop` is this walk's own decision, already on a local
             // field, and is honoured on the very next entry. The caller's token
@@ -2999,7 +3117,7 @@ impl<'walker> WalkState<'walker> {
                 }
                 EntryAction::Descend(task) => {
                     reset_to_directory(&mut frame.scratch.path, path);
-                    frame.scratch.listing.release_directory_open();
+                    frame.suspend(backend);
                     pending.push(SerialTask::Resume(frame));
                     pending.push(SerialTask::Directory(task));
                     return Ok(());
@@ -3010,7 +3128,7 @@ impl<'walker> WalkState<'walker> {
                 EntryAction::DescendAndEmit(entry, task) => {
                     let entry = entry.with_path(own_path(&mut self.spare, &frame.scratch.path));
                     reset_to_directory(&mut frame.scratch.path, path);
-                    frame.scratch.listing.release_directory_open();
+                    frame.suspend(backend);
                     pending.push(SerialTask::Resume(frame));
                     pending.push(SerialTask::Emit(entry));
                     pending.push(SerialTask::Directory(task));
@@ -3025,7 +3143,7 @@ impl<'walker> WalkState<'walker> {
                         return Err(error);
                     }
                     if let Some(task) = descend {
-                        frame.scratch.listing.release_directory_open();
+                        frame.suspend(backend);
                         pending.push(SerialTask::Resume(frame));
                         pending.push(SerialTask::Directory(task));
                         return Ok(());

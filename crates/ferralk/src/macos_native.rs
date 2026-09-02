@@ -36,7 +36,7 @@ use std::{
     ops::Range,
     os::unix::{
         ffi::OsStrExt,
-        fs::OpenOptionsExt,
+        fs::{MetadataExt, OpenOptionsExt},
         io::{AsRawFd, FromRawFd, IntoRawFd},
     },
     path::Path,
@@ -51,7 +51,7 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard};
 
-use super::{Listing, defer_entry_stat_error};
+use super::{DirectoryIdentity, Listing, defer_entry_stat_error};
 
 const BUFFER_SIZE: usize = 32 * 1024;
 const GETDIRENTRIES64_EXTENDED_BUFFER_MINIMUM: usize = 1024;
@@ -321,15 +321,42 @@ fn open_directory(path: &Path, refuse_final_symlink: bool) -> io::Result<File> {
     OpenOptions::new().read(true).custom_flags(flags).open(path)
 }
 
-/// Reacquires an optional descriptor for a serial frame after its child has
-/// completed. Failure only disables the relative-open optimization: the next
-/// child still takes the ordinary full-path route.
-pub(super) fn restore_retained_directory(path: &Path, listing: &mut Listing) {
-    if listing.native_directory.is_none() {
-        listing.native_directory = open_directory(path, false)
-            .ok()
-            .and_then(RetainedDirectory::retain);
+fn file_identity(directory: &File) -> io::Result<DirectoryIdentity> {
+    let metadata = directory.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+pub(super) fn retained_directory_identity(listing: &Listing) -> Option<DirectoryIdentity> {
+    listing
+        .native_directory
+        .as_ref()
+        .and_then(|directory| file_identity(&directory.0).ok())
+}
+
+/// Reacquires a serial frame's released descriptor only when its path still
+/// reaches the same directory. A changed identity invalidates the cached
+/// listing; retention-budget exhaustion alone keeps the established full-path
+/// fallback.
+pub(super) fn restore_retained_directory(
+    path: &Path,
+    expected: Option<DirectoryIdentity>,
+    refuse_final_symlink: bool,
+    listing: &mut Listing,
+) -> bool {
+    if listing.native_directory.is_some() {
+        return true;
     }
+    let Some(expected) = expected else {
+        return true;
+    };
+    let Ok(directory) = open_directory(path, refuse_final_symlink) else {
+        return false;
+    };
+    if file_identity(&directory).ok() != Some(expected) {
+        return false;
+    }
+    listing.native_directory = RetainedDirectory::retain(directory);
+    true
 }
 
 /// Opens a queued child relative to the still-open parent that named it.

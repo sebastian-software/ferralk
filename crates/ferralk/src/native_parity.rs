@@ -20,7 +20,7 @@ use std::{
     collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -506,6 +506,49 @@ fn retained_directory_budget_exhaustion_uses_full_path_fallback() {
         stats.denied > 0,
         "the fixture must exercise retention-budget exhaustion: {stats:?}"
     );
+}
+
+#[test]
+fn resumed_serial_frame_never_enters_a_replacement_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new("serial-resume-original");
+    fixture.write("parent/first/trigger.txt");
+    fixture.write("parent/second/safe.txt");
+    let replacement = Fixture::new("serial-resume-replacement");
+    replacement.write("second/escaped.txt");
+    let swapped = AtomicBool::new(false);
+    let retention = crate::retained_directory_test::Guard::new(64);
+
+    let result = collecting_walker(&fixture.root)
+        .visit(|entry| {
+            if entry.path().ends_with("parent/first/trigger.txt")
+                && !swapped.swap(true, Ordering::AcqRel)
+            {
+                fs::rename(
+                    fixture.root.join("parent"),
+                    fixture.root.join("moved-parent"),
+                )
+                .expect("move the suspended frame directory");
+                symlink(&replacement.root, fixture.root.join("parent"))
+                    .expect("replace the suspended path with a symlink");
+            }
+            crate::Verdict::Keep
+        })
+        .expect("replacement race stays recoverable");
+
+    assert!(
+        swapped.load(Ordering::Acquire),
+        "fixture performed the swap"
+    );
+    assert!(
+        !result
+            .entries()
+            .iter()
+            .any(|entry| entry.path().ends_with("parent/second/escaped.txt")),
+        "a resumed frame must not use the replacement as its relative-open base"
+    );
+    assert_eq!(retention.stats().current, 0);
 }
 
 #[test]
