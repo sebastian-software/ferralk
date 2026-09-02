@@ -205,6 +205,14 @@ Important defaults:
   aliases — start independent chains. A root that is itself a directory
   symlink is opened regardless, because the caller supplied it as the tree to
   walk.
+- Repository discovery and ignore-rule anchoring resolve the root once, the
+  way Git resolves its working directory: `.` and `..` are folded and every
+  symlink is followed, so a root reached through a link belongs to the
+  repository that physically contains it whether it is spelled `link`,
+  `./link` or `work/../link`. Directories below the root derive their
+  discovery spelling from that resolved root lexically, so an ignore file
+  inside a followed symlinked directory anchors where its entries are
+  spelled. Entry paths keep the caller's spelling throughout.
 - `files_only(true)` and `directories_only(true)` filter on the kind a
   directory listing reports, and a listing reports a symlink as a symlink and
   nothing about its target. So by default `files_only` keeps every symlink -

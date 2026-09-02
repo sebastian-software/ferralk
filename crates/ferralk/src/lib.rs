@@ -5386,6 +5386,116 @@ mod tests {
         );
     }
 
+    /// A `..` in the root used to canonicalize every directory the walk
+    /// entered, which followed a symlinked directory to its target and
+    /// anchored the target's own ignore file where no candidate below the
+    /// link is ever spelled. The root is resolved once; directories below it
+    /// derive their discovery spelling lexically.
+    #[cfg(unix)]
+    #[test]
+    fn anchored_rules_inside_a_followed_symlink_survive_a_parent_component_in_the_root() {
+        let fixture = Fixture::new();
+        fixture.write("src/realdir/secret.txt");
+        fixture.write("src/realdir/keep.txt");
+        fs::write(
+            fixture.root.join("src/realdir/.gitignore"),
+            b"/secret.txt\n",
+        )
+        .expect("write anchored ignore rule inside the link target");
+        fs::create_dir(fixture.root.join(".git")).expect("create repository metadata directory");
+        std::os::unix::fs::symlink("realdir", fixture.root.join("src/lnk"))
+            .expect("create directory symlink");
+
+        for root in [
+            fixture.root.join("src"),
+            fixture.root.join("src/../src"),
+            fixture.root.join("src/./realdir/.."),
+        ] {
+            for threads in [1, 4] {
+                let walked = Walker::new(&root)
+                    .threads(threads)
+                    .respect_git_ignore(true)
+                    .options(
+                        WalkOptions::default()
+                            .sort(true)
+                            .files_only(true)
+                            .follow_symlinks(true),
+                    )
+                    .collect()
+                    .expect("walk through the followed link succeeds");
+                let paths = relative_paths(walked.entries(), &root);
+                assert!(
+                    paths.contains(&PathBuf::from("lnk/keep.txt")),
+                    "root {root:?} with {threads} threads: {paths:?}"
+                );
+                assert!(
+                    !paths.contains(&PathBuf::from("lnk/secret.txt")),
+                    "root {root:?} with {threads} threads must apply the link target's \
+                     anchored rule below the link: {paths:?}"
+                );
+            }
+        }
+    }
+
+    /// One policy for a symlinked root, whatever its spelling: the root is
+    /// attributed to the repository that physically contains it, as Git does
+    /// for a working directory reached through a link. Before, `link` chose
+    /// the lexical repository and `work/../link` the physical one.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_uses_the_physical_repository_under_every_spelling() {
+        let fixture = Fixture::new();
+        fixture.write("physical/repository/sub/secret.txt");
+        fixture.write("physical/repository/sub/keep.txt");
+        fs::create_dir(fixture.root.join("physical/repository/.git"))
+            .expect("create physical repository metadata directory");
+        fs::write(
+            fixture.root.join("physical/repository/.gitignore"),
+            b"/sub/secret.txt\n",
+        )
+        .expect("write physical repository ignore rule");
+        fs::create_dir_all(fixture.root.join("lexical/work"))
+            .expect("create lexical working directory");
+        fs::create_dir(fixture.root.join("lexical/.git"))
+            .expect("create lexical repository metadata directory");
+        fs::write(
+            fixture.root.join("lexical/.gitignore"),
+            b"/work/link/keep.txt\n",
+        )
+        .expect("write lexical repository ignore rule");
+        std::os::unix::fs::symlink(
+            fixture.root.join("physical/repository/sub"),
+            fixture.root.join("lexical/work/link"),
+        )
+        .expect("create directory symlink");
+
+        for root in [
+            fixture.root.join("lexical/work/link"),
+            fixture.root.join("lexical/work/./link"),
+            fixture.root.join("lexical/work/link/."),
+            fixture.root.join("lexical/work/../work/link"),
+            fixture.root.join("lexical/./work/link"),
+        ] {
+            let walked = Walker::new(&root)
+                .respect_git_ignore(true)
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("symlinked-root walk succeeds");
+            assert_eq!(
+                relative_paths(walked.entries(), &root),
+                vec![PathBuf::from("keep.txt")],
+                "root {root:?} must use the physical repository's rules"
+            );
+            assert!(
+                walked
+                    .entries()
+                    .iter()
+                    .all(|entry| entry.path().starts_with(&root)),
+                "entry paths keep the caller's spelling under {root:?}"
+            );
+        }
+    }
+
     /// Starts a Git oracle process that is independent of the developer's
     /// global and system configuration, just like the corpus harness.
     fn git_command() -> Command {

@@ -83,20 +83,45 @@ pub(crate) struct IgnoreScope {
     candidate_root: Option<Arc<CandidateRoot>>,
 }
 
+/// The walk root as the caller spelled it and as repository discovery
+/// resolved it, so candidates and ignore-file directories spelled below the
+/// former can be matched against rules anchored below the latter.
 #[derive(Debug, Clone)]
 struct CandidateRoot {
     walk: Vec<u8>,
     discovery: Vec<u8>,
+    walk_path: PathBuf,
+    discovery_path: PathBuf,
 }
 
 impl CandidateRoot {
     fn between(walk: &Path, discovery: &Path) -> Option<Self> {
-        let mut walk = without_dot_components(&glob_path_bytes(walk)).into_owned();
-        while walk.len() > 1 && walk.ends_with(b"/") {
-            walk.pop();
+        let mut walk_bytes = without_dot_components(&glob_path_bytes(walk)).into_owned();
+        while walk_bytes.len() > 1 && walk_bytes.ends_with(b"/") {
+            walk_bytes.pop();
         }
-        let discovery = without_dot_components(&glob_path_bytes(discovery)).into_owned();
-        (walk != discovery).then_some(Self { walk, discovery })
+        let discovery_bytes = without_dot_components(&glob_path_bytes(discovery)).into_owned();
+        (walk_bytes != discovery_bytes).then(|| Self {
+            walk: walk_bytes,
+            discovery: discovery_bytes,
+            walk_path: walk.to_path_buf(),
+            discovery_path: discovery.to_path_buf(),
+        })
+    }
+
+    /// The discovery spelling of a directory the walk entered.
+    ///
+    /// Derived lexically: the walk appended the directory's relative path to
+    /// the root it was given, so the same relative path below the resolved
+    /// root names it for discovery. Resolving each directory through the
+    /// filesystem instead would follow a symlink at the directory itself and
+    /// anchor its ignore rules somewhere the candidates below it are never
+    /// spelled.
+    fn map_directory(&self, directory: &Path) -> PathBuf {
+        match directory.strip_prefix(&self.walk_path) {
+            Ok(relative) => self.discovery_path.join(relative),
+            Err(_) => directory.to_path_buf(),
+        }
     }
 
     fn map<'a>(&self, candidate: &'a [u8]) -> Cow<'a, [u8]> {
@@ -188,7 +213,7 @@ impl IgnoreScope {
         }
         let match_directory = self.candidate_root.as_ref().map_or_else(
             || Cow::Borrowed(directory),
-            |_| Cow::Owned(discovery_path(directory)),
+            |root| Cow::Owned(root.map_directory(directory)),
         );
         let (rules, errors) = read_rules(
             backend,
@@ -254,23 +279,24 @@ impl IgnoreScope {
     }
 }
 
-/// Resolves a relative spelling against the current directory, then removes
-/// lexical `.` components. A spelling containing `..` is canonicalized when
-/// possible so a preceding symlink is followed before its parent is selected,
-/// matching the filesystem lookup the walker performs.
+/// Resolves the walk root to the one spelling repository discovery and
+/// ignore anchoring use: absolute, with `.` and `..` resolved and every
+/// symlink followed, which is the directory Git reports as its working
+/// directory there. One policy for every spelling: a root reached through a
+/// symlink belongs to the repository that physically contains it, whether
+/// the caller wrote `link`, `./link` or `work/../link`. A root that cannot
+/// be canonicalized, because it does not exist, is normalized lexically so
+/// the walk can still report its own error.
 ///
-/// Repository discovery and ignore anchoring need one canonical spelling of
-/// the path, while the walker deliberately retains the caller's spelling for
-/// filesystem operations and returned [`crate::WalkEntry`] paths.
+/// Called once per walk. The walker deliberately retains the caller's
+/// spelling for filesystem operations and returned [`crate::WalkEntry`]
+/// paths, and directories below the root derive their discovery spelling
+/// from this one lexically, see [`CandidateRoot::map_directory`].
 fn discovery_path(path: &Path) -> PathBuf {
     let Ok(absolute) = std::path::absolute(path) else {
         return path.to_path_buf();
     };
-    if absolute
-        .components()
-        .any(|component| component == Component::ParentDir)
-        && let Ok(canonical) = fs::canonicalize(&absolute)
-    {
+    if let Ok(canonical) = fs::canonicalize(&absolute) {
         return canonical;
     }
     let mut normalized = PathBuf::new();
