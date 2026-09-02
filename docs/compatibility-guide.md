@@ -36,7 +36,7 @@ assert!(pattern.is_match("src/lib.rs"));
 | syntax validation | `Pattern::validate` |
 | syntax preflight | `Pattern::has_wildcards` |
 | single filesystem-glob candidate | `Pattern::is_match_glob_path` (all ordinary wildcards are component-local) |
-| `zlob_match_paths` / `_at` and index variants | `Pattern::{is_match_path,filter_paths,filter_paths_at,filter_path_indices,filter_path_indices_at}` (stable input order; component-local `*`, `?`, and classes after `/`; `**` is recursive only with `recursive_double_star`, otherwise ordinary-star semantics) |
+| `zlob_match_paths` / `_at` and index variants | `Pattern::{is_match_path,filter_paths,filter_paths_at,filter_path_indices,filter_path_indices_at}` (stable input order; a `*`, `?`, or class directly after `/` is component-local and a later wildcard in that component may cross again, as zlob does; `**` is recursive only with `recursive_double_star`, otherwise two ordinary stars) |
 
 Ferralk accepts raw bytes (`AsRef<[u8]>`) for patterns and candidate paths, so
 callers do not need lossy UTF-8 conversion.

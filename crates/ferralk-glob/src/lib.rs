@@ -6291,6 +6291,43 @@ mod tests {
         }
     }
 
+    /// zlob's list filter makes a wildcard component-local only when it
+    /// stands directly behind an explicit separator. A later wildcard in the
+    /// same component, the star of `?*`, a star behind a class or a literal,
+    /// or the second star of a non-recursive `**`, crosses separators again;
+    /// the zlob oracle lane replays these verdicts from the corpus. `is_match`
+    /// crosses throughout and `is_match_glob_path` is component-local
+    /// throughout, so the three entry points stay distinguishable.
+    #[test]
+    fn only_a_wildcard_directly_behind_a_separator_is_component_local() {
+        let options = PatternOptions::default();
+        let local = Pattern::compile("a/*/z", options).unwrap();
+        assert!(local.is_match_path("a/b/z"));
+        assert!(
+            !local.is_match_path("a/b/c/z"),
+            "a/*/z stays inside one component"
+        );
+        for pattern in ["a/**/z", "a/?*/z", "a/*[a-z]*/z", "a/b*/z"] {
+            let compiled = Pattern::compile(pattern, options).unwrap();
+            assert!(compiled.is_match("a/b/c/z"), "{pattern}: is_match crosses");
+            assert!(compiled.is_match_path("a/b/z"), "{pattern}: one component");
+            assert!(
+                compiled.is_match_path("a/b/c/z"),
+                "{pattern}: the wildcard behind the first one crosses under is_match_path, as in zlob's matchPaths"
+            );
+            assert!(
+                !compiled.is_match_glob_path("a/b/c/z"),
+                "{pattern}: the glob-path reading is component-local throughout"
+            );
+            for candidate in ["a/b/z", "a/b/c/z"] {
+                assert!(
+                    compiled.engines_agree(candidate),
+                    "{pattern}: engines disagree on {candidate}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn compiled_patterns_summarize_explicit_hidden_components() {
         let walker_options = PatternOptions::default()

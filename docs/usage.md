@@ -13,11 +13,16 @@ operators stay within one component, while an explicitly enabled `**` crosses
 components.
 
 `is_match_path` preserves the zlob list-filter convention instead: a wildcard
-in the root component may cross separators, while a wildcard after an explicit
-separator is component-local. Both path entry points ignore one conventional
-leading `./` on the pattern and candidate; `is_match` compares those bytes
-literally. With `recursive_double_star` disabled, any consecutive `**` has the
-same ordinary-star semantics as `*` through all three entry points.
+in the root component may cross separators, and a wildcard standing directly
+behind an explicit separator is component-local. That is zlob's exact rule and
+it stops there: a later wildcard in the same component, the star of `a/?*` or
+`a/b*`, may cross separators again, so `a/?*/z` accepts `a/b/c/z` while `a/*/z`
+does not, exactly as zlob's `matchPaths` answers. Both path entry points ignore
+one conventional leading `./` on the pattern and candidate; `is_match` compares
+those bytes literally. With `recursive_double_star` disabled a consecutive `**`
+is two ordinary stars: through `is_match` and `is_match_glob_path` that equals
+`*`, while through `is_match_path` the second star stands behind the first
+rather than behind the separator and follows the rule above.
 
 ```rust
 use ferralk_glob::{Pattern, PatternOptions};
