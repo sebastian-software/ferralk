@@ -335,8 +335,8 @@ pub(super) fn retained_directory_identity(listing: &Listing) -> Option<Directory
 
 /// Reacquires a serial frame's released descriptor only when its path still
 /// reaches the same directory. A changed identity invalidates the cached
-/// listing; retention-budget exhaustion alone keeps the established full-path
-/// fallback.
+/// listing. A retention-budget denial also invalidates the cached remainder:
+/// the verified descriptor cannot safely be replaced by mutable full paths.
 pub(super) fn restore_retained_directory(
     path: &Path,
     expected: Option<DirectoryIdentity>,
@@ -356,7 +356,7 @@ pub(super) fn restore_retained_directory(
         return false;
     }
     listing.native_directory = RetainedDirectory::retain(directory);
-    true
+    listing.native_directory.is_some()
 }
 
 /// Opens a queued child relative to the still-open parent that named it.

@@ -20,7 +20,10 @@ use std::{
     collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -549,6 +552,60 @@ fn resumed_serial_frame_never_enters_a_replacement_symlink() {
         "a resumed frame must not use the replacement as its relative-open base"
     );
     assert_eq!(retention.stats().current, 0);
+}
+
+#[test]
+fn resume_budget_denial_never_falls_back_to_a_replacement_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new("serial-resume-budget-original");
+    fixture.write("parent/first/trigger.txt");
+    fixture.write("parent/second/safe.txt");
+    let replacement = Fixture::new("serial-resume-budget-replacement");
+    replacement.write("second/escaped.txt");
+    let armed = AtomicBool::new(false);
+    let swapped = Arc::new(AtomicBool::new(false));
+    let retention = crate::retained_directory_test::Guard::new(64);
+
+    let original_parent = fixture.root.join("parent");
+    let moved_parent = fixture.root.join("moved-parent");
+    let fixture_root = fixture.root.clone();
+    let replacement_root = replacement.root.clone();
+    let hook_swapped = Arc::clone(&swapped);
+    retention.on_next_denial(move || {
+        fs::rename(original_parent, moved_parent)
+            .expect("move the verified suspended frame directory");
+        symlink(replacement_root, fixture_root.join("parent"))
+            .expect("replace the verified path during retention denial");
+        hook_swapped.store(true, Ordering::Release);
+    });
+
+    let result = collecting_walker(&fixture.root)
+        .visit(|entry| {
+            if entry.path().ends_with("parent/first/trigger.txt")
+                && !armed.swap(true, Ordering::AcqRel)
+            {
+                retention.set_limit(0);
+            }
+            crate::Verdict::Keep
+        })
+        .expect("retention denial stays recoverable");
+
+    assert!(armed.load(Ordering::Acquire), "fixture armed the denial");
+    assert!(
+        swapped.load(Ordering::Acquire),
+        "the replacement happened after identity verification"
+    );
+    assert!(
+        !result
+            .entries()
+            .iter()
+            .any(|entry| entry.path().ends_with("parent/second/escaped.txt")),
+        "a denied verified handle must not fall back to mutable child paths"
+    );
+    let stats = retention.stats();
+    assert_eq!(stats.current, 0);
+    assert!(stats.denied > 0, "the fixture denied resume retention");
 }
 
 #[test]

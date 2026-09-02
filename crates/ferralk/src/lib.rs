@@ -66,6 +66,7 @@ mod retained_directory_test {
 
     std::thread_local! {
         static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+        static DENIAL_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     }
 
     pub(super) struct Guard;
@@ -96,28 +97,54 @@ mod retained_directory_test {
                 }
             })
         }
+
+        pub(super) fn set_limit(&self, limit: usize) {
+            STATE.with(|state| {
+                state
+                    .borrow_mut()
+                    .as_mut()
+                    .expect("retention test override is active")
+                    .limit = limit;
+            });
+        }
+
+        pub(super) fn on_next_denial(&self, hook: impl FnOnce() + 'static) {
+            DENIAL_HOOK.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                assert!(slot.is_none(), "retention denial hook is already armed");
+                *slot = Some(Box::new(hook));
+            });
+        }
     }
 
     impl Drop for Guard {
         fn drop(&mut self) {
             STATE.with(|state| *state.borrow_mut() = None);
+            DENIAL_HOOK.with(|hook| *hook.borrow_mut() = None);
         }
     }
 
     /// Returns `None` without an active override, or whether the test budget
     /// granted a permit when one is active.
     pub(super) fn try_acquire() -> Option<bool> {
-        STATE.with(|state| {
+        let granted = STATE.with(|state| {
             let mut state = state.borrow_mut();
             let state = state.as_mut()?;
-            if state.current == state.limit {
+            if state.current >= state.limit {
                 state.denied += 1;
                 return Some(false);
             }
             state.current += 1;
             state.high_water = state.high_water.max(state.current);
             Some(true)
-        })
+        });
+        if granted == Some(false) {
+            let hook = DENIAL_HOOK.with(|hook| hook.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        granted
     }
 
     pub(super) fn release() {
