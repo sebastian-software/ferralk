@@ -34,7 +34,7 @@ pub(crate) enum Rewrite {
     Relative,
     /// The pattern was absolute and named paths inside the root. These are the
     /// equivalent root-relative pattern bytes.
-    Rooted(Vec<u8>),
+    Rooted { bytes: Vec<u8>, source_start: usize },
     /// The pattern was absolute and named paths outside the root, so no entry
     /// this walk can produce will match it.
     ///
@@ -201,6 +201,7 @@ pub(crate) fn rewrite_in(
     root: &[u8],
     syntax: Syntax,
 ) -> Result<Rewrite, PatternError> {
+    let source_pattern = pattern;
     let pattern = deverbatimize(pattern, syntax);
     let root = deverbatimize(root, syntax);
     let pattern = pattern.as_ref();
@@ -227,7 +228,7 @@ pub(crate) fn rewrite_in(
     // selecting nothing there would be worse than saying so.
     if let Some(at) = dot_dot_component(pattern) {
         return Err(PatternError::new(
-            at,
+            source_offset_after_deverbatimize(source_pattern, syntax, at),
             "`..` in an absolute pattern is not resolved, because resolving it lexically would be wrong across a symlink",
         ));
     }
@@ -256,7 +257,7 @@ pub(crate) fn rewrite_in(
             }
             if magic.is_some_and(|at| at < offset + component.len()) {
                 return Err(PatternError::new(
-                    offset,
+                    source_offset_after_deverbatimize(source_pattern, syntax, offset),
                     "a wildcard at or above the walk root cannot be made relative to it",
                 ));
             }
@@ -289,11 +290,33 @@ pub(crate) fn rewrite_in(
     let remainder = &pattern[offset..];
     if remainder.is_empty() {
         return Err(PatternError::new(
-            offset,
+            source_offset_after_deverbatimize(source_pattern, syntax, offset),
             "an absolute pattern that names the walk root itself selects nothing; add `/**` to select what is inside it",
         ));
     }
-    Ok(Rewrite::Rooted(remainder.to_vec()))
+    Ok(Rewrite::Rooted {
+        bytes: remainder.to_vec(),
+        source_start: source_offset_after_deverbatimize(source_pattern, syntax, offset),
+    })
+}
+
+/// Maps a byte offset in the normalized spelling back to the caller's bytes.
+///
+/// Drive verbatim paths lose `//?/`. UNC verbatim paths replace `//?/UNC/`
+/// with `//`, whose two leading separators retain their original positions;
+/// every following byte moves six places to the left.
+fn source_offset_after_deverbatimize(source: &[u8], syntax: Syntax, offset: usize) -> usize {
+    if syntax != Syntax::Windows {
+        return offset;
+    }
+    let Some(rest) = source.strip_prefix(b"//?/") else {
+        return offset;
+    };
+    if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case(b"UNC/") {
+        if offset < 2 { offset } else { offset + 6 }
+    } else {
+        offset + 4
+    }
 }
 
 /// Removes Windows' verbatim namespace prefix from a normalized path spelling.
@@ -397,7 +420,7 @@ mod tests {
     /// Convenience for the common assertion: this rewrote to these bytes.
     fn rooted(pattern: &str, root: &str, syntax: Syntax) -> String {
         match rewrite_in(pattern.as_bytes(), root.as_bytes(), syntax) {
-            Ok(Rewrite::Rooted(bytes)) => String::from_utf8(bytes).expect("ASCII fixture"),
+            Ok(Rewrite::Rooted { bytes, .. }) => String::from_utf8(bytes).expect("ASCII fixture"),
             other => panic!("expected a rewrite, got {other:?}"),
         }
     }

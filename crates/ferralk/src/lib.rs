@@ -1351,15 +1351,26 @@ fn walker_pattern_for_root(
     syntax: absolute::Syntax,
     options: PatternOptions,
 ) -> Result<Option<Vec<u8>>, PatternError> {
-    let Some(rewritten) = rewrite_pattern_for_root(pattern, root, syntax)? else {
+    let Some(rewritten) = rewrite_pattern_for_root_with_source(pattern, root, syntax)? else {
         return Ok(None);
     };
-    let parsed = Pattern::compile(pattern_without_directory_marker(&rewritten), options)?;
+    let parsed = Pattern::compile(pattern_without_directory_marker(&rewritten.bytes), options)
+        .map_err(|error| rebase_pattern_error(error, rewritten.source_start))?;
     reject_unwalkable_relative_pattern(
         parsed.walker_path_viability(),
         parsed.walker_path_problem_offset(),
-    )?;
-    Ok(Some(rewritten))
+    )
+    .map_err(|error| rebase_pattern_error(error, rewritten.source_start))?;
+    Ok(Some(rewritten.bytes))
+}
+
+struct RewrittenPattern {
+    bytes: Vec<u8>,
+    source_start: usize,
+}
+
+fn rebase_pattern_error(error: PatternError, source_start: usize) -> PatternError {
+    PatternError::new(source_start + error.offset(), error.message())
 }
 
 /// Applies only the root-to-pattern relation shared by the walk and corpus
@@ -1371,14 +1382,33 @@ fn rewrite_pattern_for_root(
     root: &[u8],
     syntax: absolute::Syntax,
 ) -> Result<Option<Vec<u8>>, PatternError> {
+    Ok(rewrite_pattern_for_root_with_source(pattern, root, syntax)?
+        .map(|rewritten| rewritten.bytes))
+}
+
+fn rewrite_pattern_for_root_with_source(
+    pattern: &[u8],
+    root: &[u8],
+    syntax: absolute::Syntax,
+) -> Result<Option<RewrittenPattern>, PatternError> {
     match absolute::rewrite_in(pattern, root, syntax)? {
         absolute::Rewrite::Relative => {
             absolute::reject_path_shaped(pattern, syntax)?;
-            Ok(Some(pattern.to_vec()))
+            Ok(Some(RewrittenPattern {
+                bytes: pattern.to_vec(),
+                source_start: 0,
+            }))
         }
-        absolute::Rewrite::Rooted(rooted) => {
-            absolute::reject_path_shaped(&rooted, syntax)?;
-            Ok(Some(rooted))
+        absolute::Rewrite::Rooted {
+            bytes,
+            source_start,
+        } => {
+            absolute::reject_path_shaped(&bytes, syntax)
+                .map_err(|error| rebase_pattern_error(error, source_start))?;
+            Ok(Some(RewrittenPattern {
+                bytes,
+                source_start,
+            }))
         }
         absolute::Rewrite::Outside => Ok(None),
     }
@@ -3980,6 +4010,69 @@ mod tests {
             Walker::new(".")
                 .include(pattern)
                 .unwrap_or_else(|error| panic!("{pattern} remains matcher text: {error}"));
+        }
+    }
+
+    #[test]
+    fn absolute_pattern_errors_keep_caller_source_offsets() {
+        let options = traversal_pattern_options(false);
+        for (pattern, root, syntax, offset, invalid) in [
+            (
+                "/repo/src/[",
+                "/repo",
+                super::absolute::Syntax::Posix,
+                10,
+                b'[',
+            ),
+            (
+                "/repo/src/./x",
+                "/repo",
+                super::absolute::Syntax::Posix,
+                10,
+                b'.',
+            ),
+            (
+                "/repo/a{b,[}",
+                "/repo",
+                super::absolute::Syntax::Posix,
+                10,
+                b'[',
+            ),
+            (
+                "/repo/src/../x",
+                "/repo",
+                super::absolute::Syntax::Posix,
+                10,
+                b'.',
+            ),
+            (
+                "//?/C:/repo/src/[",
+                "//?/C:/repo",
+                super::absolute::Syntax::Windows,
+                16,
+                b'[',
+            ),
+            (
+                "//?/UNC/server/share/src/[",
+                "//?/UNC/server/share",
+                super::absolute::Syntax::Windows,
+                25,
+                b'[',
+            ),
+        ] {
+            let error = super::walker_pattern_for_root(
+                pattern.as_bytes(),
+                root.as_bytes(),
+                syntax,
+                options,
+            )
+            .expect_err("the absolute walker pattern is invalid");
+            assert_eq!(error.offset(), offset, "{pattern}: {error}");
+            assert_eq!(
+                pattern.as_bytes().get(error.offset()),
+                Some(&invalid),
+                "{pattern} points into the caller's source: {error}"
+            );
         }
     }
 
