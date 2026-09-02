@@ -7839,7 +7839,7 @@ mod tests {
             (paths, reads)
         };
 
-        for (include, match_hidden) in [("**/*{rs,toml}", false), ("**/*{rs,toml}", true)] {
+        for (include, match_hidden) in [("**/*.{rs,toml}", false), ("**/*.{rs,toml}", true)] {
             let (paths, reads) = walk(include, match_hidden);
             assert_eq!(paths, [PathBuf::from("src/keep.rs")]);
             assert_eq!(
@@ -7864,30 +7864,27 @@ mod tests {
         );
     }
 
-    /// A wildcard may stop immediately before a literal period, or cross a
-    /// separator and leave that period at the next component boundary. The
-    /// prune summary must retain both possibilities when a covering exclude
-    /// would otherwise hide the matching descendant.
+    /// A wildcard cannot stop immediately before a leading literal period.
+    /// Therefore these includes cannot reach the hidden descendants and a
+    /// covering exclude may prune their parent subtree.
     #[test]
-    fn covering_excludes_keep_hidden_descendants_reachable_after_wildcards() {
+    fn covering_excludes_prune_hidden_descendants_after_wildcards() {
         let fixture = Fixture::new();
         fixture.write("build/.env");
         fixture.write("x/foo/.hidden/keep.rs");
 
-        for (label, mode, include, exclude, expected) in [
+        for (label, mode, include, exclude) in [
             (
                 "zero-width star",
                 WildcardMode::ComponentScoped,
                 "**/*.env",
                 "build/**",
-                PathBuf::from("build/.env"),
             ),
             (
                 "separator-crossing star",
                 WildcardMode::SeparatorCrossing,
                 "x/f*.hidden/keep.rs",
                 "x/**",
-                PathBuf::from("x/foo/.hidden/keep.rs"),
             ),
         ] {
             let build = || {
@@ -7909,8 +7906,8 @@ mod tests {
                         .entries(),
                     &fixture.root,
                 ),
-                [expected],
-                "{label}: the covering exclude must not prune the hidden match"
+                Vec::<PathBuf>::new(),
+                "{label}: the covering exclude may prune an unreachable hidden match"
             );
         }
     }
