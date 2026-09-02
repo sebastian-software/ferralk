@@ -36,7 +36,7 @@ use std::{
     ops::Range,
     os::unix::{
         ffi::OsStrExt,
-        fs::OpenOptionsExt,
+        fs::{MetadataExt, OpenOptionsExt},
         io::{AsRawFd, FromRawFd, IntoRawFd},
     },
     path::Path,
@@ -51,7 +51,7 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard};
 
-use super::{Listing, defer_entry_stat_error};
+use super::{DirectoryIdentity, Listing, defer_entry_stat_error};
 
 const BUFFER_SIZE: usize = 32 * 1024;
 const GETDIRENTRIES64_EXTENDED_BUFFER_MINIMUM: usize = 1024;
@@ -205,21 +205,37 @@ pub(super) struct RelativeDirectoryOpen {
 }
 
 #[derive(Debug)]
-pub(super) struct RetainedDirectory(File);
+enum RetentionPermit {
+    Global,
+    #[cfg(test)]
+    Test,
+}
+
+#[derive(Debug)]
+pub(super) struct RetainedDirectory(File, RetentionPermit);
 
 impl RetainedDirectory {
     fn retain(directory: File) -> Option<Arc<Self>> {
+        #[cfg(test)]
+        if let Some(granted) = super::retained_directory_test::try_acquire() {
+            return granted.then(|| Arc::new(Self(directory, RetentionPermit::Test)));
+        }
         RETAINED_DIRECTORIES
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
                 (retained < retained_directory_limit()).then_some(retained + 1)
             })
             .ok()
-            .map(|_| Arc::new(Self(directory)))
+            .map(|_| Arc::new(Self(directory, RetentionPermit::Global)))
     }
 }
 
 impl Drop for RetainedDirectory {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if matches!(self.1, RetentionPermit::Test) {
+            super::retained_directory_test::release();
+            return;
+        }
         RETAINED_DIRECTORIES.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -303,6 +319,44 @@ fn open_directory(path: &Path, refuse_final_symlink: bool) -> io::Result<File> {
             0
         };
     OpenOptions::new().read(true).custom_flags(flags).open(path)
+}
+
+fn file_identity(directory: &File) -> io::Result<DirectoryIdentity> {
+    let metadata = directory.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+pub(super) fn retained_directory_identity(listing: &Listing) -> Option<DirectoryIdentity> {
+    listing
+        .native_directory
+        .as_ref()
+        .and_then(|directory| file_identity(&directory.0).ok())
+}
+
+/// Reacquires a serial frame's released descriptor only when its path still
+/// reaches the same directory. A changed identity invalidates the cached
+/// listing. A retention-budget denial also invalidates the cached remainder:
+/// the verified descriptor cannot safely be replaced by mutable full paths.
+pub(super) fn restore_retained_directory(
+    path: &Path,
+    expected: Option<DirectoryIdentity>,
+    refuse_final_symlink: bool,
+    listing: &mut Listing,
+) -> bool {
+    if listing.native_directory.is_some() {
+        return true;
+    }
+    let Some(expected) = expected else {
+        return true;
+    };
+    let Ok(directory) = open_directory(path, refuse_final_symlink) else {
+        return false;
+    };
+    if file_identity(&directory).ok() != Some(expected) {
+        return false;
+    }
+    listing.native_directory = RetainedDirectory::retain(directory);
+    listing.native_directory.is_some()
 }
 
 /// Opens a queued child relative to the still-open parent that named it.

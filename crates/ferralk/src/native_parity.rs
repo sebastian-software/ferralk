@@ -20,7 +20,10 @@ use std::{
     collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -441,6 +444,168 @@ fn parity_over_a_deep_tree() {
     }
 
     assert_parity("deep tree", &fixture.root, collecting_walker(&fixture.root));
+}
+
+#[test]
+fn serial_suspension_keeps_native_descriptor_high_water_bounded() {
+    let fixture = Fixture::new("serial-retained-fd");
+    let mut directory = PathBuf::new();
+    for level in 0..32 {
+        directory.push(format!("level-{level}"));
+        fixture.write(directory.join("file.txt"));
+    }
+    let walker = collecting_walker(&fixture.root);
+    let (portable_entries, portable_errors) = walk_portable(&walker);
+
+    let retention = crate::retained_directory_test::Guard::new(64);
+    let native = walker.collect().expect("native serial walk succeeds");
+    let stats = retention.stats();
+
+    assert_eq!(
+        describe_entries(native.entries(), &fixture.root),
+        describe_entries(&portable_entries, &fixture.root)
+    );
+    assert_eq!(
+        describe_errors(native.errors(), &fixture.root),
+        describe_errors(&portable_errors, &fixture.root)
+    );
+    assert_eq!(stats.current, 0, "the completed walk releases every permit");
+    assert!(
+        stats.high_water <= 2,
+        "a parent-to-child handoff needs at most two descriptors: {stats:?}"
+    );
+    assert_eq!(
+        stats.denied, 0,
+        "a 64-descriptor budget covers a one-at-a-time serial walk"
+    );
+}
+
+#[test]
+fn retained_directory_budget_exhaustion_uses_full_path_fallback() {
+    let fixture = Fixture::new("retained-fd-fallback");
+    let mut directory = PathBuf::new();
+    for level in 0..8 {
+        directory.push(format!("level-{level}"));
+        fixture.write(directory.join("file.txt"));
+    }
+    let walker = collecting_walker(&fixture.root);
+    let (portable_entries, portable_errors) = walk_portable(&walker);
+
+    let retention = crate::retained_directory_test::Guard::new(1);
+    let native = walker.collect().expect("budget fallback keeps walking");
+    let stats = retention.stats();
+
+    assert_eq!(
+        describe_entries(native.entries(), &fixture.root),
+        describe_entries(&portable_entries, &fixture.root)
+    );
+    assert_eq!(
+        describe_errors(native.errors(), &fixture.root),
+        describe_errors(&portable_errors, &fixture.root)
+    );
+    assert_eq!(stats.current, 0, "the completed walk releases its permit");
+    assert_eq!(stats.high_water, 1);
+    assert!(
+        stats.denied > 0,
+        "the fixture must exercise retention-budget exhaustion: {stats:?}"
+    );
+}
+
+#[test]
+fn resumed_serial_frame_never_enters_a_replacement_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new("serial-resume-original");
+    fixture.write("parent/first/trigger.txt");
+    fixture.write("parent/second/safe.txt");
+    let replacement = Fixture::new("serial-resume-replacement");
+    replacement.write("second/escaped.txt");
+    let swapped = AtomicBool::new(false);
+    let retention = crate::retained_directory_test::Guard::new(64);
+
+    let result = collecting_walker(&fixture.root)
+        .visit(|entry| {
+            if entry.path().ends_with("parent/first/trigger.txt")
+                && !swapped.swap(true, Ordering::AcqRel)
+            {
+                fs::rename(
+                    fixture.root.join("parent"),
+                    fixture.root.join("moved-parent"),
+                )
+                .expect("move the suspended frame directory");
+                symlink(&replacement.root, fixture.root.join("parent"))
+                    .expect("replace the suspended path with a symlink");
+            }
+            crate::Verdict::Keep
+        })
+        .expect("replacement race stays recoverable");
+
+    assert!(
+        swapped.load(Ordering::Acquire),
+        "fixture performed the swap"
+    );
+    assert!(
+        !result
+            .entries()
+            .iter()
+            .any(|entry| entry.path().ends_with("parent/second/escaped.txt")),
+        "a resumed frame must not use the replacement as its relative-open base"
+    );
+    assert_eq!(retention.stats().current, 0);
+}
+
+#[test]
+fn resume_budget_denial_never_falls_back_to_a_replacement_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new("serial-resume-budget-original");
+    fixture.write("parent/cached-child/safe.txt");
+    let replacement = Fixture::new("serial-resume-budget-replacement");
+    replacement.write("cached-child/escaped.txt");
+    let swapped = Arc::new(AtomicBool::new(false));
+    let retention = crate::retained_directory_test::Guard::new(64);
+    let backend = crate::SystemBackend;
+    let mut listing = Listing::default();
+
+    let original_parent = fixture.root.join("parent");
+    let moved_parent = fixture.root.join("moved-parent");
+    let fixture_root = fixture.root.clone();
+    let replacement_root = replacement.root.clone();
+    backend
+        .read_directory(&original_parent, false, true, &mut listing)
+        .expect("read the directory before suspension");
+    let expected = backend.directory_identity(&listing);
+    assert!(
+        expected.is_some(),
+        "the native listing retains its identity"
+    );
+    listing.release_directory_open();
+
+    let hook_swapped = Arc::clone(&swapped);
+    retention.on_next_denial(move || {
+        fs::rename(original_parent, moved_parent)
+            .expect("move the verified suspended frame directory");
+        symlink(replacement_root, fixture_root.join("parent"))
+            .expect("replace the verified path during retention denial");
+        hook_swapped.store(true, Ordering::Release);
+    });
+    retention.set_limit(0);
+
+    let restored =
+        backend.restore_directory_open(&fixture.root.join("parent"), expected, true, &mut listing);
+
+    assert!(
+        swapped.load(Ordering::Acquire),
+        "the replacement happened after identity verification"
+    );
+    assert!(
+        !restored,
+        "a denied verified handle must invalidate the cached listing"
+    );
+    assert!(listing.native_directory.is_none());
+    let stats = retention.stats();
+    assert_eq!(stats.current, 0);
+    assert!(stats.denied > 0, "the fixture denied resume retention");
 }
 
 #[test]
