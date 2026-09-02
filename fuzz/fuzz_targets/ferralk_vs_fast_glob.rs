@@ -12,20 +12,31 @@
 //! A disagreement is reported as a ready-to-paste corpus line, so a finding
 //! goes straight into `corpus/fast-glob.jsonl` after review.
 
-use corpus::{Case, Source, encode_bytes};
-use ferralk_glob::{Pattern, PatternOptions, expand_braces};
-use libfuzzer_sys::fuzz_target;
+use std::{
+    path::PathBuf,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
-fuzz_target!(|data: &[u8]| {
+use corpus::{Case, Source, encode_bytes};
+use ferralk_fuzz::{in_shared_subset, matcher_options, split_input};
+use ferralk_glob::Pattern;
+use libfuzzer_sys::{Corpus, fuzz_target};
+
+fuzz_target!(|data: &[u8]| -> Corpus {
     let (pattern, path) = split_input(data);
-    if !in_shared_subset(pattern, path) {
-        return;
+    let shared = in_shared_subset(pattern, path);
+    record_subset_hit(shared);
+    if !shared {
+        return Corpus::Reject;
     }
     // fast-glob rejects patterns ferralk accepts and the reverse; comparing a
     // verdict either engine declines to produce would compare error models,
     // not matching. `validate` is a parse and stays cheap on every input.
     if fast_glob::validate(pattern).is_err() {
-        return;
+        return Corpus::Reject;
     }
     // Compiling before `glob_match` is what keeps this target fast: fast-glob
     // backtracks over brace alternatives instead of expanding them, and spends
@@ -33,8 +44,8 @@ fuzz_target!(|data: &[u8]| {
     // rejects that pattern here, so only patterns inside the budget — measured
     // at microseconds in fast-glob — ever reach the comparison. Raising
     // `MAX_BRACE_ALTERNATIVES` would need this checked again.
-    let Ok(compiled) = Pattern::compile(pattern, options()) else {
-        return;
+    let Ok(compiled) = Pattern::compile(pattern, matcher_options()) else {
+        return Corpus::Reject;
     };
 
     // fast-glob keeps every ordinary wildcard inside one path component, which
@@ -47,233 +58,41 @@ fuzz_target!(|data: &[u8]| {
         "ferralk and fast-glob disagree; corpus candidate:\n{}",
         corpus_candidate(pattern, path, ours, reference)
     );
+    Corpus::Keep
 });
 
-/// Brace groups fast-glob answers correctly for.
+const SUBSET_STATS_INTERVAL: u64 = 4_096;
+static SUBSET_STATS_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+static SUBSET_INPUTS: AtomicU64 = AtomicU64::new(0);
+static SUBSET_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Saves a cheap rolling checkpoint for the workflow to print after fuzzing.
 ///
-/// Past ten it returns `false` for a pattern that matches, whatever the
-/// alternative count and whichever combination the candidate takes: eleven
-/// two-way groups miss even their first one. A single group of two thousand
-/// alternatives is fine, so the cap counts groups rather than combinations.
-/// Measured against fast-glob 1.1.0; see `docs/fast-glob-reference.md`.
-const FAST_GLOB_MAX_BRACE_GROUPS: usize = 10;
+/// libFuzzer owns process shutdown and offers no safe target-level finalizer.
+/// Updating every 4,096 inputs keeps the reported ratio close to the final
+/// count without putting filesystem I/O on the hot path of every execution.
+fn record_subset_hit(shared: bool) {
+    let Some(path) = SUBSET_STATS_PATH
+        .get_or_init(|| std::env::var_os("FERRALK_FUZZ_SUBSET_STATS").map(PathBuf::from))
+    else {
+        return;
+    };
 
-/// The options that make ferralk speak fast-glob's dialect.
-///
-/// Extglobs are fast-glob-only syntax, case folding is ferralk-only, and
-/// escapes stay on because both engines honour a backslash before a
-/// metacharacter.
-fn options() -> PatternOptions {
-    PatternOptions::default()
-        .braces(true)
-        .recursive_double_star(true)
-        .match_hidden(true)
-}
+    let inputs = SUBSET_INPUTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if shared {
+        SUBSET_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    if inputs != 1 && !inputs.is_multiple_of(SUBSET_STATS_INTERVAL) {
+        return;
+    }
 
-fn split_input(data: &[u8]) -> (&[u8], &[u8]) {
-    match data.iter().position(|&byte| byte == b'\n') {
-        Some(separator) => (&data[..separator], &data[separator + 1..]),
-        None => (data, &[]),
-    }
-}
-
-/// Whether both engines document this pattern's syntax the same way.
-///
-/// Each rejection corresponds to one recorded divergence; see
-/// `docs/fast-glob-reference.md`.
-fn in_shared_subset(pattern: &[u8], path: &[u8]) -> bool {
-    // ferralk path entry points normalize one conventional current-directory
-    // prefix on both sides; fast-glob compares those bytes literally.
-    if path.starts_with(b"./") {
-        return false;
-    }
-    // fast-glob reads a leading `!` as negation; ferralk has no negation.
-    if pattern.first() == Some(&b'!') {
-        return false;
-    }
-    // `**` is a whole path component in fast-glob and an ordinary recursive
-    // wildcard in ferralk. The two readings agree only when the pattern is
-    // nothing else, so every other consecutive star pair stays out.
-    if pattern != b"**" && contains_double_star(pattern) {
-        return false;
-    }
-    let mut index = 0;
-    let mut brace_depth = 0_usize;
-    let mut brace_groups = 0_usize;
-    while index < pattern.len() {
-        match pattern[index] {
-            b'\\' => {
-                let Some(&escaped) = pattern.get(index + 1) else {
-                    return false;
-                };
-                if !is_shared_escape(escaped) {
-                    return false;
-                }
-                index += 2;
-                continue;
-            }
-            b'[' => {
-                let Some(next) = class_end(pattern, index, brace_depth > 0) else {
-                    return false;
-                };
-                index = next;
-                continue;
-            }
-            b']' => return false,
-            b'{' | b'}' | b',' => {
-                match pattern[index] {
-                    b'{' => {
-                        // fast-glob caps brace nesting; one level is common
-                        // ground.
-                        brace_depth += 1;
-                        if brace_depth > 1 {
-                            return false;
-                        }
-                        // It also caps how many groups a pattern may have at
-                        // all, and answers `false` rather than erring past it.
-                        brace_groups += 1;
-                        if brace_groups > FAST_GLOB_MAX_BRACE_GROUPS {
-                            return false;
-                        }
-                    }
-                    b'}' => {
-                        if brace_depth == 0 {
-                            return false;
-                        }
-                        brace_depth -= 1;
-                    }
-                    // A comma separates alternatives inside a brace group and
-                    // is an ordinary byte outside one, but fast-glob does not
-                    // always return to that reading after a group closes:
-                    // `{}{},` matches the empty candidate there and the
-                    // literal `,` in ferralk.
-                    _ => {
-                        if brace_depth == 0 {
-                            return false;
-                        }
-                    }
-                }
-                // Brace expansion concatenates its alternative with the
-                // surrounding text, so a star beside brace punctuation can
-                // still produce a `**` that only ferralk reads recursively.
-                let star_before = index > 0 && pattern[index - 1] == b'*';
-                let star_after = pattern.get(index + 1) == Some(&b'*');
-                if star_before || star_after {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    brace_depth == 0 && !has_leading_dot_slash_alternative(pattern)
-}
-
-/// Whether brace expansion exposes a current-directory prefix.
-///
-/// Looking at the source alone misses both an empty arm before `./` (`{x,}./`)
-/// and a dot arm before `/` (`{.}/`). Reusing the public expansion keeps this
-/// exclusion aligned with the matcher without duplicating its brace grammar.
-fn has_leading_dot_slash_alternative(pattern: &[u8]) -> bool {
-    if !pattern.contains(&b'{') {
-        return pattern.starts_with(b"./");
-    }
-    expand_braces(pattern, options())
-        .is_ok_and(|alternatives| alternatives.iter().any(|pattern| pattern.starts_with(b"./")))
-}
-
-fn contains_double_star(pattern: &[u8]) -> bool {
-    pattern.windows(2).any(|pair| pair == b"**")
-}
-
-/// Both engines unescape a metacharacter. Only ferralk also unescapes an
-/// ordinary byte, where `\b` becomes a literal `b`.
-fn is_shared_escape(byte: u8) -> bool {
-    matches!(byte, b'*' | b'?' | b'[' | b']' | b'{' | b'}' | b'\\')
-}
-
-/// Returns the index just past a shared-syntax character class.
-///
-/// Inside a brace group a class may not contain a comma: brace expansion in
-/// ferralk (like bash) splits alternatives on every comma without looking at
-/// brackets, while fast-glob keeps the class atomic — `{,[a,b]}[c]` vs `a`
-/// is true here and false there once a later `]` lets the split halves
-/// compile.
-fn class_end(pattern: &[u8], open: usize, inside_brace: bool) -> Option<usize> {
-    let mut scan = open + 1;
-    // A negated class implicitly contains the separator, which only fast-glob
-    // lets a class accept.
-    if matches!(pattern.get(scan), Some(b'!' | b'^')) {
-        return None;
-    }
-    // POSIX class names are ferralk-only.
-    if pattern.get(scan) == Some(&b':') {
-        return None;
-    }
-    // A leading `]` is an ordinary member in both engines.
-    let mut previous = None;
-    if pattern.get(scan) == Some(&b']') {
-        previous = Some(b']');
-        scan += 1;
-    }
-    loop {
-        match pattern.get(scan) {
-            None => return None,
-            Some(b']') => return Some(scan + 1),
-            // Only fast-glob lets a class accept a separator, and brace
-            // expansion inside a class rewrites the class itself.
-            Some(b'/' | b'{' | b'}') => return None,
-            Some(b',') if inside_brace => return None,
-            Some(b'-') => {
-                // A `-` with nothing before it, or directly before the closing
-                // bracket, is an ordinary member rather than a range.
-                let (Some(start), Some(&next)) = (previous, pattern.get(scan + 1)) else {
-                    previous = Some(b'-');
-                    scan += 1;
-                    continue;
-                };
-                if next == b']' {
-                    previous = Some(b'-');
-                    scan += 1;
-                    continue;
-                }
-                let (end, after) = if next == b'\\' {
-                    let escaped = *pattern.get(scan + 2)?;
-                    if !is_shared_escape(escaped) {
-                        return None;
-                    }
-                    (escaped, scan + 3)
-                } else if matches!(next, b'/' | b'{' | b'}') || (next == b',' && inside_brace) {
-                    // Bytes excluded as members must not slip in as range
-                    // endpoints either (`[0-{src,9]` did exactly that, found
-                    // on PR #45; a comma endpoint inside a brace group would
-                    // reopen the split-vs-atomic divergence the same way).
-                    return None;
-                } else {
-                    (next, scan + 2)
-                };
-                // A range that spans the separator accepts it, which is the
-                // same divergence as writing `/` in the class directly.
-                if start <= b'/' && b'/' <= end {
-                    return None;
-                }
-                previous = None;
-                scan = after;
-            }
-            Some(b'\\') => {
-                let escaped = *pattern.get(scan + 1)?;
-                if !is_shared_escape(escaped) {
-                    return None;
-                }
-                previous = Some(escaped);
-                scan += 2;
-            }
-            Some(&byte) => {
-                previous = Some(byte);
-                scan += 1;
-            }
-        }
-    }
+    let hits = SUBSET_HITS.load(Ordering::Relaxed);
+    let rate = 100.0 * hits as f64 / inputs as f64;
+    let summary = format!(
+        "ferralk_vs_fast_glob shared-subset checkpoint: {hits}/{inputs} inputs ({rate:.2}%); at most {} later executions are omitted\n",
+        SUBSET_STATS_INTERVAL - 1
+    );
+    let _ = std::fs::write(path, summary);
 }
 
 /// Renders a disagreement as one `corpus/fast-glob.jsonl` line.

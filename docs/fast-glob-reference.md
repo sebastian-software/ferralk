@@ -25,7 +25,7 @@ excluded by the input shape, so a fuzz failure is always a new finding.
 |---|---|---|---|---|
 | One leading `./` is normalized by path APIs | `./` vs `` | `true` | `false` | Any brace-expanded pattern or candidate starting with `./` |
 | Leading `!` reads as negation | `!a` vs `b` | `false` | `true` | Patterns starting with `!` |
-| `**` is a whole path component, not a recursive wildcard | `**/a` vs `aa` | `true` | `false` | Any `**` except the pattern `**` itself |
+| `**` is a whole path component, not a recursive wildcard | `**/a` vs `aa`, `a/**/b` vs `a/ab` | `true` | `false` | Any syntactic `**` except bare `**`, or a complete `**/` component followed by an ordinary component-leading `*` |
 | A trailing `**` component elides to nothing | `a/**` vs `a` | `true` | `false` | Same rule |
 | A backslash before an ordinary byte unescapes it | `\b` vs `b` | `true` | `false` | `\` only before `* ? [ ] { } \` |
 | A class may accept a separator | `[/]` vs `/`, `[.-r]` vs `/` | `false` | `true` | `/` inside a class, a range spanning `/`, and every negated class |
@@ -51,6 +51,15 @@ fuzz harness used to apply to both engines; reported upstream:
 <https://github.com/oxc-project/fast-glob/issues/166>. It is the only reference
 that bounds brace expansion at all: zlob 1.6.3 and glibc `GLOB_BRACE` run until
 they exhaust the machine, and ferralk reports `too many brace alternatives`.
+
+The recursive-wildcard exclusion has one deliberately narrow shared case.
+Patterns such as `**/*.rs` and `src/**/*.rs` accept the same language after the
+leading-`./` candidate exclusion: the ordinary component-leading `*` can absorb
+every partial-component match that ferralk's recursive wildcard could add.
+That reasoning does not extend to a literal, `?`, or class after `**/` —
+`a/**/b` versus `a/ab` is already a counterexample — nor to a trailing `**`.
+The classifier reads escapes and classes before recognizing a star pair, so an
+escaped or class-member `**` is not rejected as recursive syntax.
 
 Brace expansion happens before matching, so an alternative can concatenate
 with the surrounding text into a `**` that only ferralk reads recursively
