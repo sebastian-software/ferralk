@@ -880,7 +880,8 @@ impl Walker {
     ///
     /// Separators, repeated or trailing, and `.` components are ignored on
     /// both sides, so `/repo//src/*.ts` against a root of `/repo/` rewrites the
-    /// same as the tidy spelling.
+    /// same as the tidy spelling. Below the root they are not: `src//*.ts` has
+    /// an empty component and is rejected, like `src/./main.rs`.
     ///
     /// # Patterns are written with `/`
     ///
@@ -1575,7 +1576,8 @@ fn pattern_without_directory_marker(pattern: &[u8]) -> &[u8] {
 /// A leading `./` remains the conventional harmless spelling for a pattern
 /// below the root, but `.` and `./` name the root itself, which a walk never
 /// emits. Any other real `.` component (`src/./x` or `src/.`) likewise names
-/// a spelling no root-relative candidate uses. Brace alternatives are expanded
+/// a spelling no root-relative candidate uses, and so does an empty component
+/// (`src//x`, `/x`, or `src/{}/x`). Brace alternatives are expanded
 /// and reject every arm containing `..`, including mixed forms such as
 /// `{src,..}`, while an extglob-only
 /// component such as `@(.)` remains deliberately opaque matcher text and
@@ -1599,6 +1601,9 @@ fn reject_unwalkable_relative_pattern(
         }
         WalkerPathViability::DotComponent => {
             "a walker-relative pattern with a `.` component is not normalized; remove `/.` to name the entry below that directory"
+        }
+        WalkerPathViability::EmptyComponent => {
+            "a walker-relative pattern with an empty path component selects nothing; remove the repeated separator, leading `/`, or empty alternative that produces it"
         }
     };
     // Brace expansion can create several equally valid source locations. The
@@ -7333,6 +7338,40 @@ mod tests {
         assert!(!outside.roots[0].includes[0].could_match_descendant(b"src"));
         assert!(
             !outside.roots[0].includes[0].covers_subtree(b"src", WildcardMode::ComponentScoped)
+        );
+    }
+
+    /// A repeated separator below the root is an empty component, not a
+    /// spelling of the root, and the rejection has to say so whether the
+    /// pattern is relative or absolute (#331). At the junction of root and
+    /// pattern the doubled separator is still ignored.
+    #[test]
+    fn a_repeated_separator_below_the_root_is_reported_as_an_empty_component() {
+        let fixture = Fixture::new();
+        fixture.write("src/a.ts");
+
+        for pattern in ["src//*.ts", &fixture.absolute("/src//*.ts")] {
+            for add in [Walker::include, Walker::exclude] {
+                let error = add(Walker::new(&fixture.root), pattern)
+                    .expect_err("an empty component below the root is rejected");
+                assert!(
+                    error
+                        .message()
+                        .starts_with("a walker-relative pattern with an empty path component"),
+                    "{pattern}: {error}"
+                );
+            }
+        }
+
+        let joined = Walker::new(&fixture.root)
+            .include(fixture.absolute("//src/*.ts"))
+            .expect("a doubled separator at the root junction is ignored")
+            .options(WalkOptions::default().sort(true).files_only(true))
+            .collect()
+            .expect("walk succeeds");
+        assert_eq!(
+            relative_paths(joined.entries(), &fixture.root),
+            vec![PathBuf::from("src/a.ts")]
         );
     }
 

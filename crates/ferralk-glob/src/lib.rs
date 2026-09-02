@@ -179,6 +179,9 @@ pub enum WalkerPathViability {
     ParentComponent,
     /// Every compiled arm names only the walk root.
     Root,
+    /// Every compiled arm has an empty leading or interior component: a
+    /// repeated separator, a leading `/`, or an empty alternative.
+    EmptyComponent,
     /// Every compiled arm ends in a literal `.` component.
     TrailingDot,
     /// Every compiled arm contains a non-final literal `.` component.
@@ -3204,7 +3207,7 @@ impl WalkerPathEvaluation {
     fn complete_problem(self) -> Option<WalkerPathProblem> {
         self.problem.or_else(|| {
             (!self.selects_candidate).then_some(WalkerPathProblem {
-                viability: WalkerPathViability::Root,
+                viability: WalkerPathViability::EmptyComponent,
                 offset: None,
             })
         })
@@ -3401,7 +3404,7 @@ impl CompiledExtglob {
         }
         Ok(first_problem.or_else(|| {
             saw_unselectable.then_some(WalkerPathProblem {
-                viability: WalkerPathViability::Root,
+                viability: WalkerPathViability::EmptyComponent,
                 offset: None,
             })
         }))
@@ -6676,7 +6679,7 @@ mod tests {
                 Pattern::compile(source, options)
                     .expect("empty extglob arm compiles")
                     .walker_path_viability(),
-                WalkerPathViability::Root,
+                WalkerPathViability::EmptyComponent,
                 "{source} has only an empty leading or interior component"
             );
         }
@@ -6685,8 +6688,19 @@ mod tests {
                 Pattern::compile(source, options)
                     .expect("empty plain or brace arm compiles")
                     .walker_path_viability(),
-                WalkerPathViability::Root,
+                WalkerPathViability::EmptyComponent,
                 "{source} has no selectable complete walker alternative"
+            );
+        }
+        // Only a pattern made of nothing but empty and `.` components names
+        // the root itself.
+        for source in ["", ".", "./", "//"] {
+            assert_eq!(
+                Pattern::compile(source, options)
+                    .expect("root spelling compiles")
+                    .walker_path_viability(),
+                WalkerPathViability::Root,
+                "{source} names only the walk root"
             );
         }
         for source in ["src/?(x)/bar", "src/?()bar", "?(x)/bar"] {
