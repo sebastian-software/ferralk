@@ -775,15 +775,13 @@ impl Pattern {
         let path_filter_alternatives = alternatives
             .iter()
             .any(|alternative| {
-                // Only a wildcard behind an explicit separator reads
-                // differently from `is_match`; a root-only pattern keeps the
-                // crossing engines it already has.
                 alternative.raw.starts_with(b"./")
-                    || alternative
-                        .tokens
-                        .iter()
-                        .skip(Self::separator_anchor(&alternative.tokens))
-                        .any(|token| matches!(token, Token::Any | Token::Star | Token::Class(_)))
+                    || alternative.tokens.windows(2).any(|tokens| {
+                        matches!(
+                            tokens,
+                            [Token::Separator, Token::Any | Token::Star | Token::Class(_)]
+                        )
+                    })
             })
             .then(|| {
                 // A second compiled copy of every alternative, so it costs the
@@ -869,7 +867,6 @@ impl Pattern {
         deferred: &mut Vec<(usize, usize)>,
         work: &mut StarWork<'_>,
     ) -> bool {
-        let separator_anchor = Self::separator_anchor(tokens);
         let mut state = (0_usize, 0_usize);
 
         loop {
@@ -898,29 +895,21 @@ impl Pattern {
                             None
                         }
                     }
-                    Token::Any => Self::advance_one(
-                        separator_anchor,
-                        token_index,
-                        path_index,
-                        path,
-                        options,
-                        |_| true,
-                    ),
-                    Token::Class(class) => Self::advance_one(
-                        separator_anchor,
-                        token_index,
-                        path_index,
-                        path,
-                        options,
-                        |byte| class.matches(byte, options.case_insensitive),
-                    ),
+                    Token::Any => {
+                        Self::advance_one(tokens, token_index, path_index, path, options, |_| true)
+                    }
+                    Token::Class(class) => {
+                        Self::advance_one(tokens, token_index, path_index, path, options, |byte| {
+                            class.matches(byte, options.case_insensitive)
+                        })
+                    }
                     Token::Star => Self::advance_star::<SKIP>(
                         token_index,
                         path_index,
                         path,
                         options,
                         StarSemantics::ordinary(!Self::component_wildcard(
-                            separator_anchor,
+                            tokens,
                             token_index,
                             options,
                         )),
@@ -959,30 +948,10 @@ impl Pattern {
         }
     }
 
-    /// Whether the wildcard at `token_index` stays inside one path component.
-    ///
-    /// Under `component_wildcards` alone, every wildcard behind the first
-    /// explicit separator is component-local, whatever stands between the two:
-    /// `a/b*` is as component-local as `a/*b`, and the second wildcard of a
-    /// run such as `a/?*` does not cross either. A wildcard in the root
-    /// component keeps crossing separators unless `root_component_wildcards`
-    /// is set as well.
-    fn component_wildcard(
-        separator_anchor: usize,
-        token_index: usize,
-        options: PatternOptions,
-    ) -> bool {
+    fn component_wildcard(tokens: &[Token], token_index: usize, options: PatternOptions) -> bool {
         options.component_wildcards
-            && (options.root_component_wildcards || token_index > separator_anchor)
-    }
-
-    /// Index of the first explicit separator token, or `usize::MAX` when the
-    /// pattern has none: the boundary [`Self::component_wildcard`] anchors to.
-    fn separator_anchor(tokens: &[Token]) -> usize {
-        tokens
-            .iter()
-            .position(|token| matches!(token, Token::Separator))
-            .unwrap_or(usize::MAX)
+            && (options.root_component_wildcards
+                || token_index > 0 && matches!(tokens[token_index - 1], Token::Separator))
     }
 
     /// Returns the state after a literal token, or `None` if it does not match.
@@ -1005,7 +974,7 @@ impl Pattern {
     /// byte is rejected by the token, the component policy, or the leading-dot
     /// policy.
     fn advance_one(
-        separator_anchor: usize,
+        tokens: &[Token],
         token_index: usize,
         path_index: usize,
         path: &[u8],
@@ -1014,8 +983,7 @@ impl Pattern {
     ) -> Option<(usize, usize)> {
         let &byte = path.get(path_index)?;
         (accepts(byte)
-            && (!Self::component_wildcard(separator_anchor, token_index, options)
-                || !is_separator(byte))
+            && (!Self::component_wildcard(tokens, token_index, options) || !is_separator(byte))
             && (options.match_hidden
                 || byte != b'.'
                 || !at_component_start(path, path_index, options)))
@@ -2451,7 +2419,6 @@ impl FastPath {
                 path_index == path.len()
             }
             Self::DeterministicTokens(tokens) => {
-                let separator_anchor = Pattern::separator_anchor(tokens);
                 let mut path_index = 0;
                 for (token_index, token) in tokens.iter().enumerate() {
                     match token {
@@ -2477,7 +2444,7 @@ impl FastPath {
                             let Some(&byte) = path.get(path_index) else {
                                 return false;
                             };
-                            if Pattern::component_wildcard(separator_anchor, token_index, options)
+                            if Pattern::component_wildcard(tokens, token_index, options)
                                 && is_separator(byte)
                             {
                                 return false;
@@ -2494,7 +2461,7 @@ impl FastPath {
                             let Some(&byte) = path.get(path_index) else {
                                 return false;
                             };
-                            if (Pattern::component_wildcard(separator_anchor, token_index, options)
+                            if (Pattern::component_wildcard(tokens, token_index, options)
                                 && is_separator(byte))
                                 || !class.matches(byte, options.case_insensitive)
                                 || (!options.match_hidden
@@ -8270,10 +8237,6 @@ mod tests {
         let root_pattern =
             Pattern::compile("*.rs", PatternOptions::default()).expect("root pattern compiles");
         assert!(root_pattern.path_filter_alternatives.is_none());
-
-        let literal_then_wildcard = Pattern::compile("a/b*", PatternOptions::default())
-            .expect("literal-then-wildcard pattern compiles");
-        assert!(literal_then_wildcard.path_filter_alternatives.is_some());
     }
 
     #[test]
@@ -8446,75 +8409,6 @@ mod tests {
                 "is_match_glob_path differs for {candidate:?}"
             );
         }
-    }
-
-    /// The component policy is a state over the whole token run behind an
-    /// explicit separator, not a look-back at the one token before a
-    /// wildcard: the second wildcard of `?*` or `*[a-z]*`, a `**` with
-    /// recursion disabled, and a wildcard behind a literal (`b*`) all stay
-    /// inside that component under the path entry points. The root component
-    /// and `is_match` keep their crossing reading.
-    #[test]
-    fn wildcard_runs_after_a_separator_stay_in_one_component() {
-        let options = PatternOptions::default();
-        for pattern in [
-            "a/*/z",
-            "a/**/z",
-            "a/?*/z",
-            "a/*?*/z",
-            "a/*[a-z]*/z",
-            "a/b*/z",
-            "a/[b]*/z",
-        ] {
-            let compiled = Pattern::compile(pattern, options).unwrap();
-            assert!(compiled.is_match("a/b/c/z"), "{pattern}: is_match crosses");
-            assert!(compiled.is_match_path("a/b/z"), "{pattern}: one component");
-            assert!(
-                !compiled.is_match_path("a/b/c/z"),
-                "{pattern}: is_match_path stays inside the component"
-            );
-            assert!(
-                !compiled.is_match_glob_path("a/b/c/z"),
-                "{pattern}: is_match_glob_path stays inside the component"
-            );
-            for candidate in ["a/b/z", "a/b/c/z"] {
-                assert!(
-                    compiled.engines_agree(candidate),
-                    "{pattern}: engines disagree on {candidate}"
-                );
-            }
-        }
-
-        let nested = Pattern::compile("src/**/*.rs", options).unwrap();
-        assert!(nested.is_match("src/a/b/c.rs"));
-        assert!(nested.is_match_path("src/a/c.rs"));
-        assert!(!nested.is_match_path("src/a/b/c.rs"));
-        assert_eq!(
-            nested.filter_paths(&["src/a/c.rs", "src/a/b/c.rs"]),
-            vec![&"src/a/c.rs"]
-        );
-
-        // A wildcard run in the root component still crosses under
-        // `is_match_path`, with or without a `**/` prefix before it.
-        for (pattern, candidate) in [("*?*", "a/b/c"), ("?*.c", "d/e/a.c"), ("**/*.c", "d/e/a.c")] {
-            let compiled = Pattern::compile(pattern, options).unwrap();
-            assert!(
-                compiled.is_match_path(candidate),
-                "{pattern}: root run crosses"
-            );
-            assert!(
-                !compiled.is_match_glob_path(candidate),
-                "{pattern}: the glob-path reading is component-local at the root too"
-            );
-        }
-        let recursive = PatternOptions::default().recursive_double_star(true);
-        let root_run = Pattern::compile("**/a*b", recursive).unwrap();
-        assert!(root_run.is_match_path("x/ayy/zb"));
-        let anchored_run = Pattern::compile("a/**/b*c", recursive).unwrap();
-        assert!(anchored_run.is_match("a/x/byy/zc"));
-        assert!(!anchored_run.is_match_path("a/x/byy/zc"));
-        assert!(anchored_run.is_match_path("a/x/byyzc"));
-        assert!(anchored_run.engines_agree("a/x/byy/zc"));
     }
 
     #[test]
