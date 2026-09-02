@@ -1460,14 +1460,46 @@ mod tests {
         (state.entries, state.errors)
     }
 
+    /// Set in the child test process that owns the `RLIMIT_NOFILE` change.
+    const LOWERED_DESCRIPTOR_LIMIT_CHILD: &str = "FERRALK_LOWERED_DESCRIPTOR_LIMIT_CHILD";
+
     /// A process that lowers `RLIMIT_NOFILE` between walks must walk with
-    /// the budget that limit allows, not the ceiling measured earlier. The
-    /// soft limit is lowered to at most 512, or half its current value, for
-    /// the duration of one walk of an empty directory and restored before
-    /// the test returns.
+    /// the budget that limit allows, not the ceiling measured earlier.
+    ///
+    /// The soft limit and the measured ceiling are process-wide, and libtest
+    /// runs the other native tests on threads of this process: a concurrent
+    /// walk would re-measure the ceiling inside the window, and the lowered
+    /// limit could starve it of descriptors. The mutation therefore runs in
+    /// a child test process that executes only this test, the way the
+    /// cwd- and environment-sensitive tests in `lib.rs` do, and restores the
+    /// limit before that child exits.
     #[test]
-    #[allow(unsafe_code)]
     fn the_next_walk_measures_a_lowered_descriptor_limit() {
+        if std::env::var_os(LOWERED_DESCRIPTOR_LIMIT_CHILD).is_some() {
+            lower_the_descriptor_limit_between_two_walks();
+            return;
+        }
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("locate test binary"))
+                .args([
+                    "linux_native::tests::the_next_walk_measures_a_lowered_descriptor_limit",
+                    "--exact",
+                ])
+                .env(LOWERED_DESCRIPTOR_LIMIT_CHILD, "1")
+                .status()
+                .expect("run the isolated descriptor-limit regression test");
+        assert!(
+            status.success(),
+            "the isolated descriptor-limit child failed: {status}"
+        );
+    }
+
+    /// The body of the regression, run only in the isolated child. The soft
+    /// limit is lowered to at most 512, or half its current value, for the
+    /// duration of one walk of an empty directory and restored on every
+    /// exit path through the guard.
+    #[allow(unsafe_code)]
+    fn lower_the_descriptor_limit_between_two_walks() {
         struct RestoreLimit(libc::rlimit);
 
         impl Drop for RestoreLimit {
