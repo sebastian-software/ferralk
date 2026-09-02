@@ -887,7 +887,11 @@ impl Pattern {
                         path_index,
                         path,
                         options,
-                        !Self::component_wildcard(tokens, token_index, options),
+                        StarSemantics::ordinary(!Self::component_wildcard(
+                            tokens,
+                            token_index,
+                            options,
+                        )),
                         deferred,
                         work,
                     ),
@@ -896,16 +900,25 @@ impl Pattern {
                         path_index,
                         path,
                         options,
-                        false,
+                        StarSemantics::ordinary(false),
                         deferred,
                         work,
                     ),
-                    Token::RecursiveStar | Token::RecursivePrefix => Self::advance_star::<SKIP>(
+                    Token::RecursiveStar => Self::advance_star::<SKIP>(
                         token_index,
                         path_index,
                         path,
                         options,
-                        true,
+                        StarSemantics::ordinary(true),
+                        deferred,
+                        work,
+                    ),
+                    Token::RecursivePrefix => Self::advance_star::<SKIP>(
+                        token_index,
+                        path_index,
+                        path,
+                        options,
+                        StarSemantics::RECURSIVE_PREFIX,
                         deferred,
                         work,
                     ),
@@ -966,13 +979,17 @@ impl Pattern {
     }
 
     /// Queues the star's repetition branch and returns the branch that stops
-    /// consuming here, which the caller explores first.
+    /// consuming here, which the caller explores first. An ordinary star may
+    /// not stop immediately before a component-leading period: doing so would
+    /// let a following literal opt into a hidden name implicitly. The
+    /// syntactic `**/` prefix is exempt because it explicitly advances to the
+    /// next component without consuming one.
     fn advance_star<const SKIP: bool>(
         token_index: usize,
         path_index: usize,
         path: &[u8],
         options: PatternOptions,
-        recursive: bool,
+        semantics: StarSemantics,
         deferred: &mut Vec<(usize, usize)>,
         work: &mut StarWork<'_>,
     ) -> Option<(usize, usize)> {
@@ -981,12 +998,16 @@ impl Pattern {
             path_index,
             path,
             options,
-            recursive,
+            semantics.recursive,
             work,
         ) {
             deferred.push((token_index, next));
         }
-        Some((token_index + 1, path_index))
+        (!semantics.blocks_hidden_stop
+            || options.match_hidden
+            || path.get(path_index) != Some(&b'.')
+            || !at_component_start(path, path_index, options))
+        .then_some((token_index + 1, path_index))
     }
 
     /// Where the star should resume consuming, or `None` when it cannot.
@@ -1153,6 +1174,26 @@ struct StarWork<'scratch> {
     skip_token: usize,
     /// The literal that star aims at.
     skip_literal: &'scratch [u8],
+}
+
+#[derive(Clone, Copy)]
+struct StarSemantics {
+    recursive: bool,
+    blocks_hidden_stop: bool,
+}
+
+impl StarSemantics {
+    const RECURSIVE_PREFIX: Self = Self {
+        recursive: true,
+        blocks_hidden_stop: false,
+    };
+
+    const fn ordinary(recursive: bool) -> Self {
+        Self {
+            recursive,
+            blocks_hidden_stop: true,
+        }
+    }
 }
 
 impl StarWork<'_> {
@@ -1572,13 +1613,12 @@ impl CompiledAlternative {
 /// Whether a plain compiled alternative can place a literal period at the
 /// start of any candidate component.
 ///
-/// A wildcard may stop without consuming a byte, and under separator-crossing
-/// semantics it may also leave the next token immediately after a separator.
-/// A following period literal is therefore hidden-capable even when an earlier
-/// literal means the wildcard did not start at a component boundary in the
-/// token stream. This summary is deliberately conservative because walkers
-/// use it to decide whether pruning a subtree is sound under either wildcard
-/// mode.
+/// Single-byte wildcards can cross a separator under separator-crossing
+/// semantics and leave the following token at a component boundary. Stars do
+/// not: their zero-width branch is forbidden immediately before a leading
+/// period, so a following period literal is not an implicit hidden opt-in.
+/// The syntactic `**/` prefix is different because it explicitly advances to
+/// a component boundary without consuming candidate bytes.
 fn tokens_can_match_hidden_component_without_match_hidden(tokens: &[Token]) -> bool {
     let mut at_component_start = true;
     for token in tokens {
@@ -1590,9 +1630,8 @@ fn tokens_can_match_hidden_component_without_match_hidden(tokens: &[Token]) -> b
                 }
                 at_component_start = false;
             }
-            Token::Any | Token::Star | Token::RecursiveStar | Token::PathStar | Token::Class(_) => {
-                at_component_start = true
-            }
+            Token::Any | Token::Class(_) => at_component_start = true,
+            Token::Star | Token::RecursiveStar | Token::PathStar => at_component_start = false,
         }
     }
     false
@@ -1648,7 +1687,7 @@ impl CompiledExtglob {
                     at_component_start = false;
                     index = self.groups[*group].rest;
                 }
-                ExtglobStep::Star { next } | ExtglobStep::Class { next, .. } => {
+                ExtglobStep::Star { next, .. } | ExtglobStep::Class { next, .. } => {
                     at_component_start = false;
                     index = *next;
                 }
@@ -1989,6 +2028,9 @@ impl SuffixSet {
             {
                 continue;
             }
+            if star_stops_before_hidden_component(path, variable_end, options) {
+                continue;
+            }
             if options.match_hidden
                 || !contains_hidden_component_in(
                     path,
@@ -2090,6 +2132,9 @@ impl ScopedSuffixSet {
             }
             let variable_end = path.len() - offset - 1;
             if variable_start > variable_end {
+                continue;
+            }
+            if star_stops_before_hidden_component(path, variable_end, options) {
                 continue;
             }
             if options.match_hidden
@@ -2462,6 +2507,9 @@ impl FastPath {
                 if options.component_wildcards && next_separator(variable).is_some() {
                     return false;
                 }
+                if star_stops_before_hidden_component(path, variable.len(), options) {
+                    return false;
+                }
                 options.match_hidden
                     || !contains_hidden_component_in(
                         path,
@@ -2481,11 +2529,15 @@ impl FastPath {
                     return false;
                 };
                 let variable_start = path.len() - remainder.len();
+                let variable_end = variable_start + variable.len();
+                if star_stops_before_hidden_component(path, variable_end, options) {
+                    return false;
+                }
                 options.match_hidden
                     || !contains_hidden_component_in(
                         path,
                         variable_start,
-                        variable_start + variable.len(),
+                        variable_end,
                         options.candidate_starts_component,
                     )
             }
@@ -2497,6 +2549,9 @@ impl FastPath {
                     return false;
                 };
                 if variable_start > variable_end {
+                    return false;
+                }
+                if star_stops_before_hidden_component(path, variable_end, options) {
                     return false;
                 }
                 options.match_hidden
@@ -2535,6 +2590,9 @@ impl FastPath {
                 let Some(variable) = suffix.strip_from(path, options.case_insensitive) else {
                     return false;
                 };
+                if star_stops_before_hidden_component(path, variable.len(), options) {
+                    return false;
+                }
                 options.match_hidden
                     || !contains_hidden_component_in(
                         path,
@@ -2570,11 +2628,15 @@ impl FastPath {
                     return false;
                 }
                 let variable_start = prefix.len() + 1;
+                let variable_end = variable_start + variable.len();
+                if star_stops_before_hidden_component(path, variable_end, options) {
+                    return false;
+                }
                 options.match_hidden
                     || !contains_hidden_component_in(
                         path,
                         variable_start,
-                        variable_start + variable.len(),
+                        variable_end,
                         options.candidate_starts_component,
                     )
             }
@@ -2683,6 +2745,14 @@ fn contains_hidden_component_in(
         offset = index + 1;
     }
     false
+}
+
+/// Whether an ordinary star would hand a component-leading period to the
+/// literal suffix without consuming it.
+fn star_stops_before_hidden_component(path: &[u8], index: usize, options: PatternOptions) -> bool {
+    !options.match_hidden
+        && path.get(index) == Some(&b'.')
+        && at_component_start(path, index, options)
 }
 
 fn path_after_base<'a>(base_path: &[u8], path: &'a [u8]) -> Option<&'a [u8]> {
@@ -3247,7 +3317,7 @@ impl CompiledExtglob {
                     states = self.groups[*group].apply_to(states, budget)?;
                     index = self.groups[*group].rest;
                 }
-                ExtglobStep::Star { next } | ExtglobStep::Class { next, .. } => {
+                ExtglobStep::Star { next, .. } | ExtglobStep::Class { next, .. } => {
                     for state in &mut states {
                         state.wildcard();
                     }
@@ -3977,7 +4047,12 @@ enum ExtglobStep {
     /// filler for an offset no walk reaches.
     NoMatch,
     /// A run of `*`, resuming at the offset after it.
-    Star { next: usize },
+    Star {
+        next: usize,
+        /// Ordinary stars cannot stop immediately before a leading period.
+        /// A syntactic recursive `**/` prefix is the sole exemption.
+        blocks_leading_period: bool,
+    },
     /// `?`.
     Any,
     /// A bracket class, resuming at the offset after it.
@@ -4014,6 +4089,7 @@ enum PositiveExtglobState {
     Star {
         matcher: PositiveExtglobMatcher,
         next: usize,
+        blocks_leading_period: bool,
     },
     Match,
 }
@@ -4314,9 +4390,19 @@ impl PositiveExtglobNfa {
                     }
                     scratch.pending.extend(targets.iter().copied());
                 }
-                PositiveExtglobState::Star { next, .. } => {
+                PositiveExtglobState::Star {
+                    next,
+                    blocks_leading_period,
+                    ..
+                } => {
                     active.push(state);
-                    scratch.pending.push(*next);
+                    if !(*blocks_leading_period
+                        && !options.match_hidden
+                        && at_component_start
+                        && byte == Some(b'.'))
+                    {
+                        scratch.pending.push(*next);
+                    }
                 }
                 PositiveExtglobState::Consume { .. } | PositiveExtglobState::Match => {
                     active.push(state);
@@ -4397,9 +4483,19 @@ impl PositiveExtglobBuilder<'_> {
         &mut self,
         matcher: PositiveExtglobMatcher,
         next: Option<usize>,
+        blocks_leading_period: bool,
     ) -> Result<Option<usize>, PatternError> {
-        next.map(|next| self.push(PositiveExtglobState::Star { matcher, next }, 1))
-            .transpose()
+        next.map(|next| {
+            self.push(
+                PositiveExtglobState::Star {
+                    matcher,
+                    next,
+                    blocks_leading_period,
+                },
+                1,
+            )
+        })
+        .transpose()
     }
 
     fn epsilon(
@@ -4515,14 +4611,22 @@ impl PositiveExtglobBuilder<'_> {
                 Token::Star => self.star(
                     PositiveExtglobMatcher::Wildcard(WildcardScope::Group),
                     start,
+                    true,
                 )?,
                 Token::PathStar => self.star(
                     PositiveExtglobMatcher::Wildcard(WildcardScope::Group),
                     start,
+                    true,
                 )?,
-                Token::RecursiveStar | Token::RecursivePrefix => self.star(
+                Token::RecursiveStar => self.star(
                     PositiveExtglobMatcher::Wildcard(WildcardScope::Group),
                     start,
+                    true,
+                )?,
+                Token::RecursivePrefix => self.star(
+                    PositiveExtglobMatcher::Wildcard(WildcardScope::Group),
+                    start,
+                    false,
                 )?,
             };
             if token_index + 2 == tokens.len()
@@ -4574,7 +4678,7 @@ fn compile_extglob(
         )?;
         match &step {
             ExtglobStep::Group(group) => pending.push(groups[*group].rest),
-            ExtglobStep::Star { next } | ExtglobStep::Class { next, .. } => pending.push(*next),
+            ExtglobStep::Star { next, .. } | ExtglobStep::Class { next, .. } => pending.push(*next),
             // A literal backslash consumes one offset and leaves the walk on
             // the escaped byte, which is read as ordinary text from there.
             ExtglobStep::Escape { .. } => {
@@ -4665,7 +4769,12 @@ fn compile_extglob_step(
             while pattern.get(next) == Some(&b'*') {
                 next += 1;
             }
-            ExtglobStep::Star { next }
+            ExtglobStep::Star {
+                next,
+                blocks_leading_period: !(options.recursive_double_star
+                    && next - index == 2
+                    && pattern.get(next) == Some(&b'/')),
+            }
         }
         b'?' => ExtglobStep::Any,
         // An unparseable class never matched and was never read as a literal
@@ -5232,12 +5341,21 @@ fn match_extglob_task(
                     }
                     return false;
                 }
-                ExtglobStep::Star { next } => {
-                    star_pattern_index = *next;
-                    star_path_index = path_index;
-                    has_star = true;
-                    pattern_index = *next;
-                    continue;
+                ExtglobStep::Star {
+                    next,
+                    blocks_leading_period,
+                } => {
+                    let blocked = *blocks_leading_period
+                        && !options.match_hidden
+                        && path.get(path_index) == Some(&b'.')
+                        && at_component_start(path, path_index, options);
+                    if !blocked {
+                        star_pattern_index = *next;
+                        star_path_index = path_index;
+                        has_star = true;
+                        pattern_index = *next;
+                        continue;
+                    }
                 }
                 ExtglobStep::UnclosedGroup { byte: b'*' } => {
                     star_pattern_index = pattern_index + 1;
@@ -5741,9 +5859,10 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     use super::LiteralSuffix;
     use super::{
-        AlternativeFastPath, FailedStates, FastPath, Pattern, PatternOptions, Prefilter, Token,
-        WalkerPathViability, extglob_failed_len, extglob_failed_stats, extglob_pending_peak,
-        extglob_scratch_capacities, positive_extglob_scratch_capacities, scratch_capacities,
+        AlternativeFastPath, ExtglobStep, FailedStates, FastPath, Pattern, PatternOptions,
+        Prefilter, Token, WalkerPathViability, extglob_failed_len, extglob_failed_stats,
+        extglob_pending_peak, extglob_scratch_capacities, positive_extglob_scratch_capacities,
+        scratch_capacities,
     };
 
     fn compile(pattern: &str) -> Pattern {
@@ -5862,11 +5981,17 @@ mod tests {
     #[test]
     fn leading_period_requires_an_explicit_option_or_literal() {
         assert!(!compile("*").is_match(".gitignore"));
+        assert!(!compile("*.rs").is_match(".rs"));
         assert!(compile(".*").is_match(".gitignore"));
         assert!(
             Pattern::compile("*", PatternOptions::default().match_hidden(true))
                 .unwrap()
                 .is_match(".gitignore")
+        );
+        assert!(
+            Pattern::compile("*.rs", PatternOptions::default().match_hidden(true))
+                .unwrap()
+                .is_match(".rs")
         );
     }
 
@@ -5882,12 +6007,12 @@ mod tests {
                 .can_match_hidden_component_without_match_hidden()
         };
 
-        assert!(can_match_hidden("**/*.txt"));
-        assert!(can_match_hidden("**/*.{rs,toml}"));
-        assert!(can_match_hidden("x/f*.hidden/keep.rs"));
+        assert!(!can_match_hidden("**/*.txt"));
+        assert!(!can_match_hidden("**/*.{rs,toml}"));
+        assert!(!can_match_hidden("x/f*.hidden/keep.rs"));
         assert!(!can_match_hidden("visible/**"));
-        assert!(can_match_hidden("**/@(*|visible)/*.txt"));
-        assert!(can_match_hidden("**/!(.gitignore)/*.txt"));
+        assert!(!can_match_hidden("**/@(*|visible)/*.txt"));
+        assert!(!can_match_hidden("**/!(.gitignore)/*.txt"));
         assert!(can_match_hidden(".hidden/keep.txt"));
         assert!(can_match_hidden("**/.hidden/keep.txt"));
         assert!(can_match_hidden("**/{visible,.hidden}/keep.txt"));
@@ -6797,22 +6922,68 @@ mod tests {
 
     #[test]
     fn extglob_zero_width_forms_honor_leading_period_policy() {
-        let optional = Pattern::compile("?(a|b).c", PatternOptions::default().extglob(true))
-            .expect("optional extglob compiles");
+        let options = PatternOptions::default().extglob(true);
+        let optional = Pattern::compile("?(a|b).c", options).expect("optional extglob compiles");
         assert!(!optional.is_match(".c"));
         assert!(optional.is_match("a.c"));
 
-        let repeating = Pattern::compile("*(ab).c", PatternOptions::default().extglob(true))
-            .expect("repeating extglob compiles");
+        let repeating = Pattern::compile("*(ab).c", options).expect("repeating extglob compiles");
         assert!(!repeating.is_match(".c"));
         assert!(repeating.is_match("ab.c"));
 
-        let hidden = Pattern::compile(
-            "?(a|b).c",
-            PatternOptions::default().extglob(true).match_hidden(true),
-        )
-        .expect("period-enabled optional extglob compiles");
+        let outer_star = Pattern::compile("*.c@(x)", options).expect("outer star compiles");
+        assert!(!outer_star.is_match(".cx"));
+
+        let group_star = Pattern::compile("x@(*.c)", options).expect("group star compiles");
+        assert!(!group_star.is_match("xvisible/.c"));
+
+        let hidden = Pattern::compile("?(a|b).c", options.match_hidden(true))
+            .expect("period-enabled optional extglob compiles");
         assert!(hidden.is_match(".c"));
+        assert!(
+            Pattern::compile("*.c@(x)", options.match_hidden(true))
+                .expect("period-enabled outer star compiles")
+                .is_match(".cx")
+        );
+        assert!(
+            Pattern::compile("x@(*.c)", options.match_hidden(true))
+                .expect("period-enabled group star compiles")
+                .is_match("xvisible/.c")
+        );
+    }
+
+    #[test]
+    fn extglob_recursive_prefix_exemption_requires_exactly_two_stars() {
+        let options = PatternOptions::default()
+            .extglob(true)
+            .recursive_double_star(true);
+
+        let recursive = Pattern::compile("**/@(foo)", options).expect("extglob compiles");
+        assert!(matches!(
+            recursive.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("the pattern carries an extglob program")
+                .steps[0],
+            ExtglobStep::Star {
+                next: 2,
+                blocks_leading_period: false
+            }
+        ));
+
+        let ordinary = Pattern::compile("***/@(foo)", options).expect("extglob compiles");
+        assert!(matches!(
+            ordinary.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("the pattern carries an extglob program")
+                .steps[0],
+            ExtglobStep::Star {
+                next: 3,
+                blocks_leading_period: true
+            }
+        ));
+        assert!(!ordinary.is_match(".hidden/foo"));
     }
 
     #[test]
@@ -7277,11 +7448,15 @@ mod tests {
                     .into_iter()
                     .map(|suffix| [b"src/".as_slice(), suffix.as_slice()].concat()),
             );
-            // The recursive prefix and star may both consume nothing. Use a
-            // non-first prefix/suffix pair so the first-alternative shortcut
-            // cannot conceal a boundary error in the aggregate matcher.
-            assert!(fast.is_match("packages/.js"));
-            assert!(fast.is_match_glob_path("packages/.js"));
+            // The recursive prefix may consume no component, but the ordinary
+            // star cannot hand a leading period to its suffix unless hidden
+            // matching is explicit. Use a non-first prefix/suffix pair so the
+            // aggregate matcher cannot conceal a boundary error.
+            assert_eq!(fast.is_match("packages/.js"), options.match_hidden);
+            assert_eq!(
+                fast.is_match_glob_path("packages/.js"),
+                options.match_hidden
+            );
             for candidate in candidates {
                 assert_eq!(
                     fast.is_match(&candidate),
@@ -7541,7 +7716,7 @@ mod tests {
     fn component_suffix_fast_paths_preserve_separator_and_hidden_rules() {
         let star = Pattern::compile("*.ts", PatternOptions::default()).unwrap();
         assert!(star.is_match_glob_path("index.ts"));
-        assert!(star.is_match_glob_path(".ts"));
+        assert!(!star.is_match_glob_path(".ts"));
         assert!(!star.is_match_glob_path("src/index.ts"));
         assert!(!star.is_match_glob_path(".hidden.ts"));
 
@@ -7552,7 +7727,7 @@ mod tests {
         .unwrap();
         assert!(recursive.is_match_glob_path("index.ts"));
         assert!(recursive.is_match_glob_path("src/deep/index.ts"));
-        assert!(recursive.is_match_glob_path("src/.ts"));
+        assert!(!recursive.is_match_glob_path("src/.ts"));
         assert!(!recursive.is_match_glob_path("src/.hidden.ts"));
         assert!(!recursive.is_match_glob_path(".hidden/index.ts"));
 
@@ -7563,6 +7738,7 @@ mod tests {
                 .match_hidden(true),
         )
         .unwrap();
+        assert!(hidden.is_match_glob_path("src/.ts"));
         assert!(hidden.is_match_glob_path("src/.hidden.ts"));
         assert!(hidden.is_match_glob_path(".hidden/index.ts"));
     }

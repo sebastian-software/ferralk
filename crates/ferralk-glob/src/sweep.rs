@@ -41,11 +41,11 @@ const NARROW_IR_UNITS: usize = size_of::<NarrowSweepEngine>().div_ceil(size_of::
 
 /// Persistent and temporary word rows allocated while compiling a wide sweep.
 ///
-/// The byte table owns 256 rows, the engine keeps six policy/state rows, and
+/// The byte table owns 256 rows, the engine keeps seven policy/state rows, and
 /// compilation uses two more rows for the wildcard sets. Charging the peak
 /// before allocation keeps the existing compiled-IR budget meaningful for a
 /// literal whose bytes expand to many sweep positions.
-const WIDE_WORD_ROWS_AT_COMPILE: usize = 256 + 6 + 2;
+const WIDE_WORD_ROWS_AT_COMPILE: usize = 256 + 7 + 2;
 
 /// A compiled Shift-And automaton for one alternative's token list.
 ///
@@ -88,6 +88,10 @@ pub(crate) struct NarrowSweepEngine {
     /// Positions a `.` at a component start never reaches. Empty when hidden
     /// entries match; otherwise every wildcard position, literals exempt.
     dot_block: u64,
+    /// Boundaries immediately after an ordinary star. These are removed
+    /// before a leading period is consumed so the star cannot stop zero-width
+    /// and hand that period to a literal. `RecursivePrefix` is exempt.
+    dot_stop_block: u64,
     /// Boundaries that accept once the candidate is exhausted: the final
     /// boundary, plus the boundary before a trailing `Separator` +
     /// `RecursiveStar` pair — `src/**` accepts `src` itself.
@@ -124,6 +128,7 @@ impl SweepEngine {
             sep_block_component: 0,
             sep_block_glob: 0,
             dot_block: 0,
+            dot_stop_block: 0,
             accept: 1_u64 << position_count,
             initial: 0,
             match_hidden: options.match_hidden,
@@ -189,6 +194,9 @@ impl SweepEngine {
                 }
                 Token::Star => {
                     engine.stars |= bit;
+                    if !options.match_hidden {
+                        engine.dot_stop_block |= bit << 1;
+                    }
                     wildcards |= bit;
                     consume_any |= bit;
                     if after_separator {
@@ -201,6 +209,9 @@ impl SweepEngine {
                 // `Token::PathStar` in `matches_from`.
                 Token::PathStar => {
                     engine.stars |= bit;
+                    if !options.match_hidden {
+                        engine.dot_stop_block |= bit << 1;
+                    }
                     wildcards |= bit;
                     consume_any |= bit;
                     engine.sep_block_component |= bit;
@@ -208,7 +219,15 @@ impl SweepEngine {
                 }
                 // Recursive stars cross separators under every policy; only
                 // the leading-dot rule still binds them.
-                Token::RecursiveStar | Token::RecursivePrefix => {
+                Token::RecursiveStar => {
+                    engine.stars |= bit;
+                    if !options.match_hidden {
+                        engine.dot_stop_block |= bit << 1;
+                    }
+                    wildcards |= bit;
+                    consume_any |= bit;
+                }
+                Token::RecursivePrefix => {
                     engine.stars |= bit;
                     wildcards |= bit;
                     consume_any |= bit;
@@ -382,7 +401,7 @@ impl SweepEngine {
 impl NarrowSweepEngine {
     fn advance(
         &self,
-        state: u64,
+        mut state: u64,
         byte: u8,
         at_component_start: bool,
         options: PatternOptions,
@@ -405,6 +424,7 @@ impl NarrowSweepEngine {
         if separator {
             mask &= !sep_block;
         } else if byte == b'.' && at_component_start {
+            state &= !self.dot_stop_block;
             mask &= !self.dot_block;
         }
         let consuming = state & mask;
@@ -441,6 +461,7 @@ pub(crate) struct WideSweepEngine {
     sep_block_component: Vec<u64>,
     sep_block_glob: Vec<u64>,
     dot_block: Vec<u64>,
+    dot_stop_block: Vec<u64>,
     accept: Vec<u64>,
     initial: Vec<u64>,
     match_hidden: bool,
@@ -472,6 +493,7 @@ impl WideSweepEngine {
             sep_block_component: vec![0; word_count],
             sep_block_glob: vec![0; word_count],
             dot_block: vec![0; word_count],
+            dot_stop_block: vec![0; word_count],
             accept: vec![0; word_count],
             initial: vec![0; word_count],
             match_hidden: options.match_hidden,
@@ -525,6 +547,9 @@ impl WideSweepEngine {
                 }
                 Token::Star => {
                     set_bit(&mut engine.stars, position);
+                    if !options.match_hidden {
+                        set_bit(&mut engine.dot_stop_block, position + 1);
+                    }
                     set_bit(&mut wildcards, position);
                     set_bit(&mut consume_any, position);
                     if after_separator {
@@ -534,12 +559,23 @@ impl WideSweepEngine {
                 }
                 Token::PathStar => {
                     set_bit(&mut engine.stars, position);
+                    if !options.match_hidden {
+                        set_bit(&mut engine.dot_stop_block, position + 1);
+                    }
                     set_bit(&mut wildcards, position);
                     set_bit(&mut consume_any, position);
                     set_bit(&mut engine.sep_block_component, position);
                     set_bit(&mut engine.sep_block_glob, position);
                 }
-                Token::RecursiveStar | Token::RecursivePrefix => {
+                Token::RecursiveStar => {
+                    set_bit(&mut engine.stars, position);
+                    if !options.match_hidden {
+                        set_bit(&mut engine.dot_stop_block, position + 1);
+                    }
+                    set_bit(&mut wildcards, position);
+                    set_bit(&mut consume_any, position);
+                }
+                Token::RecursivePrefix => {
                     set_bit(&mut engine.stars, position);
                     set_bit(&mut wildcards, position);
                     set_bit(&mut consume_any, position);
@@ -597,6 +633,11 @@ impl WideSweepEngine {
         let separator = is_separator(byte);
         let row_start = usize::from(byte) * word_count;
         let row = &self.table[row_start..row_start + word_count];
+        if byte == b'.' && at_component_start {
+            for (state, blocked) in state.iter_mut().zip(&self.dot_stop_block) {
+                *state &= !blocked;
+            }
+        }
         let blocked = if separator {
             sep_block
         } else if byte == b'.' && at_component_start {

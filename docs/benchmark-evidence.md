@@ -154,12 +154,21 @@ root constraint, not a benchmark or process isolation boundary.
 
 The harness also measures an **exclude-pruned** query: the unscoped include
 paired with `exclude("**/node_modules/**")`. It must return the same 2,600 files
-as the scoped query, but exercises covering-exclude pruning instead. A companion
+as the scoped query, but exercises covering-exclude pruning instead. The plain
+star in `**/*.{ts,tsx}` cannot stop immediately before a component-leading
+period unless `match_hidden` is enabled, so the include has no hidden-descendant
+blind spot that would keep a covered `node_modules` subtree open. A companion
 arm obtains the same policy from `respect_git_ignore(true)` and the fixture's
 `node_modules/` rule. These arms were added after the recorded tables below;
 they are reported by new runs of the reproducible command above.
 
-### `**/*.{ts,tsx}` — nothing can be pruned
+The deterministic guard for that performance property is the mock-backend
+walker test `covering_excludes_prune_when_includes_cannot_reach_hidden_descendants`:
+it uses the same `**/*.{rs,toml}` shape and asserts the exact directories read,
+so post-filtering the covered subtree fails ordinary CI even though wall-time
+measurements remain non-gating.
+
+### `**/*.{ts,tsx}` alone — nothing can be pruned
 
 | Arm | Median | Relative |
 | --- | ---: | ---: |
