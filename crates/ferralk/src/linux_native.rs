@@ -19,7 +19,7 @@ use std::{
     },
     path::Path,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -122,24 +122,62 @@ fn unsupported_is_latched_for(_path: &Path) -> bool {
 /// the existing full-path open instead of turning a wide tree into `EMFILE`.
 const MAX_RETAINED_DIRECTORIES: usize = 256;
 static RETAINED_DIRECTORIES: AtomicUsize = AtomicUsize::new(0);
-static RETAINED_DIRECTORY_LIMIT: OnceLock<usize> = OnceLock::new();
+/// `usize::MAX` until the first walk measures it; every walk start measures
+/// it again, see [`refresh_retained_directory_limit`].
+static RETAINED_DIRECTORY_LIMIT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 fn retained_directory_limit() -> usize {
-    *RETAINED_DIRECTORY_LIMIT.get_or_init(|| {
-        let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-        // SAFETY: `limits` points at writable storage for one `rlimit`; a
-        // successful call initializes it before `assume_init` below.
-        let status = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) };
-        if status != 0 {
-            return 64;
-        }
-        // SAFETY: `getrlimit` returned success and initialized the output.
-        let soft_limit = unsafe { limits.assume_init() }.rlim_cur;
-        usize::try_from(soft_limit)
-            .unwrap_or(MAX_RETAINED_DIRECTORIES)
-            .saturating_div(4)
-            .min(MAX_RETAINED_DIRECTORIES)
-    })
+    match RETAINED_DIRECTORY_LIMIT.load(Ordering::Relaxed) {
+        usize::MAX => refresh_retained_directory_limit(),
+        limit => limit,
+    }
+}
+
+/// Re-derives the retention ceiling from the `RLIMIT_NOFILE` in force now.
+///
+/// Every walk start calls this. A process that lowers its descriptor limit
+/// between walks, as container runtimes and daemon setups do, must not keep
+/// the ceiling an earlier walk measured: retaining a quarter of a limit that
+/// no longer applies turns scheduled opens into `EMFILE` errors instead of
+/// full-path fallbacks.
+pub(super) fn refresh_retained_directory_limit() -> usize {
+    let limit = measure_retained_directory_limit();
+    RETAINED_DIRECTORY_LIMIT.store(limit, Ordering::Relaxed);
+    limit
+}
+
+fn measure_retained_directory_limit() -> usize {
+    let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: `limits` points at writable storage for one `rlimit`; a
+    // successful call initializes it before `assume_init` below.
+    let status = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) };
+    if status != 0 {
+        return 64;
+    }
+    // SAFETY: `getrlimit` returned success and initialized the output.
+    let soft_limit = unsafe { limits.assume_init() }.rlim_cur;
+    usize::try_from(soft_limit)
+        .unwrap_or(MAX_RETAINED_DIRECTORIES)
+        .saturating_div(4)
+        .min(MAX_RETAINED_DIRECTORIES)
+}
+
+/// Whether a serial frame that is being suspended should release its
+/// descriptor instead of keeping it across its subtree.
+///
+/// Pinning one descriptor per suspended ancestor costs nothing on the wide
+/// trees that dominate real walks, and it spares the resumed frame a
+/// full-path open and two identity checks. Past the release threshold the
+/// directories below and the other walkers sharing the budget would soon be
+/// denied relative opens, so from there on suspension releases the descriptor
+/// and resumption reacquires it through a verified full-path open.
+fn retention_under_pressure() -> bool {
+    #[cfg(test)]
+    if let Some(under_pressure) = super::retained_directory_test::under_pressure() {
+        return under_pressure;
+    }
+    RETAINED_DIRECTORIES.load(Ordering::Acquire)
+        >= super::retention_release_threshold(retained_directory_limit())
 }
 
 /// Parent capability and basename retained by a queued child directory.
@@ -151,7 +189,12 @@ pub(super) struct RelativeDirectoryOpen {
 
 #[derive(Debug)]
 enum RetentionPermit {
-    Global,
+    /// Counted against the process-wide budget.
+    Budgeted,
+    /// A resumed serial frame's verified descriptor, kept when the budget
+    /// denied a permit. A serial walk holds at most one of these at a time,
+    /// and the frame's next suspension or completion releases it.
+    Unbudgeted,
     #[cfg(test)]
     Test,
 }
@@ -160,28 +203,48 @@ enum RetentionPermit {
 pub(super) struct RetainedDirectory(File, RetentionPermit);
 
 impl RetainedDirectory {
-    fn retain(directory: File) -> Option<Arc<Self>> {
+    /// Takes one permit from the budget for `directory`, or hands the
+    /// descriptor back when the budget is exhausted so the caller decides
+    /// whether to keep it anyway.
+    fn retain(directory: File) -> Result<Arc<Self>, File> {
         #[cfg(test)]
         if let Some(granted) = super::retained_directory_test::try_acquire() {
-            return granted.then(|| Arc::new(Self(directory, RetentionPermit::Test)));
+            return if granted {
+                Ok(Arc::new(Self(directory, RetentionPermit::Test)))
+            } else {
+                Err(directory)
+            };
         }
-        RETAINED_DIRECTORIES
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
+        let permit =
+            RETAINED_DIRECTORIES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
                 (retained < retained_directory_limit()).then_some(retained + 1)
-            })
-            .ok()
-            .map(|_| Arc::new(Self(directory, RetentionPermit::Global)))
+            });
+        match permit {
+            Ok(_) => Ok(Arc::new(Self(directory, RetentionPermit::Budgeted))),
+            Err(_) => Err(directory),
+        }
+    }
+
+    /// Keeps a verified descriptor outside the budget.
+    fn unbudgeted(directory: File) -> Arc<Self> {
+        Arc::new(Self(directory, RetentionPermit::Unbudgeted))
+    }
+
+    const fn is_budgeted(&self) -> bool {
+        !matches!(self.1, RetentionPermit::Unbudgeted)
     }
 }
 
 impl Drop for RetainedDirectory {
     fn drop(&mut self) {
-        #[cfg(test)]
-        if matches!(self.1, RetentionPermit::Test) {
-            super::retained_directory_test::release();
-            return;
+        match self.1 {
+            RetentionPermit::Budgeted => {
+                RETAINED_DIRECTORIES.fetch_sub(1, Ordering::AcqRel);
+            }
+            RetentionPermit::Unbudgeted => {}
+            #[cfg(test)]
+            RetentionPermit::Test => super::retained_directory_test::release(),
         }
-        RETAINED_DIRECTORIES.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -252,37 +315,50 @@ fn file_identity(directory: &File) -> io::Result<DirectoryIdentity> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
-pub(super) fn retained_directory_identity(listing: &Listing) -> Option<DirectoryIdentity> {
-    listing
-        .native_directory
-        .as_ref()
-        .and_then(|directory| file_identity(&directory.0).ok())
+/// Releases a serial frame's descriptor at suspension when keeping it would
+/// crowd the retention budget, returning the identity that
+/// [`restore_retained_directory`] must find again. `None` keeps the
+/// descriptor in the frame, which makes its resumption free.
+pub(super) fn suspend_retained_directory(listing: &mut Listing) -> Option<DirectoryIdentity> {
+    let directory = listing.native_directory.as_ref()?;
+    if directory.is_budgeted() && !retention_under_pressure() {
+        return None;
+    }
+    // If identity capture fails, keep the rare descriptor rather than
+    // reopening an identity that could not be verified later.
+    let identity = file_identity(&directory.0).ok()?;
+    listing.native_directory = None;
+    Some(identity)
 }
 
-/// Reacquires a serial frame's released descriptor only when its path still
-/// reaches the same directory. A changed identity invalidates the cached
-/// listing. A retention-budget denial also invalidates the cached remainder:
-/// the verified descriptor cannot safely be replaced by mutable full paths.
+/// Reacquires a serial frame's released descriptor for the rest of its
+/// cached listing.
+///
+/// The path is opened again and must reach the identity recorded at
+/// suspension. A changed identity means the cached names belong to a
+/// directory this path no longer reaches, so the remaining entries are
+/// reported lost instead of being resolved below the replacement. A
+/// retention-budget denial keeps the verified descriptor outside the budget:
+/// it is exactly the capability whose loss would force mutable full paths.
 pub(super) fn restore_retained_directory(
     path: &Path,
     expected: Option<DirectoryIdentity>,
     refuse_final_symlink: bool,
     listing: &mut Listing,
-) -> bool {
+) -> io::Result<()> {
     if listing.native_directory.is_some() {
-        return true;
+        return Ok(());
     }
     let Some(expected) = expected else {
-        return true;
+        return Ok(());
     };
-    let Ok(directory) = open_directory(path, refuse_final_symlink) else {
-        return false;
-    };
-    if file_identity(&directory).ok() != Some(expected) {
-        return false;
+    let directory = open_directory(path, refuse_final_symlink)?;
+    if file_identity(&directory)? != expected {
+        return Err(super::directory_replaced_while_suspended());
     }
-    listing.native_directory = RetainedDirectory::retain(directory);
-    listing.native_directory.is_some()
+    listing.native_directory =
+        Some(RetainedDirectory::retain(directory).unwrap_or_else(RetainedDirectory::unbudgeted));
+    Ok(())
 }
 
 /// Opens a queued child relative to the still-open parent that named it.
@@ -341,7 +417,7 @@ fn read_open_directory_with_portable_fallback(
     let directory = open_scheduled_directory(path, relative, refuse_final_symlink)?;
     match native(&directory, path, buffer, listing) {
         Ok(()) => {
-            listing.native_directory = RetainedDirectory::retain(directory);
+            listing.native_directory = RetainedDirectory::retain(directory).ok();
             Ok(false)
         }
         Err(NativeDirectoryReadError::CapabilityUnavailable) => {
@@ -969,7 +1045,8 @@ mod tests {
         let listing = Listing {
             native_directory: RetainedDirectory::retain(
                 open_directory(&root, false).expect("open fixture root"),
-            ),
+            )
+            .ok(),
             ..Listing::default()
         };
 
@@ -1381,6 +1458,76 @@ mod tests {
                 .sort_by(|left, right| left.path.cmp(&right.path));
         }
         (state.entries, state.errors)
+    }
+
+    /// A process that lowers `RLIMIT_NOFILE` between walks must walk with
+    /// the budget that limit allows, not the ceiling measured earlier. The
+    /// soft limit is lowered to at most 512, or half its current value, for
+    /// the duration of one walk of an empty directory and restored before
+    /// the test returns.
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_next_walk_measures_a_lowered_descriptor_limit() {
+        struct RestoreLimit(libc::rlimit);
+
+        impl Drop for RestoreLimit {
+            fn drop(&mut self) {
+                // SAFETY: `self.0` is the initialized limit pair `getrlimit`
+                // returned for this process.
+                let status = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) };
+                assert_eq!(status, 0, "restore the descriptor limit");
+                super::refresh_retained_directory_limit();
+            }
+        }
+
+        let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: `limits` points at writable storage for one `rlimit`; a
+        // successful call initializes it before `assume_init` below.
+        let status = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) };
+        assert_eq!(status, 0, "read the descriptor limit");
+        // SAFETY: `getrlimit` returned success and initialized the output.
+        let original = unsafe { limits.assume_init() };
+        let _restore = RestoreLimit(original);
+
+        let root = fixture_root("lowered-descriptor-limit");
+        fs::create_dir_all(&root).expect("create fixture");
+        Walker::new(&root)
+            .collect()
+            .expect("walk under the original limit");
+        let measured_before = super::retained_directory_limit();
+        let expected_before = usize::try_from(original.rlim_cur)
+            .map_or(256, |limit| limit.saturating_div(4).min(256));
+        assert_eq!(measured_before, expected_before);
+
+        let lowered = libc::rlimit {
+            rlim_cur: (original.rlim_cur / 2).min(512),
+            rlim_max: original.rlim_max,
+        };
+        // SAFETY: `lowered` is a fully initialized limit pair whose soft
+        // limit stays below the unchanged hard limit.
+        let status = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) };
+        assert_eq!(status, 0, "lower the soft descriptor limit");
+        assert_eq!(
+            super::retained_directory_limit(),
+            measured_before,
+            "nothing re-measures the limit between walks"
+        );
+
+        Walker::new(&root)
+            .collect()
+            .expect("walk under the lowered limit");
+        let expected_after =
+            usize::try_from(lowered.rlim_cur).map_or(256, |limit| limit.saturating_div(4).min(256));
+        assert_eq!(
+            super::retained_directory_limit(),
+            expected_after,
+            "the walk start re-measures the limit"
+        );
+        assert!(
+            expected_after < expected_before,
+            "the lowered limit must be observable: {expected_before} -> {expected_after}"
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     fn describe_walk_entries(entries: &[WalkEntry], root: &Path) -> Vec<DescribedWalkEntry> {

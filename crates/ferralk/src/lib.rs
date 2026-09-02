@@ -125,6 +125,16 @@ mod retained_directory_test {
     }
 
     /// Returns `None` without an active override, or whether the test budget
+    /// has reached the release threshold when one is active.
+    pub(super) fn under_pressure() -> Option<bool> {
+        STATE.with(|state| {
+            let state = state.borrow();
+            let state = state.as_ref()?;
+            Some(state.current >= super::retention_release_threshold(state.limit))
+        })
+    }
+
+    /// Returns `None` without an active override, or whether the test budget
     /// granted a permit when one is active.
     pub(super) fn try_acquire() -> Option<bool> {
         let granted = STATE.with(|state| {
@@ -1280,6 +1290,7 @@ impl Walker {
         backend: &B,
         visitor: EntryVisitor<'_>,
     ) -> Result<WalkResult, WalkError> {
+        backend.begin_walk();
         if self.threads > 1 {
             return parallel::collect(self, backend, visitor);
         }
@@ -1312,6 +1323,7 @@ impl Walker {
     /// is intentionally a collect-only global operation.
     #[must_use]
     pub fn stream(self) -> WalkStream {
+        SystemBackend.begin_walk();
         // Reversed, because the stream pops from the back and the roots are
         // walked in the order the caller added them.
         let mut pending_directories = self.root_tasks(&SystemBackend);
@@ -1905,6 +1917,31 @@ type DirectoryIdentity = (u64, u64);
 )))]
 type DirectoryIdentity = ();
 
+/// Retained descriptors at which a serial frame that is being suspended
+/// releases its own instead of keeping it across its subtree. Half of the
+/// budget stays free for the directories below it and for the other walkers
+/// sharing the process-wide budget.
+#[cfg(any(
+    all(feature = "native-macos", target_os = "macos"),
+    all(feature = "native-linux", target_os = "linux")
+))]
+const fn retention_release_threshold(limit: usize) -> usize {
+    limit / 2
+}
+
+/// The error a resumed serial frame reports when its path no longer reaches
+/// the directory whose listing it holds.
+#[cfg(any(
+    all(feature = "native-macos", target_os = "macos"),
+    all(feature = "native-linux", target_os = "linux")
+))]
+fn directory_replaced_while_suspended() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "directory replaced while its listing was suspended; its remaining entries were not walked",
+    )
+}
+
 impl DirectoryOpen {
     fn suspended(_identity: DirectoryIdentity) -> Self {
         #[cfg(any(
@@ -1975,26 +2012,35 @@ trait DirectoryBackend {
         DirectoryOpen::default()
     }
 
-    /// Identity of the retained directory capability, when this backend has
-    /// one. Serial suspension records it before releasing the descriptor.
-    fn directory_identity(&self, listing: &Listing) -> Option<DirectoryIdentity> {
+    /// Prepares process-wide backend state for one walk. The system backend
+    /// re-reads the descriptor limit here, so a walk runs under the limit in
+    /// force when it starts rather than the one an earlier walk measured.
+    fn begin_walk(&self) {}
+
+    /// Releases the directory capability of a serial frame that is being
+    /// suspended when holding it across the subtree would crowd the backend's
+    /// retention budget. Returns the identity `restore_directory_open` must
+    /// find again; `None` keeps the capability in the frame.
+    fn suspend_directory_open(&self, listing: &mut Listing) -> Option<DirectoryIdentity> {
         let _ = listing;
         None
     }
 
-    /// Reacquires the current directory capability after a serial frame
-    /// resumes and verifies it still names the directory that was suspended.
-    /// `false` means the mutable path now reaches a different identity, so its
-    /// cached entries must not be used as names below that replacement.
+    /// Reacquires a suspended serial frame's directory capability and verifies
+    /// it still names the directory that was suspended. An error means the
+    /// rest of the cached listing cannot be walked: the path can no longer be
+    /// opened, or it reaches a different identity, whose cached entries must
+    /// not be used as names below that replacement. The caller reports it
+    /// like any other directory read failure.
     fn restore_directory_open(
         &self,
         path: &Path,
         expected: Option<DirectoryIdentity>,
         refuse_final_symlink: bool,
         listing: &mut Listing,
-    ) -> bool {
+    ) -> std::io::Result<()> {
         let _ = (path, expected, refuse_final_symlink, listing);
-        true
+        Ok(())
     }
 
     /// Follows symlinks; decides whether a link points at a directory.
@@ -2254,18 +2300,6 @@ impl Listing {
             self.native_directory = None;
         }
         self.deferred_errors.clear();
-    }
-
-    /// Releases the native handle while a serial listing is suspended. The
-    /// queued child already owns the clone it needs for its one relative open.
-    fn release_directory_open(&mut self) {
-        #[cfg(any(
-            all(feature = "native-macos", target_os = "macos"),
-            all(feature = "native-linux", target_os = "linux")
-        ))]
-        {
-            self.native_directory = None;
-        }
     }
 
     /// Adds one entry, reusing the buffer left by the directory before.
@@ -2559,15 +2593,26 @@ impl DirectoryBackend for SystemBackend {
         }
     }
 
-    fn directory_identity(&self, listing: &Listing) -> Option<DirectoryIdentity> {
+    fn begin_walk(&self) {
         #[cfg(all(feature = "native-macos", target_os = "macos"))]
-        return macos_native::retained_directory_identity(listing);
+        macos_native::refresh_retained_directory_limit();
         #[cfg(all(
             feature = "native-linux",
             target_os = "linux",
             not(all(feature = "native-macos", target_os = "macos"))
         ))]
-        return linux_native::retained_directory_identity(listing);
+        linux_native::refresh_retained_directory_limit();
+    }
+
+    fn suspend_directory_open(&self, listing: &mut Listing) -> Option<DirectoryIdentity> {
+        #[cfg(all(feature = "native-macos", target_os = "macos"))]
+        return macos_native::suspend_retained_directory(listing);
+        #[cfg(all(
+            feature = "native-linux",
+            target_os = "linux",
+            not(all(feature = "native-macos", target_os = "macos"))
+        ))]
+        return linux_native::suspend_retained_directory(listing);
         #[cfg(not(any(
             all(feature = "native-macos", target_os = "macos"),
             all(feature = "native-linux", target_os = "linux")
@@ -2584,7 +2629,7 @@ impl DirectoryBackend for SystemBackend {
         expected: Option<DirectoryIdentity>,
         refuse_final_symlink: bool,
         listing: &mut Listing,
-    ) -> bool {
+    ) -> std::io::Result<()> {
         #[cfg(all(feature = "native-macos", target_os = "macos"))]
         return macos_native::restore_retained_directory(
             path,
@@ -2609,7 +2654,7 @@ impl DirectoryBackend for SystemBackend {
         )))]
         {
             let _ = (path, expected, refuse_final_symlink, listing);
-            true
+            Ok(())
         }
     }
 }
@@ -2889,9 +2934,10 @@ struct DirectoryScratch {
 /// One suspended serial-directory listing. A child directory is scheduled
 /// separately, then this frame resumes at the next entry, which retains the
 /// serial walk's depth-first order without borrowing a call-stack frame. The
-/// listing keeps its entry buffers while suspended but releases its native
-/// handle after handing one clone to the child; resume reacquires an optional
-/// handle instead of pinning one descriptor per ancestor.
+/// listing keeps its entry buffers while suspended. It keeps its native
+/// handle too while the backend's retention budget has room, and otherwise
+/// hands one clone to the child and releases it, so that a deep tree does not
+/// pin one descriptor per ancestor; resume then reacquires a verified handle.
 struct DirectoryFrame {
     task: DirectoryTask,
     ignores: IgnoreScope,
@@ -2901,12 +2947,8 @@ struct DirectoryFrame {
 
 impl DirectoryFrame {
     fn suspend(&mut self, backend: &impl DirectoryBackend) {
-        let identity = backend.directory_identity(&self.scratch.listing);
-        // If identity capture failed, keep the rare descriptor rather than
-        // reopening an identity we could not later verify.
-        if let Some(identity) = identity {
+        if let Some(identity) = backend.suspend_directory_open(&mut self.scratch.listing) {
             self.task.open = DirectoryOpen::suspended(identity);
-            self.scratch.listing.release_directory_open();
         }
     }
 }
@@ -3094,14 +3136,20 @@ impl<'walker> WalkState<'walker> {
         let depth = frame.task.depth;
         let suspended_identity = frame.task.open.suspended_identity();
         if frame.next_entry < frame.scratch.listing.entries().len()
-            && !backend.restore_directory_open(
+            && let Err(source) = backend.restore_directory_open(
                 path,
                 suspended_identity,
                 !self.walker.options.follow_symlinks && depth > 0,
                 &mut frame.scratch.listing,
             )
         {
-            return self.finish_directory(frame);
+            // The rest of this listing is unreachable. That is a directory
+            // read failure like any other and goes through the error policy;
+            // ending the directory quietly would truncate the walk without
+            // a trace, even under `ErrorPolicy::Abort`.
+            let result = self.handle_error("read_dir", path.to_path_buf(), source, depth == 0);
+            self.finish_directory(frame)?;
+            return result;
         }
         frame.task.open = DirectoryOpen::default();
         while frame.next_entry < frame.scratch.listing.entries().len() {

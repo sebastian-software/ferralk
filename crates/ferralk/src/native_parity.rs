@@ -457,6 +457,51 @@ fn serial_suspension_keeps_native_descriptor_high_water_bounded() {
     let walker = collecting_walker(&fixture.root);
     let (portable_entries, portable_errors) = walk_portable(&walker);
 
+    let budget = 16;
+    let retention = crate::retained_directory_test::Guard::new(budget);
+    let native = walker.collect().expect("native serial walk succeeds");
+    let stats = retention.stats();
+
+    assert_eq!(
+        describe_entries(native.entries(), &fixture.root),
+        describe_entries(&portable_entries, &fixture.root)
+    );
+    assert_eq!(
+        describe_errors(native.errors(), &fixture.root),
+        describe_errors(&portable_errors, &fixture.root)
+    );
+    assert_eq!(stats.current, 0, "the completed walk releases every permit");
+    let threshold = crate::retention_release_threshold(budget);
+    assert!(
+        stats.high_water <= threshold + 2,
+        "suspended frames pin descriptors up to the release threshold plus one \
+         parent-to-child handoff, never one per ancestor: {stats:?}"
+    );
+    assert!(
+        stats.high_water > threshold,
+        "frames keep their descriptors while the budget has room: {stats:?}"
+    );
+    assert_eq!(
+        stats.denied, 0,
+        "releasing past the threshold keeps a deep serial walk inside its budget"
+    );
+}
+
+/// Below the release threshold a suspended frame keeps its descriptor, so a
+/// resumed frame costs no full-path open and no identity check. The root and
+/// its eight levels are nine descriptors, one per ancestor of the deepest
+/// file, and nothing is denied or reopened.
+#[test]
+fn serial_frames_keep_their_descriptors_while_the_budget_has_room() {
+    let fixture = Fixture::new("serial-retained-fd-pinned");
+    let mut directory = PathBuf::new();
+    for level in 0..8 {
+        directory.push(format!("level-{level}"));
+        fixture.write(directory.join("file.txt"));
+    }
+    let walker = collecting_walker(&fixture.root);
+    let (portable_entries, portable_errors) = walk_portable(&walker);
+
     let retention = crate::retained_directory_test::Guard::new(64);
     let native = walker.collect().expect("native serial walk succeeds");
     let stats = retention.stats();
@@ -470,14 +515,11 @@ fn serial_suspension_keeps_native_descriptor_high_water_bounded() {
         describe_errors(&portable_errors, &fixture.root)
     );
     assert_eq!(stats.current, 0, "the completed walk releases every permit");
-    assert!(
-        stats.high_water <= 2,
-        "a parent-to-child handoff needs at most two descriptors: {stats:?}"
-    );
     assert_eq!(
-        stats.denied, 0,
-        "a 64-descriptor budget covers a one-at-a-time serial walk"
+        stats.high_water, 9,
+        "one pinned descriptor per ancestor below the threshold: {stats:?}"
     );
+    assert_eq!(stats.denied, 0);
 }
 
 #[test]
@@ -551,61 +593,255 @@ fn resumed_serial_frame_never_enters_a_replacement_symlink() {
             .any(|entry| entry.path().ends_with("parent/second/escaped.txt")),
         "a resumed frame must not use the replacement as its relative-open base"
     );
+    assert!(
+        result
+            .entries()
+            .iter()
+            .any(|entry| entry.path().ends_with("parent/second/safe.txt")),
+        "a frame that kept its descriptor keeps walking the directory it listed"
+    );
+    assert!(
+        result.errors().is_empty(),
+        "a pinned frame is immune to the swap: {:?}",
+        result.errors()
+    );
     assert_eq!(retention.stats().current, 0);
 }
 
+/// Eight subdirectories under `parent`, so whichever one the filesystem lists
+/// first still leaves the suspended frame seven entries to resume.
+fn write_swap_fixture(fixture: &Fixture) {
+    for child in 0..8 {
+        fixture.write(format!("parent/child-{child}/trigger.txt"));
+    }
+}
+
+fn write_swap_replacement(replacement: &Fixture) {
+    for child in 0..8 {
+        replacement.write(format!("child-{child}/escaped.txt"));
+    }
+}
+
+/// Swaps `parent` for a symlink to `replacement` on the first trigger file.
+fn swap_parent_on_first_trigger<'a>(
+    fixture: &'a Fixture,
+    replacement: &'a Fixture,
+    swapped: &'a AtomicBool,
+) -> impl Fn(&WalkEntry) -> crate::Verdict + 'a {
+    move |entry| {
+        if entry.path().ends_with("trigger.txt") && !swapped.swap(true, Ordering::AcqRel) {
+            fs::rename(
+                fixture.root.join("parent"),
+                fixture.root.join("moved-parent"),
+            )
+            .expect("move the suspended frame directory");
+            std::os::unix::fs::symlink(&replacement.root, fixture.root.join("parent"))
+                .expect("replace the suspended path with a symlink");
+        }
+        crate::Verdict::Keep
+    }
+}
+
+/// Under budget pressure a suspended frame releases its descriptor, and the
+/// swap happens before it resumes. Its remaining entries are unreachable, and
+/// that must surface as a `read_dir` error on the directory instead of the
+/// walk ending the listing as if it were complete: under
+/// [`ErrorPolicy::Abort`] the caller relies on seeing every loss.
+#[test]
+fn released_serial_frame_reports_a_replacement_instead_of_truncating() {
+    for (policy, follow_symlinks) in [
+        (ErrorPolicy::Collect, false),
+        (ErrorPolicy::Collect, true),
+        (ErrorPolicy::Abort, false),
+        (ErrorPolicy::Abort, true),
+    ] {
+        let case = format!("policy={policy:?} follow={follow_symlinks}");
+        let fixture = Fixture::new("serial-resume-replaced-original");
+        write_swap_fixture(&fixture);
+        let replacement = Fixture::new("serial-resume-replaced-replacement");
+        write_swap_replacement(&replacement);
+        let swapped = AtomicBool::new(false);
+        // Two permits: one for the frame being read, one for the child being
+        // handed off, which puts every suspension past the release threshold.
+        let retention = crate::retained_directory_test::Guard::new(2);
+
+        let outcome = collecting_walker(&fixture.root)
+            .error_policy(policy)
+            .options(
+                WalkOptions::default()
+                    .sort(true)
+                    .follow_symlinks(follow_symlinks),
+            )
+            .visit(swap_parent_on_first_trigger(
+                &fixture,
+                &replacement,
+                &swapped,
+            ));
+
+        assert!(
+            swapped.load(Ordering::Acquire),
+            "{case}: fixture performed the swap"
+        );
+        let stats = retention.stats();
+        assert_eq!(stats.current, 0, "{case}: {stats:?}");
+        let (operation, path) = match (policy, outcome) {
+            (ErrorPolicy::Abort, Err(error)) => (error.operation(), error.path().to_path_buf()),
+            (ErrorPolicy::Abort, Ok(result)) => {
+                panic!("{case}: Abort must surface the lost remainder, got {result:?}")
+            }
+            (_, Err(error)) => panic!("{case}: Collect keeps walking, got {error}"),
+            (_, Ok(result)) => {
+                assert!(
+                    !result
+                        .entries()
+                        .iter()
+                        .any(|entry| entry.path().ends_with("escaped.txt")),
+                    "{case}: the cached names must never resolve below the replacement"
+                );
+                let triggers = result
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.path().ends_with("trigger.txt"))
+                    .count();
+                assert_eq!(
+                    triggers, 1,
+                    "{case}: only the child walked before the swap is reachable"
+                );
+                let errors = result.errors();
+                assert_eq!(
+                    errors.len(),
+                    1,
+                    "{case}: the lost remainder is reported exactly once: {errors:?}"
+                );
+                (errors[0].operation(), errors[0].path().to_path_buf())
+            }
+        };
+        assert_eq!(
+            operation,
+            "read_dir",
+            "{case}: {operation} {}",
+            path.display()
+        );
+        assert_eq!(path, fixture.root.join("parent"), "{case}");
+    }
+}
+
+/// Arms the retention override so that the next permit request, the
+/// suspended parent's resume, is denied, and runs `on_denial` inside that
+/// denial.
+fn deny_the_next_resume_on_first_trigger<'a>(
+    retention: &'a crate::retained_directory_test::Guard,
+    on_denial: impl FnOnce() + 'static,
+) -> impl Fn(&WalkEntry) -> crate::Verdict + 'a {
+    let on_denial = std::sync::Mutex::new(Some(on_denial));
+    move |entry| {
+        if entry.path().ends_with("trigger.txt")
+            && let Some(on_denial) = on_denial.lock().expect("hook lock").take()
+        {
+            retention.set_limit(0);
+            retention.on_next_denial(on_denial);
+        }
+        crate::Verdict::Keep
+    }
+}
+
+/// A resumed frame that verified its directory but is denied a retention
+/// permit keeps that verified descriptor instead of dropping the rest of its
+/// listing. This is the exact configuration the budget exists for, many
+/// walkers on a low descriptor limit, and it used to lose entries silently.
+#[test]
+fn resume_budget_denial_keeps_the_walk_complete() {
+    let fixture = Fixture::new("serial-resume-budget-complete");
+    write_swap_fixture(&fixture);
+    let walker = collecting_walker(&fixture.root);
+    let (portable_entries, portable_errors) = walk_portable(&walker);
+    let retention = crate::retained_directory_test::Guard::new(2);
+
+    let result = walker
+        .visit(deny_the_next_resume_on_first_trigger(&retention, || {}))
+        .expect("a denied resume keeps walking");
+
+    assert_eq!(
+        describe_entries(result.entries(), &fixture.root),
+        describe_entries(&portable_entries, &fixture.root),
+        "a denied verified handle walks the listed directory to completion"
+    );
+    assert_eq!(
+        describe_errors(result.errors(), &fixture.root),
+        describe_errors(&portable_errors, &fixture.root)
+    );
+    let stats = retention.stats();
+    assert_eq!(stats.current, 0);
+    assert!(
+        stats.denied > 0,
+        "the fixture denied resume retention: {stats:?}"
+    );
+}
+
+/// The descriptor kept through a denial is the verified one, so the child
+/// handed off right after the denial opens relative to the directory that
+/// was listed even though its path now leads elsewhere. The frame's next
+/// suspension releases that unbudgeted descriptor again, and the following
+/// resume finds the replacement and reports the rest of the listing lost.
 #[test]
 fn resume_budget_denial_never_falls_back_to_a_replacement_symlink() {
-    use std::os::unix::fs::symlink;
-
     let fixture = Fixture::new("serial-resume-budget-original");
-    fixture.write("parent/cached-child/safe.txt");
+    write_swap_fixture(&fixture);
     let replacement = Fixture::new("serial-resume-budget-replacement");
-    replacement.write("cached-child/escaped.txt");
+    write_swap_replacement(&replacement);
     let swapped = Arc::new(AtomicBool::new(false));
-    let retention = crate::retained_directory_test::Guard::new(64);
-    let backend = crate::SystemBackend;
-    let mut listing = Listing::default();
-
-    let original_parent = fixture.root.join("parent");
-    let moved_parent = fixture.root.join("moved-parent");
-    let fixture_root = fixture.root.clone();
-    let replacement_root = replacement.root.clone();
-    backend
-        .read_directory(&original_parent, false, true, &mut listing)
-        .expect("read the directory before suspension");
-    let expected = backend.directory_identity(&listing);
-    assert!(
-        expected.is_some(),
-        "the native listing retains its identity"
-    );
-    listing.release_directory_open();
+    let retention = crate::retained_directory_test::Guard::new(2);
 
     let hook_swapped = Arc::clone(&swapped);
-    retention.on_next_denial(move || {
-        fs::rename(original_parent, moved_parent)
-            .expect("move the verified suspended frame directory");
-        symlink(replacement_root, fixture_root.join("parent"))
-            .expect("replace the verified path during retention denial");
-        hook_swapped.store(true, Ordering::Release);
-    });
-    retention.set_limit(0);
-
-    let restored =
-        backend.restore_directory_open(&fixture.root.join("parent"), expected, true, &mut listing);
+    let original_parent = fixture.root.join("parent");
+    let moved_parent = fixture.root.join("moved-parent");
+    let replacement_root = replacement.root.clone();
+    let result = collecting_walker(&fixture.root)
+        .visit(deny_the_next_resume_on_first_trigger(
+            &retention,
+            move || {
+                fs::rename(&original_parent, &moved_parent)
+                    .expect("move the verified suspended frame directory");
+                std::os::unix::fs::symlink(&replacement_root, &original_parent)
+                    .expect("replace the verified path during retention denial");
+                hook_swapped.store(true, Ordering::Release);
+            },
+        ))
+        .expect("the replacement race stays recoverable under Collect");
 
     assert!(
         swapped.load(Ordering::Acquire),
         "the replacement happened after identity verification"
     );
     assert!(
-        !restored,
-        "a denied verified handle must invalidate the cached listing"
+        !result
+            .entries()
+            .iter()
+            .any(|entry| entry.path().ends_with("escaped.txt")),
+        "a denied verified handle must never be replaced by the mutable path"
     );
-    assert!(listing.native_directory.is_none());
+    let triggers = result
+        .entries()
+        .iter()
+        .filter(|entry| entry.path().ends_with("trigger.txt"))
+        .count();
+    assert_eq!(
+        triggers,
+        2,
+        "the child before the swap and the child opened through the verified \
+         descriptor are walked, the rest is reported: {:?}",
+        result.entries()
+    );
+    let errors = result.errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].operation(), "read_dir");
+    assert_eq!(errors[0].path(), fixture.root.join("parent"));
     let stats = retention.stats();
     assert_eq!(stats.current, 0);
-    assert!(stats.denied > 0, "the fixture denied resume retention");
+    assert!(
+        stats.denied > 0,
+        "the fixture denied resume retention: {stats:?}"
+    );
 }
 
 #[test]
