@@ -1397,21 +1397,16 @@ impl Walker {
         SystemBackend.begin_walk();
         // Reversed, because the stream pops from the back and the roots are
         // walked in the order the caller added them.
-        let mut pending_directories = self.root_tasks(&SystemBackend);
-        pending_directories.reverse();
+        let mut pending = self
+            .root_tasks(&SystemBackend)
+            .into_iter()
+            .map(SerialTask::Directory)
+            .collect::<Vec<_>>();
+        pending.reverse();
         WalkStream {
-            pending_directories,
+            pending,
             walker: self,
-            listing: Listing::default(),
-            glob_bytes: Vec::new(),
-            ignore_bytes: Vec::new(),
-            next_entry: 0,
-            path: PathBuf::new(),
-            directory: PathBuf::new(),
-            ancestors: AncestorChain::default(),
-            ignores: IgnoreScope::default(),
-            depth: 0,
-            root: 0,
+            scratch: Vec::new(),
             pending_errors: Vec::new(),
             cancelled: false,
             stopped: false,
@@ -2741,25 +2736,11 @@ impl DirectoryBackend for SystemBackend {
 #[derive(Debug)]
 pub struct WalkStream {
     walker: Walker,
-    pending_directories: Vec<DirectoryTask>,
-    /// The directory being delivered and how far through it the stream is.
-    listing: Listing,
-    glob_bytes: Vec<u8>,
-    ignore_bytes: Vec<u8>,
-    next_entry: usize,
-    /// That directory's path, with the entry being classified pushed onto it.
-    path: PathBuf,
-    /// The same directory without an entry on it, kept so `path` can be reset
-    /// by [`reset_to_directory`] rather than by `PathBuf::pop`.
-    directory: PathBuf,
-    /// The ancestor chain of the directory currently being delivered.
-    ancestors: AncestorChain,
-    /// Ignore rules of the directory whose entries are being delivered.
-    ignores: IgnoreScope,
-    /// Depth of that same directory, so its entries need not recount it.
-    depth: usize,
-    /// Which root that directory sits under, for the same reason.
-    root: usize,
+    /// LIFO traversal work. A suspended listing is one frame rather than one
+    /// task per child, so a flat directory has a constant-size frontier.
+    pending: Vec<SerialTask>,
+    /// Completed frames return their buffers here for later directories.
+    scratch: Vec<DirectoryScratch>,
     /// Ignore-file failures discovered while preparing the current directory.
     pending_errors: Vec<PendingWalkError>,
     cancelled: bool,
@@ -2853,101 +2834,180 @@ impl WalkStream {
         }
     }
 
-    fn prepare_directory(&mut self, task: DirectoryTask) -> Option<Result<WalkEntry, WalkError>> {
-        let DirectoryTask {
-            path,
-            open,
-            depth,
-            root,
-            ancestors,
-            ignores,
-            mut ignore_errors,
-        } = task;
-        let ancestors = if self.walker.options.follow_symlinks {
-            match SystemBackend.cycle_key(&path) {
-                Ok(key) => ancestors.enter(key)?,
-                Err(source) => return self.error(CYCLE_KEY_OPERATION, path, source, depth == 0),
-            }
-        } else {
-            ancestors
-        };
-        match SystemBackend.read_scheduled_directory(
-            &path,
-            &open,
+    fn prepare_directory(
+        &mut self,
+        mut task: DirectoryTask,
+    ) -> Option<Result<WalkEntry, WalkError>> {
+        let is_root = task.depth == 0;
+        if self.walker.options.follow_symlinks {
+            task.ancestors = match SystemBackend.cycle_key(&task.path) {
+                Ok(key) => task.ancestors.enter(key)?,
+                Err(source) => {
+                    return self.error(CYCLE_KEY_OPERATION, task.path, source, is_root);
+                }
+            };
+        }
+        let mut scratch = self.scratch.pop().unwrap_or_default();
+        let read_result = SystemBackend.read_scheduled_directory(
+            &task.path,
+            &task.open,
             self.walker.options.follow_symlinks,
-            !self.walker.options.follow_symlinks && depth > 0,
-            &mut self.listing,
-        ) {
-            Ok(()) => {
-                // The directory's own ignore files join the chain here, once,
-                // recognized in the listing that was just read.
-                let (ignores, mut entered_errors) =
-                    ignores.enter(&self.walker, &SystemBackend, &path, &self.listing);
-                self.ignores = ignores;
-                ignore_errors.append(&mut entered_errors);
-                self.depth = depth;
-                self.root = root;
-                self.ancestors = ancestors;
-                self.next_entry = 0;
-                self.directory = path;
-                reset_to_directory(&mut self.path, &self.directory);
-                self.queue_ignore_errors(ignore_errors)
+            !self.walker.options.follow_symlinks && task.depth > 0,
+            &mut scratch.listing,
+        );
+        task.open = DirectoryOpen::default();
+        if let Err(source) = read_result {
+            // A backend can fail after appending entries. They belong to the
+            // failed directory and must never survive in reusable scratch.
+            scratch.listing.clear();
+            self.scratch.push(scratch);
+            return self.error(WalkOperation::ReadDir, task.path, source, is_root);
+        }
+        let (ignores, mut entered_errors) = std::mem::take(&mut task.ignores).enter(
+            &self.walker,
+            &SystemBackend,
+            &task.path,
+            &scratch.listing,
+        );
+        task.ignore_errors.append(&mut entered_errors);
+        scratch.path.clear();
+        scratch.path.push(&task.path);
+        let ignore_errors = std::mem::take(&mut task.ignore_errors);
+        self.pending.push(SerialTask::Resume(DirectoryFrame {
+            task,
+            ignores,
+            scratch,
+            next_entry: 0,
+        }));
+        self.queue_ignore_errors(ignore_errors)
+    }
+
+    /// Continues one listing until it emits, fails, descends, or finishes.
+    /// Descending suspends the whole listing in one frame; it never expands
+    /// the remaining siblings into a directory-task queue.
+    fn resume_directory(
+        &mut self,
+        mut frame: DirectoryFrame,
+    ) -> Option<Result<WalkEntry, WalkError>> {
+        let path = frame.task.path.as_path();
+        let depth = frame.task.depth;
+        let suspended_identity = frame.task.open.suspended_identity();
+        if frame.next_entry < frame.scratch.listing.entries().len()
+            && let Err(source) = SystemBackend.restore_directory_open(
+                path,
+                suspended_identity,
+                !self.walker.options.follow_symlinks && depth > 0,
+                &mut frame.scratch.listing,
+            )
+        {
+            let path = path.to_path_buf();
+            self.finish_directory(frame);
+            return self.error(WalkOperation::ReadDir, path, source, depth == 0);
+        }
+        frame.task.open = DirectoryOpen::default();
+        while frame.next_entry < frame.scratch.listing.entries().len() {
+            if frame.next_entry.is_multiple_of(CANCELLATION_STRIDE) && self.check_cancellation() {
+                self.stopped = true;
+                self.finish_directory(frame);
+                return None;
             }
-            Err(source) => {
-                // A backend can fail after appending entries. They belong to
-                // the failed directory and must never be classified against
-                // the directory the stream delivered previously.
-                self.listing.clear();
-                self.next_entry = 0;
-                self.error(WalkOperation::ReadDir, path, source, depth == 0)
+            let index = frame.next_entry;
+            frame.next_entry += 1;
+            frame
+                .scratch
+                .path
+                .push(frame.scratch.listing.entries()[index].name());
+            let action = classify_entry(
+                &self.walker,
+                &SystemBackend,
+                &frame.scratch.path,
+                &frame.scratch.listing.entries()[index],
+                &frame.ignores,
+                depth,
+                TraversalContext {
+                    root: frame.task.root,
+                    ancestors: &frame.task.ancestors,
+                    listing: &frame.scratch.listing,
+                    glob_bytes_scratch: &mut frame.scratch.glob_bytes,
+                    ignore_bytes_scratch: &mut frame.scratch.ignore_bytes,
+                },
+            );
+            match action {
+                EntryAction::Skip => reset_to_directory(&mut frame.scratch.path, path),
+                EntryAction::Emit(entry) => {
+                    let entry = entry.with_path(frame.scratch.path.clone());
+                    reset_to_directory(&mut frame.scratch.path, path);
+                    self.pending.push(SerialTask::Resume(frame));
+                    return Some(Ok(entry));
+                }
+                EntryAction::Descend(task) => {
+                    reset_to_directory(&mut frame.scratch.path, path);
+                    frame.suspend(&SystemBackend);
+                    self.pending.push(SerialTask::Resume(frame));
+                    self.pending.push(SerialTask::Directory(task));
+                    return None;
+                }
+                EntryAction::DescendAndEmit(entry, task) => {
+                    let entry = entry.with_path(frame.scratch.path.clone());
+                    reset_to_directory(&mut frame.scratch.path, path);
+                    frame.suspend(&SystemBackend);
+                    self.pending.push(SerialTask::Resume(frame));
+                    self.pending.push(SerialTask::Directory(task));
+                    // Streaming has always delivered a directory before its
+                    // subtree. Keep that observable order while the parent
+                    // listing itself is now suspended depth-first.
+                    return Some(Ok(entry));
+                }
+                EntryAction::Failed { failure, descend } => {
+                    reset_to_directory(&mut frame.scratch.path, path);
+                    let result = self.error(failure.operation, failure.path, failure.source, false);
+                    if self.stopped {
+                        self.finish_directory(frame);
+                        return result;
+                    }
+                    if let Some(task) = descend {
+                        frame.suspend(&SystemBackend);
+                        self.pending.push(SerialTask::Resume(frame));
+                        self.pending.push(SerialTask::Directory(task));
+                        return result;
+                    }
+                    if result.is_some() {
+                        self.pending.push(SerialTask::Resume(frame));
+                        return result;
+                    }
+                }
+            }
+        }
+        let mut deferred_errors = Vec::new();
+        while let Some(error) = frame.scratch.listing.take_deferred_error() {
+            deferred_errors.push(PendingWalkError {
+                operation: WalkOperation::ReadDir,
+                path: error.path,
+                kind: error.source.kind,
+                message: error.source.message,
+            });
+        }
+        self.finish_directory(frame);
+        match self.walker.error_policy {
+            ErrorPolicy::Skip => None,
+            ErrorPolicy::Abort => deferred_errors.into_iter().next().map(|error| {
+                self.stopped = true;
+                Err(error.into_walk_error())
+            }),
+            ErrorPolicy::Collect => {
+                self.pending_errors
+                    .extend(deferred_errors.into_iter().rev());
+                self.pending_errors
+                    .pop()
+                    .map(PendingWalkError::into_walk_error)
+                    .map(Err)
             }
         }
     }
 
-    /// Classifies the entry at `index` of the directory being delivered.
-    ///
-    /// The entry's path is assembled onto the scratch buffer and taken back off
-    /// it again, so the stream holds one path buffer rather than one per entry.
-    fn process_entry(&mut self, index: usize) -> Option<Result<WalkEntry, WalkError>> {
-        self.path.push(self.listing.entries()[index].name());
-        let action = classify_entry(
-            &self.walker,
-            &SystemBackend,
-            &self.path,
-            &self.listing.entries()[index],
-            &self.ignores,
-            self.depth,
-            TraversalContext {
-                root: self.root,
-                ancestors: &self.ancestors,
-                listing: &self.listing,
-                glob_bytes_scratch: &mut self.glob_bytes,
-                ignore_bytes_scratch: &mut self.ignore_bytes,
-            },
-        );
-        // Only an emitted entry needs a path of its own, and the stream hands
-        // every one of them to the caller.
-        let emitted = match action {
-            EntryAction::Skip => None,
-            EntryAction::Descend(task) => {
-                self.pending_directories.push(task);
-                None
-            }
-            EntryAction::Emit(entry) => Some(Ok(entry.with_path(self.path.clone()))),
-            EntryAction::DescendAndEmit(entry, task) => {
-                let entry = entry.with_path(self.path.clone());
-                self.pending_directories.push(task);
-                Some(Ok(entry))
-            }
-            EntryAction::Failed { failure, descend } => {
-                if let Some(task) = descend {
-                    self.pending_directories.push(task);
-                }
-                self.error(failure.operation, failure.path, failure.source, false)
-            }
-        };
-        reset_to_directory(&mut self.path, &self.directory);
-        emitted
+    fn finish_directory(&mut self, mut frame: DirectoryFrame) {
+        frame.scratch.listing.clear();
+        self.scratch.push(frame.scratch);
     }
 }
 
@@ -2963,44 +3023,17 @@ impl Iterator for WalkStream {
             if let Some(error) = self.pending_errors.pop() {
                 return Some(Err(error.into_walk_error()));
             }
-            if self.next_entry < self.listing.entries().len() {
-                let index = self.next_entry;
-                self.next_entry += 1;
-                if let Some(result) = self.process_entry(index) {
-                    return Some(result);
-                }
-                continue;
-            }
-            if let Some(error) = self.listing.take_deferred_error() {
-                if let Some(result) = self.error(
-                    WalkOperation::ReadDir,
-                    error.path,
-                    error.source.into_io_error(),
-                    false,
-                ) {
-                    return Some(result);
-                }
-                continue;
-            }
-            let task = self.pending_directories.pop()?;
-            release_drained_capacity(&mut self.pending_directories);
-            if let Some(result) = self.prepare_directory(task) {
-                return Some(result);
+            let task = self.pending.pop()?;
+            let result = match task {
+                SerialTask::Directory(task) => self.prepare_directory(task),
+                SerialTask::Resume(frame) => self.resume_directory(frame),
+                SerialTask::Emit(entry) => Some(Ok(entry)),
+            };
+            if result.is_some() {
+                return result;
             }
         }
         None
-    }
-}
-
-/// Gives back the capacity a wide listing left behind once most of it has
-/// drained, so a stream over a tree with one huge directory does not hold that
-/// directory's worth of task buffers until the stream ends. Shrinking only
-/// past a quarter keeps the copies amortized: a buffer is moved at most once
-/// per halving.
-fn release_drained_capacity<T>(pending: &mut Vec<T>) {
-    const RETAINED_CAPACITY: usize = 64;
-    if pending.capacity() > RETAINED_CAPACITY && pending.len() <= pending.capacity() / 4 {
-        pending.shrink_to((pending.len() * 2).max(RETAINED_CAPACITY));
     }
 }
 
@@ -3020,7 +3053,7 @@ struct WalkState<'walker> {
 
 /// What reading one directory needs: its listing, and the path buffer its
 /// entries are assembled onto.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct DirectoryScratch {
     listing: Listing,
     path: PathBuf,
@@ -3035,6 +3068,7 @@ struct DirectoryScratch {
 /// handle too while the backend's retention budget has room, and otherwise
 /// hands one clone to the child and releases it, so that a deep tree does not
 /// pin one descriptor per ancestor; resume then reacquires a verified handle.
+#[derive(Debug)]
 struct DirectoryFrame {
     task: DirectoryTask,
     ignores: IgnoreScope,
@@ -3053,6 +3087,7 @@ impl DirectoryFrame {
 /// Work the serial frontend has yet to carry out. The LIFO order models the
 /// former recursive calls while keeping arbitrarily deep trees off the Rust
 /// call stack.
+#[derive(Debug)]
 enum SerialTask {
     Directory(DirectoryTask),
     Resume(DirectoryFrame),
@@ -3423,9 +3458,10 @@ mod tests {
     };
 
     use super::{
-        CancellationToken, ErrorPolicy, Pattern, PatternOptions, TraversalPattern, Verdict,
-        WalkEntry, WalkEntryKind, WalkOptions, WalkStream, Walker, WildcardMode, glob_path_bytes,
-        literal_extension, literal_pattern_root, traversal_pattern_options,
+        CancellationToken, DirectoryFrame, DirectoryScratch, ErrorPolicy, Pattern, PatternOptions,
+        SerialTask, TraversalPattern, Verdict, WalkEntry, WalkEntryKind, WalkOptions, WalkStream,
+        Walker, WildcardMode, glob_path_bytes, literal_extension, literal_pattern_root,
+        traversal_pattern_options,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -3837,11 +3873,10 @@ mod tests {
         );
     }
 
-    /// A stream over one wide directory queues every child before it yields
-    /// the first of them. The queue's buffer used to stay at that size until
-    /// the stream ended; now it is given back as the queue drains.
+    /// A stream suspends a wide parent listing around each child instead of
+    /// materializing every sibling as a pending directory task.
     #[test]
-    fn stream_releases_task_capacity_as_a_wide_listing_drains() {
+    fn stream_keeps_a_constant_frontier_for_a_wide_listing() {
         let fixture = Fixture::new();
         for child in 0..300 {
             fs::create_dir_all(fixture.root.join(format!("child-{child:03}")))
@@ -3851,17 +3886,31 @@ mod tests {
         let mut peak_capacity = 0;
         while let Some(item) = stream.next() {
             item.expect("fixture walk succeeds");
-            peak_capacity = peak_capacity.max(stream.pending_directories.capacity());
+            peak_capacity = peak_capacity.max(stream.pending.capacity());
         }
         assert!(
-            peak_capacity >= 300,
-            "the wide listing was queued at once: {peak_capacity}"
+            peak_capacity <= 8,
+            "a flat listing needs only its frame, child and deferred emission: {peak_capacity}"
         );
+
+        let cancellation = CancellationToken::default();
+        let mut stream = Walker::new(&fixture.root)
+            .cancellation(cancellation.clone())
+            .stream();
+        stream
+            .next()
+            .expect("the wide stream yields before cancellation")
+            .expect("fixture walk succeeds");
         assert!(
-            stream.pending_directories.capacity() <= 64,
-            "the drained queue keeps only a small buffer: {}",
-            stream.pending_directories.capacity()
+            stream
+                .pending
+                .iter()
+                .any(|task| matches!(task, SerialTask::Resume(_))),
+            "the parent listing is suspended between yields"
         );
+        cancellation.cancel();
+        assert!(stream.next().is_none());
+        assert!(stream.was_cancelled());
     }
 
     #[test]
@@ -3873,20 +3922,33 @@ mod tests {
             .stream();
 
         // Model a backend that appended an entry before it reported its error.
-        stream
+        let mut scratch = DirectoryScratch::default();
+        scratch
             .listing
             .push(std::ffi::OsStr::new("must-not-leak"), false, false);
+        stream.scratch.push(scratch);
 
-        let task = stream
-            .pending_directories
+        let SerialTask::Directory(task) = stream
+            .pending
             .pop()
-            .expect("the root is queued for reading");
+            .expect("the root is queued for reading")
+        else {
+            panic!("a fresh stream starts with its root directory task");
+        };
         let error = stream
             .prepare_directory(task)
             .expect("the failed root produces an error")
             .expect_err("a missing root cannot yield an entry");
         assert_eq!(error.operation().as_str(), "read_dir");
-        assert!(stream.listing.entries().is_empty());
+        assert!(
+            stream
+                .scratch
+                .last()
+                .expect("failed scratch is reusable")
+                .listing
+                .entries()
+                .is_empty()
+        );
         assert!(stream.next().is_none(), "partial entries must not leak");
     }
 
@@ -8782,17 +8844,32 @@ mod tests {
         // Feed the stream the same completed listing native and portable
         // readers create. This isolates delivery order from a host filesystem
         // that usually supplies a file type without a fallible stat.
-        stream.pending_directories.clear();
-        stream.directory = fixture.root.clone();
-        stream.path = fixture.root.clone();
-        stream.listing.push("before".as_ref(), false, false);
+        let SerialTask::Directory(mut task) = stream
+            .pending
+            .pop()
+            .expect("the root is queued for reading")
+        else {
+            panic!("a fresh stream starts with its root directory task");
+        };
+        let ignores = std::mem::take(&mut task.ignores);
+        let mut scratch = DirectoryScratch {
+            path: fixture.root.clone(),
+            ..DirectoryScratch::default()
+        };
+        scratch.listing.push("before".as_ref(), false, false);
         super::defer_entry_stat_error(
-            &mut stream.listing,
+            &mut scratch.listing,
             fixture.root.join("unknown"),
             std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         )
         .expect("permission failure is deferred");
-        stream.listing.push("after".as_ref(), false, false);
+        scratch.listing.push("after".as_ref(), false, false);
+        stream.pending.push(SerialTask::Resume(DirectoryFrame {
+            task,
+            ignores,
+            scratch,
+            next_entry: 0,
+        }));
 
         let delivered = stream
             .map(|item| match item {

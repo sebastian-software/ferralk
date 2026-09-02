@@ -201,6 +201,15 @@ const HELPER_WORK_FLOOR: usize = 224;
 /// directory holding about a thousand files.
 const HELPER_LISTING_FLOOR: usize = 1024;
 
+/// Entries one continuation materializes before handing the listing back.
+///
+/// Directory tasks stay local to the worker that classified them; the single
+/// continuation goes through the shared injector. That makes the worker drain
+/// its children before it can produce another batch, while an idle helper can
+/// take over producing the next one. The frontier is therefore bounded by a
+/// small batch per active worker rather than by the width of the directory.
+const LISTING_BATCH_SIZE: usize = 64;
+
 impl<'scope, 'env> HelperPool<'scope, 'env> {
     /// Starts helpers while queued directories outnumber the running workers
     /// and the thread budget has room. Cheap enough to call after every
@@ -344,6 +353,10 @@ impl<'backend> Shared<'backend> {
 
     fn schedule(&self, worker: &Worker<ParallelTask>, task: ParallelTask) {
         self.coordinator.schedule(|| worker.push(task));
+    }
+
+    fn schedule_shared(&self, task: ParallelTask) {
+        self.coordinator.schedule(|| self.scheduler.push(task));
     }
 
     /// Whether the tree has shown enough work to be worth a helper.
@@ -734,7 +747,8 @@ fn process_directory(
     };
     worker.path.clear();
     worker.path.push(&path);
-    for index in start_index..worker.listing.entries().len() {
+    let end_index = (start_index + LISTING_BATCH_SIZE).min(worker.listing.entries().len());
+    for index in start_index..end_index {
         // Once per directory above, and then every [`CANCELLATION_STRIDE`]
         // entries so a listing of a hundred thousand names still stops
         // promptly.
@@ -743,30 +757,7 @@ fn process_directory(
                 return;
             }
             if let Some(pool) = pool {
-                // A wide listing can discover many independent subdirectories
-                // long before its current worker reaches a directory boundary.
                 pool.grow();
-            } else if index != start_index
-                && shared.tree_is_worth_helpers()
-                && (!worker.queue.is_empty() || !shared.scheduler.is_empty())
-            {
-                // Put the unvisited tail back on the caller's deque. The
-                // caller's next drain iteration sees both this continuation
-                // and the descendants already queued, then builds the pool.
-                let listing = std::mem::take(&mut worker.listing);
-                shared.schedule(
-                    &worker.queue,
-                    ParallelTask::Continuation(Box::new(Continuation {
-                        path,
-                        depth,
-                        root,
-                        ancestors,
-                        ignores,
-                        listing,
-                        next_entry: index,
-                    })),
-                );
-                return;
             }
         }
         // The entry's path exists only for as long as it is being decided
@@ -789,6 +780,19 @@ fn process_directory(
         );
         act(shared, worker, action);
         reset_to_directory(&mut worker.path, &path);
+    }
+    if end_index < worker.listing.entries().len() && !shared.should_stop() {
+        let listing = std::mem::take(&mut worker.listing);
+        shared.schedule_shared(ParallelTask::Continuation(Box::new(Continuation {
+            path,
+            depth,
+            root,
+            ancestors,
+            ignores,
+            listing,
+            next_entry: end_index,
+        })));
+        return;
     }
     while let Some(error) = worker.listing.take_deferred_error() {
         shared.record_error(
