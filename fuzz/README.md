@@ -48,10 +48,10 @@ length stays unrestricted, so the long-path seeds still exercise matcher
 stack and state bounds. A compact sub-kilobyte seed retains the compiled-IR
 budget rejection path, and the fuzz-library tests ensure every checked-in
 matcher seed remains below the pattern ceiling and replays it through the
-compiler. Automated and manual workflow runs additionally set libFuzzer's
-total input limit to 128 bytes for this target, keeping nightly mutations
-focused on syntax shape; direct seed replay retains the original long-candidate
-coverage outside that mutation limit.
+compiler. Automated and manual workflow runs first replay that checked-in
+corpus without truncation, then set libFuzzer's total input limit to 128 bytes
+for mutation, keeping nightly exploration focused on syntax shape without
+losing the compiled-IR or long-candidate regression paths.
 
 `ferralk_vs_fast_glob` depends on that budget for its own speed: fast-glob
 backtracks over brace alternatives rather than expanding them, and spends 42 s

@@ -49,6 +49,12 @@ jobs:
       # quarantine can retain several of those temporary allocations, so keep
       # the RSS limit above that retained peak while bounding any one input's
       # live allocation budget.
+      - name: Replay pattern_matcher regression seeds without truncation
+        if: matrix.target == 'pattern_matcher'
+        run: >-
+          cargo fuzz run --target x86_64-unknown-linux-gnu pattern_matcher
+          fuzz/corpus/pattern_matcher -- -runs=1 -rss_limit_mb=4096
+          -malloc_limit_mb=256 -print_final_stats=1
       - name: Run ${{ matrix.target }}
         env:
           FERRALK_FUZZ_SUBSET_STATS: ${{ runner.temp }}/ferralk-fast-glob-subset.txt

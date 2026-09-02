@@ -312,7 +312,12 @@ impl Pattern {
                 ..options
             };
             let mut alternatives = Vec::new();
-            ensure_source_brace_compiled_ir_lower_bound(pattern, parse_options, budget)?;
+            ensure_source_brace_compiled_ir_lower_bound(
+                pattern,
+                parse_options,
+                budget,
+                provenance_budget,
+            )?;
             let expanded = expand_brace_alternatives_with_provenance(
                 pattern,
                 walker_source_provenance,
@@ -3796,8 +3801,51 @@ struct BraceExpansion {
 
 #[derive(Clone, Copy)]
 struct BraceExpansionSummary {
+    source_length: usize,
     alternatives: usize,
     minimum_length: usize,
+    final_length_sum: usize,
+    nodes: usize,
+    written: usize,
+}
+
+impl BraceExpansionSummary {
+    const fn literal(length: usize) -> Self {
+        Self {
+            source_length: length,
+            alternatives: 1,
+            minimum_length: length,
+            final_length_sum: length,
+            nodes: 1,
+            written: length,
+        }
+    }
+
+    /// Symbolically expands `self` before `suffix`, matching the work-list's
+    /// left-to-right order without materializing either expansion tree.
+    fn concat(self, suffix: Self) -> Self {
+        let suffix_descendants = suffix.nodes.saturating_sub(1);
+        Self {
+            source_length: self.source_length.saturating_add(suffix.source_length),
+            alternatives: self.alternatives.saturating_mul(suffix.alternatives),
+            minimum_length: self.minimum_length.saturating_add(suffix.minimum_length),
+            final_length_sum: suffix
+                .alternatives
+                .saturating_mul(self.final_length_sum)
+                .saturating_add(self.alternatives.saturating_mul(suffix.final_length_sum)),
+            nodes: self
+                .nodes
+                .saturating_add(self.alternatives.saturating_mul(suffix_descendants)),
+            written: self
+                .written
+                .saturating_add(self.nodes.saturating_mul(suffix.source_length))
+                .saturating_add(suffix_descendants.saturating_mul(self.final_length_sum))
+                .saturating_add(
+                    self.alternatives
+                        .saturating_mul(suffix.written.saturating_sub(suffix.source_length)),
+                ),
+        }
+    }
 }
 
 /// Refuses a source whose syntax proves that every brace expansion together
@@ -3813,16 +3861,35 @@ fn ensure_source_brace_compiled_ir_lower_bound(
     pattern: &[u8],
     options: PatternOptions,
     budget: &IrBudget,
+    provenance_budget: &ProvenanceBudget,
 ) -> Result<(), PatternError> {
     // Class parsing is the only fallible syntax pass after brace expansion.
-    // Let the ordinary compiler preserve that error's precedence and offset.
-    if has_unescaped_class_opener(pattern, options.escape) {
+    // Only look ahead when every class is valid and brace expansion cannot
+    // split or rewrite one, preserving parser-error precedence and offsets.
+    if !source_classes_are_stable_and_valid(pattern, options.escape) {
         return Ok(());
     }
     let Some(summary) = brace_expansion_summary(pattern, options.escape, 0) else {
         return Ok(());
     };
     if summary.alternatives > MAX_BRACE_ALTERNATIVES {
+        return Ok(());
+    }
+    // Preserve the earlier expansion-byte error whenever both budgets would
+    // fail. `written` models that exact work-list counter symbolically.
+    if summary.written > MAX_BRACE_EXPANSION_BYTES {
+        return Ok(());
+    }
+    // Selecting one brace arm can split at most two existing provenance
+    // spans. Bound every generated node by the deepest possible source path;
+    // if that cannot fit, preserve the provenance-budget error as well.
+    let brace_openers = unescaped_brace_openers(pattern, options.escape);
+    let spans_per_node = 1_usize.saturating_add(brace_openers.saturating_mul(2));
+    let provenance_upper = summary
+        .nodes
+        .saturating_sub(1)
+        .saturating_mul(spans_per_node);
+    if provenance_upper > provenance_budget.remaining {
         return Ok(());
     }
     let (question_marks, has_extglob) = unconditional_compiled_units(pattern, options);
@@ -3834,18 +3901,56 @@ fn ensure_source_brace_compiled_ir_lower_bound(
     budget.ensure(summary.alternatives.saturating_mul(per_alternative), 0)
 }
 
-fn has_unescaped_class_opener(pattern: &[u8], escapes: bool) -> bool {
+fn unescaped_brace_openers(pattern: &[u8], escapes: bool) -> usize {
+    let mut openers = 0_usize;
     let mut index = 0;
     while index < pattern.len() {
         if escapes && pattern[index] == b'\\' {
             index += usize::from(index + 1 < pattern.len()) + 1;
-        } else if pattern[index] == b'[' {
-            return true;
         } else {
+            openers += usize::from(pattern[index] == b'{');
             index += 1;
         }
     }
-    false
+    openers
+}
+
+fn source_classes_are_stable_and_valid(pattern: &[u8], escapes: bool) -> bool {
+    let mut brace_depth = 0_usize;
+    let mut index = 0;
+    while index < pattern.len() {
+        if escapes && pattern[index] == b'\\' {
+            index += usize::from(index + 1 < pattern.len()) + 1;
+            continue;
+        }
+        match pattern[index] {
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b'[' => {
+                let Ok((_, next)) = parse_class(pattern, index, escapes) else {
+                    return false;
+                };
+                let mut class_index = index + 1;
+                while class_index < next {
+                    if escapes && pattern[class_index] == b'\\' {
+                        class_index += usize::from(class_index + 1 < next) + 1;
+                        continue;
+                    }
+                    if matches!(pattern[class_index], b'{' | b'}')
+                        || (brace_depth > 0 && pattern[class_index] == b',')
+                    {
+                        return false;
+                    }
+                    class_index += 1;
+                }
+                index = next;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    true
 }
 
 fn brace_expansion_summary(
@@ -3858,33 +3963,37 @@ fn brace_expansion_summary(
         return None;
     }
     let Some(open) = first_unescaped_brace(pattern, escapes) else {
-        return Some(BraceExpansionSummary {
-            alternatives: 1,
-            minimum_length: pattern.len(),
-        });
+        return Some(BraceExpansionSummary::literal(pattern.len()));
     };
     let Some(close) = matching_brace(pattern, open, escapes) else {
-        return Some(BraceExpansionSummary {
-            alternatives: 1,
-            minimum_length: pattern.len(),
-        });
+        return Some(BraceExpansionSummary::literal(pattern.len()));
     };
 
     let content = &pattern[open + 1..close];
     let mut group_alternatives = 0_usize;
     let mut group_minimum = usize::MAX;
+    let mut group_final_length_sum = 0_usize;
+    let mut group_nodes = 1_usize;
+    let mut group_written = close - open + 1;
     for range in split_brace_alternatives(content, escapes) {
         let arm = brace_expansion_summary(&content[range], escapes, depth + 1)?;
         group_alternatives = group_alternatives.saturating_add(arm.alternatives);
         group_minimum = group_minimum.min(arm.minimum_length);
+        group_final_length_sum = group_final_length_sum.saturating_add(arm.final_length_sum);
+        group_nodes = group_nodes.saturating_add(arm.nodes);
+        group_written = group_written.saturating_add(arm.written);
     }
+    let prefix = BraceExpansionSummary::literal(open);
+    let group = BraceExpansionSummary {
+        source_length: close - open + 1,
+        alternatives: group_alternatives,
+        minimum_length: group_minimum,
+        final_length_sum: group_final_length_sum,
+        nodes: group_nodes,
+        written: group_written,
+    };
     let suffix = brace_expansion_summary(&pattern[close + 1..], escapes, depth + 1)?;
-    Some(BraceExpansionSummary {
-        alternatives: group_alternatives.saturating_mul(suffix.alternatives),
-        minimum_length: open
-            .saturating_add(group_minimum)
-            .saturating_add(suffix.minimum_length),
-    })
+    Some(prefix.concat(group).concat(suffix))
 }
 
 /// Counts compiler units whose syntax is outside every matched brace group.
@@ -6670,6 +6779,32 @@ mod tests {
     }
 
     #[test]
+    fn brace_expansion_summary_matches_the_materialization_tree() {
+        for (pattern, expected) in [
+            ("{a,b}", (5, 2, 1, 2, 3, 7)),
+            ("{a,b}{c,d}", (10, 4, 2, 8, 7, 30)),
+            ("x{a,b}y", (7, 2, 3, 6, 3, 13)),
+            ("{a,{b,c}}", (9, 3, 1, 3, 5, 17)),
+            ("x{a", (3, 1, 3, 3, 1, 3)),
+        ] {
+            let summary = super::brace_expansion_summary(pattern.as_bytes(), true, 0)
+                .expect("small expansion has a summary");
+            assert_eq!(
+                (
+                    summary.source_length,
+                    summary.alternatives,
+                    summary.minimum_length,
+                    summary.final_length_sum,
+                    summary.nodes,
+                    summary.written,
+                ),
+                expected,
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
     fn brace_expansion_stops_at_the_work_budget() {
         let options = PatternOptions::default().braces(true);
 
@@ -6686,6 +6821,13 @@ mod tests {
         // alternatives of a 10 KB pattern is 80 MB of rewriting.
         let wide = format!("{}{}", "x".repeat(10_000), "{a,b}".repeat(12));
         let error = Pattern::compile(&wide, options).unwrap_err();
+        assert_eq!(error.message(), "brace expansion is too large");
+        assert_eq!(error.offset(), 10_000);
+
+        // The IR lower bound is also over budget, but expansion has always
+        // been the first failing phase and keeps its established error.
+        let overlapping = format!("{}{}", "?".repeat(10_000), "{a,b}".repeat(12));
+        let error = Pattern::compile(&overlapping, options).unwrap_err();
         assert_eq!(error.message(), "brace expansion is too large");
         assert_eq!(error.offset(), 10_000);
 
@@ -6732,6 +6874,13 @@ mod tests {
                 .unwrap_err()
                 .message(),
             "unclosed character class"
+        );
+        let stable_class = format!("{}[a-z]{}", "?".repeat(300), "{a,b}".repeat(12));
+        assert_eq!(
+            Pattern::compile(&stable_class, PatternOptions::default().braces(true))
+                .unwrap_err()
+                .message(),
+            "pattern compiles to too much"
         );
 
         // The budget is a compile-time ceiling, not a syntax rule.
