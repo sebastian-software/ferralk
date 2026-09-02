@@ -42,6 +42,17 @@ hundred bytes of nine-way groups exhausted memory. `Pattern::compile` now
 rejects those patterns itself, so the targets hand them straight to it and
 exercise the real error path.
 
+`pattern_matcher` sends at most 384 pattern bytes into the compiler and
+returns libFuzzer's rejected-corpus verdict for larger patterns. Candidate
+length stays unrestricted, so the long-path seeds still exercise matcher
+stack and state bounds. A compact sub-kilobyte seed retains the compiled-IR
+budget rejection path, and the fuzz-library tests ensure every checked-in
+matcher seed remains below the pattern ceiling and replays it through the
+compiler. Automated and manual workflow runs first replay that checked-in
+corpus without truncation, then set libFuzzer's total input limit to 128 bytes
+for mutation, keeping nightly exploration focused on syntax shape without
+losing the compiled-IR or long-candidate regression paths.
+
 `ferralk_vs_fast_glob` depends on that budget for its own speed: fast-glob
 backtracks over brace alternatives rather than expanding them, and spends 42 s
 on the ten-group pattern from issue #42. Compiling before `fast_glob::glob_match`
@@ -49,8 +60,10 @@ keeps such a pattern away from it. Raising `MAX_BRACE_ALTERNATIVES` means
 re-measuring fast-glob at the new limit.
 
 The glob targets run automatically: a short budget per pull request and a long
-nightly run, both from `.github/workflows/glob-fuzz.yml`. `fuzz.yml` runs one
-chosen target with a custom budget on demand.
+nightly run, both from `.github/workflows/glob-fuzz.yml`. A failed scheduled
+run opens or refreshes the repository's nightly glob-fuzz tracking issue, in
+addition to uploading its reproducer. `fuzz.yml` runs one chosen target with a
+custom budget on demand.
 
 Install cargo-fuzz, then run cargo fuzz run pattern_parser, cargo fuzz run
 pattern_matcher, or cargo fuzz run ferralk_vs_fast_glob from the repository

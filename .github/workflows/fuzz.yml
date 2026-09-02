@@ -38,12 +38,20 @@ jobs:
       # cargo-fuzz defaults to the target it was itself built for, and the
       # prebuilt binary is musl, where the sanitizer cannot link against a
       # static libc. Name this runner's host target instead.
+      - name: Replay pattern_matcher regression seeds without truncation
+        if: inputs.target == 'pattern_matcher'
+        run: >-
+          cargo fuzz run --target x86_64-unknown-linux-gnu pattern_matcher
+          fuzz/corpus/pattern_matcher -- -runs=1 -rss_limit_mb=4096
+          -malloc_limit_mb=256 -print_final_stats=1
       - name: Run ${{ inputs.target }}
         env:
           FERRALK_FUZZ_SUBSET_STATS: ${{ runner.temp }}/ferralk-fast-glob-subset.txt
+          MAX_LEN: ${{ inputs.target == 'pattern_matcher' && '128' || '0' }}
         run: >-
           cargo fuzz run --target x86_64-unknown-linux-gnu ${{ inputs.target }}
-          -- -max_total_time=${{ inputs.max_total_time }} -print_final_stats=1
+          -- -max_total_time=${{ inputs.max_total_time }} -max_len=$MAX_LEN
+          -print_final_stats=1
       - name: Report differential subset hit rate
         if: always() && inputs.target == 'ferralk_vs_fast_glob'
         run: |

@@ -49,13 +49,22 @@ jobs:
       # quarantine can retain several of those temporary allocations, so keep
       # the RSS limit above that retained peak while bounding any one input's
       # live allocation budget.
+      - name: Replay pattern_matcher regression seeds without truncation
+        if: matrix.target == 'pattern_matcher'
+        run: >-
+          cargo fuzz run --target x86_64-unknown-linux-gnu pattern_matcher
+          fuzz/corpus/pattern_matcher -- -runs=1 -rss_limit_mb=4096
+          -malloc_limit_mb=256 -print_final_stats=1
       - name: Run ${{ matrix.target }}
         env:
           FERRALK_FUZZ_SUBSET_STATS: ${{ runner.temp }}/ferralk-fast-glob-subset.txt
+          # The matcher target has direct seed replay for its long-candidate
+          # case; automated mutation should spend its budget on syntax shape.
+          MAX_LEN: ${{ matrix.target == 'pattern_matcher' && '128' || '0' }}
         run: >-
           cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }}
           -- -max_total_time=$MAX_TOTAL_TIME -rss_limit_mb=4096 -malloc_limit_mb=256
-          -print_final_stats=1
+          -max_len=$MAX_LEN -print_final_stats=1
       - name: Report differential subset hit rate
         if: always() && matrix.target == 'ferralk_vs_fast_glob'
         run: |
@@ -74,3 +83,62 @@ jobs:
           name: glob-fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/
           if-no-files-found: ignore
+
+  report-nightly-failure:
+    name: report scheduled failure
+    needs: fuzz
+    if: always() && github.event_name == 'schedule' && needs.fuzz.result == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or refresh the nightly glob-fuzz issue
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const marker = '<!-- ferralk-nightly-glob-fuzz -->';
+            const runMarker = `<!-- run:${context.runId} -->`;
+            const title = 'Nightly glob fuzz failure';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const latest = `${runMarker}\n- Run: ${runUrl}\n- Commit: \`${context.sha}\``;
+            const body = `${marker}\nAutomated tracker for failed scheduled glob-fuzz runs. Keep this issue open until the latest failure is triaged.\n\nLatest failure:\n${latest}`;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              ...context.repo,
+              state: 'all',
+              labels: 'area: glob,type: testing',
+              per_page: 100,
+            });
+            const tracking = issues.find(issue =>
+              !issue.pull_request && issue.body?.includes(marker)
+            );
+
+            if (!tracking) {
+              await github.rest.issues.create({
+                ...context.repo,
+                title,
+                body,
+                labels: ['area: glob', 'type: testing'],
+              });
+              return;
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: tracking.number,
+              per_page: 100,
+            });
+            const alreadyRecorded = tracking.body?.includes(runMarker) ||
+              comments.some(comment => comment.body?.includes(runMarker));
+            await github.rest.issues.update({
+              ...context.repo,
+              issue_number: tracking.number,
+              state: 'open',
+              body,
+            });
+            if (!alreadyRecorded) {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: tracking.number,
+                body: `Another scheduled glob-fuzz run failed.\n\n${latest}`,
+              });
+            }

@@ -1,12 +1,19 @@
 #![forbid(unsafe_code)]
 
-//! Shared support for the differential fast-glob fuzz target.
+//! Shared support and executable invariants for the glob fuzz targets.
 //!
 //! Keeping the subset classifier in a library makes its exclusions and the
 //! checked-in seed corpus executable tests instead of untested target-local
 //! control flow.
 
 use ferralk_glob::{PatternOptions, expand_braces};
+
+/// Largest pattern the matcher target sends through the full compiler.
+///
+/// Candidate bytes remain unbounded, preserving the long-path regression
+/// seeds while oversized random patterns are rejected before expensive brace
+/// and extglob work crowds structural mutations out of the corpus.
+pub const MAX_PATTERN_MATCHER_PATTERN_BYTES: usize = 384;
 
 /// Brace groups fast-glob answers correctly for.
 ///
@@ -29,6 +36,23 @@ pub fn split_input(data: &[u8]) -> (&[u8], &[u8]) {
         Some(separator) => (&data[..separator], &data[separator + 1..]),
         None => (data, &[]),
     }
+}
+
+/// Derives the matcher target's option combination from one fuzz input.
+///
+/// A final newline is ignored so compact, reviewable text seeds can still
+/// select options with their last candidate byte. Arbitrary binary inputs and
+/// all existing non-newline-terminated seeds keep their previous reading.
+pub fn pattern_matcher_options(data: &[u8]) -> PatternOptions {
+    let without_final_newline = data.strip_suffix(b"\n").unwrap_or(data);
+    let bits = without_final_newline.last().copied().unwrap_or_default();
+    PatternOptions::default()
+        .braces(bits & 1 != 0)
+        .recursive_double_star(bits & 2 != 0)
+        .extglob(bits & 4 != 0)
+        .match_hidden(bits & 8 != 0)
+        .case_insensitive(bits & 16 != 0)
+        .escape(bits & 32 == 0)
 }
 
 /// Whether both engines document this pattern and candidate the same way.
@@ -242,7 +266,49 @@ mod tests {
 
     use ferralk_glob::Pattern;
 
-    use super::{in_shared_subset, matcher_options, split_input};
+    use super::{
+        MAX_PATTERN_MATCHER_PATTERN_BYTES, in_shared_subset, matcher_options,
+        pattern_matcher_options, split_input,
+    };
+
+    #[test]
+    fn every_checked_in_matcher_seed_reaches_the_target_logic() {
+        let seed_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/pattern_matcher");
+        let mut seeds = fs::read_dir(&seed_dir)
+            .expect("read matcher seed directory")
+            .map(|entry| entry.expect("read matcher seed entry").path())
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        seeds.sort();
+        assert!(!seeds.is_empty(), "the matcher seed corpus is empty");
+
+        for seed in seeds {
+            let data = fs::read(&seed).expect("read matcher seed");
+            let (pattern, _) = split_input(&data);
+            assert!(
+                pattern.len() <= MAX_PATTERN_MATCHER_PATTERN_BYTES,
+                "{} has a {}-byte pattern above the {}-byte target ceiling",
+                seed.display(),
+                pattern.len(),
+                MAX_PATTERN_MATCHER_PATTERN_BYTES
+            );
+
+            match ferralk_glob::Pattern::compile(pattern, pattern_matcher_options(&data)) {
+                Ok(compiled) => assert!(
+                    compiled.engines_agree(split_input(&data).1),
+                    "{} reaches a matcher-engine disagreement",
+                    seed.display()
+                ),
+                Err(error)
+                    if seed.file_name().and_then(|name| name.to_str())
+                        == Some("compiled-ir-budget") =>
+                {
+                    assert_eq!(error.message(), "pattern compiles to too much");
+                }
+                Err(error) => panic!("{} unexpectedly fails to compile: {error}", seed.display()),
+            }
+        }
+    }
 
     #[test]
     fn globstar_exclusion_keeps_only_proven_shared_shapes() {

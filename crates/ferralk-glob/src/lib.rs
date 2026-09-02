@@ -312,12 +312,19 @@ impl Pattern {
                 ..options
             };
             let mut alternatives = Vec::new();
+            ensure_source_brace_compiled_ir_lower_bound(
+                pattern,
+                parse_options,
+                budget,
+                provenance_budget,
+            )?;
             let expanded = expand_brace_alternatives_with_provenance(
                 pattern,
                 walker_source_provenance,
                 options.escape,
                 provenance_budget,
             )?;
+            ensure_brace_compiled_ir_lower_bound(&expanded, parse_options, budget)?;
             for alternative in expanded {
                 let compiled = Self::compile_within(
                     &alternative.bytes,
@@ -3598,6 +3605,21 @@ impl IrBudget {
             }),
         }
     }
+
+    /// Rejects a proven lower bound without consuming it.
+    ///
+    /// The ordinary compiler still performs the exact charge as structures
+    /// are built. This look-ahead only avoids starting work that cannot fit.
+    fn ensure(&self, units: usize, offset: usize) -> Result<(), PatternError> {
+        if units <= self.remaining {
+            Ok(())
+        } else {
+            Err(PatternError {
+                offset,
+                message: TOO_MUCH_COMPILED_IR,
+            })
+        }
+    }
 }
 
 /// Bounds source-span metadata independently from matcher IR.
@@ -3775,6 +3797,279 @@ impl SourceProvenance {
 struct BraceExpansion {
     bytes: Vec<u8>,
     source_provenance: Option<SourceProvenance>,
+}
+
+#[derive(Clone, Copy)]
+struct BraceExpansionSummary {
+    source_length: usize,
+    alternatives: usize,
+    minimum_length: usize,
+    final_length_sum: usize,
+    nodes: usize,
+    written: usize,
+}
+
+impl BraceExpansionSummary {
+    const fn literal(length: usize) -> Self {
+        Self {
+            source_length: length,
+            alternatives: 1,
+            minimum_length: length,
+            final_length_sum: length,
+            nodes: 1,
+            written: length,
+        }
+    }
+
+    /// Symbolically expands `self` before `suffix`, matching the work-list's
+    /// left-to-right order without materializing either expansion tree.
+    fn concat(self, suffix: Self) -> Self {
+        let suffix_descendants = suffix.nodes.saturating_sub(1);
+        Self {
+            source_length: self.source_length.saturating_add(suffix.source_length),
+            alternatives: self.alternatives.saturating_mul(suffix.alternatives),
+            minimum_length: self.minimum_length.saturating_add(suffix.minimum_length),
+            final_length_sum: suffix
+                .alternatives
+                .saturating_mul(self.final_length_sum)
+                .saturating_add(self.alternatives.saturating_mul(suffix.final_length_sum)),
+            nodes: self
+                .nodes
+                .saturating_add(self.alternatives.saturating_mul(suffix_descendants)),
+            written: self
+                .written
+                .saturating_add(self.nodes.saturating_mul(suffix.source_length))
+                .saturating_add(suffix_descendants.saturating_mul(self.final_length_sum))
+                .saturating_add(
+                    self.alternatives
+                        .saturating_mul(suffix.written.saturating_sub(suffix.source_length)),
+                ),
+        }
+    }
+}
+
+/// Refuses a source whose syntax proves that every brace expansion together
+/// cannot fit the compiled-IR budget.
+///
+/// The summary computes only the number of final alternatives and the shortest
+/// final byte length. Syntax outside every brace arm survives in every result,
+/// so an unconditional extglob opener proves one step table of at least that
+/// length per alternative, while unconditional question marks each prove one
+/// ordinary token. Ambiguous, very deep, or over-the-brace-count-limit sources
+/// simply defer to the existing expansion and exact compiler budgets.
+fn ensure_source_brace_compiled_ir_lower_bound(
+    pattern: &[u8],
+    options: PatternOptions,
+    budget: &IrBudget,
+    provenance_budget: &ProvenanceBudget,
+) -> Result<(), PatternError> {
+    // Class parsing is the only fallible syntax pass after brace expansion.
+    // Only look ahead when every class is valid and brace expansion cannot
+    // split or rewrite one, preserving parser-error precedence and offsets.
+    if !source_classes_are_stable_and_valid(pattern, options.escape) {
+        return Ok(());
+    }
+    let Some(summary) = brace_expansion_summary(pattern, options.escape, 0) else {
+        return Ok(());
+    };
+    if summary.alternatives > MAX_BRACE_ALTERNATIVES {
+        return Ok(());
+    }
+    // Preserve the earlier expansion-byte error whenever both budgets would
+    // fail. `written` models that exact work-list counter symbolically.
+    if summary.written > MAX_BRACE_EXPANSION_BYTES {
+        return Ok(());
+    }
+    // Selecting one brace arm can split at most two existing provenance
+    // spans. Bound every generated node by the deepest possible source path;
+    // if that cannot fit, preserve the provenance-budget error as well.
+    let brace_openers = unescaped_brace_openers(pattern, options.escape);
+    let spans_per_node = 1_usize.saturating_add(brace_openers.saturating_mul(2));
+    let provenance_upper = summary
+        .nodes
+        .saturating_sub(1)
+        .saturating_mul(spans_per_node);
+    if provenance_upper > provenance_budget.remaining {
+        return Ok(());
+    }
+    let (question_marks, has_extglob) = unconditional_compiled_units(pattern, options);
+    let per_alternative = question_marks.saturating_add(if has_extglob {
+        summary.minimum_length
+    } else {
+        0
+    });
+    budget.ensure(summary.alternatives.saturating_mul(per_alternative), 0)
+}
+
+fn unescaped_brace_openers(pattern: &[u8], escapes: bool) -> usize {
+    let mut openers = 0_usize;
+    let mut index = 0;
+    while index < pattern.len() {
+        if escapes && pattern[index] == b'\\' {
+            index += usize::from(index + 1 < pattern.len()) + 1;
+        } else {
+            openers += usize::from(pattern[index] == b'{');
+            index += 1;
+        }
+    }
+    openers
+}
+
+fn source_classes_are_stable_and_valid(pattern: &[u8], escapes: bool) -> bool {
+    let mut brace_depth = 0_usize;
+    let mut index = 0;
+    while index < pattern.len() {
+        if escapes && pattern[index] == b'\\' {
+            index += usize::from(index + 1 < pattern.len()) + 1;
+            continue;
+        }
+        match pattern[index] {
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b'[' => {
+                let Ok((_, next)) = parse_class(pattern, index, escapes) else {
+                    return false;
+                };
+                let mut class_index = index + 1;
+                while class_index < next {
+                    if escapes && pattern[class_index] == b'\\' {
+                        class_index += usize::from(class_index + 1 < next) + 1;
+                        continue;
+                    }
+                    if matches!(pattern[class_index], b'{' | b'}')
+                        || (brace_depth > 0 && pattern[class_index] == b',')
+                    {
+                        return false;
+                    }
+                    class_index += 1;
+                }
+                index = next;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    true
+}
+
+fn brace_expansion_summary(
+    pattern: &[u8],
+    escapes: bool,
+    depth: usize,
+) -> Option<BraceExpansionSummary> {
+    const MAX_SUMMARY_DEPTH: usize = 128;
+    if depth > MAX_SUMMARY_DEPTH {
+        return None;
+    }
+    let Some(open) = first_unescaped_brace(pattern, escapes) else {
+        return Some(BraceExpansionSummary::literal(pattern.len()));
+    };
+    let Some(close) = matching_brace(pattern, open, escapes) else {
+        return Some(BraceExpansionSummary::literal(pattern.len()));
+    };
+
+    let content = &pattern[open + 1..close];
+    let mut group_alternatives = 0_usize;
+    let mut group_minimum = usize::MAX;
+    let mut group_final_length_sum = 0_usize;
+    let mut group_nodes = 1_usize;
+    let mut group_written = close - open + 1;
+    for range in split_brace_alternatives(content, escapes) {
+        let arm = brace_expansion_summary(&content[range], escapes, depth + 1)?;
+        group_alternatives = group_alternatives.saturating_add(arm.alternatives);
+        group_minimum = group_minimum.min(arm.minimum_length);
+        group_final_length_sum = group_final_length_sum.saturating_add(arm.final_length_sum);
+        group_nodes = group_nodes.saturating_add(arm.nodes);
+        group_written = group_written.saturating_add(arm.written);
+    }
+    let prefix = BraceExpansionSummary::literal(open);
+    let group = BraceExpansionSummary {
+        source_length: close - open + 1,
+        alternatives: group_alternatives,
+        minimum_length: group_minimum,
+        final_length_sum: group_final_length_sum,
+        nodes: group_nodes,
+        written: group_written,
+    };
+    let suffix = brace_expansion_summary(&pattern[close + 1..], escapes, depth + 1)?;
+    Some(prefix.concat(group).concat(suffix))
+}
+
+/// Counts compiler units whose syntax is outside every matched brace group.
+fn unconditional_compiled_units(pattern: &[u8], options: PatternOptions) -> (usize, bool) {
+    let mut question_marks = 0_usize;
+    let mut has_extglob = false;
+    let mut index = 0;
+    while index < pattern.len() {
+        if options.escape && pattern[index] == b'\\' {
+            index += usize::from(index + 1 < pattern.len()) + 1;
+            continue;
+        }
+        if pattern[index] == b'{'
+            && let Some(close) = matching_brace(pattern, index, options.escape)
+        {
+            index = close + 1;
+            continue;
+        }
+        question_marks += usize::from(pattern[index] == b'?');
+        has_extglob |= detect_extglob_at(pattern, index).is_some();
+        index += 1;
+    }
+    (question_marks, options.extglob && has_extglob)
+}
+
+/// Rejects brace expansions whose unavoidable compiler structures exceed the
+/// remaining IR budget before building any alternative's matcher program.
+///
+/// This deliberately remains a lower bound. Every valid class contributes its
+/// token and owned members, every ordinary `?` contributes a token, and an
+/// extglob-enabled alternative with extglob syntax always allocates one step
+/// slot per byte. Literal runs and the derived fast paths are left uncounted,
+/// so passing this guard never promises that the exact compiler will fit.
+/// Returning `None` for an invalid class preserves the parser error that the
+/// ordinary alternative-by-alternative compiler reports.
+fn ensure_brace_compiled_ir_lower_bound(
+    alternatives: &[BraceExpansion],
+    options: PatternOptions,
+    budget: &IrBudget,
+) -> Result<(), PatternError> {
+    let mut total = 0_usize;
+    for alternative in alternatives {
+        let Some(units) = compiled_ir_lower_bound(&alternative.bytes, options) else {
+            return Ok(());
+        };
+        total = total.saturating_add(units);
+        if total > budget.remaining {
+            return budget.ensure(total, 0);
+        }
+    }
+    budget.ensure(total, 0)
+}
+
+fn compiled_ir_lower_bound(pattern: &[u8], options: PatternOptions) -> Option<usize> {
+    let mut units = if options.extglob && contains_extglob(pattern, options.escape) {
+        pattern.len()
+    } else {
+        0
+    };
+    let mut index = 0;
+    while index < pattern.len() {
+        match pattern[index] {
+            b'\\' if options.escape => index += usize::from(index + 1 < pattern.len()) + 1,
+            b'[' => {
+                let (class, next) = parse_class(pattern, index, options.escape).ok()?;
+                units = units.saturating_add(1 + class.members.len());
+                index = next;
+            }
+            b'?' => {
+                units = units.saturating_add(1);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    Some(units)
 }
 
 /// Expands brace groups into one pattern per combination.
@@ -6484,6 +6779,32 @@ mod tests {
     }
 
     #[test]
+    fn brace_expansion_summary_matches_the_materialization_tree() {
+        for (pattern, expected) in [
+            ("{a,b}", (5, 2, 1, 2, 3, 7)),
+            ("{a,b}{c,d}", (10, 4, 2, 8, 7, 30)),
+            ("x{a,b}y", (7, 2, 3, 6, 3, 13)),
+            ("{a,{b,c}}", (9, 3, 1, 3, 5, 17)),
+            ("x{a", (3, 1, 3, 3, 1, 3)),
+        ] {
+            let summary = super::brace_expansion_summary(pattern.as_bytes(), true, 0)
+                .expect("small expansion has a summary");
+            assert_eq!(
+                (
+                    summary.source_length,
+                    summary.alternatives,
+                    summary.minimum_length,
+                    summary.final_length_sum,
+                    summary.nodes,
+                    summary.written,
+                ),
+                expected,
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
     fn brace_expansion_stops_at_the_work_budget() {
         let options = PatternOptions::default().braces(true);
 
@@ -6503,6 +6824,13 @@ mod tests {
         assert_eq!(error.message(), "brace expansion is too large");
         assert_eq!(error.offset(), 10_000);
 
+        // The IR lower bound is also over budget, but expansion has always
+        // been the first failing phase and keeps its established error.
+        let overlapping = format!("{}{}", "?".repeat(10_000), "{a,b}".repeat(12));
+        let error = Pattern::compile(&overlapping, options).unwrap_err();
+        assert_eq!(error.message(), "brace expansion is too large");
+        assert_eq!(error.offset(), 10_000);
+
         // The same shape at a realistic length still compiles, and so does the
         // largest alternative count the other budget admits.
         let narrow = format!("{}{}", "x".repeat(1_000), "{a,b}".repeat(12));
@@ -6517,22 +6845,43 @@ mod tests {
     fn compiled_size_is_budgeted_across_every_alternative() {
         let options = PatternOptions::default().braces(true).extglob(true);
 
-        // 4096 alternatives of a kilobyte each: inside the alternative budget
-        // and inside the expansion byte budget, but millions of compiled units.
-        let extglob = format!("@(a|b){}{}", "x".repeat(1_000), "{a,b}".repeat(12));
+        // 4096 alternatives hundreds of bytes long: inside the alternative
+        // and expansion-byte budgets, but millions of compiled units.
+        let extglob = format!("@(a|b){}{}", "x".repeat(300), "{a,b}".repeat(12));
         let error = Pattern::compile(&extglob, options).unwrap_err();
         assert_eq!(error.message(), "pattern compiles to too much");
 
         // The same dimension without extglob: one token per wildcard byte.
-        let wildcards = format!("{}{}", "?".repeat(1_000), "{a,b}".repeat(12));
+        let wildcards = format!("{}{}", "?".repeat(300), "{a,b}".repeat(12));
         let error =
             Pattern::compile(&wildcards, PatternOptions::default().braces(true)).unwrap_err();
         assert_eq!(error.message(), "pattern compiles to too much");
+        assert!(
+            extglob.len() < 384 && wildcards.len() < 384,
+            "the budget rejection must remain reachable below the matcher fuzz ceiling"
+        );
 
         // A literal run is one token however long, so the same alternative
         // count over the same number of bytes compiles.
         let literals = format!("{}{}", "x".repeat(1_000), "{a,b}".repeat(12));
         assert!(Pattern::compile(&literals, PatternOptions::default().braces(true)).is_ok());
+
+        // The early lower bound must not hide a parser error that exact
+        // alternative-by-alternative compilation would report first.
+        let invalid_class = format!("{}[{}", "?".repeat(300), "{a,b}".repeat(12));
+        assert_eq!(
+            Pattern::compile(&invalid_class, PatternOptions::default().braces(true))
+                .unwrap_err()
+                .message(),
+            "unclosed character class"
+        );
+        let stable_class = format!("{}[a-z]{}", "?".repeat(300), "{a,b}".repeat(12));
+        assert_eq!(
+            Pattern::compile(&stable_class, PatternOptions::default().braces(true))
+                .unwrap_err()
+                .message(),
+            "pattern compiles to too much"
+        );
 
         // The budget is a compile-time ceiling, not a syntax rule.
         assert!(Pattern::compile(&wildcards, PatternOptions::default()).is_ok());
