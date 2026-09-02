@@ -627,6 +627,10 @@ impl Walker {
     /// error and no entry for the file. A directory symlink supplied as the
     /// root is traversed regardless of [`WalkOptions::follow_symlinks`], which
     /// only controls symlinks discovered below the root.
+    /// A relative root is resolved against the process's current directory
+    /// when [`Walker::collect`], [`Walker::visit`] or [`Walker::stream`] starts;
+    /// changing that directory after construction therefore changes which
+    /// directory the walk opens.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
@@ -2985,6 +2989,7 @@ mod tests {
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
     const HOSTILE_GIT_CONFIG_FIXTURE: &str = "FERRALK_HOSTILE_GIT_CONFIG_FIXTURE";
+    const PARENT_ROOT_IGNORE_FIXTURE: &str = "FERRALK_PARENT_ROOT_IGNORE_FIXTURE";
     const RELATIVE_ROOT_IGNORE_FIXTURE: &str = "FERRALK_RELATIVE_ROOT_IGNORE_FIXTURE";
     const RELATIVE_ROOT_SPELLING: &str = "FERRALK_RELATIVE_ROOT_SPELLING";
 
@@ -4793,9 +4798,14 @@ mod tests {
                 .options(WalkOptions::default().sort(true).files_only(true))
                 .collect()
                 .expect("relative-root walk succeeds");
+            let expected = if matches!(spelling.to_str(), Some("sub/" | "./sub/")) {
+                vec![PathBuf::from("keep.rs")]
+            } else {
+                vec![PathBuf::from("keep.rs"), PathBuf::from("sub/keep.rs")]
+            };
             assert_eq!(
                 relative_paths(walked.entries(), &spelling),
-                vec![PathBuf::from("keep.rs")],
+                expected,
                 "root spelling {spelling:?} must inherit repository rules from {root:?}",
             );
             return;
@@ -4805,14 +4815,24 @@ mod tests {
         fixture.write("src/debug.log");
         fixture.write("src/secret.txt");
         fixture.write("src/keep.rs");
+        fixture.write("src/sub/secret.txt");
+        fixture.write("src/sub/keep.rs");
         fs::create_dir(fixture.root.join(".git")).expect("create repository metadata directory");
-        fs::write(fixture.root.join(".gitignore"), b"*.log\n/src/secret.txt\n")
-            .expect("write repository ignore rules");
+        fs::write(
+            fixture.root.join(".gitignore"),
+            b"*.log\n/src/secret.txt\n/src/sub/secret.txt\n",
+        )
+        .expect("write repository ignore rules");
 
         for (working_directory, spelling) in [
             (fixture.root.join("src"), "."),
             (fixture.root.join("src"), "./"),
             (fixture.root.clone(), "src"),
+            (fixture.root.clone(), "src/"),
+            (fixture.root.clone(), "./src/"),
+            (fixture.root.join("src"), "sub/"),
+            (fixture.root.join("src"), "./sub/"),
+            (fixture.root.join("src"), "../src/"),
         ] {
             let status = Command::new(std::env::current_exe().expect("locate test binary"))
                 .args([
@@ -4827,6 +4847,88 @@ mod tests {
             assert!(
                 status.success(),
                 "relative-root child failed for {spelling:?}: {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_components_in_relative_roots_keep_ignore_anchors() {
+        if let Some(root) = std::env::var_os(PARENT_ROOT_IGNORE_FIXTURE) {
+            let root = PathBuf::from(root);
+            let spelling = std::env::var_os(RELATIVE_ROOT_SPELLING)
+                .expect("child receives its relative root spelling");
+            let spelling = PathBuf::from(spelling);
+            let walked = Walker::new(&spelling)
+                .respect_git_ignore(true)
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("parent-relative-root walk succeeds");
+            let paths = relative_paths(walked.entries(), &spelling);
+            let (visible, hidden): (&[&str], &[&str]) = match spelling.to_str() {
+                Some("..") => (
+                    &["keep.rs", "local.txt", "sub/keep.rs"],
+                    &["secret.txt", "sub/deep.txt", "sub/local.txt"],
+                ),
+                Some("../src/sub") => (&["keep.rs"], &["deep.txt", "local.txt"]),
+                Some("../..") => (
+                    &["src/keep.rs", "src/local.txt", "src/sub/keep.rs"],
+                    &["src/secret.txt", "src/sub/deep.txt", "src/sub/local.txt"],
+                ),
+                other => panic!("unexpected parent-relative root {other:?}"),
+            };
+            for path in visible {
+                assert!(
+                    paths.contains(&PathBuf::from(path)),
+                    "root spelling {spelling:?} must keep {path} under {root:?}: {paths:?}"
+                );
+            }
+            for path in hidden {
+                assert!(
+                    !paths.contains(&PathBuf::from(path)),
+                    "root spelling {spelling:?} must ignore {path} under {root:?}: {paths:?}"
+                );
+            }
+            return;
+        }
+
+        let fixture = Fixture::new();
+        for path in [
+            "src/secret.txt",
+            "src/local.txt",
+            "src/keep.rs",
+            "src/sub/deep.txt",
+            "src/sub/local.txt",
+            "src/sub/keep.rs",
+        ] {
+            fixture.write(path);
+        }
+        fs::create_dir(fixture.root.join(".git")).expect("create repository metadata directory");
+        fs::write(
+            fixture.root.join(".gitignore"),
+            b"/src/secret.txt\n/src/sub/deep.txt\n",
+        )
+        .expect("write repository ignore rules");
+        fs::write(fixture.root.join("src/sub/.gitignore"), b"local.txt\n")
+            .expect("write subtree ignore rule");
+
+        for (working_directory, spelling) in [
+            (fixture.root.join("src/sub"), ".."),
+            (fixture.root.join("src"), "../src/sub"),
+            (fixture.root.join("src/sub"), "../.."),
+        ] {
+            let status = Command::new(std::env::current_exe().expect("locate test binary"))
+                .args([
+                    "tests::parent_components_in_relative_roots_keep_ignore_anchors",
+                    "--exact",
+                ])
+                .current_dir(working_directory)
+                .env(PARENT_ROOT_IGNORE_FIXTURE, &fixture.root)
+                .env(RELATIVE_ROOT_SPELLING, spelling)
+                .status()
+                .expect("run isolated parent-relative-root regression test");
+            assert!(
+                status.success(),
+                "parent-relative-root child failed for {spelling:?}: {status}"
             );
         }
     }

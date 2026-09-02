@@ -18,7 +18,7 @@
 use std::{
     borrow::Cow,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
@@ -89,7 +89,10 @@ struct CandidateRoot {
 
 impl CandidateRoot {
     fn between(walk: &Path, discovery: &Path) -> Option<Self> {
-        let walk = without_dot_components(&glob_path_bytes(walk)).into_owned();
+        let mut walk = without_dot_components(&glob_path_bytes(walk)).into_owned();
+        while walk.len() > 1 && walk.ends_with(b"/") {
+            walk.pop();
+        }
         let discovery = without_dot_components(&glob_path_bytes(discovery)).into_owned();
         (walk != discovery).then_some(Self { walk, discovery })
     }
@@ -136,7 +139,7 @@ impl IgnoreScope {
         // public walk root is spelled as `.` or as one relative component.
         // Keep the original spelling in the walker itself: entry paths and
         // explicit-pattern anchoring are intentionally relative to that root.
-        let discovery_root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+        let discovery_root = discovery_path(root);
         let repository = repository_layout(&discovery_root);
         let adaptation =
             GitIgnoreAdaptation::effective(walker, repository.as_ref().map(|(_, layout)| layout));
@@ -183,11 +186,7 @@ impl IgnoreScope {
         }
         let match_directory = self.candidate_root.as_ref().map_or_else(
             || Cow::Borrowed(directory),
-            |_| {
-                Cow::Owned(
-                    std::path::absolute(directory).unwrap_or_else(|_| directory.to_path_buf()),
-                )
-            },
+            |_| Cow::Owned(discovery_path(directory)),
         );
         let (rules, errors) = read_rules(
             backend,
@@ -251,6 +250,29 @@ impl IgnoreScope {
             candidate_root: self.candidate_root,
         }
     }
+}
+
+/// Resolves a relative spelling against the current directory, then removes
+/// lexical `.` and `..` components without following a symlink.
+///
+/// Repository discovery and ignore anchoring need one canonical spelling of
+/// the path, while the walker deliberately retains the caller's spelling for
+/// filesystem operations and returned [`crate::WalkEntry`] paths.
+fn discovery_path(path: &Path) -> PathBuf {
+    let Ok(absolute) = std::path::absolute(path) else {
+        return path.to_path_buf();
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// The directories whose in-tree rules a subtree walk inherits, from the
