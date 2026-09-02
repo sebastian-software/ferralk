@@ -78,7 +78,9 @@ pub(crate) struct IgnoreScope {
     /// that has any; directories without ignore files never appear.
     rules: Option<Arc<IgnoreNode>>,
     adaptation: GitIgnoreAdaptation,
-    candidate_root: Option<CandidateRoot>,
+    /// Behind an `Arc`: every queued directory carries a clone of its scope,
+    /// and the two spellings inside are the same for the whole walk.
+    candidate_root: Option<Arc<CandidateRoot>>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,7 +148,7 @@ impl IgnoreScope {
         let mut scope = Self {
             rules: None,
             adaptation,
-            candidate_root: CandidateRoot::between(root, &discovery_root),
+            candidate_root: CandidateRoot::between(root, &discovery_root).map(Arc::new),
         };
         let Some((repository_root, layout)) = repository else {
             return (scope, Vec::new());

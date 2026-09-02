@@ -315,6 +315,15 @@ start, because the process is at its thread or memory limit, leaves the walk
 to the workers already running and is reported as one recoverable
 `spawn_worker` error under `ErrorPolicy::Collect`.
 
+A long-running host should know one allocator effect of parallel walks. Each
+helper thread lands in its own glibc malloc arena, and the result vectors a
+large walk frees raise glibc's dynamic trim threshold, so after a parallel
+walk of a few hundred thousand entries the process can keep tens of megabytes
+of freed heap resident with almost nothing live; serial and `stream()` walks
+show no such retention. This is glibc's behaviour, not a leak. A daemon or
+language server that measures it can cap the arenas with `MALLOC_ARENA_MAX`
+or install a different global allocator.
+
 ### Hidden paths: two separate switches
 
 An ordinary wildcard does not cover a leading period, so `**/*.ts` skips

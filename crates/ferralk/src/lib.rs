@@ -2911,11 +2911,24 @@ impl Iterator for WalkStream {
                 continue;
             }
             let task = self.pending_directories.pop()?;
+            release_drained_capacity(&mut self.pending_directories);
             if let Some(result) = self.prepare_directory(task) {
                 return Some(result);
             }
         }
         None
+    }
+}
+
+/// Gives back the capacity a wide listing left behind once most of it has
+/// drained, so a stream over a tree with one huge directory does not hold that
+/// directory's worth of task buffers until the stream ends. Shrinking only
+/// past a quarter keeps the copies amortized: a buffer is moved at most once
+/// per halving.
+fn release_drained_capacity<T>(pending: &mut Vec<T>) {
+    const RETAINED_CAPACITY: usize = 64;
+    if pending.capacity() > RETAINED_CAPACITY && pending.len() <= pending.capacity() / 4 {
+        pending.shrink_to((pending.len() * 2).max(RETAINED_CAPACITY));
     }
 }
 
@@ -3738,6 +3751,33 @@ mod tests {
                 PathBuf::from("a/f1.txt"),
                 PathBuf::from("a"),
             ]
+        );
+    }
+
+    /// A stream over one wide directory queues every child before it yields
+    /// the first of them. The queue's buffer used to stay at that size until
+    /// the stream ended; now it is given back as the queue drains.
+    #[test]
+    fn stream_releases_task_capacity_as_a_wide_listing_drains() {
+        let fixture = Fixture::new();
+        for child in 0..300 {
+            fs::create_dir_all(fixture.root.join(format!("child-{child:03}")))
+                .expect("create child directory");
+        }
+        let mut stream = Walker::new(&fixture.root).stream();
+        let mut peak_capacity = 0;
+        while let Some(item) = stream.next() {
+            item.expect("fixture walk succeeds");
+            peak_capacity = peak_capacity.max(stream.pending_directories.capacity());
+        }
+        assert!(
+            peak_capacity >= 300,
+            "the wide listing was queued at once: {peak_capacity}"
+        );
+        assert!(
+            stream.pending_directories.capacity() <= 64,
+            "the drained queue keeps only a small buffer: {}",
+            stream.pending_directories.capacity()
         );
     }
 

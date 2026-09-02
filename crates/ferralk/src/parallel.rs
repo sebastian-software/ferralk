@@ -467,20 +467,27 @@ struct WorkerScratch {
 }
 
 /// Work local to the parallel frontend.
+///
+/// A task sits inline in the work-stealing deques, which double up to 65,536
+/// slots on a wide listing, so its size is paid once per queued directory.
+/// The continuation carries a whole `Listing` and is rare, one per widening
+/// listing rather than one per directory, so it lives behind a pointer.
 enum ParallelTask {
     Directory(DirectoryTask),
-    /// The unvisited tail of a wide directory listing. It lets the serial
-    /// route make already-discovered child directories available to helpers
-    /// without reopening the directory or its ignore files.
-    Continuation {
-        path: PathBuf,
-        depth: usize,
-        root: usize,
-        ancestors: AncestorChain,
-        ignores: super::gitignore::IgnoreScope,
-        listing: Listing,
-        next_entry: usize,
-    },
+    Continuation(Box<Continuation>),
+}
+
+/// The unvisited tail of a wide directory listing. It lets the serial route
+/// make already-discovered child directories available to helpers without
+/// reopening the directory or its ignore files.
+struct Continuation {
+    path: PathBuf,
+    depth: usize,
+    root: usize,
+    ancestors: AncestorChain,
+    ignores: super::gitignore::IgnoreScope,
+    listing: Listing,
+    next_entry: usize,
 }
 
 impl WorkerScratch {
@@ -709,15 +716,16 @@ fn process_directory(
             }
             (path, depth, root, ancestors, ignores, 0)
         }
-        ParallelTask::Continuation {
-            path,
-            depth,
-            root,
-            ancestors,
-            ignores,
-            listing,
-            next_entry,
-        } => {
+        ParallelTask::Continuation(continuation) => {
+            let Continuation {
+                path,
+                depth,
+                root,
+                ancestors,
+                ignores,
+                listing,
+                next_entry,
+            } = *continuation;
             worker.listing = listing;
             (path, depth, root, ancestors, ignores, next_entry)
         }
@@ -746,7 +754,7 @@ fn process_directory(
                 let listing = std::mem::take(&mut worker.listing);
                 shared.schedule(
                     &worker.queue,
-                    ParallelTask::Continuation {
+                    ParallelTask::Continuation(Box::new(Continuation {
                         path,
                         depth,
                         root,
@@ -754,7 +762,7 @@ fn process_directory(
                         ignores,
                         listing,
                         next_entry: index,
-                    },
+                    })),
                 );
                 return;
             }
@@ -1646,6 +1654,25 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The deques hold tasks inline and double up to 65,536 slots on a wide
+    /// listing, so the rare continuation must not set the size of every
+    /// queued directory. 352 bytes per task, before the continuation moved
+    /// behind a pointer, cost a flat 100,000-directory tree five times its
+    /// result in peak heap.
+    #[test]
+    fn a_queued_directory_costs_no_more_than_its_task() {
+        assert_eq!(
+            std::mem::size_of::<super::ParallelTask>(),
+            std::mem::size_of::<crate::DirectoryTask>(),
+            "the continuation payload must stay behind a pointer"
+        );
+        assert!(
+            std::mem::size_of::<super::ParallelTask>() <= 128,
+            "a task is {} bytes",
+            std::mem::size_of::<super::ParallelTask>()
+        );
     }
 
     #[test]
