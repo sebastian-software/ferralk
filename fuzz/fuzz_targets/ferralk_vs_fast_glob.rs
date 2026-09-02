@@ -13,7 +13,7 @@
 //! goes straight into `corpus/fast-glob.jsonl` after review.
 
 use corpus::{Case, Source, encode_bytes};
-use ferralk_glob::{Pattern, PatternOptions};
+use ferralk_glob::{Pattern, PatternOptions, expand_braces};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -84,7 +84,7 @@ fn split_input(data: &[u8]) -> (&[u8], &[u8]) {
 fn in_shared_subset(pattern: &[u8], path: &[u8]) -> bool {
     // ferralk path entry points normalize one conventional current-directory
     // prefix on both sides; fast-glob compares those bytes literally.
-    if pattern.starts_with(b"./") || path.starts_with(b"./") {
+    if path.starts_with(b"./") {
         return false;
     }
     // fast-glob reads a leading `!` as negation; ferralk has no negation.
@@ -166,7 +166,20 @@ fn in_shared_subset(pattern: &[u8], path: &[u8]) -> bool {
         }
         index += 1;
     }
-    brace_depth == 0
+    brace_depth == 0 && !has_leading_dot_slash_alternative(pattern)
+}
+
+/// Whether brace expansion exposes a current-directory prefix.
+///
+/// Looking at the source alone misses both an empty arm before `./` (`{x,}./`)
+/// and a dot arm before `/` (`{.}/`). Reusing the public expansion keeps this
+/// exclusion aligned with the matcher without duplicating its brace grammar.
+fn has_leading_dot_slash_alternative(pattern: &[u8]) -> bool {
+    if !pattern.contains(&b'{') {
+        return pattern.starts_with(b"./");
+    }
+    expand_braces(pattern, options())
+        .is_ok_and(|alternatives| alternatives.iter().any(|pattern| pattern.starts_with(b"./")))
 }
 
 fn contains_double_star(pattern: &[u8]) -> bool {

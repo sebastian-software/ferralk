@@ -23,7 +23,7 @@ excluded by the input shape, so a fuzz failure is always a new finding.
 
 | Divergence | Example | ferralk | fast-glob | Exclusion |
 |---|---|---|---|---|
-| One leading `./` is normalized by path APIs | `./` vs `` | `true` | `false` | Pattern or candidate starting with `./` |
+| One leading `./` is normalized by path APIs | `./` vs `` | `true` | `false` | Any brace-expanded pattern or candidate starting with `./` |
 | Leading `!` reads as negation | `!a` vs `b` | `false` | `true` | Patterns starting with `!` |
 | `**` is a whole path component, not a recursive wildcard | `**/a` vs `aa` | `true` | `false` | Any `**` except the pattern `**` itself |
 | A trailing `**` component elides to nothing | `a/**` vs `a` | `true` | `false` | Same rule |
@@ -55,6 +55,9 @@ they exhaust the machine, and ferralk reports `too many brace alternatives`.
 Brace expansion happens before matching, so an alternative can concatenate
 with the surrounding text into a `**` that only ferralk reads recursively
 (`{*}*` vs `/`). A star next to brace punctuation is therefore excluded too.
+For the same reason, the `./` exclusion checks the expanded alternatives: an
+empty brace arm can expose a later prefix (`{x,}./`), while a dot arm can join
+the following separator (`{.}/`).
 
 The negation, recursive wildcard, escaping, and POSIX rows hold for `is_match`
 as well and are corpus candidates. Leading `./` normalization and the
