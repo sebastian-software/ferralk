@@ -1553,7 +1553,8 @@ fn pattern_without_directory_marker(pattern: &[u8]) -> &[u8] {
 /// below the root, but `.` and `./` name the root itself, which a walk never
 /// emits. Any other real `.` component (`src/./x` or `src/.`) likewise names
 /// a spelling no root-relative candidate uses. Brace alternatives are expanded
-/// and therefore reject forms such as `{.,..}`, while an extglob-only
+/// and reject every arm containing `..`, including mixed forms such as
+/// `{src,..}`, while an extglob-only
 /// component such as `@(.)` remains deliberately opaque matcher text and
 /// selects nothing. The glob compiler summarizes its actual expanded
 /// alternatives and extglob branches, so this policy never reparses matcher
@@ -4045,7 +4046,7 @@ mod tests {
 
         // Dots that are matcher text, rather than slash-delimited path
         // components, remain valid in every mode. In particular this keeps
-        // escaped, class, brace and extglob literals out of the path check.
+        // escaped, class and extglob literals out of the path check.
         for pattern in [
             "./src/**",
             "...",
@@ -4053,11 +4054,9 @@ mod tests {
             r"\.\.",
             r"src\..\main.rs",
             "[.]",
-            "{..,src}",
             "@(..)",
             "src/[[:alpha:]/../].rs",
             "src/[]/../].rs",
-            "{dead/../branch,src/main.rs}",
             "@(dead/../branch|src/main.rs)",
             "src/[{],a}/../].rs",
             "@(dead/{),x}/../branch|src/main.rs)",
@@ -4092,17 +4091,12 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{pattern} remains opaque matcher text: {error}"));
         }
 
-        // A dead brace or extglob arm must not reject a viable one. Character
-        // classes use the glob parser's POSIX and leading-`]` grammar, so a
-        // slash or `..` text inside either class stays matcher syntax too.
+        // A dead extglob arm remains matcher syntax rather than brace-expanded
+        // walker input. Character classes use the glob parser's POSIX and
+        // leading-`]` grammar, so slash or `..` text stays matcher syntax too.
         // Extglobs retain their component-scoped matching rule, so only the
         // separator-crossing walk reads its slash-containing arm as one path.
         for (pattern, matching_paths, component_scoped_paths) in [
-            (
-                "{dead/../branch,src/main.rs}",
-                &["src/main.rs"][..],
-                &["src/main.rs"][..],
-            ),
             (
                 "@(dead/../branch|src/main.rs)",
                 &["src/main.rs"][..],
@@ -4196,6 +4190,9 @@ mod tests {
         for pattern in [
             "src/../main.rs",
             "src/{live,dead}/../main.rs",
+            "{..,src}",
+            "src/{a,..}",
+            "{dead/../branch,src/main.rs}",
             "{dead/[}]]/../x,src/main.rs}",
             "@(dead/[)]]/../x|src/main.rs)",
             "{dead/../branch}",
@@ -4226,6 +4223,9 @@ mod tests {
             WildcardMode::SeparatorCrossing,
         ] {
             for pattern in [
+                "{..,src}",
+                "src/{a,..}",
+                "{dead/../branch,src/main.rs}",
                 "{dead/[}]]/../x,src/main.rs}",
                 "@(dead/[)]]/../x|src/main.rs)",
                 "{dead/../branch}",
@@ -4274,6 +4274,7 @@ mod tests {
             ("src/@(./a.rs)", 6),
             ("{src}/../main.rs", 6),
             ("{a,b}/../main.rs", 6),
+            ("{a,..}/main.rs", 3),
             ("src/{x}/.", 8),
         ] {
             for mode in [
@@ -4336,6 +4337,13 @@ mod tests {
                 "/repo",
                 super::absolute::Syntax::Posix,
                 10,
+                b'.',
+            ),
+            (
+                "/repo/src/{a,..}",
+                "/repo",
+                super::absolute::Syntax::Posix,
+                13,
                 b'.',
             ),
             (

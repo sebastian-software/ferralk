@@ -12,6 +12,13 @@ paths, prefer `is_match_glob_path`: ordinary `*`, `?`, classes, and Extglob
 operators stay within one component, while an explicitly enabled `**` crosses
 components.
 
+`is_match_path` preserves the zlob list-filter convention instead: a wildcard
+in the root component may cross separators, while a wildcard after an explicit
+separator is component-local. Both path entry points ignore one conventional
+leading `./` on the pattern and candidate; `is_match` compares those bytes
+literally. With `recursive_double_star` disabled, any consecutive `**` has the
+same ordinary-star semantics as `*` through all three entry points.
+
 ```rust
 use ferralk_glob::{Pattern, PatternOptions};
 
@@ -33,7 +40,7 @@ The `PatternOptions` default is intentionally conservative:
 | Option | Default | Effect when enabled |
 | --- | --- | --- |
 | `braces` | off | Enables nested `{a,b}` alternatives. |
-| `recursive_double_star` | off | Gives consecutive `**` recursive semantics. |
+| `recursive_double_star` | off | Gives consecutive `**` recursive semantics; while off, a star run is equivalent to `*`. |
 | `extglob` | off | Enables Bash-style `@()`, `?()`, `*()`, `+()`, and `!()`. |
 | `match_hidden` | off | Allows wildcard tokens to match a leading period. |
 | `case_insensitive` | off | Uses ASCII-only case folding. |
