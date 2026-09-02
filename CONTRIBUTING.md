@@ -78,9 +78,14 @@ cargo check --manifest-path fuzz/Cargo.toml \
 ```
 
 This is the canonical portable preflight for a pull request and needs no Zig
-installation. Its Git-backed ignore test requires Git 2.52.0 or newer; on an
-older Git release that test prints a skip diagnostic, while CI replays it with
-the exact reference release, Git 2.52.0. The separate fuzz workspace is
+installation. Its Git-backed ignore test requires Git 2.52.0 or newer. On an
+older Git release that test skips and still passes; its companion
+`git_ignore_oracle_version_is_reported` prints the detected version and whether
+the corpus was replayed or skipped, visible with
+`cargo test -p harness --test git_check_ignore -- --show-output`, and fails
+when `FERRALK_REQUIRE_GIT_ORACLE=1` is set. CI sets that variable while
+replaying with the exact reference release, Git 2.52.0. The separate fuzz
+workspace is
 included because root-workspace commands do not compile it. The
 development-only `oracle` package links zlob; include it by dropping
 `--exclude oracle` only after installing Zig 0.16 and libclang.

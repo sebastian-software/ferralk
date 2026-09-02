@@ -243,7 +243,14 @@ pub struct CancellationToken {
 }
 
 impl CancellationToken {
-    /// Requests that the walker stop before its next filesystem operation.
+    /// Requests that the walker stop.
+    ///
+    /// The request is observed at a bounded granularity, not before the very
+    /// next filesystem operation. `collect()` reads the token when a worker
+    /// takes a directory and then once every 64 entries of that listing, so
+    /// each worker classifies at most that many more entries before stopping
+    /// and never opens another directory. `stream()` reads it before every
+    /// entry it yields.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }

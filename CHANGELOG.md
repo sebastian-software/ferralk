@@ -181,7 +181,8 @@
 
 * **Breaking:** pattern compilation now rejects `.` and `..` path components
   instead of accepting them. Correct the pattern before constructing a matcher
-  or walker.
+  or walker. (Since 0.11.0 only the walker rejects them; `Pattern::compile`
+  accepts `.` and `..` components as matcher text again.)
 * `ErrorPolicy::Skip` now reports every failure for a caller-supplied root,
   including read, metadata, and canonicalize failures in follow-symlink walks.
   It still skips recoverable failures discovered below a root.

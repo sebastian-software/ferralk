@@ -141,6 +141,9 @@ jobs:
           echo "$prefix/bin" >> "$GITHUB_PATH"
       - name: Replay the ignore corpus with the pinned Git oracle
         shell: bash
+        env:
+          # Turn a version skip into a failure: this job exists to replay.
+          FERRALK_REQUIRE_GIT_ORACLE: "1"
         run: |
           test "$(git --version)" = "git version $GIT_ORACLE_VERSION"
           cargo test -p harness --test git_check_ignore --locked -- --show-output

@@ -149,7 +149,8 @@ Important defaults:
   wildcard at or above the root, a `..`, and a pattern naming the root itself
   are rejected. Relative patterns receive the same guardrails: `.` and `./`
   name the root, and a `.` component after the conventional leading `./`
-  (such as `src/./main.rs`) or a real `..` component is rejected with guidance
+  (such as `src/./main.rs`), a real `..` component, or an empty component
+  left by a repeated separator (`src//*.ts`) is rejected with guidance
   instead of silently selecting nothing. See the
   [compatibility guide](compatibility-guide.md#absolute-patterns-and-the-caller-side-rewrite-they-replace).
 
@@ -338,8 +339,9 @@ or install a different global allocator.
 
 An ordinary wildcard does not cover a leading period, so `**/*.ts` skips
 `.react-router/routes.ts` — the period belongs to a directory component, and
-the whole subtree stays out of the result. `Walker::match_hidden(true)` opts in
-for include and exclude patterns alike:
+the whole subtree stays out of the result. The rule holds inside one component
+too: `*.rs` matches `.rs` only with `match_hidden(true)`.
+`Walker::match_hidden(true)` opts in for include and exclude patterns alike:
 
 ```rust,no_run
 use ferralk::{WalkOptions, Walker};

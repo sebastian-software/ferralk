@@ -36,7 +36,7 @@ assert!(pattern.is_match("src/lib.rs"));
 | syntax validation | `Pattern::validate` |
 | syntax preflight | `Pattern::has_wildcards` |
 | single filesystem-glob candidate | `Pattern::is_match_glob_path` (all ordinary wildcards are component-local) |
-| `zlob_match_paths` / `_at` and index variants | `Pattern::{is_match_path,filter_paths,filter_paths_at,filter_path_indices,filter_path_indices_at}` (stable input order; component-local `*`, `?`, and classes after `/`; `**` is recursive) |
+| `zlob_match_paths` / `_at` and index variants | `Pattern::{is_match_path,filter_paths,filter_paths_at,filter_path_indices,filter_path_indices_at}` (stable input order; component-local `*`, `?`, and classes after `/`; `**` is recursive only with `recursive_double_star`, otherwise ordinary-star semantics) |
 
 Ferralk accepts raw bytes (`AsRef<[u8]>`) for patterns and candidate paths, so
 callers do not need lossy UTF-8 conversion.
@@ -336,7 +336,13 @@ same way. It is a matching policy, independent of `match_hidden` and of
 - Direct matching excludes leading-period path components by default. Enable
   `PatternOptions::match_hidden` for a compiled pattern, or
   `Walker::match_hidden` for a whole walk, to opt in; this is the
-  POSIX-conservative default selected by ADR-0011.
+  POSIX-conservative default selected by ADR-0011. It holds inside one
+  component too: `*.rs` matches `.rs` only with `match_hidden` enabled.
+- Under `PatternOptions::case_insensitive`, `[[:upper:]]` and `[[:lower:]]`
+  fold symmetrically, so each matches every ASCII letter. Bash's `nocasematch`
+  tests a POSIX class against the unfolded byte, so `[[:upper:]]` still
+  rejects `a` there. Ranges fold both bounds before comparing, as Bash does,
+  so `[A-z]` and `[Z-a]` read the same way in both.
 - `ZLOB_TILDE` and `ZLOB_TILDE_CHECK` are out of scope. Callers resolve home
   directories before constructing a `Walker` when that behaviour is wanted.
 - `ZLOB_APPEND` and `ZLOB_DOOFFS` have no equivalent because Rust results are
