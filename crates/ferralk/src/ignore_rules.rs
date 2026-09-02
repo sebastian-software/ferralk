@@ -273,6 +273,14 @@ pub(crate) fn without_dot_components(path: &[u8]) -> Cow<'_, [u8]> {
     }
 
     let mut normalized = Vec::with_capacity(path.len());
+    without_dot_components_into(path, &mut normalized);
+    Cow::Owned(normalized)
+}
+
+/// The same lexical view, written into a caller-owned buffer so a walk that
+/// spells every candidate pays no allocation per entry.
+pub(crate) fn without_dot_components_into(path: &[u8], normalized: &mut Vec<u8>) {
+    normalized.clear();
     let mut wrote_component = false;
     for component in path.split(|byte| *byte == b'/') {
         if component == b"." {
@@ -284,7 +292,6 @@ pub(crate) fn without_dot_components(path: &[u8]) -> Cow<'_, [u8]> {
         normalized.extend_from_slice(component);
         wrote_component = true;
     }
-    Cow::Owned(normalized)
 }
 
 /// Fuzz entry point for the rule layer.

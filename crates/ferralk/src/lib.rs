@@ -1352,6 +1352,7 @@ impl Walker {
             walker: self,
             listing: Listing::default(),
             glob_bytes: Vec::new(),
+            ignore_bytes: Vec::new(),
             next_entry: 0,
             path: PathBuf::new(),
             directory: PathBuf::new(),
@@ -2690,6 +2691,7 @@ pub struct WalkStream {
     /// The directory being delivered and how far through it the stream is.
     listing: Listing,
     glob_bytes: Vec<u8>,
+    ignore_bytes: Vec<u8>,
     next_entry: usize,
     /// That directory's path, with the entry being classified pushed onto it.
     path: PathBuf,
@@ -2866,6 +2868,7 @@ impl WalkStream {
                 ancestors: &self.ancestors,
                 listing: &self.listing,
                 glob_bytes_scratch: &mut self.glob_bytes,
+                ignore_bytes_scratch: &mut self.ignore_bytes,
             },
         );
         // Only an emitted entry needs a path of its own, and the stream hands
@@ -2965,6 +2968,7 @@ struct DirectoryScratch {
     listing: Listing,
     path: PathBuf,
     glob_bytes: Vec<u8>,
+    ignore_bytes: Vec<u8>,
 }
 
 /// One suspended serial-directory listing. A child directory is scheduled
@@ -3219,6 +3223,7 @@ impl<'walker> WalkState<'walker> {
                     ancestors: &frame.task.ancestors,
                     listing: &frame.scratch.listing,
                     glob_bytes_scratch: &mut frame.scratch.glob_bytes,
+                    ignore_bytes_scratch: &mut frame.scratch.ignore_bytes,
                 },
             );
             match action {

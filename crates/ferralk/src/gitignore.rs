@@ -25,7 +25,7 @@ use std::{
 use super::glob_path_bytes;
 use super::{
     DirectoryBackend, Listing, Walker,
-    ignore_rules::{RuleSet, RuleSetBuilder, without_dot_components},
+    ignore_rules::{RuleSet, RuleSetBuilder, without_dot_components, without_dot_components_into},
     read_bounded_file,
 };
 
@@ -124,28 +124,33 @@ impl CandidateRoot {
         }
     }
 
-    fn map<'a>(&self, candidate: &'a [u8]) -> Cow<'a, [u8]> {
-        let candidate = without_dot_components(candidate);
-        let relative = if self.walk.is_empty() {
-            candidate.as_ref()
-        } else if candidate.as_ref() == self.walk {
-            &[]
-        } else if candidate.as_ref().starts_with(&self.walk)
-            && candidate.get(self.walk.len()) == Some(&b'/')
-        {
-            &candidate[self.walk.len() + 1..]
+    /// Spells a candidate given in the walk spelling in the discovery
+    /// spelling, into `scratch`, which the caller keeps for the whole walk so
+    /// that this costs one copy per entry and no allocation.
+    fn spell_into<'a>(&self, candidate: &[u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        without_dot_components_into(candidate, scratch);
+        let relative_start = if self.walk.is_empty() {
+            Some(0)
+        } else if scratch.as_slice() == self.walk {
+            Some(scratch.len())
+        } else if scratch.starts_with(&self.walk) && scratch.get(self.walk.len()) == Some(&b'/') {
+            Some(self.walk.len() + 1)
         } else {
-            return candidate;
+            None
         };
-        let mut mapped = Vec::with_capacity(self.discovery.len() + 1 + relative.len());
-        mapped.extend_from_slice(&self.discovery);
-        if !relative.is_empty() {
-            if !mapped.ends_with(b"/") {
-                mapped.push(b'/');
-            }
-            mapped.extend_from_slice(relative);
+        if let Some(relative_start) = relative_start {
+            let separator: &[u8] =
+                if relative_start < scratch.len() && !self.discovery.ends_with(b"/") {
+                    b"/"
+                } else {
+                    b""
+                };
+            scratch.splice(
+                ..relative_start,
+                self.discovery.iter().chain(separator).copied(),
+            );
         }
-        Cow::Owned(mapped)
+        scratch
     }
 }
 
@@ -230,8 +235,11 @@ impl IgnoreScope {
     /// The deepest ignore file with an opinion decides, which is Git's
     /// precedence. An entry below an ignored directory never reaches this: the
     /// walk does not enter such a directory.
+    ///
+    /// `scratch` is the walk's buffer for the candidate in the discovery
+    /// spelling; see [`CandidateRoot::spell_into`].
     #[cfg(not(windows))]
-    pub(crate) fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+    pub(crate) fn is_ignored(&self, path: &Path, is_dir: bool, scratch: &mut Vec<u8>) -> bool {
         let Some(node) = self.rules.as_ref() else {
             return false;
         };
@@ -242,23 +250,28 @@ impl IgnoreScope {
         // `.` in every emitted path. Align the spelling once for the whole
         // rule chain without resolving `..` or following the filesystem.
         let candidate = glob_path_bytes(path);
-        let candidate = self.candidate_root.as_ref().map_or_else(
-            || without_dot_components(&candidate),
-            |root| root.map(&candidate),
-        );
-        node.verdict(&candidate, is_dir).unwrap_or(false)
+        match self.candidate_root.as_ref() {
+            Some(root) => node.verdict(root.spell_into(&candidate, scratch), is_dir),
+            None => node.verdict(&without_dot_components(&candidate), is_dir),
+        }
+        .unwrap_or(false)
     }
 
     #[cfg(windows)]
-    pub(crate) fn is_ignored_bytes(&self, candidate: &[u8], is_dir: bool) -> bool {
-        let candidate = self.candidate_root.as_ref().map_or_else(
-            || without_dot_components(candidate),
-            |root| root.map(candidate),
-        );
-        self.rules
-            .as_ref()
-            .and_then(|node| node.verdict(&candidate, is_dir))
-            .unwrap_or(false)
+    pub(crate) fn is_ignored_bytes(
+        &self,
+        candidate: &[u8],
+        is_dir: bool,
+        scratch: &mut Vec<u8>,
+    ) -> bool {
+        let Some(node) = self.rules.as_ref() else {
+            return false;
+        };
+        match self.candidate_root.as_ref() {
+            Some(root) => node.verdict(root.spell_into(candidate, scratch), is_dir),
+            None => node.verdict(&without_dot_components(candidate), is_dir),
+        }
+        .unwrap_or(false)
     }
 
     /// Puts `rules` on the chain, unless they are empty: an empty matcher can
