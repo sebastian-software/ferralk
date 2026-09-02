@@ -13,7 +13,7 @@ use zlob::{
 /// Any corpus change must update this inventory deliberately, so additions
 /// cannot bypass the oracle through a broadened skip condition.
 const EXPECTED_REPLAYED: usize = 527;
-const EXPECTED_SKIPPED: usize = 264;
+const EXPECTED_SKIPPED: usize = 265;
 
 /// Cases the zlob 1.6.3 Rust API cannot express, counted by reason.
 #[derive(Default)]

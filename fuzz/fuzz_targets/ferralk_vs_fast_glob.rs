@@ -18,7 +18,7 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let (pattern, path) = split_input(data);
-    if !in_shared_subset(pattern) {
+    if !in_shared_subset(pattern, path) {
         return;
     }
     // fast-glob rejects patterns ferralk accepts and the reverse; comparing a
@@ -81,7 +81,12 @@ fn split_input(data: &[u8]) -> (&[u8], &[u8]) {
 ///
 /// Each rejection corresponds to one recorded divergence; see
 /// `docs/fast-glob-reference.md`.
-fn in_shared_subset(pattern: &[u8]) -> bool {
+fn in_shared_subset(pattern: &[u8], path: &[u8]) -> bool {
+    // ferralk path entry points normalize one conventional current-directory
+    // prefix on both sides; fast-glob compares those bytes literally.
+    if pattern.starts_with(b"./") || path.starts_with(b"./") {
+        return false;
+    }
     // fast-glob reads a leading `!` as negation; ferralk has no negation.
     if pattern.first() == Some(&b'!') {
         return false;
@@ -262,7 +267,7 @@ fn class_end(pattern: &[u8], open: usize, inside_brace: bool) -> Option<usize> {
 fn corpus_candidate(pattern: &[u8], path: &[u8], ours: bool, reference: bool) -> String {
     let case = Case {
         id: format!("fastglob-diff-{:016x}", fingerprint(pattern, path)),
-        kind: corpus::CaseKind::Matcher,
+        kind: corpus::CaseKind::MatchGlobPath,
         paths: Vec::new(),
         matches: Vec::new(),
         oracle_matches: None,

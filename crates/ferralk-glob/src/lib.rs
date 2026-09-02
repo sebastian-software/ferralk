@@ -7964,6 +7964,13 @@ mod tests {
             assert!(pattern.is_match_glob_path("lua/setup.lua"));
             assert!(pattern.is_match_glob_path("./lua/setup.lua"));
         }
+
+        let current_directory = compile("./");
+        assert!(current_directory.is_match_path(""));
+        assert!(current_directory.is_match_path("./"));
+        assert!(current_directory.is_match_glob_path(""));
+        assert!(current_directory.is_match_glob_path("./"));
+        assert!(!current_directory.is_match(""));
     }
 
     #[test]
