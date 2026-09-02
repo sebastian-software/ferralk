@@ -4743,7 +4743,11 @@ fn compile_extglob_step(
     Ok(match pattern[index] {
         b'*' => {
             let mut next = index + 1;
-            while pattern.get(next) == Some(&b'*') {
+            // Shell extglob grammar gives the final star in a run to a `*(`
+            // opener. Keep the preceding stars as one ordinary wildcard, but
+            // leave that last offset for the group compiler instead of
+            // greedily swallowing it into the run.
+            while pattern.get(next) == Some(&b'*') && detect_extglob_at(pattern, next).is_none() {
                 next += 1;
             }
             ExtglobStep::Star {
@@ -7118,6 +7122,43 @@ mod tests {
             .expect("backtracking extglob compiles");
         assert!(retained.is_match_path("aa//"));
         assert!(!retained.is_match("aa/./"));
+    }
+
+    #[test]
+    fn last_star_in_a_run_opens_an_extglob_group() {
+        let options = PatternOptions::default().extglob(true).match_hidden(true);
+
+        for pattern in ["**(a)", "***(a)", "a**(b)"] {
+            let compiled = Pattern::compile(pattern, options).expect("extglob compiles");
+            assert!(
+                compiled.alternatives[0]
+                    .extglob
+                    .as_ref()
+                    .is_some_and(|program| !program.groups.is_empty()),
+                "{pattern:?} must retain its final `*(` as an extglob opener"
+            );
+        }
+
+        let leading = Pattern::compile("**(a)", options).expect("extglob compiles");
+        for candidate in ["", "ab", "x", "(a)", "x(a)"] {
+            assert!(
+                leading.is_match(candidate),
+                "the outer star may consume {candidate:?} before the zero-width group"
+            );
+        }
+
+        let embedded = Pattern::compile("a**(b)", options).expect("extglob compiles");
+        for candidate in ["a", "ab", "ax"] {
+            assert!(
+                embedded.is_match(candidate),
+                "expected {candidate:?} to match"
+            );
+        }
+
+        let disabled = Pattern::compile("**(a)", PatternOptions::default())
+            .expect("literal parenthesized suffix compiles");
+        assert!(disabled.is_match("x(a)"));
+        assert!(!disabled.is_match("x"));
     }
 
     #[test]
