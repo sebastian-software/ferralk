@@ -3,7 +3,8 @@ name: Walker benchmarks
 # The wall-time lane, and since 2026-08-19 the only automated performance
 # lane: walker benches touch the filesystem and run on several threads, so
 # only elapsed time says anything useful about them. Criterion measures, and
-# the medians are published as a job summary and an artifact.
+# pull requests compare merge-base and head medians back to back in one job.
+# Push and dispatch runs publish one snapshot.
 #
 # A shared GitHub runner is noisy: read these numbers as indicative, and
 # compare runs on the same lane rather than treating a single delta as a
@@ -45,14 +46,98 @@ jobs:
             features: "--features native-macos"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Pull-request jobs need both commits in order to derive the true
+          # merge base rather than comparing with a stored or moving baseline.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Prepare pull-request revisions
+        if: github.event_name == 'pull_request'
+        id: revisions
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          git worktree add --detach "$RUNNER_TEMP/ferralk-bench-base" "$merge_base"
+          git worktree add --detach "$RUNNER_TEMP/ferralk-bench-head" "$HEAD_SHA"
+          echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+      - name: Build pull-request benchmark binaries
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_benchmark() {
+            local source=$1
+            local destination=$2
+            local target=$3
+            CARGO_TARGET_DIR="$target" \
+              cargo bench --manifest-path "$source/Cargo.toml" \
+                -p bench --bench walker ${{ matrix.features }} \
+                --locked --no-run --message-format=json |
+              python3 -c '
+          import json
+          import shutil
+          import sys
+
+          executable = None
+          for line in sys.stdin:
+              try:
+                  message = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if message.get("reason") == "compiler-message":
+                  rendered = message.get("message", {}).get("rendered")
+                  if rendered:
+                      print(rendered, file=sys.stderr, end="")
+              target = message.get("target", {})
+              if target.get("name") == "walker" and message.get("executable"):
+                  executable = message["executable"]
+          if executable is None:
+              raise SystemExit("cargo did not report the walker benchmark executable")
+          shutil.copy2(executable, sys.argv[1])
+          ' "$destination"
+            chmod +x "$destination"
+          }
+
+          build_benchmark \
+            "$RUNNER_TEMP/ferralk-bench-base" \
+            "$RUNNER_TEMP/walker-merge-base" \
+            "$GITHUB_WORKSPACE/target/walker-${{ matrix.lane }}-merge-base"
+          build_benchmark \
+            "$RUNNER_TEMP/ferralk-bench-head" \
+            "$RUNNER_TEMP/walker-head" \
+            "$GITHUB_WORKSPACE/target/walker-${{ matrix.lane }}-head"
+      - name: Measure merge base and pull-request head
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd "$RUNNER_TEMP/ferralk-bench-base"
+            CARGO_TARGET_DIR="$RUNNER_TEMP/criterion-merge-base" \
+              "$RUNNER_TEMP/walker-merge-base" \
+                --bench --warm-up-time 1 --measurement-time 5 --sample-size 20 \
+                --output-format bencher
+          ) | tee "walker-${{ matrix.lane }}-merge-base.txt"
+          (
+            cd "$RUNNER_TEMP/ferralk-bench-head"
+            CARGO_TARGET_DIR="$RUNNER_TEMP/criterion-head" \
+              "$RUNNER_TEMP/walker-head" \
+                --bench --warm-up-time 1 --measurement-time 5 --sample-size 20 \
+                --output-format bencher
+          ) | tee "walker-${{ matrix.lane }}-head.txt"
       # Shorter than criterion's defaults so the lane stays inside a pull
       # request's budget; the sample count is still large enough for a median.
       # The restored target directory can carry partial criterion state from
       # another commit, and criterion then fails to load a baseline and prints
       # no measurement at all -- while still exiting zero. Start from nothing.
       - name: Measure
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           rm -rf target/criterion
@@ -61,6 +146,7 @@ jobs:
             --output-format bencher | tee walker-${{ matrix.lane }}.txt
       # A performance lane that prints nothing must not report success.
       - name: Check that the lane actually measured something
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           if ! grep -q 'ns/iter' walker-${{ matrix.lane }}.txt; then
@@ -68,7 +154,7 @@ jobs:
             exit 1
           fi
       - name: Publish the medians
-        if: always()
+        if: github.event_name != 'pull_request' && always()
         run: |
           {
             echo "### Walker wall time — ${{ matrix.lane }}"
@@ -80,12 +166,28 @@ jobs:
             echo
             echo 'Shared runner, warm page cache. Indicative, not a regression gate.'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish the pull-request comparison
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### Walker wall time — ${{ matrix.lane }}"
+            echo
+            echo 'Merge base `${{ steps.revisions.outputs.merge_base }}`; PR head `${{ steps.revisions.outputs.head }}`.'
+            echo
+            cargo run --quiet --locked -p bench --bin compare_bencher -- \
+              "walker-${{ matrix.lane }}-merge-base.txt" \
+              "walker-${{ matrix.lane }}-head.txt"
+            echo
+            echo 'Shared runner, warm page cache. Head/base is indicative, not a regression gate.'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload the raw measurements
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: walker-walltime-${{ matrix.lane }}
-          path: walker-${{ matrix.lane }}.txt
+          path: walker-${{ matrix.lane }}*.txt
           if-no-files-found: warn
 
   # The engine comparison from docs/benchmark-evidence.md. It builds a 53k-file
