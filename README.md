@@ -39,9 +39,9 @@ For an unreleased Git dependency, pin a revision for repeatable builds.
 
 ## Local benchmark snapshot
 
-This snapshot was refreshed on 2026-08-28 on a Mac Studio with an Apple M1
-Ultra, 20 cores, 64 GB RAM, macOS 26.5.2, Rust 1.96.0, and Node.js 24.19.0. It
-is a local comparison, not a portable promise. Lower is better.
+This snapshot was refreshed on 2026-09-03 on a MacBook Pro with an Apple M1
+Pro, 10 cores, 32 GB RAM, macOS 26.6.2, Rust 1.97.1, and Node.js 26.8.1. It is
+a local comparison, not a portable promise. Lower is better.
 
 Matcher values use the common `src/**/*.rs` syntax. The Rust and zlob rows are
 Criterion point estimates; the Node.js rows are medians of fifteen
@@ -50,13 +50,13 @@ order-rotated samples, each containing 100,000 matches.
 | Matcher | Match | Non-match |
 | --- | ---: | ---: |
 | Ferralk (compiled) | **10 ns** | 3 ns |
-| zlob 1.6.3 (compiled) | 37 ns | **2 ns** |
-| `globset` (compiled) | 39 ns | 39 ns |
+| zlob 1.6.5 (compiled) | 35 ns | **2 ns** |
+| `globset` (compiled) | 37 ns | 36 ns |
 | `fast-glob` (interpreted) | 97 ns | 106 ns |
-| `wax` (compiled) | 31 ns | 31 ns |
-| `picomatch` 4.0.7 (compiled, Node.js) | 80.9 ns | 90.9 ns |
-| `micromatch` 4.0.8 (compiled, Node.js) | 80.6 ns | 91.0 ns |
-| `minimatch` 10.2.6 (compiled, Node.js) | 238.3 ns | 219.0 ns |
+| `wax` (compiled) | 31 ns | 30 ns |
+| `picomatch` 4.0.7 (compiled, Node.js) | 73.6 ns | 85.9 ns |
+| `micromatch` 4.0.8 (compiled, Node.js) | 73.5 ns | 86.9 ns |
+| `minimatch` 10.2.6 (compiled, Node.js) | 210.9 ns | 198.5 ns |
 
 The walker fixture contains 53,600 files. An **unscoped** query such as
 `**/*.{ts,tsx}` can match anywhere, so every walker must inspect the complete
@@ -66,15 +66,15 @@ especially `node_modules`, directly from the pattern.
 
 | Walker | Unscoped, 7,400 matches | Scoped, 2,600 matches |
 | --- | ---: | ---: |
-| Ferralk portable, 4 threads | 37.78 ms | **4.29 ms** |
-| zlob 1.6.3, same portable run | **20.12 ms** | 20.30 ms |
-| Ferralk macOS-native, 4 threads | 33.90 ms | 6.27 ms |
-| zlob 1.6.3, same native run | 30.22 ms | 20.93 ms |
-| Node.js `node:fs` sync | 286.49 ms | 31.51 ms |
-| `glob` 13.0.6 async | 48.56 ms | 8.08 ms |
-| `fast-glob` 3.3.3 async | 50.73 ms | 8.29 ms |
-| `tinyglobby` 0.2.17 async | 47.34 ms | 8.21 ms |
-| `fdir` 6.5.0 + `picomatch` async | 47.08 ms | 42.09 ms |
+| Ferralk portable, 4 threads | 33.00 ms | 5.92 ms |
+| zlob 1.6.5, same portable run | 30.35 ms | 30.60 ms |
+| Ferralk macOS-native, 4 threads | 29.80 ms | **5.41 ms** |
+| zlob 1.6.5, same native run | **29.56 ms** | 30.54 ms |
+| Node.js `node:fs` sync | 219.24 ms | 27.73 ms |
+| `glob` 13.0.6 async | 37.97 ms | 7.76 ms |
+| `fast-glob` 3.3.3 async | 45.35 ms | 7.12 ms |
+| `tinyglobby` 0.2.17 async | 37.08 ms | 7.23 ms |
+| `fdir` 6.5.0 + `picomatch` async | 36.57 ms | 37.46 ms |
 
 The Rust walker rows are Criterion point estimates; the Node.js rows are
 medians of ten order-rotated samples. The APIs and estimators are not identical,
