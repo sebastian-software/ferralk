@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.12.0](https://github.com/sebastian-software/ferralk/compare/v0.11.0...v0.12.0) (2026-09-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* settle the v1.0 contract ([#351](https://github.com/sebastian-software/ferralk/issues/351))
+* resolve the round-5 review findings (#328 to #339) ([#340](https://github.com/sebastian-software/ferralk/issues/340))
+
+### Features
+
+* settle the v1.0 contract ([#351](https://github.com/sebastian-software/ferralk/issues/351)) ([83cadf4](https://github.com/sebastian-software/ferralk/commit/83cadf4939e6f97a6e3e7c271a0c27521d751a2f)), closes [#343](https://github.com/sebastian-software/ferralk/issues/343) [#344](https://github.com/sebastian-software/ferralk/issues/344) [#345](https://github.com/sebastian-software/ferralk/issues/345) [#346](https://github.com/sebastian-software/ferralk/issues/346) [#347](https://github.com/sebastian-software/ferralk/issues/347) [#348](https://github.com/sebastian-software/ferralk/issues/348) [#349](https://github.com/sebastian-software/ferralk/issues/349) [#342](https://github.com/sebastian-software/ferralk/issues/342)
+
+
+### Bug Fixes
+
+* resolve the round-5 review findings ([#328](https://github.com/sebastian-software/ferralk/issues/328) to [#339](https://github.com/sebastian-software/ferralk/issues/339)) ([#340](https://github.com/sebastian-software/ferralk/issues/340)) ([518a7d9](https://github.com/sebastian-software/ferralk/commit/518a7d9222d85fb8c40146ceabd271992db6c7b2))
+
+
+### Performance Improvements
+
+* **walker:** bound wide directory frontiers ([#352](https://github.com/sebastian-software/ferralk/issues/352)) ([0590fa6](https://github.com/sebastian-software/ferralk/commit/0590fa621cc680566200beaa9832f8b4b32511aa))
+* **walker:** classify ordinary directories in one batch ([#355](https://github.com/sebastian-software/ferralk/issues/355)) ([a84ec92](https://github.com/sebastian-software/ferralk/commit/a84ec92bcf3503cab785a9ffce337aca04fbecca))
+* **walker:** scan entry names byte by byte ([#356](https://github.com/sebastian-software/ferralk/issues/356)) ([9abe9b6](https://github.com/sebastian-software/ferralk/commit/9abe9b650b6fe64cbf675f662de80e66fa3a2217))
+
 ## [0.11.0](https://github.com/sebastian-software/ferralk/compare/v0.10.0...v0.11.0) (2026-09-02)
 
 

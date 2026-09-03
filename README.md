@@ -67,14 +67,14 @@ consecutive adversarial review rounds without a consumer-visible breaking
 change, then a release candidate, then one more clean round. Until then, do not
 rely on a 1.0 stability guarantee. Both crates are published on crates.io; use
 the current
-0.11.0 release line for applications. <!-- x-release-please-version -->
+0.12.0 release line for applications. <!-- x-release-please-version -->
 
 ## Install
 
 ```toml
 [dependencies]
-ferralk = "0.11.0" # x-release-please-version
-ferralk-glob = "0.11.0" # x-release-please-version
+ferralk = "0.12.0" # x-release-please-version
+ferralk-glob = "0.12.0" # x-release-please-version
 ```
 
 Depend on `ferralk-glob` alone when you only match strings or paths you already
