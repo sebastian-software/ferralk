@@ -1868,10 +1868,21 @@ impl TraversalPattern {
     }
 }
 
+/// Whether `path` ends in `.` followed by `extension`.
+///
+/// The period is checked first and the extension compared byte by byte: this
+/// runs for every entry against every literal extension, and a two- or
+/// three-byte comparison through `memcmp` cost more than the comparison.
 fn ends_with_extension(path: &[u8], extension: &[u8]) -> bool {
-    path.len() > extension.len()
-        && path.ends_with(extension)
-        && path[path.len() - extension.len() - 1] == b'.'
+    let Some(start) = path.len().checked_sub(extension.len()) else {
+        return false;
+    };
+    start > 0
+        && path[start - 1] == b'.'
+        && path[start..]
+            .iter()
+            .zip(extension)
+            .all(|(actual, expected)| actual == expected)
 }
 
 /// Whether `path` is the literal root, or one of the two contains the other:
@@ -2967,10 +2978,10 @@ impl WalkStream {
             }
             let index = frame.next_entry;
             frame.next_entry += 1;
-            frame
-                .scratch
-                .path
-                .push(frame.scratch.listing.entries()[index].name());
+            push_entry_name(
+                &mut frame.scratch.path,
+                frame.scratch.listing.entries()[index].name(),
+            );
             let action = classify_entry(
                 &self.walker,
                 &SystemBackend,
@@ -3174,6 +3185,25 @@ fn reset_to_directory(path: &mut PathBuf, directory: &Path) {
     path.as_mut_os_string().push(directory.as_os_str());
 }
 
+/// Appends one directory entry's name below the directory already in `path`.
+///
+/// `PathBuf::push` inspects every value it is given for a root or a prefix,
+/// which a name from a directory listing never carries. This runs once per
+/// entry, so the separator and the name go straight onto the buffer instead.
+/// The separator rule is `PathBuf::push`'s: none after an empty buffer or one
+/// that already ends in a separator.
+pub(crate) fn push_entry_name(path: &mut PathBuf, name: &OsStr) {
+    let buffer = path.as_mut_os_string();
+    let needs_separator = buffer
+        .as_encoded_bytes()
+        .last()
+        .is_some_and(|&byte| byte != b'/' && !(cfg!(windows) && byte == b'\\'));
+    if needs_separator {
+        buffer.push(std::path::MAIN_SEPARATOR_STR);
+    }
+    buffer.push(name);
+}
+
 /// Copies `path` into a buffer of its own, reusing `spare` when an entry the
 /// walk dropped left one behind.
 ///
@@ -3359,10 +3389,10 @@ impl<'walker> WalkState<'walker> {
             // about; anything that outlives that copies it out.
             let index = frame.next_entry;
             frame.next_entry += 1;
-            frame
-                .scratch
-                .path
-                .push(frame.scratch.listing.entries()[index].name());
+            push_entry_name(
+                &mut frame.scratch.path,
+                frame.scratch.listing.entries()[index].name(),
+            );
             let action = classify_entry(
                 self.walker,
                 backend,
@@ -3514,9 +3544,34 @@ mod tests {
     use super::{
         CancellationToken, DirectoryFrame, DirectoryScratch, ErrorPolicy, Pattern, PatternOptions,
         SerialTask, TraversalPattern, Verdict, WalkEntry, WalkEntryKind, WalkOptions, WalkStream,
-        Walker, WildcardMode, glob_path_bytes, literal_extension, literal_pattern_root,
-        traversal_pattern_options,
+        Walker, WildcardMode, ends_with_extension, glob_path_bytes, literal_extension,
+        literal_pattern_root, push_entry_name, traversal_pattern_options,
     };
+
+    #[test]
+    fn push_entry_name_follows_path_buf_push() {
+        for root in ["", "/", ".", "./", "dir", "dir/", "/a/b", "a//b"] {
+            let mut expected = PathBuf::from(root);
+            expected.push("name.rs");
+            let mut actual = PathBuf::from(root);
+            push_entry_name(&mut actual, std::ffi::OsStr::new("name.rs"));
+            assert_eq!(actual, expected, "root {root:?}");
+        }
+    }
+
+    #[test]
+    fn extension_check_requires_a_period_before_the_literal_extension() {
+        assert!(ends_with_extension(b"src/lib.rs", b"rs"));
+        assert!(ends_with_extension(b"lib.rs", b"rs"));
+        assert!(ends_with_extension(b".rs", b"rs"));
+        assert!(ends_with_extension(b"types.d.ts", b"ts"));
+        assert!(!ends_with_extension(b"rs", b"rs"));
+        assert!(!ends_with_extension(b"lib.rsx", b"rs"));
+        assert!(!ends_with_extension(b"lib.ts", b"tsx"));
+        assert!(!ends_with_extension(b"librs", b"rs"));
+        assert!(!ends_with_extension(b"dir.rs/main", b"rs"));
+        assert!(!ends_with_extension(b"", b"rs"));
+    }
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
