@@ -14,7 +14,7 @@
 //! Run it on macOS with the native ferralk backend and the pinned zlob oracle:
 //!
 //! ```text
-//! LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib cargo +stable bench -p bench \
+//! LIBCLANG_PATH=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib cargo +stable bench -p bench \
 //!   --bench walker_zlob_ablation --features native-macos,zlob-oracle \
 //!   -- --output-format bencher --noplot
 //! ```
