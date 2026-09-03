@@ -32,13 +32,11 @@
 //! cargo bench -p bench --bench walker_palamedes --features zlob-oracle  # needs Zig
 //! ```
 
-use std::{
-    fs,
-    hint::black_box,
-    path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{hint::black_box, path::Path, time::Duration};
 
+use bench::{
+    NODE_MODULES_EXCLUDE, RepositoryFixture, SCOPED_TYPESCRIPT_PATTERN, TYPESCRIPT_PATTERN,
+};
 use criterion::{Criterion, criterion_group, criterion_main};
 use ferralk::{WalkOptions, Walker};
 use globset::{Glob, GlobSetBuilder};
@@ -52,145 +50,17 @@ use wax::walk::Entry as _;
 /// Threads for every parallel arm, so the comparison is like for like rather
 /// than a reading of whatever `available_parallelism` reports on the host.
 const THREADS: usize = 4;
-const TYPESCRIPT_PATTERN: &str = "**/*.{ts,tsx}";
-const SCOPED_TYPESCRIPT_PATTERN: &str = "{src,packages}/**/*.{ts,tsx}";
-const NODE_MODULES_EXCLUDE: &str = "**/node_modules/**";
-const NODE_MODULES_GITIGNORE: &[u8] = include_bytes!("../fixtures/palamedes.gitignore");
-
-/// A JavaScript repository whose file count sits in `node_modules`.
-///
-/// The proportions follow the shape the RFC measured: a few thousand source
-/// files worth finding, buried under an order of magnitude more dependency
-/// files that every walk has to step over.
-struct Fixture {
-    root: PathBuf,
-    files: usize,
-    sources: usize,
-}
-
-impl Fixture {
-    fn new() -> Self {
-        let unique = format!(
-            "ferralk-palamedes-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock is after epoch")
-                .as_nanos()
-        );
-        let root = std::env::temp_dir().join(unique);
-        let mut files = 0;
-        let mut sources = 0;
-
-        // Application sources: what the query is actually looking for.
-        for area in 0..40 {
-            for module in 0..10 {
-                let directory = root
-                    .join("src")
-                    .join(format!("area-{area}"))
-                    .join(format!("module-{module}"));
-                fs::create_dir_all(&directory).expect("create source directory");
-                for index in 0..10 {
-                    let (name, is_source) = match index % 5 {
-                        0 => (format!("view-{index}.tsx"), true),
-                        1 | 2 => (format!("unit-{index}.ts"), true),
-                        3 => (format!("style-{index}.css"), false),
-                        _ => (format!("legacy-{index}.js"), false),
-                    };
-                    write(&directory.join(name));
-                    files += 1;
-                    sources += usize::from(is_source);
-                }
-            }
-        }
-
-        // A second source root, so a scoped query has more than one literal
-        // root to prune to.
-        for package in 0..20 {
-            let directory = root
-                .join("packages")
-                .join(format!("pkg-{package}"))
-                .join("src");
-            fs::create_dir_all(&directory).expect("create package directory");
-            for index in 0..20 {
-                let is_source = index % 2 == 0;
-                let name = if is_source {
-                    format!("index-{index}.ts")
-                } else {
-                    format!("index-{index}.js")
-                };
-                write(&directory.join(name));
-                files += 1;
-                sources += usize::from(is_source);
-            }
-        }
-
-        // Dependencies: the bulk of the tree, and the part a scoped query never
-        // needs to open. Every tenth package nests its own dependencies, the
-        // way a real tree does.
-        for package in 0_usize..400 {
-            let package_root = root.join("node_modules").join(format!("dep-{package}"));
-            files += write_package(&package_root, 100);
-            if package.is_multiple_of(10) {
-                for nested in 0..5 {
-                    let nested_root = package_root
-                        .join("node_modules")
-                        .join(format!("nested-{nested}"));
-                    files += write_package(&nested_root, 40);
-                }
-            }
-        }
-
-        fs::write(root.join(".gitignore"), NODE_MODULES_GITIGNORE)
-            .expect("write benchmark gitignore");
-        files += 1;
-
-        Self {
-            root,
-            files,
-            sources,
-        }
-    }
-}
-
-/// Writes one dependency package: mostly JavaScript and metadata, plus the
-/// type declarations that make `**/*.ts` match inside `node_modules` too.
-fn write_package(package_root: &Path, files: usize) -> usize {
-    let directory = package_root.join("lib");
-    fs::create_dir_all(&directory).expect("create dependency directory");
-    write(&package_root.join("package.json"));
-    write(&package_root.join("README.md"));
-    for index in 0..files {
-        let name = match index % 10 {
-            0 => format!("types-{index}.d.ts"),
-            1 => format!("meta-{index}.json"),
-            _ => format!("chunk-{index}.js"),
-        };
-        write(&directory.join(name));
-    }
-    files + 2
-}
-
-fn write(path: &Path) {
-    fs::write(path, b"fixture").expect("write fixture file");
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
 fn palamedes(c: &mut Criterion) {
-    let fixture = Fixture::new();
+    let fixture = RepositoryFixture::new();
     assert!(
-        fixture.files >= 50_000,
+        fixture.files() >= 50_000,
         "the fixture must reach the 50k files the RFC measured, has {}",
-        fixture.files
+        fixture.files()
     );
     println!(
         "palamedes fixture: {} files, {} of them TypeScript sources",
-        fixture.files, fixture.sources
+        fixture.files(),
+        fixture.sources()
     );
 
     let mut group = c.benchmark_group("walker_palamedes");
@@ -218,31 +88,31 @@ fn palamedes(c: &mut Criterion) {
         // A faster arm that finds fewer files would not be a comparison. Every
         // arm is run once here and has to agree on the count before any of them
         // is timed.
-        let found = ferralk_walk(&fixture.root, ferralk_pattern, THREADS);
+        let found = ferralk_walk(fixture.root(), ferralk_pattern, THREADS);
         assert_eq!(
             found,
-            ferralk_walk(&fixture.root, ferralk_pattern, 1),
+            ferralk_walk(fixture.root(), ferralk_pattern, 1),
             "{query}: ferralk's own arms disagree"
         );
         assert_eq!(
             found,
-            ignore_serial_globset(&fixture.root, &override_globs),
+            ignore_serial_globset(fixture.root(), &override_globs),
             "{query}: ignore + globset disagrees with ferralk"
         );
         assert_eq!(
             found,
-            walkdir_serial_globset(&fixture.root, &override_globs),
+            walkdir_serial_globset(fixture.root(), &override_globs),
             "{query}: walkdir + globset disagrees with ferralk"
         );
         assert_eq!(
             found,
-            jwalk_globset(&fixture.root, &override_globs, JwalkParallelism::Serial,),
+            jwalk_globset(fixture.root(), &override_globs, JwalkParallelism::Serial,),
             "{query}: jwalk serial + globset disagrees with ferralk"
         );
         assert_eq!(
             found,
             jwalk_globset(
-                &fixture.root,
+                fixture.root(),
                 &override_globs,
                 JwalkParallelism::RayonNewPool(THREADS),
             ),
@@ -250,52 +120,52 @@ fn palamedes(c: &mut Criterion) {
         );
         assert_eq!(
             found,
-            globwalk_serial(&fixture.root, &override_globs),
+            globwalk_serial(fixture.root(), &override_globs),
             "{query}: globwalk disagrees with ferralk"
         );
         assert_eq!(
             found,
-            wax_walk(&fixture.root, ferralk_pattern),
+            wax_walk(fixture.root(), ferralk_pattern),
             "{query}: wax disagrees with ferralk"
         );
         assert_eq!(
             found,
-            ignore_parallel_overrides(&fixture.root, &override_globs),
+            ignore_parallel_overrides(fixture.root(), &override_globs),
             "{query}: ignore overrides disagree with ferralk"
         );
         if !scoped_roots.is_empty() {
             assert_eq!(
                 found,
-                ignore_parallel_pruned(&fixture.root, &override_globs, scoped_roots),
+                ignore_parallel_pruned(fixture.root(), &override_globs, scoped_roots),
                 "{query}: hand-pruned ignore disagrees with ferralk"
             );
         }
         #[cfg(feature = "zlob-oracle")]
         assert_eq!(
             found,
-            zlob_walk(&fixture.root, ferralk_pattern, THREADS),
+            zlob_walk(fixture.root(), ferralk_pattern, THREADS),
             "{query}: zlob disagrees with ferralk"
         );
         println!("palamedes {query}: every arm found {found} files");
 
         group.bench_function(format!("{query}/ferralk_serial"), |benchmark| {
-            benchmark.iter(|| black_box(ferralk_walk(&fixture.root, ferralk_pattern, 1)))
+            benchmark.iter(|| black_box(ferralk_walk(fixture.root(), ferralk_pattern, 1)))
         });
         group.bench_function(format!("{query}/ferralk_parallel"), |benchmark| {
-            benchmark.iter(|| black_box(ferralk_walk(&fixture.root, ferralk_pattern, THREADS)))
+            benchmark.iter(|| black_box(ferralk_walk(fixture.root(), ferralk_pattern, THREADS)))
         });
         // The RFC's "current Palamedes" arm: walk everything serially and match
         // every path with globset, without telling the walker what to skip.
         group.bench_function(format!("{query}/ignore_serial_globset"), |benchmark| {
-            benchmark.iter(|| black_box(ignore_serial_globset(&fixture.root, &override_globs)))
+            benchmark.iter(|| black_box(ignore_serial_globset(fixture.root(), &override_globs)))
         });
         group.bench_function(format!("{query}/walkdir_serial_globset"), |benchmark| {
-            benchmark.iter(|| black_box(walkdir_serial_globset(&fixture.root, &override_globs)))
+            benchmark.iter(|| black_box(walkdir_serial_globset(fixture.root(), &override_globs)))
         });
         group.bench_function(format!("{query}/jwalk_serial_globset"), |benchmark| {
             benchmark.iter(|| {
                 black_box(jwalk_globset(
-                    &fixture.root,
+                    fixture.root(),
                     &override_globs,
                     JwalkParallelism::Serial,
                 ))
@@ -304,23 +174,23 @@ fn palamedes(c: &mut Criterion) {
         group.bench_function(format!("{query}/jwalk_parallel_globset"), |benchmark| {
             benchmark.iter(|| {
                 black_box(jwalk_globset(
-                    &fixture.root,
+                    fixture.root(),
                     &override_globs,
                     JwalkParallelism::RayonNewPool(THREADS),
                 ))
             })
         });
         group.bench_function(format!("{query}/globwalk_serial"), |benchmark| {
-            benchmark.iter(|| black_box(globwalk_serial(&fixture.root, &override_globs)))
+            benchmark.iter(|| black_box(globwalk_serial(fixture.root(), &override_globs)))
         });
         group.bench_function(format!("{query}/wax_serial"), |benchmark| {
-            benchmark.iter(|| black_box(wax_walk(&fixture.root, ferralk_pattern)))
+            benchmark.iter(|| black_box(wax_walk(fixture.root(), ferralk_pattern)))
         });
         // `ignore` parallel with the same globs as overrides. Overrides decide
         // which entries are yielded, not which directories are opened, so this
         // arm still reads the whole tree.
         group.bench_function(format!("{query}/ignore_parallel_overrides"), |benchmark| {
-            benchmark.iter(|| black_box(ignore_parallel_overrides(&fixture.root, &override_globs)))
+            benchmark.iter(|| black_box(ignore_parallel_overrides(fixture.root(), &override_globs)))
         });
         // The RFC's "safe subtree pruning" arm: the pruning Palamedes wrote by
         // hand, expressed as `filter_entry`, so `ignore` skips the directories
@@ -330,7 +200,7 @@ fn palamedes(c: &mut Criterion) {
             group.bench_function(format!("{query}/ignore_parallel_pruned"), |benchmark| {
                 benchmark.iter(|| {
                     black_box(ignore_parallel_pruned(
-                        &fixture.root,
+                        fixture.root(),
                         &override_globs,
                         scoped_roots,
                     ))
@@ -339,7 +209,7 @@ fn palamedes(c: &mut Criterion) {
         }
         #[cfg(feature = "zlob-oracle")]
         group.bench_function(format!("{query}/zlob_parallel"), |benchmark| {
-            benchmark.iter(|| black_box(zlob_walk(&fixture.root, ferralk_pattern, THREADS)))
+            benchmark.iter(|| black_box(zlob_walk(fixture.root(), ferralk_pattern, THREADS)))
         });
     }
     bench_exclude_pruning(&mut group, &fixture);
@@ -354,7 +224,7 @@ fn palamedes(c: &mut Criterion) {
 #[cfg(feature = "thread-sweep")]
 fn bench_thread_sweep(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
-    fixture: &Fixture,
+    fixture: &RepositoryFixture,
 ) {
     let available = std::thread::available_parallelism()
         .map(usize::from)
@@ -366,14 +236,14 @@ fn bench_thread_sweep(
         ("threads_8".to_owned(), 8),
         (format!("threads_available_{available}"), available),
     ];
-    let expected = ferralk_walk(&fixture.root, TYPESCRIPT_PATTERN, 1);
+    let expected = ferralk_walk(fixture.root(), TYPESCRIPT_PATTERN, 1);
     println!(
         "palamedes thread sweep: available_parallelism={available}, every arm found {expected} files"
     );
 
     for (label, threads) in points {
         assert_eq!(
-            ferralk_walk(&fixture.root, TYPESCRIPT_PATTERN, threads),
+            ferralk_walk(fixture.root(), TYPESCRIPT_PATTERN, threads),
             expected,
             "thread sweep: ferralk at {threads} threads disagrees"
         );
@@ -381,19 +251,19 @@ fn bench_thread_sweep(
             format!("thread_sweep/unscoped/ferralk/{label}"),
             |benchmark| {
                 benchmark
-                    .iter(|| black_box(ferralk_walk(&fixture.root, TYPESCRIPT_PATTERN, threads)))
+                    .iter(|| black_box(ferralk_walk(fixture.root(), TYPESCRIPT_PATTERN, threads)))
             },
         );
 
         #[cfg(feature = "zlob-oracle")]
         {
             assert_eq!(
-                zlob_walk(&fixture.root, TYPESCRIPT_PATTERN, threads),
+                zlob_walk(fixture.root(), TYPESCRIPT_PATTERN, threads),
                 expected,
                 "thread sweep: zlob at {threads} threads disagrees"
             );
             group.bench_function(format!("thread_sweep/unscoped/zlob/{label}"), |benchmark| {
-                benchmark.iter(|| black_box(zlob_walk(&fixture.root, TYPESCRIPT_PATTERN, threads)))
+                benchmark.iter(|| black_box(zlob_walk(fixture.root(), TYPESCRIPT_PATTERN, threads)))
             });
         }
     }
@@ -404,23 +274,23 @@ fn bench_thread_sweep(
 /// timings run, so a pruning arm cannot appear fast by silently finding less.
 fn bench_exclude_pruning(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
-    fixture: &Fixture,
+    fixture: &RepositoryFixture,
 ) {
-    let expected = ferralk_walk(&fixture.root, SCOPED_TYPESCRIPT_PATTERN, THREADS);
-    let excluded = ferralk_excluded_walk(&fixture.root, THREADS);
+    let expected = ferralk_walk(fixture.root(), SCOPED_TYPESCRIPT_PATTERN, THREADS);
+    let excluded = ferralk_excluded_walk(fixture.root(), THREADS);
     assert_eq!(
         excluded,
-        ferralk_excluded_walk(&fixture.root, 1),
+        ferralk_excluded_walk(fixture.root(), 1),
         "exclude-pruned: ferralk's own arms disagree"
     );
     assert_eq!(
         excluded, expected,
         "exclude-pruned and scoped queries must select the same files"
     );
-    let gitignored = ferralk_gitignore_walk(&fixture.root, THREADS);
+    let gitignored = ferralk_gitignore_walk(fixture.root(), THREADS);
     assert_eq!(
         gitignored,
-        ferralk_gitignore_walk(&fixture.root, 1),
+        ferralk_gitignore_walk(fixture.root(), 1),
         "gitignore-pruned: ferralk's own arms disagree"
     );
     assert_eq!(
@@ -430,13 +300,13 @@ fn bench_exclude_pruning(
     println!("palamedes exclude-pruned: every arm found {expected} files");
 
     group.bench_function("exclude_pruned/ferralk_serial", |benchmark| {
-        benchmark.iter(|| black_box(ferralk_excluded_walk(&fixture.root, 1)))
+        benchmark.iter(|| black_box(ferralk_excluded_walk(fixture.root(), 1)))
     });
     group.bench_function("exclude_pruned/ferralk_parallel", |benchmark| {
-        benchmark.iter(|| black_box(ferralk_excluded_walk(&fixture.root, THREADS)))
+        benchmark.iter(|| black_box(ferralk_excluded_walk(fixture.root(), THREADS)))
     });
     group.bench_function("gitignore_pruned/ferralk_parallel", |benchmark| {
-        benchmark.iter(|| black_box(ferralk_gitignore_walk(&fixture.root, THREADS)))
+        benchmark.iter(|| black_box(ferralk_gitignore_walk(fixture.root(), THREADS)))
     });
 }
 
