@@ -20,7 +20,7 @@ use super::{
     AncestorChain, CANCELLATION_STRIDE, CYCLE_KEY_OPERATION, DirectoryBackend, EntryVisitor,
     ErrorPolicy, Listing, Verdict, WalkEntry, WalkError, WalkOperation, WalkResult, Walker,
     classify::{DirectoryTask, EmittedEntry, EntryAction, TraversalContext, classify_entry},
-    own_path, reset_to_directory,
+    own_path, push_entry_name, reset_to_directory,
     scheduler::{CacheLine, Coordinator, Scheduler, WorkerSlot},
 };
 
@@ -774,7 +774,7 @@ fn process_directory(
         }
         // The entry's path exists only for as long as it is being decided
         // about; anything that outlives that copies it out.
-        worker.path.push(worker.listing.entries()[index].name());
+        push_entry_name(&mut worker.path, worker.listing.entries()[index].name());
         let action = classify_entry(
             &shared.walker,
             shared.backend,

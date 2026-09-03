@@ -665,7 +665,7 @@ fn parse_bulk_record(record: &[u8]) -> io::Result<Option<(Range<usize>, Option<u
     let Some((&0, name)) = name_with_nul.split_last() else {
         return Err(malformed_bulk_record());
     };
-    if name.is_empty() || memchr::memchr2(0, b'/', name).is_some() {
+    if name.is_empty() || name_has_nul_or_separator(name) {
         return Err(malformed_bulk_record());
     }
     // The name without its terminating nul, as a range into `record`.
@@ -1049,6 +1049,20 @@ pub fn fuzz_validate_records(records: &[u8]) {
     let _ = for_each_record(records, |_, _| Ok(()));
 }
 
+/// Whether a name carries a byte no directory entry may hold.
+///
+/// This runs for every entry of every directory the walk reads, and a name is
+/// short: the vectorised search's entry sequence costs more than the bytes it
+/// would save. A name longer than one SIMD block is where that search starts
+/// to pay, so it keeps that case.
+fn name_has_nul_or_separator(name: &[u8]) -> bool {
+    const SCALAR_CEILING: usize = 32;
+    if name.len() > SCALAR_CEILING {
+        return memchr::memchr2(0, b'/', name).is_some();
+    }
+    name.iter().any(|&byte| byte == 0 || byte == b'/')
+}
+
 fn for_each_record(
     records: &[u8],
     mut visit: impl FnMut(&[u8], u8) -> io::Result<()>,
@@ -1083,9 +1097,7 @@ fn for_each_record(
         if name.is_empty() || name == b"." || name == b".." {
             continue;
         }
-        // One vectorised pass for both rejected bytes: this runs for every
-        // entry of every directory the walk reads.
-        if memchr::memchr2(0, b'/', name).is_some() {
+        if name_has_nul_or_separator(name) {
             return Err(malformed_record());
         }
         visit(name, record[TYPE_OFFSET])?;
@@ -1256,6 +1268,41 @@ mod tests {
         let oversized_length = oversized_name.len() as u16;
         oversized_name[18..20].copy_from_slice(&oversized_length.to_ne_bytes());
         assert!(parse_records(Path::new("/tmp"), &oversized_name, &mut listing).is_err());
+    }
+
+    #[test]
+    fn parser_rejects_separators_and_nuls_in_short_and_long_names() {
+        let mut listing = Listing::default();
+        let rejected_names: [&[u8]; 2] = [b"a/b", b"a\0b"];
+        for name in rejected_names {
+            assert!(parse_records(Path::new("/tmp"), &record(name, DT_REG), &mut listing).is_err());
+        }
+
+        // Longer than the scalar scan handles, so both searches are covered.
+        let long_name = [b'y'; 200];
+        for rejected in [b'/', 0] {
+            let mut long_with_rejected = long_name.to_vec();
+            long_with_rejected[100] = rejected;
+            assert!(
+                parse_records(
+                    Path::new("/tmp"),
+                    &record(&long_with_rejected, DT_REG),
+                    &mut listing
+                )
+                .is_err()
+            );
+        }
+
+        let mut records = record(&long_name, DT_DIR);
+        records.extend(record(b"short", DT_REG));
+        parse_records(Path::new("/tmp"), &records, &mut listing).expect("long and short parse");
+        assert_eq!(listing.entries().len(), 2);
+        assert_eq!(
+            listing.entries()[0].name().as_encoded_bytes(),
+            &long_name[..]
+        );
+        assert!(listing.entries()[0].is_dir());
+        assert_eq!(listing.entries()[1].name().as_encoded_bytes(), b"short");
     }
 
     #[test]

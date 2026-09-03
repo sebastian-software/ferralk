@@ -648,6 +648,38 @@ allocation-regression test gates the property: a second 100-entry sibling on
 the parallel route may cost no more than the constant task budget above the
 backend's per-entry floor. The macOS tables above predate this change.
 
+### Per-entry scans, 2026-09-03
+
+With the batch width settled, the serial profile of the native Linux walk
+put 19% of its user-space instructions in two vectorised `memchr` calls per
+directory entry, one for the record's NUL terminator and one for a separator
+in the name, and another 12% in the extension prefilter's `memcmp` calls. A
+name is a dozen bytes: the vectorised search's entry sequence costs more than
+the bytes it saves, and the two- or three-byte extension comparison cost more
+through `memcmp` than the comparison itself. The record parsers now answer
+both name questions in one byte-at-a-time pass for names that fit one SIMD
+block and keep the vectorised search above that, the extension check compares
+the period and the bytes directly, and each entry name is appended to the
+scratch path without `PathBuf::push` inspecting it for a root.
+
+Same host, fixture, and method as the previous section. Before is `a84ec92`.
+
+| Backend, threads | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| native, 4 threads | 6.25–6.46 ms | 6.03–6.21 ms | −3% to −4% |
+| portable, 4 threads | 6.44–6.78 ms | 6.21–6.55 ms | −1% to −5% |
+| native, serial | 18.6–22.8 ms | 17.7–22.6 ms | within noise |
+| portable, serial | 22.7–22.8 ms | 22.1–22.3 ms | −2% |
+
+Instruction counts for three serial walks: native 158 M before and 132 M
+after (−16%); portable 210 M and 200 M (−5%), since the portable reader has
+no record parser of its own. Kernel time is unchanged, and on this host it is
+most of the wall time, which is why a sixth of the user-space instructions
+moves the total by a few percent. The change is worth its size because it is
+a simplification with the same validation, guarded by the parser tests for
+short and long names on both native backends and by unit tests for the path
+and extension helpers.
+
 ## Selecting without a caller-side matcher
 
 The `caller_match` arms in [`walker.rs`](../tools/bench/benches/walker.rs) model

@@ -771,9 +771,7 @@ fn for_each_record(
         // the end of the record, so a valid terminating NUL may be its final
         // byte. Search the entire name-and-padding region.
         let name_and_padding = &record[NAME_OFFSET..record_length];
-        // Both scans run for every entry of every directory the walk reads, so
-        // they use the vectorised search rather than a byte-at-a-time loop.
-        let Some(name_length) = memchr::memchr(0, name_and_padding) else {
+        let Some((name_length, has_separator)) = name_length_and_separator(name_and_padding) else {
             return Err(malformed_record());
         };
         let name = &name_and_padding[..name_length];
@@ -783,12 +781,38 @@ fn for_each_record(
         if name.is_empty() || name == b"." || name == b".." {
             continue;
         }
-        if memchr::memchr(b'/', name).is_some() {
+        if has_separator {
             return Err(malformed_record());
         }
         visit(name, record[TYPE_OFFSET])?;
     }
     Ok(())
+}
+
+/// Length of the NUL-terminated name at the start of `bytes`, and whether a
+/// separator occurs before the terminator; `None` without a terminator.
+///
+/// This runs for every entry of every directory the walk reads, and a name is
+/// short: the vectorised search's entry sequence costs more than the bytes it
+/// would save, and it had to run twice, once for each byte. One pass answers
+/// both questions. A region longer than one SIMD block, a name of about thirty
+/// bytes or more, is where the vectorised search starts to pay, so it keeps
+/// that case.
+fn name_length_and_separator(bytes: &[u8]) -> Option<(usize, bool)> {
+    const SCALAR_CEILING: usize = 32;
+    if bytes.len() > SCALAR_CEILING {
+        let length = memchr::memchr(0, bytes)?;
+        return Some((length, memchr::memchr(b'/', &bytes[..length]).is_some()));
+    }
+    let mut has_separator = false;
+    for (index, &byte) in bytes.iter().enumerate() {
+        match byte {
+            0 => return Some((index, has_separator)),
+            b'/' => has_separator = true,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Classifies one entry, or reports that it no longer exists.
@@ -893,6 +917,37 @@ mod tests {
             *byte = b'x';
         }
         assert!(parse_records(Path::new("/tmp"), &missing_nul, &mut listing).is_err());
+    }
+
+    #[test]
+    fn parser_rejects_separators_and_keeps_long_names() {
+        let mut listing = Listing::default();
+        assert!(parse_records(Path::new("/tmp"), &record(b"a/b", DT_REG), &mut listing).is_err());
+
+        // Longer than the scalar scan handles, so both searches are covered.
+        let long_name = [b'y'; 200];
+        let mut long_with_separator = long_name.to_vec();
+        long_with_separator[100] = b'/';
+        assert!(
+            parse_records(
+                Path::new("/tmp"),
+                &record(&long_with_separator, DT_REG),
+                &mut listing
+            )
+            .is_err()
+        );
+
+        let mut records = record(&long_name, DT_DIR);
+        records.extend(record(b"short", DT_REG));
+        parse_records(Path::new("/tmp"), &records, &mut listing).expect("long and short parse");
+        assert_eq!(listing.entries().len(), 2);
+        assert_eq!(
+            listing.entries()[0].name().as_encoded_bytes(),
+            &long_name[..]
+        );
+        assert!(listing.entries()[0].is_dir());
+        assert_eq!(listing.entries()[1].name().as_encoded_bytes(), b"short");
+        assert!(!listing.entries()[1].is_dir());
     }
 
     // Linux's dirent wire fields use host endianness. The reviewed native
