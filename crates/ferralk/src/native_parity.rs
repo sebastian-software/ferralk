@@ -487,6 +487,37 @@ fn serial_suspension_keeps_native_descriptor_high_water_bounded() {
     );
 }
 
+#[test]
+fn dropping_a_stream_mid_listing_releases_its_suspended_native_directory() {
+    let fixture = Fixture::new("stream-frame-drop");
+    fixture.write("child/leaf.txt");
+    let retention = crate::retained_directory_test::Guard::new(64);
+    let mut stream = Walker::new(&fixture.root).stream();
+
+    let first = stream
+        .next()
+        .expect("the root contains a directory")
+        .expect("native stream starts successfully");
+    assert_eq!(
+        first
+            .path()
+            .strip_prefix(&fixture.root)
+            .expect("entry belongs to fixture"),
+        Path::new("child")
+    );
+    assert!(
+        retention.stats().current > 0,
+        "the suspended parent keeps its native directory until the stream is dropped"
+    );
+
+    drop(stream);
+    assert_eq!(
+        retention.stats().current,
+        0,
+        "dropping a partial stream releases every retained directory"
+    );
+}
+
 /// Below the release threshold a suspended frame keeps its descriptor, so a
 /// resumed frame costs no full-path open and no identity check. The root and
 /// its eight levels are nine descriptors, one per ancestor of the deepest

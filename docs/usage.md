@@ -338,6 +338,13 @@ start, because the process is at its thread or memory limit, leaves the walk
 to the workers already running and is reported as one recoverable
 `spawn_worker` error under `ErrorPolicy::Collect`.
 
+Wide directories do not become equally wide task queues. `stream()` suspends
+the current listing in one frame while it enters a child, and parallel walks
+classify at most 64 entries before handing the remaining listing back through
+one continuation. The listing names and retained results still scale with the
+directory, but pending traversal work is bounded by depth for `stream()` and by
+a small batch per active worker for parallel collection.
+
 A long-running host should know one allocator effect of parallel walks. Each
 helper thread lands in its own glibc malloc arena, and the result vectors a
 large walk frees raise glibc's dynamic trim threshold, so after a parallel
