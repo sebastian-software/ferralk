@@ -13,7 +13,7 @@ records the same distinction for releases.
 
 | Lane | What it measures | Where | Gating |
 | --- | --- | --- | --- |
-| Allocation regression | Zero allocations for warmed compiled matches; steady-state serial-walker growth above the platform's portable `std::fs` floor, with and without Git ignore rules | [`allocation_regression.rs`](../crates/ferralk/tests/allocation_regression.rs), every platform test and both native-backend jobs | Yes |
+| Allocation regression | Zero allocations for warmed compiled matches; steady-state serial-walker growth above the platform's portable `std::fs` floor, with and without Git ignore rules, and the same growth on the parallel route over wide sibling directories | [`allocation_regression.rs`](../crates/ferralk/tests/allocation_regression.rs), every platform test and both native-backend jobs | Yes |
 | Matcher, wall time | Compiled-pattern matching and compilation, against `globset`, `fast-glob`, and `wax` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
 | Walker, wall time | Warm-cache traversal of synthetic repository-shaped trees plus a 400-level chain, including an include-plus-covering-exclude pruning arm, ferralk serial and parallel against `ignore` parallel, one job per backend that ships | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request, medians in the job summary and as an artifact | No |
 | Engine comparison | One repository shape with unscoped include, scoped include, include-plus-exclude, and gitignore-pruned queries | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), run on demand | No |
@@ -609,6 +609,44 @@ The descriptor high-water mark of a serial walk over a 300-level chain moves
 from one to 128 above the baseline, the threshold, and stays there. The
 `wide/` arm of the `walker` bench lane was added with this change so a
 per-directory cost on the serial route shows up per pull request.
+
+### Listing batch width, 2026-09-03
+
+Revision `0590fa6` split every parallel listing into 64-entry batches and
+handed the remainder on through a continuation that takes the listing's name
+buffers with it. The local queue is depth-first, so a worker reading wide
+siblings hands every one of them off before any continuation returns to it,
+and each such directory costs a fresh set of buffers that its consumer later
+drops. On the 53,600-file repository fixture that was every `lib/` directory:
+under callgrind a four-thread walk executed 40% more user-space instructions
+than a serial one (244 M against 174 M), all of them in the allocator. The
+batch is now 1,024 entries, so an ordinary directory is classified in one piece
+while the frontier bound remains for the directory that would otherwise queue a
+hundred thousand tasks. The same change replaces the extension prefilter's
+separator and period scans with a direct suffix comparison, which is where the
+serial instruction count below moves.
+
+Portable and `--features native-linux` backends, Linux x86_64 container with
+four cores, the repository fixture on tmpfs, warm cache; each cell is the
+range of three medians of 30 iterations, the before and after binaries
+alternating within every round. Before is `034d816`.
+
+| Backend, threads | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| native, 4 threads | 7.69–9.09 ms | 4.96–6.12 ms | **−32% to −35%** |
+| portable, 4 threads | 9.32–10.79 ms | 6.54–7.29 ms | **−28% to −32%** |
+| native, serial | 18.5–22.5 ms | 18.3–22.7 ms | within noise |
+| portable, serial | 23.0–23.3 ms | 22.9–23.1 ms | within noise |
+
+Instruction counts for three native walks: serial 174 M before and 158 M
+after; four threads 244 M before and 161 M after. The four-thread walk now
+executes the instructions of the serial one. Syscalls are unchanged and at the
+floor for the native backend, one `openat`, two `getdents64`, and one `close`
+per directory, so the saving is user-space work, and it should be a smaller
+share of the wall time on a host whose kernel is slower per directory. The
+allocation-regression test gates the property: a second 100-entry sibling on
+the parallel route may cost no more than the constant task budget above the
+backend's per-entry floor. The macOS tables above predate this change.
 
 ## Selecting without a caller-side matcher
 
