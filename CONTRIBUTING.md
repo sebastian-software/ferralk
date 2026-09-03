@@ -122,3 +122,9 @@ protects is defined in [`docs/stability.md`](docs/stability.md).
 - [ ] Cut `1.0.0-rc.1` only after the two clean rounds. Keep the release
   candidate for one further adversarial round; cut `1.0.0` only if that round
   also produces no consumer-visible breaking change.
+- [ ] Tell Release Please the version explicitly. Its `bump-minor-pre-major`
+  setting turns every breaking change on `0.x` into a minor bump, so it never
+  proposes a major version on its own. Land a commit on `main` whose footer
+  reads `Release-As: 1.0.0-rc.1` for the candidate, and later one with
+  `Release-As: 1.0.0`; the release pull request then carries that version and
+  the ordinary bump rules resume from it.
