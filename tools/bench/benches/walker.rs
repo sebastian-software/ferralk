@@ -20,6 +20,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use bench::{RepositoryFixture, TYPESCRIPT_PATTERN};
 use criterion::{Criterion, criterion_group, criterion_main};
 use ferralk::{Verdict, WalkOptions, Walker, WildcardMode};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -113,6 +114,11 @@ impl Drop for Fixture {
 }
 
 fn walker(c: &mut Criterion) {
+    // The regression shape from #352, kept Ferralk-only here so it is cheap
+    // enough to compare with the merge base on every pull request. The full
+    // multi-engine comparison remains in `walker_palamedes` on manual dispatch.
+    bench_repository_shape(c);
+
     // 16 chains, four levels deep, two files per directory: the same 128 files
     // the previous fixture held, now at an effective depth of four.
     let small = Fixture::new(16, 4, 2);
@@ -158,6 +164,50 @@ fn walker(c: &mut Criterion) {
     bench_caller_matching(c, "large/", &large);
     bench_caller_matching(c, "mini/", &mini);
     bench_multi_root(c, &roots);
+}
+
+fn bench_repository_shape(c: &mut Criterion) {
+    let fixture = RepositoryFixture::new();
+    assert_eq!(fixture.files(), 53_601);
+    assert_eq!(fixture.sources(), 2_600);
+
+    let collect = |threads| {
+        Walker::new(fixture.root())
+            .threads(threads)
+            .include(TYPESCRIPT_PATTERN)
+            .expect("benchmark include is valid")
+            .options(WalkOptions::default())
+            .collect()
+            .expect("benchmark walk succeeds")
+            .entries()
+            .len()
+    };
+    let stream = || {
+        Walker::new(fixture.root())
+            .include(TYPESCRIPT_PATTERN)
+            .expect("benchmark include is valid")
+            .options(WalkOptions::default())
+            .stream()
+            .fold(0, |count, entry| {
+                entry.expect("benchmark stream succeeds");
+                count + 1
+            })
+    };
+    let expected = collect(1);
+    assert_eq!(expected, 7_400);
+    assert_eq!(collect(4), expected);
+    assert_eq!(stream(), expected);
+
+    c.bench_function(&format!("{LANE}/repository/unscoped/serial"), |benchmark| {
+        benchmark.iter(|| black_box(collect(1)))
+    });
+    c.bench_function(
+        &format!("{LANE}/repository/unscoped/parallel"),
+        |benchmark| benchmark.iter(|| black_box(collect(4))),
+    );
+    c.bench_function(&format!("{LANE}/repository/unscoped/stream"), |benchmark| {
+        benchmark.iter(|| black_box(stream()))
+    });
 }
 
 /// The cheapest per-PR guard for include-plus-exclude pruning. The include

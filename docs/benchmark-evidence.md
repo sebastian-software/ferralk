@@ -15,7 +15,7 @@ records the same distinction for releases.
 | --- | --- | --- | --- |
 | Allocation regression | Zero allocations for warmed compiled matches; steady-state serial-walker growth above the platform's portable `std::fs` floor, with and without Git ignore rules, and the same growth on the parallel route over wide sibling directories | [`allocation_regression.rs`](../crates/ferralk/tests/allocation_regression.rs), every platform test and both native-backend jobs | Yes |
 | Matcher, wall time | Compiled-pattern matching and compilation, against `globset`, `fast-glob`, and `wax` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
-| Walker, wall time | Warm-cache traversal of synthetic repository-shaped trees plus a 400-level chain, including an include-plus-covering-exclude pruning arm, ferralk serial and parallel against `ignore` parallel, one job per backend that ships | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request, medians in the job summary and as an artifact | No |
+| Walker, wall time | Warm-cache traversal of synthetic trees, including serial, parallel, and `stream()` over the 53k-file repository shape, a 400-level chain, include-plus-covering-exclude pruning, and comparisons with `ignore` parallel | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request compares the merge base and head back to back in one job for every shipped backend; medians and head/base ratios are published in the job summary and as artifacts | No |
 | Engine comparison | One repository shape with unscoped include, scoped include, include-plus-exclude, and gitignore-pruned queries | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), run on demand | No |
 | Thread scaling | Ferralk and, when enabled, zlob over the unscoped 53k-file query at 1, 2, 4, 8, and `available_parallelism` threads | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs) with `thread-sweep`, local or manual zlob dispatch | No |
 | zlob ablations | Ferralk and zlob on one fixed fixture, split into traversal, filtering, result retention, and path-representation costs | [`walker_zlob_ablation.rs`](../tools/bench/benches/walker_zlob_ablation.rs), run on demand | No |
@@ -28,8 +28,10 @@ machine. It was removed on 2026-08-19: over the period it ran it produced four
 false alarms and no true finding, every one of them a stale baseline rather
 than a change in the code under test. For a library of this scope the
 back-to-back measurement a contributor takes on one machine, before and after,
-proved to be the evidence that actually caught things. Automated protection
-now comes from the walker wall-time lane, which runs on every pull request.
+proved to be the evidence that actually caught things. The walker wall-time
+lane therefore builds the merge base and pull-request head separately and
+measures them back to back on the same runner. It publishes their ratio for
+visibility but does not fail on it; push and manual runs publish one snapshot.
 
 That instrument was never right for the walker in any case: it serializes
 threads and does not model syscall cost, so a parallel-versus-serial comparison
