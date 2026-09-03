@@ -4,9 +4,42 @@
 
 //! Compiled, byte-first glob patterns with explicit behaviour-changing options.
 //!
+//! A [`Pattern`] is compiled once from any `AsRef<[u8]>` and matched many
+//! times against bytes, so filenames never pass through a lossy UTF-8
+//! conversion. Syntax that changes meaning is opt-in through
+//! [`PatternOptions`]: recursive `**`, braces, extglobs, hidden-name matching,
+//! and ASCII case folding are off until asked for.
+//!
+//! ```
+//! use ferralk_glob::{Pattern, PatternOptions};
+//!
+//! let pattern = Pattern::compile(
+//!     "src/**/*.{rs,toml}",
+//!     PatternOptions::default()
+//!         .recursive_double_star(true)
+//!         .braces(true),
+//! )?;
+//!
+//! assert!(pattern.is_match_glob_path("src/lib.rs"));
+//! assert!(pattern.is_match_glob_path("src/parser/Cargo.toml"));
+//! assert!(!pattern.is_match_glob_path("src/lib.rs.bak"));
+//! # Ok::<(), ferralk_glob::PatternError>(())
+//! ```
+//!
+//! Three entry points decide how far a wildcard may reach:
+//!
+//! - [`Pattern::is_match_glob_path`] keeps every ordinary wildcard inside one
+//!   path component, as a shell glob does. Use it for filesystem paths.
+//! - [`Pattern::is_match`] compares a whole byte sequence in which `/` is not
+//!   special.
+//! - [`Pattern::is_match_path`] and the [`Pattern::filter_paths`] family keep
+//!   zlob's list-filter rule for callers porting from it.
+//!
 //! The matcher covers literals, `*`, `?`, `**`, character
 //! classes, escapes, leading-period handling, ASCII case folding, nested brace
-//! expansion, and Bash-style extglobs.
+//! expansion, and Bash-style extglobs. The
+//! [usage guide](https://github.com/sebastian-software/ferralk/blob/main/docs/usage.md)
+//! documents each option with its default.
 //!
 //! Provenance: semantics are ported and differentially checked against zlob
 //! v1.6.3, source commit 4bc4da2cbc823d3911b4a1436448687c398977dd, primarily

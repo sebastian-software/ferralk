@@ -4,6 +4,39 @@ Ferralk has one matcher crate and one walker crate. The walker re-exports the
 matcher crate, but depending on `ferralk-glob` alone keeps applications that do
 not traverse filesystems dependency-light.
 
+## Where to start
+
+Pick the entry point by what you hold and how far a wildcard may reach:
+
+| You want to | Use | Wildcard scope |
+| --- | --- | --- |
+| Find files on disk | `Walker` with `include` and `exclude` patterns | Ordinary wildcards stay inside one component; `**` is recursive. Braces and extglobs are enabled for you. |
+| Match a path you already hold, as a shell glob would | `Pattern::is_match_glob_path` | Every ordinary wildcard stays inside one component; `**` crosses when `recursive_double_star` is enabled. |
+| Match a whole byte sequence in which `/` is not special | `Pattern::is_match` | Every wildcard may cross a separator. |
+| Filter a list the way zlob's `matchPaths` does | `Pattern::is_match_path` and the `filter_paths` family | zlob's list-filter rule, described below. |
+
+The walker's defaults are conservative: it reads nothing it was not asked to
+read and reports everything it found. The table lists each default and the
+switch that changes it; the sections below explain the semantics.
+
+| Concern | Default | Switch |
+| --- | --- | --- |
+| Which entries qualify | Every non-excluded entry when no include is set; otherwise any include, OR-ed | `Walker::include`, `Walker::exclude`, and the borrowed `try_` forms |
+| Wildcards and a leading period | Not matched, so `**/*.ts` skips `.cache/x.ts` | `Walker::match_hidden(true)` |
+| Hidden entries at all | Traversed and reported | `WalkOptions::skip_hidden(true)` drops them before any pattern runs |
+| `.gitignore`, `.ignore`, `.git/info/exclude` | Not read | `Walker::respect_git_ignore(true)` |
+| The `.git` directory under Git ignores | Skipped | `WalkOptions::keep_git_dir(true)` |
+| Symlinks below a root | Reported, not followed | `WalkOptions::follow_symlinks(true)` |
+| Symlink kind for `files_only` and `directories_only` | The listing's kind: a symlink is a symlink | `WalkOptions::resolve_symlink_kind(true)` classifies by target |
+| Entry kinds | Files, directories, and symlinks | `WalkOptions::files_only(true)` or `directories_only(true)` |
+| Depth | Unlimited | `WalkOptions::max_depth(n)` |
+| Ordering | Unsorted | `WalkOptions::sort(true)` |
+| Metadata | Not fetched | `WalkOptions::metadata(true)` |
+| Recoverable errors | Collected next to the entries | `Walker::error_policy(ErrorPolicy::Skip)` or `ErrorPolicy::Abort` |
+| Threads | Available parallelism, clamped to `1..=256` | `Walker::threads(n)`; `stream()` is always single-threaded |
+| Wildcard scope | Component-local, as in a shell | `Walker::wildcard_mode(WildcardMode::SeparatorCrossing)` for `globset`-style patterns |
+| Stopping early | Runs to completion | `Walker::cancellation(token)`, or `Verdict::Stop` from a `visit` predicate |
+
 ## Match paths deliberately
 
 `Pattern` accepts `AsRef<[u8]>`, so callers can match filenames without lossy

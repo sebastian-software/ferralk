@@ -6,12 +6,17 @@
 [![MSRV 1.96](https://img.shields.io/badge/MSRV-1.96-blue.svg)](docs/adr/0004-msrv-stable-minus-two.md)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Ferralk is a pure-Rust toolkit for byte-first glob matching and portable,
-parallel filesystem walking. It is split into two crates so consumers that only
-need matching do not pay for traversal dependencies:
+Ferralk finds files. Give it a glob such as `{src,packages}/**/*.{ts,tsx}` and
+it walks the tree in parallel, applies `.gitignore` the way Git does, and opens
+only the directories the pattern can reach. Filenames stay raw bytes and native
+`Path` values from the first directory read to the last match, so nothing is
+lost to a UTF-8 conversion.
 
-- `ferralk-glob` compiles and reuses glob patterns over arbitrary bytes.
-- `ferralk` walks filesystems, applies root-relative include/exclude patterns,
+It is published as two crates, so a consumer that only needs matching does not
+pay for traversal dependencies:
+
+- `ferralk-glob` compiles a glob once and matches it against arbitrary bytes.
+- `ferralk` walks filesystems with root-relative include and exclude patterns,
   and re-exports `ferralk-glob`.
 
 Ferralk is independently developed and inspired by
@@ -19,15 +24,52 @@ Ferralk is independently developed and inspired by
 behaviour are checked against a frozen zlob reference, but it is not source
 compatible with zlob and deliberately has no C ABI.
 
+## Why Ferralk
+
+- **The pattern prunes the walk.** `{src,packages}/**/*.{ts,tsx}` names the
+  only roots that can match, so `node_modules` is never opened. Ferralk works
+  that out from the pattern. With `ignore`, the same saving needs a
+  hand-written `filter_entry`, and passing the globs as overrides alone still
+  reads the whole tree. The [benchmark snapshot](#local-benchmark-snapshot)
+  below shows what that is worth.
+- **Git semantics come from Git.** Ignore verdicts are replayed against
+  `git check-ignore` in CI, on Linux and on Windows, instead of being
+  reimplemented from memory. Nested `.gitignore` chains, `.ignore` files,
+  `.git/info/exclude`, linked worktrees, and `core.ignoreCase` are covered.
+- **Nothing surprising is on by default.** Hidden files, symlink following,
+  Git ignores, metadata, sorting, and error handling are explicit switches,
+  and the [usage guide](docs/usage.md) documents each one with its default.
+- **Safe Rust.** The matcher crate forbids `unsafe`, the portable walker denies
+  it, and CI fails on any `unsafe` outside the two audited native-backend
+  modules, which are opt-in features.
+- **Evidence rather than claims.** More than 800 checked-in behavioural cases,
+  differential checks against `fast-glob` and the frozen zlob reference,
+  AddressSanitizer and loom lanes, and tests on Linux, macOS, and Windows.
+  Performance is measured on every pull request and never used as a gate.
+
+### Next to the crates you may already use
+
+| Crate | What it is | Where Ferralk differs |
+| --- | --- | --- |
+| [`ignore`](https://crates.io/crates/ignore) | ripgrep's parallel walker with Git-ignore support | Its overrides decide what is yielded, not what is opened, so pruning a subtree needs a hand-written `filter_entry`. Ferralk prunes from the include pattern itself. |
+| [`globset`](https://crates.io/crates/globset) | Regex-backed matcher in which `*` crosses `/` by default | Ferralk's `*` stays inside one path component, as in a shell, and no pattern is translated to a regex. `WildcardMode::SeparatorCrossing` switches a walk to the `globset` reading when porting patterns. |
+| [`walkdir`](https://crates.io/crates/walkdir) | Serial traversal with no selection of its own | Ferralk walks in parallel and selects while it walks. |
+| [`zlob`](https://github.com/dmtrKovalenko/zlob) | Zig library behind a C ABI | Ferralk is an independent safe-Rust port of its matcher and walker semantics: no C ABI and no source compatibility. See the [migration guide](docs/compatibility-guide.md). |
+
 ## Status
 
-Ferralk is pre-1.0. The public API and release cadence are still being refined;
-do not rely on a 1.0 stability guarantee yet. The proposed
-[1.x stability contract](docs/stability.md) states exactly which public API,
-corpus semantics, entry-point rules, platform tier, and MSRV policy become
-stable at 1.0—and which implementation details and feature flags do not. Both
-crates are published on crates.io; use the current
+Ferralk is pre-1.0. The
+[1.x stability contract](docs/stability.md) is settled: it states which public
+API, corpus semantics, entry-point rules, platform tier, and MSRV policy become
+stable at 1.0, and which implementation details and feature flags do not. What
+remains before 1.0 is evidence that the contract has stopped moving: two
+consecutive adversarial review rounds without a consumer-visible breaking
+change, then a release candidate, then one more clean round. Until then, do not
+rely on a 1.0 stability guarantee. Both crates are published on crates.io; use
+the current
 0.11.0 release line for applications. <!-- x-release-please-version -->
+
+## Install
 
 ```toml
 [dependencies]
@@ -35,58 +77,8 @@ ferralk = "0.11.0" # x-release-please-version
 ferralk-glob = "0.11.0" # x-release-please-version
 ```
 
-For an unreleased Git dependency, pin a revision for repeatable builds.
-
-## Local benchmark snapshot
-
-This snapshot was refreshed on 2026-09-03 on a MacBook Pro with an Apple M1
-Pro, 10 cores, 32 GB RAM, macOS 26.6.2, Rust 1.97.1, and Node.js 26.8.1. It is
-a local comparison, not a portable promise. Lower is better.
-
-Matcher values use the common `src/**/*.rs` syntax. The Rust and zlob rows are
-Criterion point estimates; the Node.js rows are medians of fifteen
-order-rotated samples, each containing 100,000 matches.
-
-| Matcher | Match | Non-match |
-| --- | ---: | ---: |
-| Ferralk (compiled) | **10 ns** | 3 ns |
-| zlob 1.6.5 (compiled) | 35 ns | **2 ns** |
-| `globset` (compiled) | 37 ns | 36 ns |
-| `fast-glob` (interpreted) | 97 ns | 106 ns |
-| `wax` (compiled) | 31 ns | 30 ns |
-| `picomatch` 4.0.7 (compiled, Node.js) | 73.6 ns | 85.9 ns |
-| `micromatch` 4.0.8 (compiled, Node.js) | 73.5 ns | 86.9 ns |
-| `minimatch` 10.2.6 (compiled, Node.js) | 210.9 ns | 198.5 ns |
-
-The walker fixture contains 53,600 files. An **unscoped** query such as
-`**/*.{ts,tsx}` can match anywhere, so every walker must inspect the complete
-tree. A **scoped** query such as `{src,packages}/**/*.{ts,tsx}` names the only
-roots that can match. Ferralk can therefore skip the rest of the tree,
-especially `node_modules`, directly from the pattern.
-
-| Walker | Unscoped, 7,400 matches | Scoped, 2,600 matches |
-| --- | ---: | ---: |
-| Ferralk portable, 4 threads | 33.00 ms | 5.92 ms |
-| zlob 1.6.5, same portable run | 30.35 ms | 30.60 ms |
-| Ferralk macOS-native, 4 threads | 29.80 ms | **5.41 ms** |
-| zlob 1.6.5, same native run | **29.56 ms** | 30.54 ms |
-| Node.js `node:fs` sync | 219.24 ms | 27.73 ms |
-| `glob` 13.0.6 async | 37.97 ms | 7.76 ms |
-| `fast-glob` 3.3.3 async | 45.35 ms | 7.12 ms |
-| `tinyglobby` 0.2.17 async | 37.08 ms | 7.23 ms |
-| `fdir` 6.5.0 + `picomatch` async | 36.57 ms | 37.46 ms |
-
-The Rust walker rows are Criterion point estimates; the Node.js rows are
-medians of ten order-rotated samples. The APIs and estimators are not identical,
-so these are same-host context rather than a universal ranking. zlob appears
-twice to keep each Rust comparison inside one invocation; its spread shows the
-host-load noise between the two runs, not a backend change. See
-[benchmark evidence](docs/benchmark-evidence.md) for the complete tables,
-exact commands, sampling details, semantic differences, and limitations.
-
-For the same comparison on real repositories instead of fixtures — including the
-`ignore`-with-hand-pruning arm the RFC's question really turns on — see
-[Palamedes adoption](docs/palamedes-adoption.md).
+Depend on `ferralk-glob` alone when you only match strings or paths you already
+hold. For an unreleased Git dependency, pin a revision for repeatable builds.
 
 ## Quick start
 
@@ -145,23 +137,115 @@ cargo run --example find -- 'src/**/*.rs'
 
 The source is in [`crates/ferralk/examples/find.rs`](crates/ferralk/examples/find.rs).
 
+### Four things worth knowing on day one
+
+1. **Ordinary wildcards stay inside one path component.** `*.ts` selects
+   `main.ts` in the walk root and not `src/main.ts`; write `**/*.ts` for
+   descendants. The walker enables `**`, braces, and extglobs for you, while
+   `ferralk-glob` leaves each one opt-in through `PatternOptions`.
+2. **Wildcards do not cover a leading period.** `**/*.ts` skips
+   `.cache/routes.ts` and the whole `.cache` subtree. Opt in with
+   `Walker::match_hidden(true)`, or drop hidden entries before any pattern is
+   consulted with `WalkOptions::skip_hidden(true)`.
+3. **Patterns use `/` on every platform, and `\` escapes.** Keep the root in
+   `Walker::new(root)` and write the pattern relative to it. Joining a
+   `PathBuf` into a pattern on Windows produces `\*`, which asks for a literal
+   star.
+4. **Nothing runs until you ask.** `.gitignore` is not read, symlinks below the
+   root are not followed, metadata is not fetched, and entries are not sorted
+   by default. Recoverable errors are collected next to the entries under the
+   default `ErrorPolicy::Collect`, so a walk never silently returns less than
+   it found.
+
+The [usage guide](docs/usage.md) starts with a table of every default and the
+switch that changes it.
+
+## Local benchmark snapshot
+
+This snapshot was refreshed on 2026-09-03 on a MacBook Pro with an Apple M1
+Pro, 10 cores, 32 GB RAM, macOS 26.6.2, Rust 1.97.1, and Node.js 26.8.1. It is
+a local comparison, not a portable promise. Lower is better.
+
+Matcher values use the common `src/**/*.rs` syntax. The Rust and zlob rows are
+Criterion point estimates; the Node.js rows are medians of fifteen
+order-rotated samples, each containing 100,000 matches.
+
+| Matcher | Match | Non-match |
+| --- | ---: | ---: |
+| Ferralk (compiled) | **10 ns** | 3 ns |
+| zlob 1.6.5 (compiled) | 35 ns | **2 ns** |
+| `globset` (compiled) | 37 ns | 36 ns |
+| `fast-glob` (interpreted) | 97 ns | 106 ns |
+| `wax` (compiled) | 31 ns | 30 ns |
+| `picomatch` 4.0.7 (compiled, Node.js) | 73.6 ns | 85.9 ns |
+| `micromatch` 4.0.8 (compiled, Node.js) | 73.5 ns | 86.9 ns |
+| `minimatch` 10.2.6 (compiled, Node.js) | 210.9 ns | 198.5 ns |
+
+The walker fixture contains 53,600 files. An **unscoped** query such as
+`**/*.{ts,tsx}` can match anywhere, so every walker must inspect the complete
+tree. A **scoped** query such as `{src,packages}/**/*.{ts,tsx}` names the only
+roots that can match. Ferralk can therefore skip the rest of the tree,
+especially `node_modules`, directly from the pattern.
+
+| Walker | Unscoped, 7,400 matches | Scoped, 2,600 matches |
+| --- | ---: | ---: |
+| Ferralk portable, 4 threads | 33.00 ms | 5.92 ms |
+| zlob 1.6.5, same portable run | 30.35 ms | 30.60 ms |
+| Ferralk macOS-native, 4 threads | 29.80 ms | **5.41 ms** |
+| zlob 1.6.5, same native run | **29.56 ms** | 30.54 ms |
+| Node.js `node:fs` sync | 219.24 ms | 27.73 ms |
+| `glob` 13.0.6 async | 37.97 ms | 7.76 ms |
+| `fast-glob` 3.3.3 async | 45.35 ms | 7.12 ms |
+| `tinyglobby` 0.2.17 async | 37.08 ms | 7.23 ms |
+| `fdir` 6.5.0 + `picomatch` async | 36.57 ms | 37.46 ms |
+
+The Rust walker rows are Criterion point estimates; the Node.js rows are
+medians of ten order-rotated samples. The APIs and estimators are not identical,
+so these are same-host context rather than a universal ranking. zlob appears
+twice to keep each Rust comparison inside one invocation; its spread shows the
+host-load noise between the two runs, not a backend change. See
+[benchmark evidence](docs/benchmark-evidence.md) for the complete tables,
+exact commands, sampling details, semantic differences, and limitations.
+
+For the same comparison on real repositories instead of fixtures — including the
+`ignore`-with-hand-pruning arm the RFC's question really turns on — see
+[Palamedes adoption](docs/palamedes-adoption.md).
+
 ## Documentation
 
-- [Usage guide](docs/usage.md) — matching and walking semantics, defaults, and
-  operational guidance.
+Using Ferralk:
+
+- [Usage guide](docs/usage.md) — every default and switch, matching and
+  walking semantics, and operational guidance.
 - [1.x stability contract](docs/stability.md) — the semver-covered surface,
   MSRV policy, and explicit exclusions.
-- [Migration guide](docs/compatibility-guide.md) — mapping from zlob 1.6.3 and
-  deliberate differences.
-- [Compatibility matrix](docs/compatibility-matrix.md) — feature-level status.
-- [Corpus format](docs/corpus-format.md) — the JSONL behavioural test corpus.
-- [Architecture RFC](RFC-zig-free-zlob-port.md) and [ADRs](docs/adr/README.md)
-  — design rationale and non-goals.
+- [Benchmark evidence](docs/benchmark-evidence.md) — what is measured, how to
+  reproduce it, and what it does not establish.
 - [Palamedes adoption](docs/palamedes-adoption.md) — a consumer integration
   measured over four releases on two real repositories, and what each round
   changed here.
+
+Coming from another library:
+
+- [Migration guide](docs/compatibility-guide.md) — mapping from zlob 1.6.3,
+  porting patterns from `globset` and `fast-glob`, and the deliberate
+  differences.
+- [Compatibility matrix](docs/compatibility-matrix.md) — feature-level status
+  against zlob.
+
+Contributing:
+
+- [Contributing](CONTRIBUTING.md) — the preflight, commit conventions, and
+  the 1.0 release checklist.
+- [Corpus format](docs/corpus-format.md) — the JSONL behavioural test corpus
+  that is the source of truth for matcher and walker semantics.
+- [Architecture RFC](RFC-zig-free-zlob-port.md) and [ADRs](docs/adr/README.md)
+  — design rationale and non-goals.
 - [Deferred follow-up](docs/external-release-gates.md) — open work tracked in
   GitHub after the initial release.
+
+The [documentation index](docs/README.md) lists everything, including the
+historical audit records.
 
 ## Principles
 
