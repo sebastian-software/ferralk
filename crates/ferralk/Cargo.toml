@@ -1,6 +1,6 @@
 [package]
 name = "ferralk"
-description = "Portable filesystem walking for ferralk."
+description = "Parallel, Git-ignore-aware filesystem walker whose glob patterns prune the traversal."
 readme = "README.md"
 version.workspace = true
 edition.workspace = true

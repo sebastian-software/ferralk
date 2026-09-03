@@ -1,6 +1,6 @@
 [package]
 name = "ferralk-glob"
-description = "Portable, byte-first glob matching for ferralk."
+description = "Compiled, byte-first glob matching with explicit wildcard, brace, and extglob semantics."
 readme = "README.md"
 version.workspace = true
 edition.workspace = true

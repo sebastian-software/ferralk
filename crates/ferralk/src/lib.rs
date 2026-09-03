@@ -2,11 +2,52 @@
 #![warn(missing_docs)]
 #![doc = "Portable filesystem walking."]
 
-//! A safe std::fs walker with a portable `std::fs` backend.
+//! Parallel filesystem walking with byte-first glob selection.
 //!
-//! Paths stay as PathBuf throughout the public API. Patterns are matched
+//! A [`Walker`] takes one or more roots, root-relative include and exclude
+//! patterns, and an explicit traversal policy, and returns entries as native
+//! [`Path`] values. The patterns prune the walk: `{src,packages}/**/*.rs`
+//! never opens a directory outside `src` and `packages`. Git ignore rules,
+//! symlink following, hidden-entry matching, metadata, and sorting stay off
+//! until asked for; recoverable errors are collected next to the entries.
+//!
+//! ```no_run
+//! use ferralk::{ErrorPolicy, WalkOptions, Walker};
+//!
+//! let result = Walker::new(".")
+//!     .include("src/**/*.rs")?
+//!     .exclude("**/generated/**")?
+//!     .respect_git_ignore(true)
+//!     .error_policy(ErrorPolicy::Collect)
+//!     .options(WalkOptions::default().files_only(true).sort(true))
+//!     .collect()?;
+//!
+//! for entry in result.entries() {
+//!     println!("{}", entry.path().display());
+//! }
+//! for error in result.errors() {
+//!     eprintln!("{error}");
+//! }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! Three ways to consume a walk:
+//!
+//! - [`Walker::collect`] walks in parallel and returns every entry and every
+//!   recoverable error in one [`WalkResult`].
+//! - [`Walker::stream`] yields entries one at a time on the calling thread.
+//! - [`Walker::visit`] runs a predicate on the worker that found each entry,
+//!   so a caller-side filter does not become a serial pass afterwards.
+//!
+//! Paths stay [`PathBuf`] throughout the public API. Patterns are matched
 //! against root-relative encoded path bytes; no filesystem result is converted
-//! through UTF-8.
+//! through UTF-8. [`WalkEntry::path_bytes`] hands those bytes to a
+//! [`ferralk_glob::Pattern`] of your own without allocating.
+//!
+//! The [usage guide](https://github.com/sebastian-software/ferralk/blob/main/docs/usage.md)
+//! lists every default and the switch that changes it. The
+//! [stability contract](https://github.com/sebastian-software/ferralk/blob/main/docs/stability.md)
+//! states what 1.x promises.
 
 use std::{
     borrow::Cow,
@@ -749,7 +790,8 @@ struct RootPlan {
     excludes: Vec<TraversalPattern>,
 }
 
-/// Builder for a portable serial traversal.
+/// Builder for a filesystem walk: its roots, include and exclude patterns,
+/// and traversal policy.
 #[derive(Debug, Clone)]
 pub struct Walker {
     /// Never empty: [`Walker::new`] establishes the first one.
