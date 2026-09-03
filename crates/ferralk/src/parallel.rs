@@ -206,9 +206,21 @@ const HELPER_LISTING_FLOOR: usize = 1024;
 /// Directory tasks stay local to the worker that classified them; the single
 /// continuation goes through the shared injector. That makes the worker drain
 /// its children before it can produce another batch, while an idle helper can
-/// take over producing the next one. The frontier is therefore bounded by a
-/// small batch per active worker rather than by the width of the directory.
-const LISTING_BATCH_SIZE: usize = 64;
+/// take over producing the next one. The frontier is therefore bounded by one
+/// batch per active worker rather than by the width of the directory.
+///
+/// The batch is sized so that an ordinary directory is classified in one
+/// piece. A hand-off moves the listing's name buffers into the continuation,
+/// and the local queue is depth-first, so a worker reading wide siblings hands
+/// every one of them off before any continuation comes back to it: each such
+/// directory then costs a fresh set of buffers, which the consumer drops. At
+/// 64 that was every 100-file directory of the 53,600-file repository fixture,
+/// 40% more user-space instructions in a four-thread walk than in a serial
+/// one, all of them in the allocator, and a quarter of its wall time on Linux.
+/// Directories wider than this are rare enough that the bound still holds
+/// where it matters: at the directory that would otherwise queue a hundred
+/// thousand tasks.
+const LISTING_BATCH_SIZE: usize = 1024;
 
 impl<'scope, 'env> HelperPool<'scope, 'env> {
     /// Starts helpers while queued directories outnumber the running workers

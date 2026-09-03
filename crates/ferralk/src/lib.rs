@@ -1857,9 +1857,21 @@ impl TraversalPattern {
         let Some(extensions) = &self.extensions else {
             return true;
         };
-        final_extension(path)
-            .is_some_and(|candidate| extensions.iter().any(|extension| extension == candidate))
+        // The same answer as comparing `final_extension(path)`: a literal
+        // extension holds neither a period nor a separator, so it is the
+        // final extension exactly when the path ends in it behind a period.
+        // Asking that directly is what every entry pays, and it skips the
+        // separator and period scans that dominated on short names.
+        extensions
+            .iter()
+            .any(|extension| ends_with_extension(path, extension))
     }
+}
+
+fn ends_with_extension(path: &[u8], extension: &[u8]) -> bool {
+    path.len() > extension.len()
+        && path.ends_with(extension)
+        && path[path.len() - extension.len() - 1] == b'.'
 }
 
 /// Whether `path` is the literal root, or one of the two contains the other:

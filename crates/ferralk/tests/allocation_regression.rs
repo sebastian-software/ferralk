@@ -20,6 +20,11 @@ use ferralk::{
 };
 
 const ENTRIES_PER_DIRECTORY: usize = 64;
+/// An ordinary directory width, wider than the 64-entry batch the parallel
+/// walk once split listings into. A directory this size must be classified in
+/// one piece: split, its name buffers travelled into the continuation and a
+/// sibling started over with none.
+const WIDE_ENTRIES_PER_DIRECTORY: usize = 100;
 const CONSTANT_GROWTH_BUDGET: u64 = 16;
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
@@ -29,14 +34,18 @@ struct Fixture {
 
 impl Fixture {
     fn plain(directories: usize) -> Self {
-        Self::new(directories, false)
+        Self::new(directories, ENTRIES_PER_DIRECTORY, false)
     }
 
     fn ignored(directories: usize) -> Self {
-        Self::new(directories, true)
+        Self::new(directories, ENTRIES_PER_DIRECTORY, true)
     }
 
-    fn new(directories: usize, ignored: bool) -> Self {
+    fn wide(directories: usize) -> Self {
+        Self::new(directories, WIDE_ENTRIES_PER_DIRECTORY, false)
+    }
+
+    fn new(directories: usize, entries_per_directory: usize, ignored: bool) -> Self {
         let root = loop {
             let candidate = std::env::temp_dir().join(format!(
                 "ferralk-allocations-{}-{}",
@@ -60,7 +69,7 @@ impl Fixture {
         for directory in 0..directories {
             let directory = root.join(format!("batch-{directory}"));
             fs::create_dir(&directory).expect("create allocation fixture batch");
-            for index in 0..ENTRIES_PER_DIRECTORY {
+            for index in 0..entries_per_directory {
                 let name = if ignored {
                     format!("ignored-{index:03}.tmp")
                 } else {
@@ -81,7 +90,22 @@ impl Drop for Fixture {
 }
 
 fn count_skipping_walk(root: &Path, gitignore: bool) -> u64 {
-    let walker = Walker::new(root).threads(1).respect_git_ignore(gitignore);
+    count_skipping_walk_with(root, 1, ENTRIES_PER_DIRECTORY, gitignore)
+}
+
+/// Counts the allocations of one walk on this thread. With more than one
+/// thread configured the walk takes the parallel route, but a fixture below
+/// the helper floor is drained by the caller alone, so what this thread
+/// counts is the whole walk, and it is repeatable.
+fn count_skipping_walk_with(
+    root: &Path,
+    threads: usize,
+    entries_per_directory: usize,
+    gitignore: bool,
+) -> u64 {
+    let walker = Walker::new(root)
+        .threads(threads)
+        .respect_git_ignore(gitignore);
     let visited = AtomicUsize::new(0);
     let mut outcome = None;
     let allocations = allocation_counter::measure(|| {
@@ -100,12 +124,12 @@ fn count_skipping_walk(root: &Path, gitignore: bool) -> u64 {
     let visited = visited.load(Ordering::Relaxed);
     if gitignore {
         assert!(
-            visited < ENTRIES_PER_DIRECTORY,
+            visited < entries_per_directory,
             "ignore rules must filter the candidate files"
         );
     } else {
         assert!(
-            visited >= ENTRIES_PER_DIRECTORY,
+            visited >= entries_per_directory,
             "plain walks must reach the candidate files"
         );
     }
@@ -113,6 +137,15 @@ fn count_skipping_walk(root: &Path, gitignore: bool) -> u64 {
 }
 
 fn assert_walk_growth(label: &str, one_batch: u64, two_batches: u64) {
+    assert_walk_growth_per_entry(label, ENTRIES_PER_DIRECTORY, one_batch, two_batches);
+}
+
+fn assert_walk_growth_per_entry(
+    label: &str,
+    entries_per_directory: usize,
+    one_batch: u64,
+    two_batches: u64,
+) {
     let growth = two_batches.checked_sub(one_batch).unwrap_or_else(|| {
         panic!("{label}: the larger fixture allocated less ({two_batches} < {one_batch})")
     });
@@ -127,14 +160,14 @@ fn assert_walk_growth(label: &str, one_batch: u64, two_batches: u64) {
     )) {
         0
     } else if cfg!(target_os = "linux") {
-        (ENTRIES_PER_DIRECTORY * 2) as u64
+        (entries_per_directory * 2) as u64
     } else {
-        ENTRIES_PER_DIRECTORY as u64
+        entries_per_directory as u64
     };
     let allowed = backend_floor + CONSTANT_GROWTH_BUDGET;
     assert!(
         growth <= allowed,
-        "{label}: a second {ENTRIES_PER_DIRECTORY}-entry sibling grew allocations by {growth}; \
+        "{label}: a second {entries_per_directory}-entry sibling grew allocations by {growth}; \
          backend floor plus constant budget is {allowed} ({one_batch} -> {two_batches})"
     );
 }
@@ -174,5 +207,21 @@ fn hot_paths_keep_their_allocation_floors() {
         "gitignore-enabled serial walk",
         gitignore_small,
         gitignore_large,
+    );
+
+    // On the parallel route a directory of ordinary width is classified in
+    // one piece, so the second sibling reads into the name buffers the first
+    // one left behind. A listing batch smaller than the directory would hand
+    // those buffers off with the continuation and start the sibling from
+    // nothing.
+    let wide_small = Fixture::wide(1);
+    let wide_large = Fixture::wide(2);
+    let wide_one = count_skipping_walk_with(&wide_small.root, 4, WIDE_ENTRIES_PER_DIRECTORY, false);
+    let wide_two = count_skipping_walk_with(&wide_large.root, 4, WIDE_ENTRIES_PER_DIRECTORY, false);
+    assert_walk_growth_per_entry(
+        "parallel walk over wide siblings",
+        WIDE_ENTRIES_PER_DIRECTORY,
+        wide_one,
+        wide_two,
     );
 }

@@ -373,10 +373,13 @@ to the workers already running and is reported as one recoverable
 
 Wide directories do not become equally wide task queues. `stream()` suspends
 the current listing in one frame while it enters a child, and parallel walks
-classify at most 64 entries before handing the remaining listing back through
-one continuation. The listing names and retained results still scale with the
-directory, but pending traversal work is bounded by depth for `stream()` and by
-a small batch per active worker for parallel collection.
+classify at most 1,024 entries before handing the remaining listing back
+through one continuation. The listing names and retained results still scale
+with the directory, but pending traversal work is bounded by depth for
+`stream()` and by one batch per active worker for parallel collection. The
+batch is wide enough that an ordinary directory is classified in one piece, so
+its name buffers stay with the worker for the next directory instead of
+travelling into a continuation.
 
 A long-running host should know one allocator effect of parallel walks. Each
 helper thread lands in its own glibc malloc arena, and the result vectors a

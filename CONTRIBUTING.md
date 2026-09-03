@@ -23,8 +23,8 @@ your local clone on this project's behalf.
 There is no continuous wall-time threshold. The deterministic allocation-count
 test in
 [`allocation_regression.rs`](crates/ferralk/tests/allocation_regression.rs)
-does gate matcher and serial-walker hot-path allocation floors on every
-platform and native backend. The walker wall-time lane in
+does gate matcher, serial-walker, and parallel wide-sibling hot-path allocation
+floors on every platform and native backend. The walker wall-time lane in
 [`walker-bench.yml`](.github/workflows/walker-bench.yml) remains non-gating: it
 runs on every pull request and publishes medians as a job summary and artifact.
 
