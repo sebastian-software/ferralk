@@ -12,6 +12,13 @@ only the directories the pattern can reach. Filenames stay raw bytes and native
 `Path` values from the first directory read to the last match, so nothing is
 lost to a UTF-8 conversion.
 
+On the repository-shaped fixture in the
+[benchmark snapshot](#local-benchmark-snapshot) below it is the fastest arm
+measured: ahead of `ignore`, `jwalk`, `walkdir`, `globwalk` and `wax`, and
+level with or ahead of the Zig library it learned from. That is one host, one
+tree shape and a warm cache, which the snapshot states — a reproducible
+measurement, not a claim to be the fastest walker everywhere.
+
 It is published as two crates, so a consumer that only needs matching does not
 pay for traversal dependencies:
 
@@ -56,10 +63,18 @@ compatible with zlob and deliberately has no C ABI.
 - **Safe Rust.** The matcher crate forbids `unsafe`, the portable walker denies
   it, and CI fails on any `unsafe` outside the two audited native-backend
   modules, which are opt-in features.
-- **Evidence rather than claims.** More than 800 checked-in behavioural cases,
-  differential checks against `fast-glob` and the frozen zlob reference,
-  AddressSanitizer and loom lanes, and tests on Linux, macOS, and Windows.
-  Performance is measured on every pull request and never used as a gate.
+- **Git is the oracle, not a spec someone read once.** The 822 checked-in
+  behavioural cases are a machine-readable corpus rather than a side effect of
+  the tests, and the ignore cases among them are replayed against
+  `git check-ignore` itself, on Linux and on Windows, pinned to Git 2.52.0. If
+  Git disagrees, CI fails; where Ferralk diverges on purpose, the case carries
+  an ADR reference or a recorded oracle defect, and all 44 of them do.
+- **Verification beyond a test suite.** Seven fuzz targets, differential checks
+  against `fast-glob` and the frozen zlob reference, AddressSanitizer, Miri,
+  and loom models of the scheduler protocol, across Linux, macOS, and Windows
+  — 32 checks on a pull request. Seventeen ADRs record the decisions rather
+  than leaving them to be rediscovered. Performance is measured on every pull
+  request and never used as a gate.
 
 ### Next to the crates you may already use
 
@@ -184,6 +199,12 @@ lane was run on its own on an idle machine rather than chained behind the
 others, which matters more than it sounds: an earlier chained refresh on this
 same host and commit read roughly 60% slower across every arm. It is a local
 comparison, not a portable promise. Lower is better.
+
+Reading it in one line: Ferralk walks the unscoped query in 20.83 ms against
+23.15 ms for the next-fastest Rust arm, and the scoped query in 4.32 ms
+against 7.61 ms for `ignore` with hand-written pruning — the second gap is the
+structural one, because it comes from never opening `node_modules` rather than
+from opening it faster.
 
 Matcher values use the common `src/**/*.rs` syntax. The Rust and zlob rows are
 Criterion point estimates; the Node.js rows are medians of fifteen
