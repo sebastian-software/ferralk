@@ -81,7 +81,7 @@ let result = Walker::new(".")
 | walker entry basename | `WalkEntry::basename()` preserves the native `OsStr` name |
 | match a walker entry with `Pattern` | `entry.path_bytes()` passes its native encoded bytes to the byte-first matcher without allocation |
 | walker entry kind | `WalkEntry::{kind,is_symlink}` exposes file, directory, or symlink identity |
-| thread count | `Walker::threads(n)`; `collect()` defaults to available parallelism and clamps explicit budgets to `1..=256` |
+| thread count | `Walker::threads(n)`; `collect()` defaults to available parallelism, held under the platform's measured metadata-concurrency ceiling, and clamps explicit budgets to `1..=256` |
 | metadata requests | `WalkOptions::metadata(true)` |
 | streaming | `Walker::stream()` returns entry-or-error items incrementally |
 

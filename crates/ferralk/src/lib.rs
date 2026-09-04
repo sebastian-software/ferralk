@@ -80,6 +80,9 @@ mod macos_native;
     )
 ))]
 mod native_parity;
+/// The worker budget a walk uses when the caller sizes none.
+#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), allow(unsafe_code))]
+mod thread_budget;
 #[cfg(all(
     test,
     any(
@@ -873,10 +876,7 @@ impl Walker {
             git_ignore_case: None,
             git_precompose_unicode: None,
             wildcard_mode: WildcardMode::default(),
-            threads: std::thread::available_parallelism()
-                .map(std::num::NonZeroUsize::get)
-                .unwrap_or(1)
-                .min(MAX_WORKERS),
+            threads: thread_budget::default_threads(),
         }
     }
 
@@ -1316,6 +1316,15 @@ impl Walker {
     /// ceiling, not a promise: a helper the operating system refuses to start
     /// leaves the walk to the workers already running, see
     /// [`Walker::collect`].
+    ///
+    /// An explicit budget is used as asked. The default is not
+    /// `available_parallelism` on every host: a warm walk is filesystem
+    /// metadata work rather than CPU work, and on Apple Silicon the kernel
+    /// serves that work fastest when the workers stay inside one performance
+    /// cluster, so that is what the default asks for there. `docs/benchmark-evidence.md`
+    /// carries the measurement and the one shape that wants more workers than
+    /// the default picks: a walk whose per-entry matching cost dwarfs its
+    /// filesystem cost, which should name its own budget.
     #[must_use]
     pub const fn threads(mut self, threads: usize) -> Self {
         self.threads = if threads == 0 {
