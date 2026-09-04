@@ -14,12 +14,15 @@ thread-sweep = []
 zlob-oracle = ["dep:zlob"]
 
 [dependencies]
+# The walker is a dependency rather than a dev-dependency because the
+# Callgrind harness is a binary target, and a binary cannot see dev-only
+# dependencies.
+ferralk = { path = "../../crates/ferralk" }
+ferralk-glob = { path = "../../crates/ferralk-glob" }
 zlob = { version = "=1.6.5", optional = true }
 
 [dev-dependencies]
 criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
-ferralk = { path = "../../crates/ferralk" }
-ferralk-glob = { path = "../../crates/ferralk-glob" }
 fast-glob = "=1.1.1"
 globwalk = "=0.9.1"
 globset = "=0.4.20"

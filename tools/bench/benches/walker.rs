@@ -20,13 +20,23 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use bench::{RepositoryFixture, TYPESCRIPT_PATTERN};
+use bench::{GitIgnoreFixture, RepositoryFixture, TYPESCRIPT_PATTERN};
 use criterion::{Criterion, criterion_group, criterion_main};
 use ferralk::{Verdict, WalkOptions, Walker, WildcardMode};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::{WalkBuilder, WalkState, overrides::OverrideBuilder};
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+/// Levels in the deep chain that isolates repeated ancestor resolution.
+///
+/// Windows rejects a full path beyond 260 bytes unless long-path support is
+/// enabled, which a runner does not guarantee, and the chain's own path grows
+/// two bytes per level on top of a temporary-directory prefix. The shorter
+/// Windows chain measures the same asymptotic property at a depth the platform
+/// allows; it is not comparable with the Unix number and never appears beside
+/// it, because each lane compares against its own merge base.
+const DEEP_LEVELS: usize = if cfg!(windows) { 80 } else { 400 };
 
 /// Benchmark-id prefix, so a native-backend run does not overwrite the
 /// portable run's series when both report to the same collector.
@@ -118,6 +128,7 @@ fn walker(c: &mut Criterion) {
     // enough to compare with the merge base on every pull request. The full
     // multi-engine comparison remains in `walker_palamedes` on manual dispatch.
     bench_repository_shape(c);
+    bench_gitignore_rules(c);
 
     // 16 chains, four levels deep, two files per directory: the same 128 files
     // the previous fixture held, now at an effective depth of four.
@@ -132,8 +143,11 @@ fn walker(c: &mut Criterion) {
     // Parent-relative opens have constant component-resolution work per
     // level; full-path opens repeat every ancestor. This fixture isolates that
     // asymptotic difference from the wide repository-shaped fixtures above.
-    let deep = Fixture::deep(400);
-    assert_eq!(deep.files, 400, "the deep fixture exercises 400 levels");
+    let deep = Fixture::deep(DEEP_LEVELS);
+    assert_eq!(
+        deep.files, DEEP_LEVELS,
+        "the deep fixture exercises its levels"
+    );
     // Two thousand shallow directories: the shape on which the serial native
     // walk suspends and resumes a frame per directory. The repository-shaped
     // fixtures above are dominated by their parallel arms, which never
@@ -164,6 +178,45 @@ fn walker(c: &mut Criterion) {
     bench_caller_matching(c, "large/", &large);
     bench_caller_matching(c, "mini/", &mini);
     bench_multi_root(c, &roots);
+}
+
+/// Git-ignore rule evaluation as the cost, rather than directory count.
+///
+/// The repository shape above carries one root rule that prunes a subtree,
+/// which is the cheap case a rule engine handles in one comparison per
+/// directory. This fixture nests rule files three deep and negates covering
+/// directory rules, so an ignored directory has to be opened and every entry
+/// inside it decided individually. A regression that re-reads or re-parses a
+/// parent rule file per entry is invisible on the repository shape and
+/// obvious here.
+fn bench_gitignore_rules(c: &mut Criterion) {
+    let fixture = GitIgnoreFixture::new();
+    assert_eq!(fixture.files(), 4_513);
+
+    let walk = |threads| {
+        Walker::new(fixture.root())
+            .threads(threads)
+            .respect_git_ignore(true)
+            .include(TYPESCRIPT_PATTERN)
+            .expect("benchmark include is valid")
+            .options(WalkOptions::default())
+            .collect()
+            .expect("benchmark walk succeeds")
+            .entries()
+            .len()
+    };
+    // The negations are the point: without them a covering `dist/` rule would
+    // prune, and this count would be lower than the tree actually holds.
+    let expected = walk(1);
+    assert_eq!(expected, 1_248);
+    assert_eq!(walk(4), expected, "the parallel walk must agree");
+
+    c.bench_function(&format!("{LANE}/gitignore_rules/serial"), |benchmark| {
+        benchmark.iter(|| black_box(walk(1)))
+    });
+    c.bench_function(&format!("{LANE}/gitignore_rules/parallel"), |benchmark| {
+        benchmark.iter(|| black_box(walk(4)))
+    });
 }
 
 fn bench_repository_shape(c: &mut Criterion) {

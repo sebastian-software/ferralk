@@ -190,6 +190,203 @@ jobs:
           path: walker-${{ matrix.lane }}*.txt
           if-no-files-found: warn
 
+  # Windows visibility. The wall-time job above compares merge base and head
+  # for every shipped backend, and Windows ships only the portable one -- but
+  # it was still the one platform whose walker had no published number at all.
+  #
+  # Snapshot only, on push and dispatch. A per-pull-request comparison would
+  # build the fixture set twice on the slowest filesystem in the matrix, which
+  # is a large budget for a tier-2 target; issue #358 asks for visibility here
+  # rather than a gate. If the fixture set stops being practical on this
+  # runner, this job is the one to drop.
+  windows:
+    name: walker walltime (portable, Windows)
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Measure
+        shell: bash
+        run: |
+          rm -rf target/criterion
+          cargo bench -p bench --bench walker -- \
+            --warm-up-time 1 --measurement-time 5 --sample-size 20 \
+            --output-format bencher | tee walker-windows.txt
+      - name: Check that the lane actually measured something
+        shell: bash
+        run: |
+          if ! grep -q 'ns/iter' walker-windows.txt; then
+            echo "::error::the Windows walker benchmark produced no measurements"
+            exit 1
+          fi
+      - name: Publish the medians
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Walker wall time — portable, Windows"
+            echo
+            echo '| Benchmark | ns/iter | +/- |'
+            echo '| --- | ---: | ---: |'
+            sed -n 's/^test \(.*\) \.\.\. bench: *\([0-9,]*\) ns\/iter (+\/- \([0-9,]*\))$/| `\1` | \2 | \3 |/p' \
+              walker-windows.txt
+            echo
+            echo 'Shared runner, warm page cache. The deep-chain arm uses a shorter chain here than on Unix; see walker.rs.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the raw measurements
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: walker-walltime-windows
+          path: walker-windows.txt
+          if-no-files-found: warn
+
+  # The user-space CPU lane. Wall time on a shared runner cannot see a walk
+  # that executes far more instructions while filesystem and kernel time hide
+  # it -- on macOS 95% of a warm walk's samples are in three syscalls, so the
+  # walker's own work could triple without moving the median. Callgrind counts
+  # instructions instead, which is deterministic enough to compare two commits
+  # on one runner.
+  #
+  # Non-gating on purpose. Per issue #358 the harness lands first so that the
+  # merge base already contains it, repeatability is observed across real pull
+  # requests, and only then does a threshold -- provisionally 5% -- start
+  # failing the job. Reading this lane as a speed measurement would be wrong in
+  # both directions: Callgrind serializes threads and does not model syscall
+  # latency, so the parallel arm reports work performed, never time taken.
+  cpu:
+    name: user-space CPU (portable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y valgrind
+      - name: Prepare pull-request revisions
+        if: github.event_name == 'pull_request'
+        id: revisions
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          git worktree add --detach "$RUNNER_TEMP/ferralk-cpu-base" "$merge_base"
+          echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+      # Both revisions walk one tree built once, natively. Building 53,601
+      # files inside the measured region would bury the walk, and building it
+      # under Valgrind would cost minutes for work no one is measuring.
+      - name: Build the harnesses and the fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p bench --bin cpu_walk
+          cp target/release/cpu_walk "$RUNNER_TEMP/cpu_walk-head"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CARGO_TARGET_DIR="$RUNNER_TEMP/cpu-base-target" \
+              cargo build --release --locked \
+                --manifest-path "$RUNNER_TEMP/ferralk-cpu-base/Cargo.toml" \
+                -p bench --bin cpu_walk
+            cp "$RUNNER_TEMP/cpu-base-target/release/cpu_walk" "$RUNNER_TEMP/cpu_walk-merge-base"
+          fi
+          fixture=$("$RUNNER_TEMP/cpu_walk-head" prepare)
+          echo "FIXTURE=$fixture" >> "$GITHUB_ENV"
+      - name: Count instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          measure() {
+            local binary=$1 label=$2 threads=$3
+            valgrind --tool=callgrind --callgrind-out-file="callgrind-$label.out" \
+              "$binary" walk "$FIXTURE" "$threads" >/dev/null 2>"callgrind-$label.log"
+          }
+          measure "$RUNNER_TEMP/cpu_walk-head" head-serial 1
+          measure "$RUNNER_TEMP/cpu_walk-head" head-parallel 4
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            measure "$RUNNER_TEMP/cpu_walk-merge-base" base-serial 1
+            measure "$RUNNER_TEMP/cpu_walk-merge-base" base-parallel 4
+          fi
+      - name: Publish the instruction counts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON' >> "$GITHUB_STEP_SUMMARY"
+          import os
+          import pathlib
+          import re
+
+
+          def instructions(label):
+              """Total Ir from a Callgrind output file, or None when absent."""
+              path = pathlib.Path(f"callgrind-{label}.out")
+              if not path.is_file():
+                  return None
+              for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                  match = re.match(r"^(?:summary|totals):\s+(\d+)", line)
+                  if match:
+                      return int(match.group(1))
+              return None
+
+
+          arms = [("serial", "1 thread"), ("parallel", "4 threads")]
+          is_pull_request = os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
+          print("### User-space CPU — portable")
+          print()
+          if is_pull_request:
+              print("| Arm | Merge base | Head | Head/base |")
+              print("| --- | ---: | ---: | ---: |")
+          else:
+              print("| Arm | Instructions |")
+              print("| --- | ---: |")
+          missing = []
+          for arm, label in arms:
+              head = instructions(f"head-{arm}")
+              if head is None:
+                  missing.append(arm)
+              if is_pull_request:
+                  base = instructions(f"base-{arm}")
+                  if base is None:
+                      missing.append(f"base-{arm}")
+                  ratio = f"{head / base:.3f}x" if head and base else "n/a"
+                  print(
+                      f"| {label} | {base:,} | {head:,} | {ratio} |"
+                      if head and base
+                      else f"| {label} | n/a | n/a | n/a |"
+                  )
+              else:
+                  print(f"| {label} | {head:,} |" if head else f"| {label} | n/a |")
+          print()
+          print(
+              "Instruction counts, not time. Callgrind serializes threads and does "
+              "not model syscall latency, so the four-thread row reports work "
+              "performed rather than elapsed time. Non-gating while repeatability "
+              "is observed; see issue #358."
+          )
+          if missing:
+              print()
+              print(f"Callgrind produced no total for: {', '.join(missing)}.")
+              raise SystemExit("::error::the CPU lane produced no instruction count")
+          PYTHON
+      - name: Upload the raw measurements
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: walker-cpu-portable
+          path: |
+            callgrind-*.out
+            callgrind-*.log
+          if-no-files-found: warn
+
   # The engine comparison from docs/benchmark-evidence.md. It builds a 53k-file
   # tree and runs every arm over it, which is too much work for every pull
   # request and answers a question that does not change per commit, so it runs
