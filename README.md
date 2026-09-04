@@ -101,14 +101,14 @@ consumer-visible breaking change has landed since the contract was settled.
 What the candidate is for is one more adversarial review round. Until `1.0.0`
 itself is tagged, treat the guarantee as intended rather than in force. Both
 crates are published on crates.io; use the current
-0.12.0 release line for applications. <!-- x-release-please-version -->
+1.0.0-rc.1 release line for applications. <!-- x-release-please-version -->
 
 ## Install
 
 ```toml
 [dependencies]
-ferralk = "0.12.0" # x-release-please-version
-ferralk-glob = "0.12.0" # x-release-please-version
+ferralk = "1.0.0-rc.1" # x-release-please-version
+ferralk-glob = "1.0.0-rc.1" # x-release-please-version
 ```
 
 Depend on `ferralk-glob` alone when you only match strings or paths you already

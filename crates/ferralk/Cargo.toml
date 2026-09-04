@@ -26,7 +26,7 @@ unstable-test-hooks = ["ferralk-glob/unstable-test-hooks"]
 
 [dependencies]
 crossbeam-deque = "=0.8.7"
-ferralk-glob = { path = "../ferralk-glob", version = "0.12.0" }
+ferralk-glob = { path = "../ferralk-glob", version = "1.0.0-rc.1" }
 memchr = "=2.8.3"
 
 [target.'cfg(unix)'.dependencies]
