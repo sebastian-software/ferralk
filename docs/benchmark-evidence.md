@@ -176,39 +176,39 @@ measurements remain non-gating.
 
 | Arm | Median | Relative |
 | --- | ---: | ---: |
-| zlob 1.6.5, 4 threads | **30.35 ms** | 1.00x |
-| ferralk, 4 threads | 33.00 ms | 1.09x |
-| `ignore` parallel + overrides, 4 threads | 38.85 ms | 1.28x |
-| ferralk, serial | 63.84 ms | 2.10x |
-| `ignore` serial + `globset` | 76.43 ms | 2.52x |
+| zlob 1.6.5, 4 threads | **32.53 ms** | 1.00x |
+| ferralk, 4 threads | 34.51 ms | 1.06x |
+| `ignore` parallel + overrides, 4 threads | 40.46 ms | 1.24x |
+| ferralk, serial | 60.88 ms | 1.87x |
+| `ignore` serial + `globset` | 76.53 ms | 2.35x |
 
 ### `{src,packages}/**/*.{ts,tsx}` — the query names its roots
 
 | Arm | Median | Relative |
 | --- | ---: | ---: |
-| ferralk, 4 threads | **5.92 ms** | 1.00x |
-| `ignore` parallel + hand-written subtree pruning, 4 threads | 9.05 ms | 1.53x |
-| ferralk, serial | 11.66 ms | 1.97x |
-| zlob 1.6.5, 4 threads | 30.60 ms | 5.17x |
-| `ignore` parallel + overrides, 4 threads | 38.45 ms | 6.49x |
-| `ignore` serial + `globset` | 77.67 ms | 13.12x |
+| ferralk, 4 threads | **6.97 ms** | 1.00x |
+| `ignore` parallel + hand-written subtree pruning, 4 threads | 10.01 ms | 1.44x |
+| ferralk, serial | 11.40 ms | 1.64x |
+| zlob 1.6.5, 4 threads | 33.38 ms | 4.79x |
+| `ignore` parallel + overrides, 4 threads | 40.55 ms | 5.82x |
+| `ignore` serial + `globset` | 76.69 ms | 11.00x |
 
 ### Reading these
 
 - **Where the whole tree must be read, zlob is still ahead**, but Ferralk is
-  now within 9% in the portable run: 30.35 ms against 33.00 ms. Ferralk and
-  four-thread `jwalk` are level to within 0.04 ms on this host.
+  within 6.1% in the portable run: 32.53 ms against 34.51 ms. Ferralk is 4%
+  faster than four-thread `jwalk` on this host.
 - **Where the query names its roots, ferralk is ahead**, and it gets there from
   the pattern alone. The `ignore` arm that comes close needs a hand-written
-  `filter_entry`; the arm that only passes the globs as overrides is 6.5x
+  `filter_entry`; the arm that only passes the globs as overrides is 5.8x
   behind, because overrides decide what is yielded, not what is opened. zlob
   reads the whole tree for this query, which is why it lands near its unscoped
   time.
-- **Serial ferralk beats parallel `ignore` on the scoped query** (11.66 ms
-  against 38.45 ms) purely by not opening `node_modules`. Pruning is worth more
+- **Serial ferralk beats parallel `ignore` on the scoped query** (11.40 ms
+  against 40.55 ms) purely by not opening `node_modules`. Pruning is worth more
   than threads on this shape.
 - The 2,355 ms in the RFC's table was a serial walk doing more per file than
-  this reconstruction does; the 76.43 ms here is the same *approach*, not the
+  this reconstruction does; the 76.53 ms here is the same *approach*, not the
   same code.
 
 ### Which backend those rows measure
@@ -217,7 +217,7 @@ The portable one. `cargo bench -p bench --bench walker_palamedes` compiles
 `ferralk` without a native feature, so both `ferralk` arms above read
 directories through `std::fs`, on macOS as everywhere else.
 
-## Expanded library comparison on this machine, 2026-09-03
+## Expanded library comparison on this machine, 2026-09-04
 
 The comparison was refreshed on the current checkout. It covers four popular
 Rust libraries plus zlob as the optional cross-language reference, and now
@@ -246,7 +246,7 @@ once outside their match loop.
 | --- | --- |
 | Host | MacBook Pro (MacBookPro18,1), Apple M1 Pro, 10 cores (8 performance, 2 efficiency), 32 GB RAM |
 | OS | macOS 26.6.2, build 25G83; Darwin 25.6.0, arm64 |
-| Benchmark revision | `0590fa6` |
+| Benchmark revision | `1985238` |
 | Toolchain | rustc/cargo 1.97.1, LLVM 22.1.6 |
 | Benchmark stack | Criterion 0.8.2, release profile; exact dependency versions are locked in `Cargo.lock` |
 | zlob toolchain | Zig 0.16.0, Apple libclang 21.0.0 from Xcode |
@@ -280,46 +280,46 @@ same fixture and host load.
 
 | Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
 | --- | ---: | ---: |
-| ferralk, serial | 63.84 ms | 11.66 ms |
-| ferralk, 4 threads | 33.00 ms | **5.92 ms** |
-| `ignore` serial + `globset` | 76.43 ms | 77.67 ms |
-| `walkdir` serial + `globset` | 76.24 ms | 77.49 ms |
-| `jwalk` serial + `globset` | 80.38 ms | 80.81 ms |
-| `jwalk`, 4 threads + `globset` | 33.04 ms | 37.71 ms |
-| `globwalk` serial | 79.46 ms | 103.12 ms |
-| `wax` serial | 98.66 ms | 15.91 ms |
-| `ignore` parallel + overrides | 38.85 ms | 38.45 ms |
-| `ignore` parallel + hand-pruned subtree | — | 9.05 ms |
-| zlob, 4 threads | **30.35 ms** | 30.60 ms |
+| ferralk, serial | 60.88 ms | 11.40 ms |
+| ferralk, 4 threads | 34.51 ms | **6.97 ms** |
+| `ignore` serial + `globset` | 76.53 ms | 76.69 ms |
+| `walkdir` serial + `globset` | 74.40 ms | 75.01 ms |
+| `jwalk` serial + `globset` | 79.86 ms | 79.57 ms |
+| `jwalk`, 4 threads + `globset` | 35.98 ms | 36.11 ms |
+| `globwalk` serial | 79.87 ms | 79.37 ms |
+| `wax` serial | 99.77 ms | 15.92 ms |
+| `ignore` parallel + overrides | 40.46 ms | 40.55 ms |
+| `ignore` parallel + hand-pruned subtree | — | 10.01 ms |
+| zlob, 4 threads | **32.53 ms** | 33.38 ms |
 
-On the unscoped query, zlob is the fastest arm at 30.35 ms. Ferralk is level
-with four-thread `jwalk` at 33.00 and 33.04 ms, and is 15% faster than parallel
-`ignore`. On the scoped query, Ferralk is fastest because it prunes
-`node_modules` from the pattern itself: 5.92 ms versus 9.05 ms for hand-pruned
-`ignore`, 15.91 ms for `wax`, and 30.60 ms for zlob. The `ignore` arm needs an
-extra caller policy that the Ferralk pattern already expresses.
+On the unscoped query, zlob is the fastest arm at 32.53 ms. Ferralk is 4%
+faster than four-thread `jwalk` at 34.51 versus 35.98 ms, and is 15% faster
+than parallel `ignore`. On the scoped query, Ferralk is fastest because it
+prunes `node_modules` from the pattern itself: 6.97 ms versus 10.01 ms for
+hand-pruned `ignore`, 15.92 ms for `wax`, and 33.38 ms for zlob. The `ignore`
+arm needs an extra caller policy that the Ferralk pattern already expresses.
 
 ### macOS-native backend
 
 | Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
 | --- | ---: | ---: |
-| ferralk, serial | 52.10 ms | 9.85 ms |
-| ferralk, 4 threads | 29.80 ms | **5.41 ms** |
-| `ignore` serial + `globset` | 77.70 ms | 78.75 ms |
-| `walkdir` serial + `globset` | 77.43 ms | 75.46 ms |
-| `jwalk` serial + `globset` | 88.55 ms | 79.89 ms |
-| `jwalk`, 4 threads + `globset` | 41.79 ms | 33.93 ms |
-| `globwalk` serial | 93.14 ms | 78.32 ms |
-| `wax` serial | 114.08 ms | 15.92 ms |
-| `ignore` parallel + overrides | 44.94 ms | 38.62 ms |
-| `ignore` parallel + hand-pruned subtree | — | 8.75 ms |
-| zlob, 4 threads | **29.56 ms** | 30.54 ms |
+| ferralk, serial | 50.24 ms | 9.99 ms |
+| ferralk, 4 threads | 32.58 ms | **6.21 ms** |
+| `ignore` serial + `globset` | 76.26 ms | 77.46 ms |
+| `walkdir` serial + `globset` | 74.35 ms | 75.80 ms |
+| `jwalk` serial + `globset` | 79.95 ms | 80.48 ms |
+| `jwalk`, 4 threads + `globset` | 35.35 ms | 35.33 ms |
+| `globwalk` serial | 78.74 ms | 79.41 ms |
+| `wax` serial | 99.16 ms | 16.30 ms |
+| `ignore` parallel + overrides | 39.99 ms | 40.49 ms |
+| `ignore` parallel + hand-pruned subtree | — | 9.92 ms |
+| zlob, 4 threads | **32.20 ms** | 33.19 ms |
 
-The native run puts Ferralk at 29.80 ms unscoped, within 0.8% of the 29.56 ms
-zlob arm in the same invocation and well inside their reported spreads. Scoped
-Ferralk remains ahead at 5.41 ms because it avoids the dependency subtree. The
-zlob anchors are close across the portable and native invocations (30.35 and
-29.56 ms), but backend differences still come from separate wall-time runs;
+The native run puts Ferralk at 32.58 ms unscoped, within 1.2% of the 32.20 ms
+zlob arm in the same invocation. Scoped Ferralk remains ahead at 6.21 ms
+because it avoids the dependency subtree. The zlob anchors are close across
+the portable and native invocations (32.53 and
+32.20 ms), but backend differences still come from separate wall-time runs;
 use the paired ablations below for claims about a code change.
 
 The same invocations also measured the newer covering-exclude and Gitignore
@@ -327,8 +327,8 @@ queries. Both select the same 2,600 paths as the scoped query:
 
 | Backend | Exclude, serial | Exclude, 4 threads | Gitignore, 4 threads |
 | --- | ---: | ---: | ---: |
-| portable | 12.18 ms | 6.16 ms | 6.35 ms |
-| macOS native | 10.30 ms | **5.41 ms** | 5.87 ms |
+| portable | 12.04 ms | 7.13 ms | 7.30 ms |
+| macOS native | 10.63 ms | **6.41 ms** | 6.99 ms |
 
 The targeted, before/after comparisons attribute a 4.9% improvement to
 parent-relative directory opens and a further 10.3% to depth-first local
@@ -345,12 +345,12 @@ speedup, so these are current point estimates, not a before/after claim:
 
 | Backend | ferralk serial | ferralk, 4 threads | `ignore`, 4 threads |
 | --- | ---: | ---: | ---: |
-| portable | 77.30 ms | **43.01 ms** | 47.06 ms |
-| macOS native | 68.83 ms | **39.26 ms** | 48.15 ms |
+| portable | 80.00 ms | **47.41 ms** | 51.22 ms |
+| macOS native | 71.18 ms | **43.83 ms** | 51.32 ms |
 
 ### Thread-count sweep, M1 Pro
 
-The opt-in sweep was run three times on 2026-09-03 on the same 10-core (8
+The opt-in sweep was run three times on 2026-09-04 on the same 10-core (8
 performance, 2 efficiency) M1 Pro host, macOS 26.6.2, rustc 1.97.1, Zig 0.16.0,
 and zlob 1.6.5. Ferralk used its portable backend so both rows extend the
 portable single-point comparison above. Each cell is the median of the three
@@ -359,19 +359,19 @@ milliseconds.
 
 | Threads | ferralk | zlob |
 | ---: | ---: | ---: |
-| 1 | 62.28 (61.92–62.72) | **51.31** (51.17–51.48) |
-| 2 | 43.53 (43.48–44.22) | **38.57** (38.18–38.81) |
-| 4 | 32.31 (32.11–32.83) | **29.64** (29.44–30.03) |
-| 8 | **33.58** (32.43–33.84) | 34.38 (31.38–35.95) |
-| available = 10 | **33.70** (32.99–36.53) | 37.43 (35.94–38.91) |
+| 1 | 62.09 (61.79–62.49) | **51.33** (50.75–51.62) |
+| 2 | 41.76 (41.74–41.87) | **38.80** (38.07–38.89) |
+| 4 | 34.36 (34.31–34.47) | **32.31** (32.13–32.41) |
+| 8 | **31.70** (31.62–31.83) | 31.93 (31.89–32.01) |
+| available = 10 | **35.03** (34.92–35.34) | 36.00 (35.70–36.01) |
 
 The curve does **not** show a zlob advantage that grows with core count. zlob is
 faster at one, two, and four threads; Ferralk is slightly faster at eight and
-3.73 ms faster at the host's full reported parallelism. Both walkers reach
-their lowest median at four threads. The four-thread gap is 2.67 ms, still far
-below the older M1 Ultra point-estimate gap, and the eight-thread ranges
-overlap. This paired sweep supports no scheduler-policy claim beyond the
-measured host and fixture.
+0.97 ms faster at the host's full reported parallelism. Both walkers reach
+their lowest median at eight threads. The four-thread gap is 2.05 ms, still far
+below the older M1 Ultra point-estimate gap; the eight-thread ranges are close
+but do not overlap. This paired sweep supports no scheduler-policy claim beyond
+the measured host and fixture.
 
 The manual Linux dispatch now emits the same ten bencher lines with its actual
 `available_parallelism` embedded in the final label. The label is intentionally
@@ -414,8 +414,8 @@ contract: unsorted parallel result order is deliberately unspecified. The
 ablation benchmark is diagnostic rather than a headline; its collect/count and
 path microbenchmarks explain where time can go, while `walker_palamedes` remains
 the complete engine comparison. In the refreshed current-code ablation,
-collecting every file took 31.63 ms for Ferralk and 32.16 ms for zlob;
-collecting the 7,400 filtered paths took 29.55 and 28.49 ms respectively.
+collecting every file took 33.26 ms for Ferralk and 32.55 ms for zlob;
+collecting the 7,400 filtered paths took 32.21 and 32.25 ms respectively.
 
 ### Matcher refresh
 
@@ -424,11 +424,11 @@ point estimates and add `wax` and zlob to the existing compiled baselines:
 
 | Case | ferralk | zlob | `globset` | `fast-glob` | `wax` |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `common` matching | **10 ns** | 35 ns | 37 ns | 97 ns | 31 ns |
-| `common` non-matching | 3 ns | **2 ns** | 36 ns | 106 ns | 30 ns |
-| `long_path` matching | **11 ns** | 68 ns | 191 ns | 534 ns | 178 ns |
-| `long_path` non-matching | 3 ns | **2 ns** | 191 ns | 543 ns | 178 ns |
-| `backtracking` non-matching | **3 ns** | 29 ns | 96 ns | 249 ns | 78 ns |
+| `common` matching | **11 ns** | 35 ns | 38 ns | 99 ns | 32 ns |
+| `common` non-matching | 3 ns | **2 ns** | 37 ns | 109 ns | 31 ns |
+| `long_path` matching | **11 ns** | 69 ns | 196 ns | 548 ns | 183 ns |
+| `long_path` non-matching | 3 ns | **2 ns** | 197 ns | 558 ns | 184 ns |
+| `backtracking` non-matching | **3 ns** | 31 ns | 97 ns | 252 ns | 79 ns |
 
 `wax` is faster than `globset` on the long-path and adversarial rows here, but
 that does not erase the API and byte-semantics differences. zlob is competitive
@@ -448,15 +448,15 @@ same 1,024 generated paths.
 
 | Operation | One brace expression | Six-pattern catalog | Scoped brace expression |
 | --- | ---: | ---: | ---: |
-| Compile | 4.55 µs | — | 17.32 µs |
-| First extension/root | 16 ns | **11 ns** | 21 ns |
+| Compile | 4.77 µs | — | 28.64 µs |
+| First extension/root | 17 ns | **11 ns** | 21 ns |
 | Last extension/root | **18 ns** | 45 ns | 36 ns |
-| Rejected extension/root | **9 ns** | 34 ns | 19 ns |
-| Filter 1,024 paths | **16.73 µs** | 28.68 µs | 48.86 µs |
+| Rejected extension/root | **10 ns** | 35 ns | 20 ns |
+| Filter 1,024 paths | **17.10 µs** | 28.97 µs | 50.00 µs |
 
 The catalog can win when its first pattern matches, but its cost depends on
 where a suffix appears. The brace trie keeps first and last extensions close
-and filters the full list 42% faster than the six-pattern catalog. The scoped
+and filters the full list 41% faster than the six-pattern catalog. The scoped
 row is not a pure suffix comparison: it also checks the allowed-root set.
 
 ### Node.js ecosystem context
@@ -481,20 +481,20 @@ the median. Every candidate must return 7,400 files for the unscoped query and
 
 | Node.js walker | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
 | --- | ---: | ---: |
-| `node:fs` sync | 219.24 ms | 27.73 ms |
-| `node:fs` async | 269.17 ms | 38.85 ms |
-| `glob` sync | 98.46 ms | 15.58 ms |
-| `glob` async | 37.97 ms | 7.76 ms |
-| `fast-glob` sync | 95.28 ms | 14.05 ms |
-| `fast-glob` async | 45.35 ms | **7.12 ms** |
-| `tinyglobby` sync | 82.79 ms | 13.79 ms |
-| `tinyglobby` async | 37.08 ms | 7.23 ms |
-| `fdir` + `picomatch` sync | 82.72 ms | 79.84 ms |
-| `fdir` + `picomatch` async | **36.57 ms** | 37.46 ms |
+| `node:fs` sync | 225.11 ms | 28.34 ms |
+| `node:fs` async | 283.16 ms | 40.28 ms |
+| `glob` sync | 90.11 ms | 16.47 ms |
+| `glob` async | 39.80 ms | 7.70 ms |
+| `fast-glob` sync | 97.31 ms | 14.62 ms |
+| `fast-glob` async | 46.27 ms | **7.64 ms** |
+| `tinyglobby` sync | 86.17 ms | 14.63 ms |
+| `tinyglobby` async | 39.25 ms | 7.73 ms |
+| `fdir` + `picomatch` sync | 84.59 ms | 80.96 ms |
+| `fdir` + `picomatch` async | **39.00 ms** | 38.32 ms |
 
-The fastest Node medians are 36.57 ms unscoped and 7.12 ms scoped. The current
-Criterion runs put portable Ferralk at 33.00 and 5.92 ms and native Ferralk at
-29.80 and 5.41 ms. That is useful same-host context, not a formal ranking: the
+The fastest Node medians are 39.00 ms unscoped and 7.64 ms scoped. The current
+Criterion runs put portable Ferralk at 34.51 and 6.97 ms and native Ferralk at
+32.58 and 6.21 ms. That is useful same-host context, not a formal ranking: the
 Rust table uses Criterion point estimates while the Node harness reports a
 median of ten samples, and the APIs do not offer identical semantics.
 
@@ -504,11 +504,11 @@ backtracking engine cannot make the run unbounded.
 
 | Node.js matcher | Common match | Common reject | Long match | Long reject | Adversarial reject |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `picomatch` | 73.6 ns | **85.9 ns** | **270.7 ns** | 284.2 ns | 371.5 µs |
-| `micromatch` | **73.5 ns** | 86.9 ns | 271.1 ns | **283.0 ns** | **371.2 µs** |
-| `minimatch` | 210.9 ns | 198.5 ns | 530.3 ns | 463.5 ns | 372.5 µs |
+| `picomatch` | 76.6 ns | 89.0 ns | **279.1 ns** | 291.0 ns | 383.5 µs |
+| `micromatch` | **75.9 ns** | **88.4 ns** | 279.9 ns | **290.9 ns** | 382.0 µs |
+| `minimatch` | 218.9 ns | 201.9 ns | 544.8 ns | 475.2 ns | **381.0 µs** |
 
-Ferralk's corresponding rows are 10/3 ns for the common case, 11/3 ns for the
+Ferralk's corresponding rows are 11/3 ns for the common case, 11/3 ns for the
 long case, and 3 ns for the adversarial rejection. This is compiled native Rust
 against JavaScript libraries, not a Node binding comparison; it isolates
 matcher work and says nothing about interop or application-level throughput.
@@ -648,7 +648,7 @@ per directory, so the saving is user-space work, and it should be a smaller
 share of the wall time on a host whose kernel is slower per directory. The
 allocation-regression test gates the property: a second 100-entry sibling on
 the parallel route may cost no more than the constant task budget above the
-backend's per-entry floor. The macOS tables above predate this change.
+backend's per-entry floor. The current macOS tables above include this change.
 
 ### Per-entry scans, 2026-09-03
 
@@ -823,17 +823,17 @@ region, as ferralk's pattern is.
 
 | Benchmark | ferralk | `globset` | `fast-glob` |
 | --- | ---: | ---: | ---: |
-| `common` matching | **10 ns** | 37 ns | 97 ns |
-| `common` non-matching | **3 ns** | 36 ns | 106 ns |
-| `literal` matching | **18 ns** | 37 ns | — |
-| `literal` non-matching | 17 ns | **9 ns** | — |
-| `recursive_casefold` matching | **12 ns** | 27 ns | — |
+| `common` matching | **11 ns** | 38 ns | 99 ns |
+| `common` non-matching | **3 ns** | 37 ns | 109 ns |
+| `literal` matching | **19 ns** | 38 ns | — |
+| `literal` non-matching | 17 ns | **10 ns** | — |
+| `recursive_casefold` matching | **12 ns** | 28 ns | — |
 | `recursive_casefold` non-matching | **3 ns** | 29 ns | — |
-| `deterministic` matching | 26 ns | **22 ns** | — |
-| `deterministic` non-matching | **11 ns** | 19 ns | — |
-| `long_path` matching | **11 ns** | 191 ns | 534 ns |
-| `long_path` non-matching | **3 ns** | 191 ns | 543 ns |
-| `backtracking` non-matching | **3 ns** | 96 ns | 249 ns |
+| `deterministic` matching | 27 ns | **23 ns** | — |
+| `deterministic` non-matching | **12 ns** | 20 ns | — |
+| `long_path` matching | **11 ns** | 196 ns | 548 ns |
+| `long_path` non-matching | **3 ns** | 197 ns | 558 ns |
+| `backtracking` non-matching | **3 ns** | 97 ns | 252 ns |
 
 **The last row used to be the one to keep in view.** On a pattern built to force
 backtracking — `a*a*a*a*b` against a run of `a`s — ferralk ran 1837 ns against
