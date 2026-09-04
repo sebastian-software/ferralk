@@ -291,7 +291,12 @@ jobs:
           set -euo pipefail
           cargo build --release --locked -p bench --bin cpu_walk
           cp target/release/cpu_walk "$RUNNER_TEMP/cpu_walk-head"
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          # A merge base older than the harness cannot build it, which is the
+          # ordinary state until this lane has landed once. Report the head
+          # alone rather than failing: a comparison the base cannot take part
+          # in is missing context, not a regression.
+          base_harness="$RUNNER_TEMP/ferralk-cpu-base/tools/bench/src/bin/cpu_walk.rs"
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -f "$base_harness" ]; then
             CARGO_TARGET_DIR="$RUNNER_TEMP/cpu-base-target" \
               cargo build --release --locked \
                 --manifest-path "$RUNNER_TEMP/ferralk-cpu-base/Cargo.toml" \
@@ -311,7 +316,7 @@ jobs:
           }
           measure "$RUNNER_TEMP/cpu_walk-head" head-serial 1
           measure "$RUNNER_TEMP/cpu_walk-head" head-parallel 4
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ -x "$RUNNER_TEMP/cpu_walk-merge-base" ]; then
             measure "$RUNNER_TEMP/cpu_walk-merge-base" base-serial 1
             measure "$RUNNER_TEMP/cpu_walk-merge-base" base-parallel 4
           fi
@@ -339,10 +344,13 @@ jobs:
 
 
           arms = [("serial", "1 thread"), ("parallel", "4 threads")]
-          is_pull_request = os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
+          # A merge base predating this lane cannot be measured. That is the
+          # normal state until the harness has landed once, so the comparison
+          # degrades to the head column instead of failing.
+          compared = any(instructions(f"base-{arm}") is not None for arm, _ in arms)
           print("### User-space CPU — portable")
           print()
-          if is_pull_request:
+          if compared:
               print("| Arm | Merge base | Head | Head/base |")
               print("| --- | ---: | ---: | ---: |")
           else:
@@ -353,25 +361,29 @@ jobs:
               head = instructions(f"head-{arm}")
               if head is None:
                   missing.append(arm)
-              if is_pull_request:
+              if compared:
                   base = instructions(f"base-{arm}")
-                  if base is None:
-                      missing.append(f"base-{arm}")
-                  ratio = f"{head / base:.3f}x" if head and base else "n/a"
-                  print(
-                      f"| {label} | {base:,} | {head:,} | {ratio} |"
-                      if head and base
-                      else f"| {label} | n/a | n/a | n/a |"
-                  )
+                  if head and base:
+                      print(f"| {label} | {base:,} | {head:,} | {head / base:.3f}x |")
+                  else:
+                      print(f"| {label} | n/a | n/a | n/a |")
               else:
                   print(f"| {label} | {head:,} |" if head else f"| {label} | n/a |")
           print()
+          if os.environ.get("GITHUB_EVENT_NAME") == "pull_request" and not compared:
+              print(
+                  "The merge base predates this lane, so there is nothing to "
+                  "compare against yet and the head counts stand alone."
+              )
+              print()
           print(
               "Instruction counts, not time. Callgrind serializes threads and does "
               "not model syscall latency, so the four-thread row reports work "
               "performed rather than elapsed time. Non-gating while repeatability "
               "is observed; see issue #358."
           )
+          # Only a missing head count is a failure: a lane that measures
+          # nothing must not report success.
           if missing:
               print()
               print(f"Callgrind produced no total for: {', '.join(missing)}.")
