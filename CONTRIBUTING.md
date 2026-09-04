@@ -141,3 +141,10 @@ protects is defined in [`docs/stability.md`](docs/stability.md).
   reads `Release-As: 1.0.0-rc.1` for the candidate, and later one with
   `Release-As: 1.0.0`; the release pull request then carries that version and
   the ordinary bump rules resume from it.
+- [ ] Check the footer actually landed: `git log -1 --format=%B origin/main`
+  must print it. This repository squashes with the pull-request body as the
+  commit body, so a footer written in that body reaches `main` only if the
+  body is kept at merge time. Clearing or replacing the message in the merge
+  dialog silently drops it, Release Please proposes the ordinary bump instead,
+  and the release pull request is the first place anyone notices. A one-line
+  follow-up commit carrying only the footer fixes it.
