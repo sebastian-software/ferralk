@@ -45,3 +45,32 @@ This is a deliberate divergence from the Ferroni blueprint, recorded here so
 the next repository adopting it can weigh the same trade-off. Everything else
 in the decision — codecov, release-please, renovate, the bench corpora — is
 unchanged.
+
+## Amendment, 2026-09-04: a user-space CPU lane, Callgrind rather than CodSpeed
+
+The 2026-08-19 amendment removed instruction-count measurement entirely. That
+went one step too far, and #352 is the evidence: a change can execute much more
+user-space work while wall time on a shared runner hides it behind filesystem
+and kernel time. Profiling the macOS walk in #362 put a number on how much room
+there is to hide in — 95% of a warm walk's samples are in `openat`,
+`getdirentries64` and `close`, so the walker's own work could triple and barely
+move a median.
+
+A Linux-only Callgrind lane therefore measures instructions for one serial and
+one four-thread walk of the repository fixture, merge base and head in the same
+job. What makes this different from the lane that was removed is not the
+instrument but the baseline: CodSpeed compared against stored history and
+misattributed its staleness to whichever pull request was open, while this
+compares two commits built and measured in one runner, so there is no history
+to go stale.
+
+It is not a speed measurement and the lane says so in its own output.
+Callgrind serializes threads and does not model syscall latency, so the
+four-thread row reports work performed rather than time taken; moving work
+between threads without removing any would look identical. Elapsed time remains
+the walker wall-time lane's job, and neither lane gates a release.
+
+The lane lands non-gating. A threshold — provisionally 5% over the merge base —
+starts failing the job only after the harness is in the merge base and its
+repeatability has been observed across real pull requests, which is the
+sequencing #358 asks for and the discipline the CodSpeed experience was missing.
