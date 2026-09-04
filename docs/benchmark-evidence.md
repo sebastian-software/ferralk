@@ -17,7 +17,7 @@ records the same distinction for releases.
 | Matcher, wall time | Compiled-pattern matching and compilation, against `globset`, `fast-glob`, and `wax` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
 | Walker, wall time | Warm-cache traversal of synthetic trees, including serial, parallel, and `stream()` over the 53k-file repository shape, a deep chain, nested Git-ignore rules with negations, include-plus-covering-exclude pruning, and comparisons with `ignore` parallel | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request compares the merge base and head back to back in one job for every shipped backend; medians and head/base ratios are published in the job summary and as artifacts | No |
 | Walker, wall time on Windows | The same benches on the portable backend, as a snapshot rather than a comparison | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), push and manual dispatch | No |
-| User-space CPU | Instructions executed by one serial and one four-thread walk of the repository shape, merge base and head in the same job | [`cpu_walk.rs`](../tools/bench/src/bin/cpu_walk.rs) under Callgrind in [`walker-bench.yml`](../.github/workflows/walker-bench.yml), Linux only | Not yet |
+| User-space CPU | Instructions executed by one serial and one four-thread walk of the repository shape, merge base and head in the same job. The first run measured 66,744,131 instructions serial and 69,160,696 on four threads, so parallelism costs 3.6% more user-space work on this shape | [`cpu_walk.rs`](../tools/bench/src/bin/cpu_walk.rs) under Callgrind in [`walker-bench.yml`](../.github/workflows/walker-bench.yml), Linux only | Not yet |
 | Engine comparison | One repository shape with unscoped include, scoped include, include-plus-exclude, and gitignore-pruned queries | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), locally on demand and by manual dispatch of [`walker-bench.yml`](../.github/workflows/walker-bench.yml) on Linux | No |
 | Thread scaling | Ferralk and, when enabled, zlob over the unscoped 53k-file query at 1, 2, 4, 8, and `available_parallelism` threads; the evidence behind the default worker budget | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs) with `thread-sweep`, local or manual zlob dispatch | No |
 | zlob ablations | Ferralk and zlob on one fixed fixture, split into traversal, filtering, result retention, and path-representation costs | [`walker_zlob_ablation.rs`](../tools/bench/benches/walker_zlob_ablation.rs), run on demand | No |
@@ -353,6 +353,39 @@ The targeted, before/after comparisons attribute a 4.9% improvement to
 parent-relative directory opens and a further 10.3% to depth-first local
 queues. These are separate wall-time runs, not percentages that can be summed
 into a complete-table improvement.
+
+### Windows, the platform with no number
+
+Windows ships the portable backend and nothing else, and until this lane
+existed it was the only supported platform whose walker had never produced a
+published measurement. The lane is a snapshot on push and manual dispatch
+rather than a per-pull-request comparison: building the fixture set twice on
+the slowest filesystem in the matrix is a large budget for a tier-2 target.
+The complete run takes about seven and a half minutes, which is what settled
+the "if the bounded fixture set remains practical there" condition in issue
+#358.
+
+| Arm | Windows | for scale: Linux |
+| --- | ---: | ---: |
+| repository, unscoped, serial | 140.69 ms | 15.76 ms |
+| repository, unscoped, 4 threads | 60.09 ms | 6.11 ms |
+| repository, unscoped, `stream()` | 138.41 ms | — |
+| nested Git-ignore rules, serial | 36.56 ms | — |
+| nested Git-ignore rules, 4 threads | 16.81 ms | — |
+| 2,000 sibling directories, 4 threads | 104.78 ms | — |
+| 2,000 sibling directories, `ignore` parallel | 115.10 ms | — |
+
+The Linux column is the portable engine-comparison run above, on a different
+runner, and is there only to place the order of magnitude: Windows is several
+times slower than either Unix platform on the same portable code. That is the
+finding the lane exists to make visible, not a defect this repository can fix
+from Rust. Nothing here is a comparison between the two rows.
+
+The deep-chain arm runs 80 levels here against 400 elsewhere, because Windows
+rejects a full path beyond 260 bytes unless long-path support is enabled and a
+runner does not guarantee it. Its number is therefore not comparable with the
+Unix one and never appears beside it; each lane compares against its own merge
+base.
 
 ### The same comparison on Linux
 
