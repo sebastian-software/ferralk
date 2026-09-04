@@ -15,6 +15,7 @@ const DOCUMENTS: &[&str] = &[
     "docs/README.md",
     "docs/benchmark-evidence.md",
     "docs/usage.md",
+    "docs/verification-comparison.md",
     "docs/compatibility-guide.md",
     "docs/compatibility-matrix.md",
     "docs/corpus-format.md",
@@ -128,6 +129,12 @@ const FENCE_POLICIES: &[FencePolicy] = &[
     FencePolicy {
         path: "docs/usage.md",
         compiled_rust_fences: 5,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/verification-comparison.md",
+        compiled_rust_fences: 0,
         ignored_rust_fences: 0,
         intentional_text_fragments: &[],
     },
@@ -342,6 +349,9 @@ pub mod benchmark_evidence {}
 
 #[doc = include_str!("../../../docs/usage.md")]
 pub mod usage {}
+
+#[doc = include_str!("../../../docs/verification-comparison.md")]
+pub mod verification_comparison {}
 
 #[doc = include_str!("../../../docs/compatibility-guide.md")]
 pub mod compatibility_guide {}

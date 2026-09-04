@@ -262,6 +262,8 @@ Using Ferralk:
   MSRV policy, and explicit exclusions.
 - [Benchmark evidence](docs/benchmark-evidence.md) — what is measured, how to
   reproduce it, and what it does not establish.
+- [Verification depth](docs/verification-comparison.md) — the checked-in
+  evidence counted next to comparable crates, and where counting misleads.
 - [Palamedes adoption](docs/palamedes-adoption.md) — a consumer integration
   measured over four releases on two real repositories, and what each round
   changed here.
