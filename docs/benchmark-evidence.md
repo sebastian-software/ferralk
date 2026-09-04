@@ -316,9 +316,9 @@ arm needs an extra caller policy that the Ferralk pattern already expresses.
 | zlob, 4 threads | **32.20 ms** | 33.19 ms |
 
 The native run puts Ferralk at 32.58 ms unscoped, within 1.2% of the 32.20 ms
-zlob arm in the same invocation and inside their reported spreads. Scoped
-Ferralk remains ahead at 6.21 ms because it avoids the dependency subtree. The
-zlob anchors are close across the portable and native invocations (32.53 and
+zlob arm in the same invocation. Scoped Ferralk remains ahead at 6.21 ms
+because it avoids the dependency subtree. The zlob anchors are close across
+the portable and native invocations (32.53 and
 32.20 ms), but backend differences still come from separate wall-time runs;
 use the paired ablations below for claims about a code change.
 
@@ -823,17 +823,17 @@ region, as ferralk's pattern is.
 
 | Benchmark | ferralk | `globset` | `fast-glob` |
 | --- | ---: | ---: | ---: |
-| `common` matching | **10 ns** | 37 ns | 97 ns |
-| `common` non-matching | **3 ns** | 36 ns | 106 ns |
-| `literal` matching | **18 ns** | 37 ns | — |
-| `literal` non-matching | 17 ns | **9 ns** | — |
-| `recursive_casefold` matching | **12 ns** | 27 ns | — |
+| `common` matching | **11 ns** | 38 ns | 99 ns |
+| `common` non-matching | **3 ns** | 37 ns | 109 ns |
+| `literal` matching | **19 ns** | 38 ns | — |
+| `literal` non-matching | 17 ns | **10 ns** | — |
+| `recursive_casefold` matching | **12 ns** | 28 ns | — |
 | `recursive_casefold` non-matching | **3 ns** | 29 ns | — |
-| `deterministic` matching | 26 ns | **22 ns** | — |
-| `deterministic` non-matching | **11 ns** | 19 ns | — |
-| `long_path` matching | **11 ns** | 191 ns | 534 ns |
-| `long_path` non-matching | **3 ns** | 191 ns | 543 ns |
-| `backtracking` non-matching | **3 ns** | 96 ns | 249 ns |
+| `deterministic` matching | 27 ns | **23 ns** | — |
+| `deterministic` non-matching | **12 ns** | 20 ns | — |
+| `long_path` matching | **11 ns** | 196 ns | 548 ns |
+| `long_path` non-matching | **3 ns** | 197 ns | 558 ns |
+| `backtracking` non-matching | **3 ns** | 97 ns | 252 ns |
 
 **The last row used to be the one to keep in view.** On a pattern built to force
 backtracking — `a*a*a*a*b` against a run of `a`s — ferralk ran 1837 ns against
