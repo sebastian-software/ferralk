@@ -30,8 +30,22 @@ compatible with zlob and deliberately has no C ABI.
   only roots that can match, so `node_modules` is never opened. Ferralk works
   that out from the pattern. With `ignore`, the same saving needs a
   hand-written `filter_entry`, and passing the globs as overrides alone still
-  reads the whole tree. The [benchmark snapshot](#local-benchmark-snapshot)
-  below shows what that is worth.
+  reads the whole tree. On the 53,601-file fixture in the
+  [benchmark snapshot](#local-benchmark-snapshot) below, that is 4.32 ms
+  against 7.61 ms for hand-pruned `ignore` — and Ferralk walking *serially*
+  still beats parallel `ignore` with the globs as overrides, because not
+  opening a directory beats opening it on four threads.
+- **Sized for the machine, not for the core count.** A warm walk is filesystem
+  metadata work: profiled on macOS, 95% of it is `openat`, `getdirentries64`,
+  and `close`, and a raw C walker issuing the same syscalls is no faster. What
+  actually limits it is how much concurrency the kernel's namespace layer
+  rewards, which on Apple Silicon is one performance cluster rather than every
+  core. Ferralk defaults to that measured ceiling instead of
+  `available_parallelism`, which is worth 1.7–1.9x out of the box on the test
+  host; `Walker::threads` overrides it. The
+  [evidence](docs/benchmark-evidence.md#the-default-worker-budget) records the
+  controls, the one workload shape that wants more threads, and the hosts this
+  was not measured on.
 - **Git semantics come from Git.** Ignore verdicts are replayed against
   `git check-ignore` in CI, on Linux and on Windows, instead of being
   reimplemented from memory. Nested `.gitignore` chains, `.ignore` files,
@@ -58,15 +72,17 @@ compatible with zlob and deliberately has no C ABI.
 
 ## Status
 
-Ferralk is pre-1.0. The
-[1.x stability contract](docs/stability.md) is settled: it states which public
-API, corpus semantics, entry-point rules, platform tier, and MSRV policy become
-stable at 1.0, and which implementation details and feature flags do not. What
-remains before 1.0 is evidence that the contract has stopped moving: two
-consecutive adversarial review rounds without a consumer-visible breaking
-change, then a release candidate, then one more clean round. Until then, do not
-rely on a 1.0 stability guarantee. Both crates are published on crates.io; use
-the current
+Ferralk is in its 1.0 release candidate. The
+[1.x stability contract](docs/stability.md) is settled and unchanged since it
+was written: it states which public API, corpus semantics, entry-point rules,
+platform tier, and MSRV policy become stable at 1.0, and which implementation
+details and feature flags do not. The checked-in
+[`cargo public-api` listings](docs/api/) have not moved either, and no
+consumer-visible breaking change has landed since the contract was settled.
+
+What the candidate is for is one more adversarial review round. Until `1.0.0`
+itself is tagged, treat the guarantee as intended rather than in force. Both
+crates are published on crates.io; use the current
 0.12.0 release line for applications. <!-- x-release-please-version -->
 
 ## Install
@@ -163,8 +179,11 @@ switch that changes it.
 ## Local benchmark snapshot
 
 This snapshot was refreshed on 2026-09-04 on a MacBook Pro with an Apple M1
-Pro, 10 cores, 32 GB RAM, macOS 26.6.2, Rust 1.97.1, and Node.js 26.8.1. It is
-a local comparison, not a portable promise. Lower is better.
+Pro, 10 cores, 32 GB RAM, macOS 26.6.2, Rust 1.97.1, and Node.js 26.8.1. Each
+lane was run on its own on an idle machine rather than chained behind the
+others, which matters more than it sounds: an earlier chained refresh on this
+same host and commit read roughly 60% slower across every arm. It is a local
+comparison, not a portable promise. Lower is better.
 
 Matcher values use the common `src/**/*.rs` syntax. The Rust and zlob rows are
 Criterion point estimates; the Node.js rows are medians of fifteen
@@ -177,9 +196,9 @@ order-rotated samples, each containing 100,000 matches.
 | `globset` (compiled) | 38 ns | 37 ns |
 | `fast-glob` (interpreted) | 99 ns | 109 ns |
 | `wax` (compiled) | 32 ns | 31 ns |
-| `picomatch` 4.0.7 (compiled, Node.js) | 76.6 ns | 89.0 ns |
-| `micromatch` 4.0.8 (compiled, Node.js) | 75.9 ns | 88.4 ns |
-| `minimatch` 10.2.6 (compiled, Node.js) | 218.9 ns | 201.9 ns |
+| `picomatch` 4.0.7 (compiled, Node.js) | 75.0 ns | 85.4 ns |
+| `micromatch` 4.0.8 (compiled, Node.js) | 71.7 ns | 84.5 ns |
+| `minimatch` 10.2.6 (compiled, Node.js) | 207.0 ns | 191.9 ns |
 
 The walker fixture contains 53,601 files. An **unscoped** query such as
 `**/*.{ts,tsx}` can match anywhere, so every walker must inspect the complete
@@ -189,21 +208,22 @@ especially `node_modules`, directly from the pattern.
 
 | Walker | Unscoped, 7,400 matches | Scoped, 2,600 matches |
 | --- | ---: | ---: |
-| Ferralk portable, 4 threads | 34.51 ms | 6.97 ms |
-| zlob 1.6.5, same portable run | 32.53 ms | 33.38 ms |
-| Ferralk macOS-native, 4 threads | 32.58 ms | **6.21 ms** |
-| zlob 1.6.5, same native run | **32.20 ms** | 33.19 ms |
-| Node.js `node:fs` sync | 225.11 ms | 28.34 ms |
-| `glob` 13.0.6 async | 39.80 ms | 7.70 ms |
-| `fast-glob` 3.3.3 async | 46.27 ms | **7.64 ms** |
-| `tinyglobby` 0.2.17 async | 39.25 ms | 7.73 ms |
-| `fdir` 6.5.0 + `picomatch` async | 39.00 ms | 38.32 ms |
+| Ferralk portable, 4 threads | 20.83 ms | 4.32 ms |
+| zlob 1.6.5, same portable run | 30.09 ms | 22.08 ms |
+| Ferralk macOS-native, 4 threads | **20.83 ms** | **3.68 ms** |
+| zlob 1.6.5, same native run | 21.45 ms | 22.32 ms |
+| Node.js `node:fs` sync | 201.53 ms | 26.42 ms |
+| `glob` 13.0.6 async | 35.12 ms | 6.34 ms |
+| `fast-glob` 3.3.3 async | 41.14 ms | 6.62 ms |
+| `tinyglobby` 0.2.17 async | 36.14 ms | 7.14 ms |
+| `fdir` 6.5.0 + `picomatch` async | 35.12 ms | 31.39 ms |
 
 The Rust walker rows are Criterion point estimates; the Node.js rows are
 medians of ten order-rotated samples. The APIs and estimators are not identical,
 so these are same-host context rather than a universal ranking. zlob appears
-twice to keep each Rust comparison inside one invocation; its spread shows the
-host-load noise between the two runs, not a backend change. See
+twice to keep each Rust comparison inside one invocation; against the native
+backend the two engines are level on the unscoped query, and the wider portable
+margin is what reading directories through `std::fs` costs. See
 [benchmark evidence](docs/benchmark-evidence.md) for the complete tables,
 exact commands, sampling details, semantic differences, and limitations.
 

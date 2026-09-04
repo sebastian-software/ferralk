@@ -57,6 +57,16 @@ section in the release notes. Describe the old and new observable behaviour in
 the pull request as well, so the generated summary has the context consumers
 need.
 
+The marker convention does not change at 1.0; what the marker *costs* does.
+Release Please's `bump-minor-pre-major` setting is what turns a `!` into a minor
+bump today. From 1.0 on, the same `!` proposes a major release, so the decision
+of whether a change is consumer-visible stops being a changelog-formatting
+question and becomes the decision of whether to spend a major version. Use the
+[1.x stability contract](docs/stability.md) to answer it: a change confined to
+the surfaces that document lists as outside the contract — performance,
+scheduling and batching internals, native-backend features, diagnostic
+wording — is not a `!` change however visible it is in a benchmark.
+
 Every pull-request title and every non-merge commit subject on its head branch
 must use `<type>[(scope)][!]: <summary>`. Pull requests are squash-merged, and
 the pull-request title becomes the single subject that Release Please sees on
@@ -122,6 +132,9 @@ protects is defined in [`docs/stability.md`](docs/stability.md).
 - [ ] Cut `1.0.0-rc.1` only after the two clean rounds. Keep the release
   candidate for one further adversarial round; cut `1.0.0` only if that round
   also produces no consumer-visible breaking change.
+- [ ] If a candidate is cut before the two rounds have run, say so in the
+  release pull request. The candidate is then the artefact the rounds run
+  against rather than their result, and `1.0.0` still waits for a clean one.
 - [ ] Tell Release Please the version explicitly. Its `bump-minor-pre-major`
   setting turns every breaking change on `0.x` into a minor bump, so it never
   proposes a major version on its own. Land a commit on `main` whose footer

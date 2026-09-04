@@ -17,7 +17,7 @@ records the same distinction for releases.
 | Matcher, wall time | Compiled-pattern matching and compilation, against `globset`, `fast-glob`, and `wax` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
 | Walker, wall time | Warm-cache traversal of synthetic trees, including serial, parallel, and `stream()` over the 53k-file repository shape, a 400-level chain, include-plus-covering-exclude pruning, and comparisons with `ignore` parallel | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request compares the merge base and head back to back in one job for every shipped backend; medians and head/base ratios are published in the job summary and as artifacts | No |
 | Engine comparison | One repository shape with unscoped include, scoped include, include-plus-exclude, and gitignore-pruned queries | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), run on demand | No |
-| Thread scaling | Ferralk and, when enabled, zlob over the unscoped 53k-file query at 1, 2, 4, 8, and `available_parallelism` threads | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs) with `thread-sweep`, local or manual zlob dispatch | No |
+| Thread scaling | Ferralk and, when enabled, zlob over the unscoped 53k-file query at 1, 2, 4, 8, and `available_parallelism` threads; the evidence behind the default worker budget | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs) with `thread-sweep`, local or manual zlob dispatch | No |
 | zlob ablations | Ferralk and zlob on one fixed fixture, split into traversal, filtering, result retention, and path-representation costs | [`walker_zlob_ablation.rs`](../tools/bench/benches/walker_zlob_ablation.rs), run on demand | No |
 | zlob context | The matcher smoke fixture and 53k-file engine comparison against zlob 1.6.5 | [`zlob-benchmark.yml`](../.github/workflows/zlob-benchmark.yml), manual dispatch on Linux only | No |
 | Node.js ecosystem context | The same matcher cases and repository-shaped walker fixture against current locked Node libraries | [`tools/bench/node`](../tools/bench/node), run on demand | No |
@@ -176,39 +176,44 @@ measurements remain non-gating.
 
 | Arm | Median | Relative |
 | --- | ---: | ---: |
-| zlob 1.6.5, 4 threads | **32.53 ms** | 1.00x |
-| ferralk, 4 threads | 34.51 ms | 1.06x |
-| `ignore` parallel + overrides, 4 threads | 40.46 ms | 1.24x |
-| ferralk, serial | 60.88 ms | 1.87x |
-| `ignore` serial + `globset` | 76.53 ms | 2.35x |
+| ferralk, 4 threads | **20.83 ms** | 1.00x |
+| `jwalk` parallel + `globset`, 4 threads | 23.15 ms | 1.11x |
+| zlob 1.6.5, 4 threads | 30.09 ms | 1.44x |
+| `ignore` parallel + overrides, 4 threads | 38.07 ms | 1.83x |
+| ferralk, serial | 56.91 ms | 2.73x |
+| `ignore` serial + `globset` | 72.23 ms | 3.47x |
 
 ### `{src,packages}/**/*.{ts,tsx}` — the query names its roots
 
 | Arm | Median | Relative |
 | --- | ---: | ---: |
-| ferralk, 4 threads | **6.97 ms** | 1.00x |
-| `ignore` parallel + hand-written subtree pruning, 4 threads | 10.01 ms | 1.44x |
-| ferralk, serial | 11.40 ms | 1.64x |
-| zlob 1.6.5, 4 threads | 33.38 ms | 4.79x |
-| `ignore` parallel + overrides, 4 threads | 40.55 ms | 5.82x |
-| `ignore` serial + `globset` | 76.69 ms | 11.00x |
+| ferralk, 4 threads | **4.32 ms** | 1.00x |
+| `ignore` parallel + hand-written subtree pruning, 4 threads | 7.61 ms | 1.76x |
+| ferralk, serial | 10.75 ms | 2.49x |
+| `wax` serial | 15.39 ms | 3.56x |
+| zlob 1.6.5, 4 threads | 22.08 ms | 5.11x |
+| `ignore` parallel + overrides, 4 threads | 30.60 ms | 7.09x |
+| `ignore` serial + `globset` | 70.17 ms | 16.24x |
 
 ### Reading these
 
-- **Where the whole tree must be read, zlob is still ahead**, but Ferralk is
-  within 6.1% in the portable run: 32.53 ms against 34.51 ms. Ferralk is 4%
-  faster than four-thread `jwalk` on this host.
+- **Where the whole tree must be read, ferralk now leads the portable run**:
+  20.83 ms against 30.09 ms for zlob and 23.15 ms for four-thread `jwalk`. With
+  `native-macos` the two engines are level instead — 20.83 ms against 21.45 ms
+  in a separate invocation — so the portable margin is partly zlob paying for a
+  comparison against `std::fs`, and the level native reading is the more
+  careful claim.
 - **Where the query names its roots, ferralk is ahead**, and it gets there from
   the pattern alone. The `ignore` arm that comes close needs a hand-written
-  `filter_entry`; the arm that only passes the globs as overrides is 5.8x
+  `filter_entry`; the arm that only passes the globs as overrides is 7.1x
   behind, because overrides decide what is yielded, not what is opened. zlob
   reads the whole tree for this query, which is why it lands near its unscoped
   time.
-- **Serial ferralk beats parallel `ignore` on the scoped query** (11.40 ms
-  against 40.55 ms) purely by not opening `node_modules`. Pruning is worth more
+- **Serial ferralk beats parallel `ignore` on the scoped query** (10.75 ms
+  against 30.60 ms) purely by not opening `node_modules`. Pruning is worth more
   than threads on this shape.
 - The 2,355 ms in the RFC's table was a serial walk doing more per file than
-  this reconstruction does; the 76.53 ms here is the same *approach*, not the
+  this reconstruction does; the 72.23 ms here is the same *approach*, not the
   same code.
 
 ### Which backend those rows measure
@@ -217,7 +222,7 @@ The portable one. `cargo bench -p bench --bench walker_palamedes` compiles
 `ferralk` without a native feature, so both `ferralk` arms above read
 directories through `std::fs`, on macOS as everywhere else.
 
-## Expanded library comparison on this machine, 2026-09-04
+## Expanded library comparison on this machine, 2026-09-04 (refreshed)
 
 The comparison was refreshed on the current checkout. It covers four popular
 Rust libraries plus zlob as the optional cross-language reference, and now
@@ -246,13 +251,14 @@ once outside their match loop.
 | --- | --- |
 | Host | MacBook Pro (MacBookPro18,1), Apple M1 Pro, 10 cores (8 performance, 2 efficiency), 32 GB RAM |
 | OS | macOS 26.6.2, build 25G83; Darwin 25.6.0, arm64 |
-| Benchmark revision | `1985238` |
+| Benchmark revision | `261df0d` plus this pull request's default-worker-budget change; every arm in these tables pins its own thread count, so the change moves none of them |
 | Toolchain | rustc/cargo 1.97.1, LLVM 22.1.6 |
 | Benchmark stack | Criterion 0.8.2, release profile; exact dependency versions are locked in `Cargo.lock` |
 | zlob toolchain | Zig 0.16.0, Apple libclang 21.0.0 from Xcode |
 | Node toolchain | Node.js 26.8.1, npm 11.19.0; the runtime is fixed in `package.json` and dependency versions in `tools/bench/node/package-lock.json` |
-| Threads | 4 for every parallel ferralk, `ignore`, and `jwalk` arm |
+| Threads | 4 for every parallel ferralk, `ignore`, `jwalk`, and zlob arm, pinned by the bench rather than read from the host |
 | Cache | Warm: the fixture is written immediately before the measurement and then reused by all arms in that invocation |
+| Session | Each invocation below was run on its own on an otherwise idle machine, not chained behind the other lanes; see the note under the portable table for why that matters |
 | Fixture | 53,601 files, 2,600 TypeScript sources under `src/` and `packages/`, plus 400 top-level and 200 nested dependency packages under `node_modules/` and one `.gitignore` |
 
 The complete refresh used these commands. `+stable` selects the installed
@@ -280,55 +286,66 @@ same fixture and host load.
 
 | Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
 | --- | ---: | ---: |
-| ferralk, serial | 60.88 ms | 11.40 ms |
-| ferralk, 4 threads | 34.51 ms | **6.97 ms** |
-| `ignore` serial + `globset` | 76.53 ms | 76.69 ms |
-| `walkdir` serial + `globset` | 74.40 ms | 75.01 ms |
-| `jwalk` serial + `globset` | 79.86 ms | 79.57 ms |
-| `jwalk`, 4 threads + `globset` | 35.98 ms | 36.11 ms |
-| `globwalk` serial | 79.87 ms | 79.37 ms |
-| `wax` serial | 99.77 ms | 15.92 ms |
-| `ignore` parallel + overrides | 40.46 ms | 40.55 ms |
-| `ignore` parallel + hand-pruned subtree | — | 10.01 ms |
-| zlob, 4 threads | **32.53 ms** | 33.38 ms |
+| ferralk, serial | 56.91 ms | 10.75 ms |
+| ferralk, 4 threads | **20.83 ms** | **4.32 ms** |
+| `ignore` serial + `globset` | 72.23 ms | 70.17 ms |
+| `walkdir` serial + `globset` | 69.96 ms | 68.66 ms |
+| `jwalk` serial + `globset` | 74.17 ms | 76.96 ms |
+| `jwalk`, 4 threads + `globset` | 23.15 ms | 23.30 ms |
+| `globwalk` serial | 73.87 ms | 80.88 ms |
+| `wax` serial | 92.77 ms | 15.39 ms |
+| `ignore` parallel + overrides | 38.07 ms | 30.60 ms |
+| `ignore` parallel + hand-pruned subtree | — | 7.61 ms |
+| zlob, 4 threads | 30.09 ms | 22.08 ms |
 
-On the unscoped query, zlob is the fastest arm at 32.53 ms. Ferralk is 4%
-faster than four-thread `jwalk` at 34.51 versus 35.98 ms, and is 15% faster
-than parallel `ignore`. On the scoped query, Ferralk is fastest because it
-prunes `node_modules` from the pattern itself: 6.97 ms versus 10.01 ms for
-hand-pruned `ignore`, 15.92 ms for `wax`, and 33.38 ms for zlob. The `ignore`
-arm needs an extra caller policy that the Ferralk pattern already expresses.
+Ferralk is the fastest arm on both queries here, at 20.83 ms unscoped and
+4.32 ms scoped. The unscoped margin is 10% over four-thread `jwalk` and 31%
+over the zlob arm in the same invocation; the scoped margin comes from pruning
+`node_modules` out of the pattern itself, which the `ignore` arm reaches only
+with an extra caller policy at 7.61 ms.
+
+These numbers replace a set roughly 60% higher that was published on
+2026-09-04. Nothing in the walker changed between them. The earlier session ran
+the complete refresh — every backend, the ablations, and three thread sweeps —
+back to back on a laptop, and its sustained clocks, not the code, are what the
+old table recorded. That is what "run the arms you want to compare in one
+invocation, on an idle machine" is protecting against, and it is why no row
+here is comparable with a row from a different session.
 
 ### macOS-native backend
 
 | Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
 | --- | ---: | ---: |
-| ferralk, serial | 50.24 ms | 9.99 ms |
-| ferralk, 4 threads | 32.58 ms | **6.21 ms** |
-| `ignore` serial + `globset` | 76.26 ms | 77.46 ms |
-| `walkdir` serial + `globset` | 74.35 ms | 75.80 ms |
-| `jwalk` serial + `globset` | 79.95 ms | 80.48 ms |
-| `jwalk`, 4 threads + `globset` | 35.35 ms | 35.33 ms |
-| `globwalk` serial | 78.74 ms | 79.41 ms |
-| `wax` serial | 99.16 ms | 16.30 ms |
-| `ignore` parallel + overrides | 39.99 ms | 40.49 ms |
-| `ignore` parallel + hand-pruned subtree | — | 9.92 ms |
-| zlob, 4 threads | **32.20 ms** | 33.19 ms |
+| ferralk, serial | 46.35 ms | 8.61 ms |
+| ferralk, 4 threads | **20.83 ms** | **3.68 ms** |
+| `ignore` serial + `globset` | 68.78 ms | 69.16 ms |
+| `walkdir` serial + `globset` | 66.89 ms | 67.35 ms |
+| `jwalk` serial + `globset` | 71.46 ms | 71.93 ms |
+| `jwalk`, 4 threads + `globset` | 23.20 ms | 22.78 ms |
+| `globwalk` serial | 70.22 ms | 70.38 ms |
+| `wax` serial | 89.89 ms | 14.04 ms |
+| `ignore` parallel + overrides | 29.90 ms | 29.99 ms |
+| `ignore` parallel + hand-pruned subtree | — | 7.36 ms |
+| zlob, 4 threads | 21.45 ms | 22.32 ms |
 
-The native run puts Ferralk at 32.58 ms unscoped, within 1.2% of the 32.20 ms
-zlob arm in the same invocation. Scoped Ferralk remains ahead at 6.21 ms
-because it avoids the dependency subtree. The zlob anchors are close across
-the portable and native invocations (32.53 and
-32.20 ms), but backend differences still come from separate wall-time runs;
-use the paired ablations below for claims about a code change.
+The native backend takes the serial walk from 56.91 ms to 46.35 ms. Its
+parallel arm lands at 20.83 ms against the 21.45 ms zlob arm in the same
+invocation — a 2.9% margin, which is inside what these two arms vary by
+between invocations and is not a claim to be faster. The honest reading is
+that the two engines are level on this query and this host. Scoped Ferralk
+stays clearly ahead at 3.68 ms because it never opens the dependency subtree.
+
+The portable and native tables come from separate invocations, so their rows
+are not comparable with each other; the paired ablations below are what a
+claim about a code change should rest on.
 
 The same invocations also measured the newer covering-exclude and Gitignore
 queries. Both select the same 2,600 paths as the scoped query:
 
 | Backend | Exclude, serial | Exclude, 4 threads | Gitignore, 4 threads |
 | --- | ---: | ---: | ---: |
-| portable | 12.04 ms | 7.13 ms | 7.30 ms |
-| macOS native | 10.63 ms | **6.41 ms** | 6.99 ms |
+| portable | 10.78 ms | 4.38 ms | 4.53 ms |
+| macOS native | 9.16 ms | **3.96 ms** | 4.25 ms |
 
 The targeted, before/after comparisons attribute a 4.9% improvement to
 parent-relative directory opens and a further 10.3% to depth-first local
@@ -350,28 +367,34 @@ speedup, so these are current point estimates, not a before/after claim:
 
 ### Thread-count sweep, M1 Pro
 
-The opt-in sweep was run three times on 2026-09-04 on the same 10-core (8
-performance, 2 efficiency) M1 Pro host, macOS 26.6.2, rustc 1.97.1, Zig 0.16.0,
-and zlob 1.6.5. Ferralk used its portable backend so both rows extend the
-portable single-point comparison above. Each cell is the median of the three
-Criterion point estimates; parentheses give the range across runs, in
+The opt-in sweep was run three times on the same 10-core (8 performance in two
+clusters of four, 2 efficiency) M1 Pro host, macOS 26.6.2, rustc 1.97.1, Zig
+0.16.0, and zlob 1.6.5. Ferralk used its portable backend so both rows extend
+the portable single-point comparison above. Each cell is the median of the
+three Criterion point estimates; parentheses give the range across runs, in
 milliseconds.
 
 | Threads | ferralk | zlob |
 | ---: | ---: | ---: |
-| 1 | 62.09 (61.79–62.49) | **51.33** (50.75–51.62) |
-| 2 | 41.76 (41.74–41.87) | **38.80** (38.07–38.89) |
-| 4 | 34.36 (34.31–34.47) | **32.31** (32.13–32.41) |
-| 8 | **31.70** (31.62–31.83) | 31.93 (31.89–32.01) |
-| available = 10 | **35.03** (34.92–35.34) | 36.00 (35.70–36.01) |
+| 1 | 55.21 (54.96–56.31) | **46.69** (45.84–46.85) |
+| 2 | 32.58 (32.37–32.61) | **28.80** (28.28–28.86) |
+| 4 | 23.56 (23.17–23.73) | **21.20** (21.19–21.21) |
+| 8 | **30.61** (30.57–30.91) | 31.43 (31.27–31.53) |
+| available = 10 | **35.90** (35.81–36.01) | 37.30 (37.21–37.49) |
 
-The curve does **not** show a zlob advantage that grows with core count. zlob is
-faster at one, two, and four threads; Ferralk is slightly faster at eight and
-0.97 ms faster at the host's full reported parallelism. Both walkers reach
-their lowest median at eight threads. The four-thread gap is 2.05 ms, still far
-below the older M1 Ultra point-estimate gap; the eight-thread ranges are close
-but do not overlap. This paired sweep supports no scheduler-policy claim beyond
-the measured host and fixture.
+One run of the same sweep with `native-macos` puts the two engines level rather
+than leaving Ferralk behind: 45.72 / 28.94 / 18.77 / 29.63 / 35.35 ms against
+zlob's 47.45 / 29.42 / 18.66 / 30.15 / 36.12 ms. The portable rows above are
+what the `std::fs` reader costs, not what the walker costs.
+
+The curve does **not** show a zlob advantage that grows with core count, and it
+does not show either walker scaling with the core count at all. Both reach
+their lowest median at four threads and get *slower* from there: Ferralk gives
+back 30% between four and eight threads and 52% between four and ten, and zlob
+gives back the same. The two engines track each other point for point, which
+is the first sign that the shape belongs to the platform rather than to either
+scheduler. What that means for the default worker budget is measured
+[below](#the-default-worker-budget).
 
 The manual Linux dispatch now emits the same ten bencher lines with its actual
 `available_parallelism` embedded in the final label. The label is intentionally
@@ -387,7 +410,95 @@ wall-time rows. zlob was run in the same fixture and invocation as the other
 walker arms with Zig 0.16.0 and Apple libclang 21.0.0 installed locally. It
 remains an optional context lane rather than an automated baseline.
 
-### What zlob's unscoped lead comes from
+### The default worker budget
+
+The sweep above raises a question the sweep alone cannot answer: is the knee at
+four threads a property of ferralk's scheduler, of zlob's, or of the machine?
+Three controls settle it, all on the same host and fixture.
+
+**A profile.** `sample` over the four-thread macOS-native walk attributes 95.3%
+of all CPU across every thread to three syscalls: `getdirentries64` 65.9%,
+`openat` 28.2%, `close` 1.2%. Everything ferralk itself does — matching, ignore
+rules, path building, scheduling, allocation — is under 3% put together. The
+serial walk is the same picture at 91%. A walk of this shape is not CPU work,
+so "how many cores are idle" is the wrong question to size it by.
+
+**A floor.** A 70-line C walker that issues the same syscalls and does nothing
+else traverses the fixture's 1,723 directories in 37.6 ms serially; the
+macOS-native walk takes 41.6 ms. The syscall counts are already minimal — one
+`openat`, one `getdirentries64`, one `close` per directory, the extended EOF
+flag removing the second read — so there is no traversal work left to remove.
+Threaded over the same tree, that C walker shows the identical knee: 38.9 ms at
+one thread, 21.5 at four, 32.9 at eight, 39.2 at ten.
+
+**A control.** A pure-CPU workload on the same host holds flat from one to
+eight threads and only degrades at ten, where the efficiency cores come in.
+`pmset -g therm` reports no thermal or performance limit during any of it, and
+the machine carries no third-party system extensions or kexts. The knee is
+therefore neither thermal nor scheduling noise: it is what the kernel's
+namespace layer does under concurrency.
+
+Four is this host's `hw.perflevel0.cpusperl2` — the performance cores sharing
+one L2. Threads inside one performance cluster keep the kernel's contended
+namespace state in that cluster's cache; spilling into the second cluster turns
+every one of those lines into cross-cluster traffic. Two further measurements
+support that mechanism over the alternatives. Capping *concurrent syscalls*
+with a semaphore of four while running ten threads barely helps (36.7 → 34.0 ms,
+against 22.2 ms at four threads), so it is not the number of threads inside the
+kernel at once. And ten threads of which six run at `QOS_CLASS_BACKGROUND`,
+which parks them on the efficiency cores, returns to 22.0 ms — the four
+foreground threads carry the walk and the rest neither help nor hurt.
+
+So the default worker budget is `min(available_parallelism, cluster width)` on
+Apple Silicon macOS, read from that sysctl rather than hard-coded, and
+unbounded elsewhere. Explicit `Walker::threads` budgets are unaffected. For a
+caller who sizes no budget on this host, the unscoped query moves from the
+`available_parallelism` row of the sweep to the four-thread row:
+
+| Backend | Default before | Default after |
+| --- | ---: | ---: |
+| portable | 35.91 ms | **21.35 ms** |
+| macOS native | 37.18 ms | **19.69 ms** |
+
+**What this costs.** A walk whose per-entry matching dwarfs its filesystem work
+does scale past four threads, and now has to ask. The crossover is far outside
+ordinary patterns: `**/*.{ts,tsx}` costs 46 ms serially and prefers four
+threads by 36%; a deliberately adversarial
+`**/*{a,b,c}*{1,2}*.{ts,tsx,js,json}` costs 94 ms serially and *still* prefers
+four threads; only at
+`**/*{a,b,c,d,e,f}*{0,1,2,3}*.{ts,tsx,js,json,md,css}`, 199 ms serially and
+roughly four times the whole filesystem cost, does eight threads win, by 1.5x.
+A 360-rule `.gitignore` — the realistic way to add per-entry cost — scales flat
+from four threads to ten and loses nothing. An adaptive ramp was considered and
+rejected: it would put clock reads and a nondeterministic policy on the hot
+path of a scheduler that is otherwise loom-modelled, to recover a case that
+`Walker::threads` already covers.
+
+**How to reproduce it.** The sweep is the standing lane and is reproduced by
+the `thread-sweep` command above. The three controls are not lanes and ship no
+command: the profile is `sample <pid> 8` over a loop of walks, and the C floor
+and its threaded variant are throwaway programs that issue `openat`,
+`getdirentries64` and `close` and count entries. They are recorded here because
+they are what turned "ferralk is slower above four threads" into "the platform
+is", and rerunning them means writing them again rather than invoking a lane.
+
+**What this does not establish.** One host, one microarchitecture. The ceiling
+is read from a sysctl so that a different Apple Silicon cluster width applies
+itself, but the *rule* — that the cluster width is the right ceiling — is
+measured on an M1 Pro only. It is not applied to Intel macOS, where
+`hw.perflevel0.cpusperl2` counts an SMT pair rather than a cluster, nor to
+Linux, where no equivalent measurement has been made. Cold-cache behaviour was
+spot-checked on a detached and remounted APFS disk image and is flat from two
+threads to ten, so the ceiling costs nothing there either; a
+high-latency network filesystem, where concurrency hides round trips, is not
+measured anywhere here and is exactly the case for naming a budget explicitly.
+
+### Where zlob's earlier unscoped lead came from
+
+zlob led the unscoped query when this section was written. It no longer does:
+the paired native arms above are level, and the changes recorded here are part
+of why. The audit and the ablations are kept because they are the evidence for
+what ferralk adopted, not because the gap is still open.
 
 A source audit found no single matcher shortcut hidden behind the unscoped
 number. Its walker combines several low-level choices: a raw
@@ -413,9 +524,11 @@ inside the native backends. Local LIFO processing also preserves the public
 contract: unsorted parallel result order is deliberately unspecified. The
 ablation benchmark is diagnostic rather than a headline; its collect/count and
 path microbenchmarks explain where time can go, while `walker_palamedes` remains
-the complete engine comparison. In the refreshed current-code ablation,
-collecting every file took 33.26 ms for Ferralk and 32.55 ms for zlob;
-collecting the 7,400 filtered paths took 32.21 and 32.25 ms respectively.
+the complete engine comparison. The ablation numbers last published for the
+current code — 33.26 ms for Ferralk against 32.55 ms for zlob collecting every
+file — come from the same over-loaded 2026-09-04 session as the old
+single-point tables and have not been re-measured since; treat them as ordering
+evidence for the variants above rather than as current wall times.
 
 ### Matcher refresh
 
@@ -481,22 +594,23 @@ the median. Every candidate must return 7,400 files for the unscoped query and
 
 | Node.js walker | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
 | --- | ---: | ---: |
-| `node:fs` sync | 225.11 ms | 28.34 ms |
-| `node:fs` async | 283.16 ms | 40.28 ms |
-| `glob` sync | 90.11 ms | 16.47 ms |
-| `glob` async | 39.80 ms | 7.70 ms |
-| `fast-glob` sync | 97.31 ms | 14.62 ms |
-| `fast-glob` async | 46.27 ms | **7.64 ms** |
-| `tinyglobby` sync | 86.17 ms | 14.63 ms |
-| `tinyglobby` async | 39.25 ms | 7.73 ms |
-| `fdir` + `picomatch` sync | 84.59 ms | 80.96 ms |
-| `fdir` + `picomatch` async | **39.00 ms** | 38.32 ms |
+| `node:fs` sync | 201.53 ms | 26.42 ms |
+| `node:fs` async | 236.26 ms | 35.05 ms |
+| `glob` sync | 81.54 ms | 14.99 ms |
+| `glob` async | 35.12 ms | **6.34 ms** |
+| `fast-glob` sync | 86.42 ms | 14.70 ms |
+| `fast-glob` async | 41.14 ms | 6.62 ms |
+| `tinyglobby` sync | 80.45 ms | 14.33 ms |
+| `tinyglobby` async | 36.14 ms | 7.14 ms |
+| `fdir` + `picomatch` sync | 78.86 ms | 75.01 ms |
+| `fdir` + `picomatch` async | **35.12 ms** | 31.39 ms |
 
-The fastest Node medians are 39.00 ms unscoped and 7.64 ms scoped. The current
-Criterion runs put portable Ferralk at 34.51 and 6.97 ms and native Ferralk at
-32.58 and 6.21 ms. That is useful same-host context, not a formal ranking: the
-Rust table uses Criterion point estimates while the Node harness reports a
-median of ten samples, and the APIs do not offer identical semantics.
+The fastest Node medians are 35.12 ms unscoped and 6.34 ms scoped. The
+Criterion runs from the same session put portable Ferralk at 20.83 and 4.32 ms
+and native Ferralk at 20.83 and 3.68 ms. That is useful same-host context, not
+a formal ranking: the Rust table uses Criterion point estimates while the Node
+harness reports a median of ten samples, and the APIs do not offer identical
+semantics.
 
 The matcher harness takes five warmups and fifteen order-rotated samples of
 100,000 matches per case. The adversarial case uses 100 matches per sample so a
@@ -504,9 +618,9 @@ backtracking engine cannot make the run unbounded.
 
 | Node.js matcher | Common match | Common reject | Long match | Long reject | Adversarial reject |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `picomatch` | 76.6 ns | 89.0 ns | **279.1 ns** | 291.0 ns | 383.5 µs |
-| `micromatch` | **75.9 ns** | **88.4 ns** | 279.9 ns | **290.9 ns** | 382.0 µs |
-| `minimatch` | 218.9 ns | 201.9 ns | 544.8 ns | 475.2 ns | **381.0 µs** |
+| `picomatch` | 75.0 ns | 85.4 ns | 268.9 ns | 279.8 ns | 368.7 µs |
+| `micromatch` | **71.7 ns** | **84.5 ns** | **268.8 ns** | **279.0 ns** | 368.8 µs |
+| `minimatch` | 207.0 ns | 191.9 ns | 519.4 ns | 452.1 ns | **367.6 µs** |
 
 Ferralk's corresponding rows are 11/3 ns for the common case, 11/3 ns for the
 long case, and 3 ns for the adversarial rejection. This is compiled native Rust
