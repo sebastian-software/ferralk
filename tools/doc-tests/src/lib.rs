@@ -862,6 +862,12 @@ mod tests {
     fn is_excluded_directory(root: &Path, directory: &Path) -> bool {
         // Git metadata and generated/build trees are not repository
         // documentation. Every other Markdown file is inventory-controlled.
+        //
+        // `node_modules` is here because the Node benchmark harness is a
+        // documented lane: `npm ci` under `tools/bench/node` drops dozens of
+        // dependency READMEs into the working tree, and without this the next
+        // `cargo test --workspace` fails with an inventory mismatch for files
+        // the repository's own `.gitignore` excludes.
         let relative = directory
             .strip_prefix(root)
             .expect("repository directory is below the repository root");
@@ -871,7 +877,7 @@ mod tests {
         relative.components().any(|component| {
             matches!(
                 component.as_os_str().to_str(),
-                Some(".git" | "target" | "vendor")
+                Some(".git" | "target" | "vendor" | "node_modules")
             )
         })
     }
