@@ -18,7 +18,16 @@ Everything behavior-changing should be an explicit builder call.
 | `*` matches leading-period names | no (`match_hidden` opts in) |
 | sorting | off (unsorted, nondeterministic order) |
 | `ErrorPolicy` | `Collect` |
-| threads | `min(available_parallelism(), 256)`; explicit budgets clamp to `1..=256` |
+| threads | `min(available_parallelism(), metadata concurrency ceiling, 256)`; explicit budgets clamp to `1..=256` |
+
+The metadata concurrency ceiling is unbounded except on Apple Silicon macOS,
+where it is `hw.perflevel0.cpusperl2` — the performance cores sharing one L2.
+A warm walk is not CPU work: 95% of its samples sit in `openat`,
+`getdirentries64` and `close`, and on that platform the kernel's namespace
+layer serves those fastest when the workers stay inside one performance
+cluster. Past it, aggregate throughput falls rather than plateaus.
+`docs/benchmark-evidence.md` carries the measurement, including the raw C and
+zlob controls that show the knee is the platform's rather than ferralk's.
 
 ## Consequences
 
@@ -26,3 +35,8 @@ Everything behavior-changing should be an explicit builder call.
   ignore handling cost only those who ask for them.
 - Consumers like Palamedes configure their policy once in the builder
   (gitignore on, symlinks off, collect errors).
+- The thread default is a starting point sized for the walk shape a glob
+  walker usually gets, not a reading of the core count. A walk whose per-entry
+  matching cost dwarfs its filesystem cost — measured, that means a serial walk
+  roughly four times its metadata-only time — is faster with more workers and
+  should call `Walker::threads`.

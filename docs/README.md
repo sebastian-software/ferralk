@@ -13,6 +13,7 @@ grouped by what you are trying to do.
 | [1.x stability contract](stability.md) | What 1.x promises: public API, corpus semantics, MSRV policy, Windows tier, and the explicit exclusions. |
 | [Benchmark evidence](benchmark-evidence.md) | What is measured, how to reproduce it, what scoped queries mean, and how Ferralk compares with Rust, Node.js, and zlob libraries. |
 | [Palamedes adoption](palamedes-adoption.md) | A consumer integration measured over four releases on two real repositories, and which finding produced which change here. |
+| [Verification depth](verification-comparison.md) | How much checkable evidence stands behind the behaviour, counted next to comparable crates, and where those counts mislead. |
 
 ## Coming from another library
 
