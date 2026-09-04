@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.0.0-rc.1](https://github.com/sebastian-software/ferralk/compare/v0.12.0...v1.0.0-rc.1) (2026-09-04)
+
+
+### Performance Improvements
+
+* **bench:** complete the benchmark lanes for 1.0 ([#364](https://github.com/sebastian-software/ferralk/issues/364)) ([a535802](https://github.com/sebastian-software/ferralk/commit/a53580288ad9c44251ca6eaa0e441f8a83d70af1))
+* **bench:** establish comparable walker PR baselines ([#359](https://github.com/sebastian-software/ferralk/issues/359)) ([1985238](https://github.com/sebastian-software/ferralk/commit/19852387d0be4976d297d60d477894d1355f1257)), closes [#358](https://github.com/sebastian-software/ferralk/issues/358)
+* **walker:** size the default worker budget to the platform ([#362](https://github.com/sebastian-software/ferralk/issues/362)) ([28b2442](https://github.com/sebastian-software/ferralk/commit/28b2442ad6087f5ef2aca309ceb4899284e81a0e))
+
+
+### Miscellaneous Chores
+
+* release the 1.0 candidate ([#363](https://github.com/sebastian-software/ferralk/issues/363)) ([6e3e344](https://github.com/sebastian-software/ferralk/commit/6e3e34424d50e91595812b918896fac1e91f1c2c))
+
 ## [0.12.0](https://github.com/sebastian-software/ferralk/compare/v0.11.0...v0.12.0) (2026-09-03)
 
 
