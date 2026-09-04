@@ -15,9 +15,12 @@ lost to a UTF-8 conversion.
 On the repository-shaped fixture in the
 [benchmark snapshot](#local-benchmark-snapshot) below it is the fastest arm
 measured: ahead of `ignore`, `jwalk`, `walkdir`, `globwalk` and `wax`, and
-level with or ahead of the Zig library it learned from. That is one host, one
-tree shape and a warm cache, which the snapshot states — a reproducible
-measurement, not a claim to be the fastest walker everywhere.
+level with or ahead of the Zig library it learned from. The same comparison on
+Linux CI puts the margin wider — 2.1x over the next-fastest arm on the
+unscoped query and 3.4x on the scoped one — and there Ferralk walking
+*serially* still beats four-thread `jwalk`. One tree shape and a warm cache,
+which the snapshot states: a reproducible measurement rather than a claim to
+be the fastest walker everywhere.
 
 It is published as two crates, so a consumer that only needs matching does not
 pay for traversal dependencies:

@@ -16,7 +16,7 @@ records the same distinction for releases.
 | Allocation regression | Zero allocations for warmed compiled matches; steady-state serial-walker growth above the platform's portable `std::fs` floor, with and without Git ignore rules, and the same growth on the parallel route over wide sibling directories | [`allocation_regression.rs`](../crates/ferralk/tests/allocation_regression.rs), every platform test and both native-backend jobs | Yes |
 | Matcher, wall time | Compiled-pattern matching and compilation, against `globset`, `fast-glob`, and `wax` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
 | Walker, wall time | Warm-cache traversal of synthetic trees, including serial, parallel, and `stream()` over the 53k-file repository shape, a 400-level chain, include-plus-covering-exclude pruning, and comparisons with `ignore` parallel | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request compares the merge base and head back to back in one job for every shipped backend; medians and head/base ratios are published in the job summary and as artifacts | No |
-| Engine comparison | One repository shape with unscoped include, scoped include, include-plus-exclude, and gitignore-pruned queries | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), run on demand | No |
+| Engine comparison | One repository shape with unscoped include, scoped include, include-plus-exclude, and gitignore-pruned queries | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), locally on demand and by manual dispatch of [`walker-bench.yml`](../.github/workflows/walker-bench.yml) on Linux | No |
 | Thread scaling | Ferralk and, when enabled, zlob over the unscoped 53k-file query at 1, 2, 4, 8, and `available_parallelism` threads; the evidence behind the default worker budget | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs) with `thread-sweep`, local or manual zlob dispatch | No |
 | zlob ablations | Ferralk and zlob on one fixed fixture, split into traversal, filtering, result retention, and path-representation costs | [`walker_zlob_ablation.rs`](../tools/bench/benches/walker_zlob_ablation.rs), run on demand | No |
 | zlob context | The matcher smoke fixture and 53k-file engine comparison against zlob 1.6.5 | [`zlob-benchmark.yml`](../.github/workflows/zlob-benchmark.yml), manual dispatch on Linux only | No |
@@ -351,6 +351,49 @@ The targeted, before/after comparisons attribute a 4.9% improvement to
 parent-relative directory opens and a further 10.3% to depth-first local
 queues. These are separate wall-time runs, not percentages that can be summed
 into a complete-table improvement.
+
+### The same comparison on Linux
+
+The engine-comparison lane in
+[`walker-bench.yml`](../.github/workflows/walker-bench.yml) runs the identical
+bench on a GitHub-hosted `ubuntu-latest` runner. It is manual dispatch, Rust
+only — the zlob arm needs Zig and stays a local concern — and it measures the
+portable backend, which is what every arm below uses.
+
+| Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
+| --- | ---: | ---: |
+| ferralk, 4 threads | **6.11 ms** | **1.18 ms** |
+| ferralk, serial | 15.76 ms | 2.40 ms |
+| `ignore` parallel + overrides | 12.64 ms | 12.44 ms |
+| `ignore` parallel + hand-pruned subtree | — | 4.01 ms |
+| `jwalk`, 4 threads + `globset` | 19.56 ms | 20.88 ms |
+| `walkdir` serial + `globset` | 23.23 ms | 23.45 ms |
+| `ignore` serial + `globset` | 24.36 ms | 24.70 ms |
+| `globwalk` serial | 29.02 ms | 27.25 ms |
+| `jwalk` serial + `globset` | 31.16 ms | 30.26 ms |
+| `wax` serial | 45.98 ms | 5.80 ms |
+
+Two things are worth reading off this rather than the absolute numbers, which
+belong to a shared runner and should not be compared with the M1 Pro tables
+above.
+
+**The ordering is the same on both platforms, and the margin is wider here.**
+Ferralk leads the unscoped query by 2.07x over the next-fastest arm, against
+1.11x on macOS, and the scoped query by 3.4x. Linux is also the faster platform
+in absolute terms for both: 6.11 ms against 20.83 ms for the same portable
+arm. The macOS syscall costs that
+[the default worker budget](#the-default-worker-budget) section measures are
+what that gap is made of, and they are why the worker ceiling is a macOS
+ceiling.
+
+**Serial Ferralk beats every parallel arm except one.** At 15.76 ms it is ahead
+of four-thread `jwalk` at 19.56 ms and behind only parallel `ignore` at
+12.64 ms — on the query where nothing can be pruned, which is the query that
+should favour threads most.
+
+The exclude-pruned and Gitignore-pruned arms select the same 2,600 paths as the
+scoped query and land at 1.39 ms and 1.27 ms on four threads, against 2.96 ms
+serial for the exclude.
 
 ### Wide-frontier wall time
 
