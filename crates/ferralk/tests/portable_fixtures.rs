@@ -785,7 +785,7 @@ fn resolving_symlink_kind_sorts_the_three_shapes_by_target() {
 
 /// A broken link is dropped rather than reported: dangling links are ordinary,
 /// and an error for each would flood `errors()` and end an `Abort` walk over a
-/// stale build artefact.
+/// stale build artifact.
 #[cfg(unix)]
 #[test]
 fn a_broken_link_is_dropped_without_an_error_under_every_policy() {

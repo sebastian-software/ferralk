@@ -1,5 +1,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
+// docs.rs passes `--cfg docsrs` (see `[package.metadata.docs.rs]`), which is
+// what lets a feature-gated item render with the flags that gate it.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = "Portable filesystem walking."]
 
 //! Parallel filesystem walking with byte-first glob selection.
@@ -212,14 +215,38 @@ mod retained_directory_test {
 }
 #[cfg(all(feature = "native-linux", target_os = "linux"))]
 #[cfg(feature = "unstable-test-hooks")]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(all(
+        feature = "native-linux",
+        feature = "unstable-test-hooks",
+        target_os = "linux"
+    )))
+)]
 #[doc(hidden)]
 pub use linux_native::fuzz_validate_records as fuzz_validate_linux_dirent_records;
 #[cfg(all(feature = "native-macos", target_os = "macos"))]
 #[cfg(feature = "unstable-test-hooks")]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(all(
+        feature = "native-macos",
+        feature = "unstable-test-hooks",
+        target_os = "macos"
+    )))
+)]
 #[doc(hidden)]
 pub use macos_native::fuzz_validate_bulk_record as fuzz_validate_macos_bulk_record;
 #[cfg(all(feature = "native-macos", target_os = "macos"))]
 #[cfg(feature = "unstable-test-hooks")]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(all(
+        feature = "native-macos",
+        feature = "unstable-test-hooks",
+        target_os = "macos"
+    )))
+)]
 #[doc(hidden)]
 pub use macos_native::fuzz_validate_records as fuzz_validate_macos_dirent_records;
 mod absolute;
@@ -347,7 +374,7 @@ pub enum WildcardMode {
     SeparatorCrossing,
 }
 
-/// Behaviour switches for a Walker.
+/// Behavior switches for a Walker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WalkOptions {
     follow_symlinks: bool,
@@ -1276,7 +1303,7 @@ impl Walker {
     /// Subsequent Git-ignore walks resume detection from each repository's
     /// local config. This is useful for a reusable builder whose caller first
     /// supplied Git's effective value and then wants its normal local-config
-    /// behaviour back.
+    /// behavior back.
     #[must_use]
     pub const fn clear_git_ignore_case(mut self) -> Self {
         self.git_ignore_case = None;
@@ -1771,7 +1798,7 @@ impl TraversalPattern {
         // The matcher expands braces before it compiles; the prefilters are
         // derived from the same expansion, so `**/*.{ts,tsx}` keeps the
         // extension filter and `{src,lib}/**` keeps its roots. A pattern
-        // without braces expands to itself, which is the previous behaviour.
+        // without braces expands to itself, which is the previous behavior.
         let alternatives = ferralk_glob::expand_braces(pattern, options)?;
         Ok(Self {
             source: source.to_vec(),
@@ -2301,7 +2328,7 @@ fn read_in_tree_ignore_file(path: &Path) -> std::io::Result<Vec<u8>> {
 /// On Unix this is `(st_dev, st_ino)`: sixteen `Copy` bytes from the one
 /// `metadata` call the guard already has to make, with no path resolution and
 /// no allocation. Two names for one directory, a symlink and the real path
-/// among them, share an inode and are therefore recognised as one place --
+/// among them, share an inode and are therefore recognized as one place --
 /// which a resolved path only manages when the resolution agrees.
 ///
 /// Elsewhere the resolved path stays the key. Windows exposes a file index

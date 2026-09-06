@@ -22,7 +22,7 @@ use ferralk::{
 const ENTRIES_PER_DIRECTORY: usize = 64;
 /// An ordinary directory width, wider than the 64-entry batch the parallel
 /// walk once split listings into. A directory this size must be classified in
-/// one piece: split, its name buffers travelled into the continuation and a
+/// one piece: split, its name buffers traveled into the continuation and a
 /// sibling started over with none.
 const WIDE_ENTRIES_PER_DIRECTORY: usize = 100;
 const CONSTANT_GROWTH_BUDGET: u64 = 16;

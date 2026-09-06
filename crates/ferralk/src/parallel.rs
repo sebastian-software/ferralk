@@ -183,7 +183,7 @@ const DIRECTORY_WEIGHT: usize = 20;
 /// still queued when it is met already weighed directories, just implicitly.
 ///
 /// Re-swept after #84 made a walked entry cheaper, on the theory that a
-/// cheaper entry leaves less work to amortise a thread and should raise this.
+/// cheaper entry leaves less work to amortize a thread and should raise this.
 /// It does not: these walks are dominated by the syscall each directory costs,
 /// and #84 changed per-entry work rather than that.
 const HELPER_WORK_FLOOR: usize = 224;
@@ -196,7 +196,7 @@ const HELPER_WORK_FLOOR: usize = 224;
 /// One listing that large is worth splitting even though nothing else is
 /// waiting, and by then a thread costs nothing against it.
 ///
-/// In work units since #88, so the listing itself counts towards it. At this
+/// In work units since #88, so the listing itself counts toward it. At this
 /// size that is a 2% difference and the constant keeps its meaning: one
 /// directory holding about a thousand files.
 const HELPER_LISTING_FLOOR: usize = 1024;
@@ -1097,7 +1097,7 @@ mod tests {
     #[test]
     fn the_floor_divides_where_the_sweep_says_it_should() {
         // Directories of files. Pooling loses on the small ones and wins once
-        // there is enough of the tree to amortise a thread.
+        // there is enough of the tree to amortize a thread.
         for (dirs, per_dir, expected, note) in [
             (9, 16, false, "pooling loses 10%"),
             (17, 16, true, "pooling wins 8.5%"),
@@ -1333,7 +1333,7 @@ mod tests {
     /// The helper floor counts the whole walk, not one root of it.
     ///
     /// Three tiny roots are still a tiny walk, and starting a pool for them
-    /// would cost more than it saves - the same judgement #76 made for one
+    /// would cost more than it saves - the same judgment #76 made for one
     /// root, applied to the sum rather than to whichever root came first.
     #[test]
     fn the_floor_counts_across_roots() {

@@ -2,7 +2,7 @@
 
 Start with the [documentation index](docs/README.md). The
 [usage guide](docs/usage.md) carries the commands a change has to pass, the
-[corpus format](docs/corpus-format.md) governs behavioural cases, and the
+[corpus format](docs/corpus-format.md) governs behavioral cases, and the
 [ADRs](docs/adr/README.md) record decisions that are not up for re-litigation
 in a pull request.
 
@@ -32,7 +32,7 @@ A change that claims a performance effect carries its own evidence: run the
 relevant bench before and after on one machine, back to back, and put both
 numbers in the pull request body along with the fixture they describe. State
 what the measurement does not establish — a warm page cache, one tree shape,
-one platform — rather than leaving a reader to assume it generalises.
+one platform — rather than leaving a reader to assume it generalizes.
 
 The CodSpeed simulation lane that used to run here was removed on 2026-08-19.
 Over the period it ran it produced four false alarms and no true finding, each
@@ -43,17 +43,17 @@ lanes that remain.
 
 ## Communicate pre-1.0 contract changes
 
-During `0.x`, a consumer-facing behaviour change must be marked as breaking in
+During `0.x`, a consumer-facing behavior change must be marked as breaking in
 its Conventional Commit. Put `!` after the type or scope (for example,
 `fix(walker)!: preserve caller cancellation`) and add a filled-in `BREAKING
-CHANGE:` footer that states the old and new observable behaviour. The marker
+CHANGE:` footer that states the old and new observable behavior. The marker
 selects the version bump; the footer gives Release Please the consumer-facing
 text it renders into the changelog. Do this even when the Rust type signatures
 are unchanged: changed runtime errors, validation, cancellation, traversal,
 matching, and default policy are all part of the consumer contract.
 
 Release Please recognizes those markers and renders a dedicated breaking-change
-section in the release notes. Describe the old and new observable behaviour in
+section in the release notes. Describe the old and new observable behavior in
 the pull request as well, so the generated summary has the context consumers
 need.
 
@@ -95,10 +95,15 @@ the corpus was replayed or skipped, visible with
 `cargo test -p harness --test git_check_ignore -- --show-output`, and fails
 when `FERRALK_REQUIRE_GIT_ORACLE=1` is set. CI sets that variable while
 replaying with the exact reference release, Git 2.52.0. The separate fuzz
-workspace is
-included because root-workspace commands do not compile it. The
+workspace is included because root-workspace commands do not compile it. The
 development-only `oracle` package links zlob; include it by dropping
 `--exclude oracle` only after installing Zig 0.16 and libclang.
+
+Ignore rules are split for the same reason. The root `.gitignore` anchors its
+build entry at `/target/`, so it deliberately does not reach into the fuzz
+workspace; `fuzz/.gitignore` covers `target/` and the `artifacts/` directory
+`cargo fuzz` writes when a target crashes. Keep both files, and add a fuzz
+ignore rule to `fuzz/.gitignore` rather than to the root.
 
 CI has additional platform, sanitizer, coverage, and policy lanes. In
 particular, coverage includes `oracle` and installs Zig itself; that CI setup
@@ -128,12 +133,12 @@ protects is defined in [`docs/stability.md`](docs/stability.md).
   Windows tier, MSRV policy, and explicit exclusions.
 - [ ] Audit every `!` change since 0.9.0 against the
   [compatibility guide](docs/compatibility-guide.md#contract-change-audit-since-090)
-  and usage guide, then check the release notes describe the final behaviour.
+  and usage guide, then check the release notes describe the final behavior.
 - [ ] Cut `1.0.0-rc.1` only after the two clean rounds. Keep the release
   candidate for one further adversarial round; cut `1.0.0` only if that round
   also produces no consumer-visible breaking change.
 - [ ] If a candidate is cut before the two rounds have run, say so in the
-  release pull request. The candidate is then the artefact the rounds run
+  release pull request. The candidate is then the artifact the rounds run
   against rather than their result, and `1.0.0` still waits for a clean one.
 - [ ] Tell Release Please the version explicitly. Its `bump-minor-pre-major`
   setting turns every breaking change on `0.x` into a minor bump, so it never

@@ -3,13 +3,21 @@ name = "ferralk-glob"
 description = "Compiled, byte-first glob matching with explicit wildcard, brace, and extglob semantics."
 readme = "README.md"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/ferralk-glob"
 keywords.workspace = true
 categories.workspace = true
+
+# `--cfg docsrs` turns on the `doc_cfg` annotations that name the feature a
+# gated item needs.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 # Development-only differential hooks. No item enabled by this feature is
@@ -17,7 +25,7 @@ categories.workspace = true
 unstable-test-hooks = []
 
 [dependencies]
-memchr = "=2.8.3"
+memchr = "2.8.3"
 
 [lints]
 workspace = true

@@ -13,7 +13,7 @@ grouped by what you are trying to do.
 | [1.x stability contract](stability.md) | What 1.x promises: public API, corpus semantics, MSRV policy, Windows tier, and the explicit exclusions. |
 | [Benchmark evidence](benchmark-evidence.md) | What is measured, how to reproduce it, what scoped queries mean, and how Ferralk compares with Rust, Node.js, and zlob libraries. |
 | [Palamedes adoption](palamedes-adoption.md) | A consumer integration measured over four releases on two real repositories, and which finding produced which change here. |
-| [Verification depth](verification-comparison.md) | How much checkable evidence stands behind the behaviour, counted next to comparable crates, and where those counts mislead. |
+| [Verification depth](verification-comparison.md) | How much checkable evidence stands behind the behavior, counted next to comparable crates, and where those counts mislead. |
 
 ## Coming from another library
 
@@ -28,7 +28,7 @@ grouped by what you are trying to do.
 | Document | Use it for |
 | --- | --- |
 | [Contributing](../CONTRIBUTING.md) | The canonical preflight, commit conventions, how a performance claim is evidenced, and the 1.0 release checklist. |
-| [Corpus format](corpus-format.md) | Maintaining or reviewing JSONL behavioural cases; the corpus is the source of truth for matcher and walker semantics. |
+| [Corpus format](corpus-format.md) | Maintaining or reviewing JSONL behavioral cases; the corpus is the source of truth for matcher and walker semantics. |
 | [Fuzzing](../fuzz/README.md) | The parser, matcher, differential, and native-record fuzz targets and their seeds. |
 | [ADRs](adr/README.md) | Accepted architectural decisions and their consequences. They are constraints, not proposals. |
 | [Deferred follow-up](external-release-gates.md) | Platform state and the open work tracked in GitHub after the initial release. |

@@ -42,7 +42,7 @@ there measures instruction count rather than speedup.
 **What each lane does not establish.** The matcher lane says nothing about
 syscall-bound work. The walker lanes
 run on synthetic trees written immediately before measurement, so every result
-describes a warm page cache; cold-cache behaviour is a different measurement and
+describes a warm page cache; cold-cache behavior is a different measurement and
 is not made anywhere here. Shared runners are noisy: compare arms measured in
 the same invocation, not numbers from different runs. And no lane says anything
 about API or semantic scope — the engines compared below do not all offer the
@@ -64,7 +64,7 @@ cargo bench -p bench --bench walker -- --warm-up-time 1 --measurement-time 5 --s
 # walkdir, jwalk, globwalk, and wax in addition to the existing arms.
 cargo bench -p bench --bench walker_palamedes -- --output-format bencher --noplot
 
-# Opt-in scaling curve. The available point is labelled with the host's actual
+# Opt-in scaling curve. The available point is labeled with the host's actual
 # available_parallelism; it remains explicit even when it duplicates 1/2/4/8.
 cargo bench -p bench --bench walker_palamedes --features thread-sweep -- \
   thread_sweep/ --output-format bencher --noplot
@@ -114,10 +114,18 @@ zlob is context, never a baseline anything depends on: its benches are behind
 the `zlob-oracle` feature, its workflow is manual dispatch only, and no
 automatic lane requires Zig. The dispatch workflow includes `walker_palamedes`
 with `thread-sweep`, so its Rust and zlob arms provide same-invocation Linux
-ratios and scaling curves over the 53k-file tree. Ferralk's compatibility
-target remains the frozen zlob 1.6.3 reference, while the current performance
-harness and refreshed local tables below use zlob 1.6.5. The current local run
-used Zig 0.16.0 and Apple libclang 21.0.0 from Xcode.
+ratios and scaling curves over the 53k-file tree.
+
+The two zlob versions on this page are deliberate. The semantic oracle in
+[`tools/oracle`](../tools/oracle/Cargo.toml) is pinned to the 1.6.3 source
+commit recorded in [NOTICE](../NOTICE) and
+[ADR-0007](adr/0007-differential-corpus-and-dev-time-oracle.md), so an upstream
+release can never move the corpus expectations under it; the performance
+harness in [`tools/bench`](../tools/bench/Cargo.toml) pins `=1.6.5`, the latest
+registry release, because a speed comparison is only useful against what a
+consumer would install today. Cargo keeps the two 1.6.x packages apart because
+one comes from Git and the other from the registry. The current local run used
+Zig 0.16.0 and Apple libclang 21.0.0 from Xcode.
 
 The engine-comparison measurements in the next section were taken with:
 
@@ -424,7 +432,7 @@ ceiling.
 **Serial Ferralk beats every parallel arm except one.** At 15.76 ms it is ahead
 of four-thread `jwalk` at 19.56 ms and behind only parallel `ignore` at
 12.64 ms — on the query where nothing can be pruned, which is the query that
-should favour threads most.
+should favor threads most.
 
 The exclude-pruned and Gitignore-pruned arms select the same 2,600 paths as the
 scoped query and land at 1.39 ms and 1.27 ms on four threads, against 2.96 ms
@@ -549,7 +557,7 @@ roughly four times the whole filesystem cost, does eight threads win, by 1.5x.
 A 360-rule `.gitignore` — the realistic way to add per-entry cost — scales flat
 from four threads to ten and loses nothing. An adaptive ramp was considered and
 rejected: it would put clock reads and a nondeterministic policy on the hot
-path of a scheduler that is otherwise loom-modelled, to recover a case that
+path of a scheduler that is otherwise loom-modeled, to recover a case that
 `Walker::threads` already covers.
 
 **How to reproduce it.** The sweep is the standing lane and is reproduced by
@@ -565,7 +573,7 @@ is read from a sysctl so that a different Apple Silicon cluster width applies
 itself, but the *rule* — that the cluster width is the right ceiling — is
 measured on an M1 Pro only. It is not applied to Intel macOS, where
 `hw.perflevel0.cpusperl2` counts an SMT pair rather than a cluster, nor to
-Linux, where no equivalent measurement has been made. Cold-cache behaviour was
+Linux, where no equivalent measurement has been made. Cold-cache behavior was
 spot-checked on a detached and remounted APFS disk image and is flat from two
 threads to ten, so the ceiling costs nothing there either; a
 high-latency network filesystem, where concurrency hides round trips, is not
@@ -769,7 +777,7 @@ expand parser input or weaken record bounds. A final flagged batch now follows
 `open + read + close`, rather than `open + read + empty read + close`: one
 directory-read syscall is removed for directories that fit their final batch.
 This is a syscall-count observation, not a new wall-time benchmark; cache,
-tree shape, filesystem and concurrent work determine the realised speedup.
+tree shape, filesystem and concurrent work determine the realized speedup.
 
 ### Serial descriptor retention, 2026-09-02
 
@@ -902,7 +910,7 @@ caller had to keep in sync.
 On the 12-file tree the includes arm is ~19 µs slower, and a control arm that
 compiles the 24 includes and never walks accounts for it: 12–16 µs. That is
 pattern compilation, paid once per walker, which a 12-file tree has no entries
-to amortise it over. A caller that builds one walker and reuses it, or walks
+to amortize it over. A caller that builds one walker and reuses it, or walks
 anything larger than a toy tree, does not see it.
 
 What this does not show: a catalog of extension globs is the case the extension
@@ -919,7 +927,7 @@ weighs is a measurement question. This sweep is the evidence behind
 
 Thirty-six shapes, directory count against files per directory. Each is walked
 process-fresh — one walk per process, because thread startup is the cost under
-test and repeated iterations in one process amortise it away — with helpers
+test and repeated iterations in one process amortize it away — with helpers
 forced off and forced on, the two arms alternating every round, medians of 51
 rounds. The cell is pooled ÷ serial: **below 1.00 pooling wins**.
 
@@ -969,7 +977,7 @@ already weighed directories, just implicitly.
 
 Against this host, the floor now picks the better arm on all 36 shapes; the
 previous one missed 4. Every ratio here is one machine's, and the constants are
-a judgement about where a thread stops paying for itself, not a threshold any
+a judgment about where a thread stops paying for itself, not a threshold any
 lane enforces.
 
 ## Several roots, one walker or several
@@ -1075,6 +1083,6 @@ is not compared against the baselines, whose builders accept different syntax.
   wrapper around `walkdir` and `ignore`, `wax` is UTF-8/regex-based, `ignore` is
   a walker with gitignore support, and zlob is a Zig library behind a C ABI with
   its own semantics. They are compared here on the one axis they share, the
-  shape and speed of a query, and the corpus is where behaviour is compared.
+  shape and speed of a query, and the corpus is where behavior is compared.
 - **Thread count is fixed at four.** A different count changes the parallel arms
   and would change the ordering on a machine with a different core count.

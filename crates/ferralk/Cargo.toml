@@ -1,19 +1,29 @@
 [package]
 name = "ferralk"
-description = "Parallel, Git-ignore-aware filesystem walker whose glob patterns prune the traversal."
+description = "Glob matching and parallel filesystem walking, byte-first, with an unsafe-free matcher."
 readme = "README.md"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/ferralk"
 keywords.workspace = true
 categories.workspace = true
 # The Git-verified ignore corpus replay needs the unpublished `corpus`
 # package, a path-only dev-dependency that Cargo strips when packaging. Keep
 # that test out of the tarball so `cargo test` builds from the published crate.
 exclude = ["tests/git_ignore_corpus.rs"]
+
+# docs.rs builds on Linux, where `native-macos` compiles to nothing, so the
+# rendered documentation covers the Linux backend and the portable walker.
+# `--cfg docsrs` turns on the `doc_cfg` annotations that name the feature and
+# target a gated item needs.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 # Experimental native backends. Their names and selected implementations are
@@ -25,15 +35,15 @@ native-macos = []
 unstable-test-hooks = ["ferralk-glob/unstable-test-hooks"]
 
 [dependencies]
-crossbeam-deque = "=0.8.7"
+crossbeam-deque = "0.8.7"
 ferralk-glob = { path = "../ferralk-glob", version = "1.0.0-rc.1" }
-memchr = "=2.8.3"
+memchr = "2.8.3"
 
 [target.'cfg(unix)'.dependencies]
-libc = "=0.2.189"
+libc = "0.2.189"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-unicode-normalization = "=0.1.25"
+unicode-normalization = "0.1.25"
 
 [dev-dependencies]
 allocation-counter = "=0.8.1"
