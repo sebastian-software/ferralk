@@ -57,12 +57,15 @@ every job in the seven of the repository's eleven workflow files that a
 `pull_request` event triggers, expanded over its matrix and filtered by its
 `if:` condition — 14 from `ci.yml`, 4 glob-fuzz targets, 3 Linux native jobs,
 3 macOS native jobs, 4 walker-benchmark jobs, the loom models, and the
-path-filtered zlob-oracle replay, which drops the total to 29 on a pull request
-that touches neither the matcher nor the corpus. The four workflows with no
-`pull_request` trigger (`fuzz.yml`, `publish.yml`, `release-please.yml`,
-`zlob-benchmark.yml`) and the jobs whose `if:` selects a schedule or a manual
-dispatch are excluded, because a check that never runs on a pull request is not
-evidence a reviewer gets. Comparable crates run 1 to 5 workflows.
+zlob-oracle replay. Twenty-nine of those run on every pull request. The
+thirtieth, the oracle replay, is the only path-filtered one: it runs when the
+pull request touches `corpus/**`, `crates/ferralk-glob/**`, `tools/corpus/**`,
+`tools/oracle/**`, `Cargo.lock`, or `.github/workflows/oracle.yml`, and is not
+queued at all otherwise. The four workflows with no `pull_request` trigger
+(`fuzz.yml`, `publish.yml`, `release-please.yml`, `zlob-benchmark.yml`) and the
+jobs whose `if:` selects a schedule or a manual dispatch are excluded, because
+a check that never runs on a pull request is not evidence a reviewer gets.
+Comparable crates run 1 to 5 workflows.
 
 ## Where these counts mislead
 

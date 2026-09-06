@@ -2,9 +2,12 @@
 
 ## Supported versions
 
-Security fixes are made for the latest release on the default branch; earlier
-releases are not patched. Update to it before reporting a problem that may
-already be fixed.
+The supported version is the latest published release. Earlier releases are not
+patched. A fix that is not published yet is available on the default branch
+until the next release carries it.
+
+Update to the latest release before reporting a problem that may already be
+fixed.
 
 ## Reporting a vulnerability
 
