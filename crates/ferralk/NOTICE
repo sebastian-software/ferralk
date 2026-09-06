@@ -1,5 +1,6 @@
-ferralk is independently developed under the MIT License. Its matcher and
-walker design is inspired by zlob v1.6.3.
+ferralk is independently developed and dual-licensed under the MIT License
+(LICENSE-MIT) or the Apache License, Version 2.0 (LICENSE-APACHE), at your
+option. Its matcher and walker design is inspired by zlob v1.6.3.
 
 The compatibility reference is zlob v1.6.3, maintained at
 https://github.com/dmtrKovalenko/zlob, at commit

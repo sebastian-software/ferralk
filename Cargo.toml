@@ -15,17 +15,19 @@ resolver = "3"
 version = "1.0.0-rc.1"
 edition = "2024"
 rust-version = "1.96"
-license = "MIT"
+authors = ["Sebastian Software GmbH"]
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/sebastian-software/ferralk"
 homepage = "https://github.com/sebastian-software/ferralk"
-keywords = ["glob", "filesystem", "walk", "ignore"]
+keywords = ["glob", "filesystem", "walk", "ignore", "ferramenta"]
 categories = ["filesystem", "development-tools"]
 
 [workspace.lints.rust]
 unsafe_code = "deny"
 # `--cfg loom` swaps the scheduler protocol onto loom's primitives for the
-# models in crates/ferralk/src/scheduler.rs.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+# models in crates/ferralk/src/scheduler.rs; `--cfg docsrs` is what docs.rs
+# passes so feature-gated items render with the flags that gate them.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(docsrs)'] }
 
 [workspace.dependencies]
 jsonschema = { version = "=0.52.1", default-features = false }

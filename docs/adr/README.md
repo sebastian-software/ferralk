@@ -22,6 +22,8 @@ Decisions from the end-to-end design review of 2026-08-18 (see
 | [0015](0015-posix-escapes-in-bracket-classes.md) | POSIX escape processing inside bracket classes |
 | [0016](0016-shell-star-runs-before-extglobs.md) | Shell grammar for star runs before extglobs |
 | [0017](0017-caller-owned-list-api-conventions.md) | Caller-owned list API conventions |
+| [0018](0018-dual-mit-apache-license.md) | Dual MIT or Apache-2.0 license (supersedes the license clause of 0001) |
+| [0019](0019-dependency-version-requirements.md) | Caret requirements in the published crates, exact pins everywhere else |
 
 Convention: [Nygard-style ADRs](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions),
 numbered sequentially, never rewritten once accepted — superseding decisions

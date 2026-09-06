@@ -9,6 +9,16 @@
       "matchManagers": ["cargo"],
       "matchFileNames": ["tools/oracle/**"],
       "enabled": false
+    },
+    {
+      "description": "ADR-0019: the published crates carry caret requirements for their library dependencies; tools, fuzz targets and dev-dependencies stay pinned",
+      "matchManagers": ["cargo"],
+      "matchFileNames": [
+        "crates/ferralk/Cargo.toml",
+        "crates/ferralk-glob/Cargo.toml"
+      ],
+      "matchDepTypes": ["dependencies"],
+      "rangeStrategy": "replace"
     }
   ]
 }
