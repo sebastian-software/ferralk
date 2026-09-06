@@ -352,9 +352,13 @@ jobs:
 
           carriers=()
           while IFS= read -r file; do
-            # Whole-line comments are stripped first, so prose about
-            # unsafety does not count as unsafe code.
-            if sed 's;^[[:space:]]*//.*$;;' "$file" | grep -qE '\bunsafe\b'; then
+            # Whole-line comments are dropped first, so prose about unsafety
+            # does not count as unsafe code. The strip and the match are
+            # deliberately not a pipeline: `grep -q` closes the pipe on its
+            # first hit, and under `pipefail` the dying `sed` would then turn
+            # a match into a miss.
+            stripped=$(sed 's;^[[:space:]]*//.*$;;' "$file")
+            if grep -qE '\bunsafe\b' <<< "$stripped"; then
               carriers+=("$file")
             fi
           done < <(git ls-files '*.rs')
