@@ -7,11 +7,14 @@
 [![MSRV 1.96](https://img.shields.io/badge/MSRV-1.96-blue.svg)](docs/adr/0004-msrv-stable-minus-two.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
-Ferralk finds files. Give it a glob such as `{src,packages}/**/*.{ts,tsx}` and
-it walks the tree in parallel, applies `.gitignore` the way Git does, and opens
-only the directories the pattern can reach. Filenames stay raw bytes and native
-`Path` values from the first directory read to the last match, so nothing is
-lost to a UTF-8 conversion.
+Ferralk finds files. Glob matching and parallel filesystem walking, byte-first,
+with an unsafe-free matcher.
+
+Give it a glob such as `{src,packages}/**/*.{ts,tsx}` and it walks the tree in
+parallel, applies `.gitignore` the way Git does, and opens only the directories
+the pattern can reach. Filenames stay raw bytes and native `Path` values from
+the first directory read to the last match, so nothing is lost to a UTF-8
+conversion.
 
 On the repository-shaped fixture in the
 [benchmark snapshot](#local-benchmark-snapshot) below it is the fastest arm

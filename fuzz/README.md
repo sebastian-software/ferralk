@@ -17,7 +17,7 @@ its checked-in native corpus is intentionally little-endian, matching the
 reviewed Linux native-backend targets.
 
 `ferralk_vs_fast_glob` is differential: it feeds one pattern and one candidate
-to both ferralk and Oxc fast-glob and asserts the same verdict. It keeps only
+to both Ferralk and Oxc fast-glob and asserts the same verdict. It keeps only
 the syntax both engines document the same way, excluding each recorded
 divergence by the shape of the pattern, so a failure is a new finding rather
 than a known difference. The divergences and their exclusions are tabulated in

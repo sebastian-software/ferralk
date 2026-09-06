@@ -207,19 +207,19 @@ measurements remain non-gating.
 
 ### Reading these
 
-- **Where the whole tree must be read, ferralk now leads the portable run**:
+- **Where the whole tree must be read, Ferralk now leads the portable run**:
   20.83 ms against 30.09 ms for zlob and 23.15 ms for four-thread `jwalk`. With
   `native-macos` the two engines are level instead — 20.83 ms against 21.45 ms
   in a separate invocation — so the portable margin is partly zlob paying for a
   comparison against `std::fs`, and the level native reading is the more
   careful claim.
-- **Where the query names its roots, ferralk is ahead**, and it gets there from
+- **Where the query names its roots, Ferralk is ahead**, and it gets there from
   the pattern alone. The `ignore` arm that comes close needs a hand-written
   `filter_entry`; the arm that only passes the globs as overrides is 7.1x
   behind, because overrides decide what is yielded, not what is opened. zlob
   reads the whole tree for this query, which is why it lands near its unscoped
   time.
-- **Serial ferralk beats parallel `ignore` on the scoped query** (10.75 ms
+- **Serial Ferralk beats parallel `ignore` on the scoped query** (10.75 ms
   against 30.60 ms) purely by not opening `node_modules`. Pruning is worth more
   than threads on this shape.
 - The 2,355 ms in the RFC's table was a serial walk doing more per file than
@@ -246,11 +246,11 @@ includes a separate Node.js ecosystem harness on the same fixture shape:
 | [`wax`](https://crates.io/crates/wax/0.7.0) | 0.7.0 | Integrated serial glob walking and compiled matching | UTF-8/regex-based API; the comparison is valid only for this ASCII fixture. |
 | [`zlob`](https://github.com/dmtrKovalenko/zlob) | 1.6.5 | Integrated parallel glob walking and compiled matching | Zig library behind a C ABI; local builds need Zig 0.16 and libclang. |
 
-`ignore` + `globset`, `globset`, `fast-glob`, ferralk, and zlob remain in the
+`ignore` + `globset`, `globset`, `fast-glob`, Ferralk, and zlob remain in the
 existing lanes. Every walker arm was checked for the exact same result count
 before it was timed: **7,400** files for the unscoped query and **2,600** for
 the scoped query. The new caller-side arms compile their `globset` inside the
-timed operation, as the existing ferralk and `ignore` arms compile their
+timed operation, as the existing Ferralk and `ignore` arms compile their
 selection inside the operation. `globwalk` and `wax` likewise include their
 builder work in their timed operation. Matcher-only baselines are compiled
 once outside their match loop.
@@ -499,12 +499,12 @@ remains an optional context lane rather than an automated baseline.
 ### The default worker budget
 
 The sweep above raises a question the sweep alone cannot answer: is the knee at
-four threads a property of ferralk's scheduler, of zlob's, or of the machine?
+four threads a property of Ferralk's scheduler, of zlob's, or of the machine?
 Three controls settle it, all on the same host and fixture.
 
 **A profile.** `sample` over the four-thread macOS-native walk attributes 95.3%
 of all CPU across every thread to three syscalls: `getdirentries64` 65.9%,
-`openat` 28.2%, `close` 1.2%. Everything ferralk itself does — matching, ignore
+`openat` 28.2%, `close` 1.2%. Everything Ferralk itself does — matching, ignore
 rules, path building, scheduling, allocation — is under 3% put together. The
 serial walk is the same picture at 91%. A walk of this shape is not CPU work,
 so "how many cores are idle" is the wrong question to size it by.
@@ -565,7 +565,7 @@ the `thread-sweep` command above. The three controls are not lanes and ship no
 command: the profile is `sample <pid> 8` over a loop of walks, and the C floor
 and its threaded variant are throwaway programs that issue `openat`,
 `getdirentries64` and `close` and count entries. They are recorded here because
-they are what turned "ferralk is slower above four threads" into "the platform
+they are what turned "Ferralk is slower above four threads" into "the platform
 is", and rerunning them means writing them again rather than invoking a lane.
 
 **What this does not establish.** One host, one microarchitecture. The ceiling
@@ -584,7 +584,7 @@ measured anywhere here and is exactly the case for naming a budget explicitly.
 zlob led the unscoped query when this section was written. It no longer does:
 the paired native arms above are level, and the changes recorded here are part
 of why. The audit and the ablations are kept because they are the evidence for
-what ferralk adopted, not because the gap is still open.
+what Ferralk adopted, not because the gap is still open.
 
 A source audit found no single matcher shortcut hidden behind the unscoped
 number. Its walker combines several low-level choices: a raw
@@ -1019,7 +1019,7 @@ the reason the table above is paired.
 
 Wall time per match, same host, one line per benchmark
 (`--output-format bencher`). Both baselines are compiled once outside the timed
-region, as ferralk's pattern is.
+region, as Ferralk's pattern is.
 
 | Benchmark | ferralk | `globset` | `fast-glob` |
 | --- | ---: | ---: | ---: |
@@ -1036,7 +1036,7 @@ region, as ferralk's pattern is.
 | `backtracking` non-matching | **3 ns** | 97 ns | 252 ns |
 
 **The last row used to be the one to keep in view.** On a pattern built to force
-backtracking — `a*a*a*a*b` against a run of `a`s — ferralk ran 1837 ns against
+backtracking — `a*a*a*a*b` against a run of `a`s — Ferralk ran 1837 ns against
 `globset`'s 102 ns, because nothing in the general engine consulted the
 pattern's trailing literal before exploring: the memoized walk visited the whole
 `tokens × path` state space and only then failed on the final `b`.
@@ -1044,7 +1044,7 @@ pattern's trailing literal before exploring: the memoized walk visited the whole
 Three facts are now read off the token IR when a pattern compiles — the leading
 run of literal and separator tokens, the trailing run, and the bytes the pattern
 consumes with every star empty — and checked before the engine starts. On the
-same host, ferralk arms only:
+same host, Ferralk arms only:
 
 | Benchmark | before | after |
 | --- | ---: | ---: |
@@ -1061,7 +1061,7 @@ request that introduced this.
 
 `globset` is still ahead on a literal non-match and on one deterministic match.
 Everywhere else the byte-first matcher is ahead, most clearly on long paths,
-where the baselines pay for path normalization ferralk does not do.
+where the baselines pay for path normalization Ferralk does not do.
 
 Pattern compilation is measured separately (`compile/*` in the same bench) and
 is not compared against the baselines, whose builders accept different syntax.

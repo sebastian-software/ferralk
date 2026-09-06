@@ -30,5 +30,5 @@ The native validation workflows run automatically for pull requests. Their
 purpose is safety and behavioral parity, not a performance threshold.
 
 Benchmark evidence lives in [benchmark evidence](benchmark-evidence.md): what
-each lane measures, how to reproduce it, and how ferralk compares with the Rust
+each lane measures, how to reproduce it, and how Ferralk compares with the Rust
 baselines and with zlob. None of it gates a release.

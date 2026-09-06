@@ -1,6 +1,6 @@
 # Palamedes adoption
 
-One consumer integrated ferralk for source discovery over four measurement
+One consumer integrated Ferralk for source discovery over four measurement
 rounds, from a trial that concluded *do not adopt* to a shipped dependency. This
 records what was measured, which finding produced which change, and what the
 result does not establish.
@@ -11,15 +11,15 @@ lanes and the reproducible comparisons; this covers the one caller.
 
 The integration is [sebastian-software/palamedes#878](https://github.com/sebastian-software/palamedes/pull/878);
 the round-by-round reports are on [ferralk#13](https://github.com/sebastian-software/ferralk/issues/13).
-Neither is ferralk's to merge, and none of it gates a ferralk release.
+Neither is Ferralk's to merge, and none of it gates a Ferralk release.
 
 ## The four rounds
 
 Ratios are against hand-pruned parallel `ignore` — `ignore` parallel with
 `filter_entry` subtree pruning and per-worker shards, which is what
 [palamedes#875](https://github.com/sebastian-software/palamedes/issues/875)
-proposed building on the stack that caller already had. That is the arm ferralk
-had to beat to be worth a dependency at all, and it is not the code palamedes
+proposed building on the stack that caller already had. That is the arm Ferralk
+had to beat to be worth a dependency at all, and it is not the code Palamedes
 was running.
 
 | Round | ferralk | palamedes | monorepo | What changed on the caller's side |
@@ -29,14 +29,14 @@ was running.
 | 3 | 0.4.0 | 1.40x | 1.24x | no caller-side matcher |
 | **4** | **0.5.0** | **1.56x** | **1.43x** | no caller-side filter either |
 
-Round 1's verdict was *no measured case for ferralk*: level serially, behind in
+Round 1's verdict was *no measured case for Ferralk*: level serially, behind in
 parallel, and silently dropping 18–50% of the files it was asked for. The
 sequence only worked because that round reported the loss rather than looking
-for a framing in which ferralk won.
+for a framing in which Ferralk won.
 
 ### Where round 4 lands, in absolute terms
 
-The palamedes repository — 84,592 files on disk, 986 discovered, 6,046
+The Palamedes repository — 84,592 files on disk, 986 discovered, 6,046
 surviving the prune:
 
 | Arm | Median | vs the walker it replaces | vs #875 x4 |
@@ -70,7 +70,7 @@ threads.
 
 Round 2 is a caution worth keeping. It was first reported as 1.12x / 1.05x and
 corrected to **1.07x / 1.05x** once the earlier run turned out to have shared
-cores with a Time Machine backup and — with some irony — one of ferralk's own
+cores with a Time Machine backup and — with some irony — one of Ferralk's own
 walker benches. The baseline arm was the one that suffered, so the error
 flattered ferralk. Interleaving the arms inside one process is what makes a
 busy stretch land on all of them instead of on whichever ran during it; a
@@ -98,32 +98,32 @@ result. This is the mapping.
 - **[#65](https://github.com/sebastian-software/ferralk/issues/65) builder ergonomics.** `include`/`exclude` consumed `self` and
   returned `Result<Self, _>`, so a rejected pattern ate the builder and skipping
   one bad pattern meant cloning the `Walker` per pattern.
-- **[#49](https://github.com/sebastian-software/ferralk/issues/49) ferralk's own gitignore engine.** ferralk depended on `ignore`, so
+- **[#49](https://github.com/sebastian-software/ferralk/issues/49) Ferralk's own gitignore engine.** Ferralk depended on `ignore`, so
   adopting it *added* crates rather than replacing any. Owning the engine is
-  what later let `cargo tree -i ignore -e normal` print nothing for palamedes'
+  what later let `cargo tree -i ignore -e normal` print nothing for Palamedes'
   production tree.
 
 ### Round 2 → #73, #76
 
 - **[#73](https://github.com/sebastian-software/ferralk/issues/73) entry materialization.** The visitor from #64 closed most of the gap
   but not all of it, and the trial supplied two real-caller points that matched
-  ferralk's own synthetic curve: ~6,000 surviving entries → 1.07x, ~15,000 →
-  1.05x, against ferralk's own measurement of 25,600 → 0.96x. Monotone in
+  Ferralk's own synthetic curve: ~6,000 surviving entries → 1.07x, ~15,000 →
+  1.05x, against Ferralk's own measurement of 25,600 → 0.96x. Monotone in
   surviving entries, and consistent with the cause — discovery discards five of
-  every six entries on the palamedes repo and one of every two on the monorepo,
+  every six entries on the Palamedes repo and one of every two on the monorepo,
   and each discard paid for an owned `PathBuf` first.
 - **[#76](https://github.com/sebastian-software/ferralk/issues/76) the helper-spawn floor.** Below the floor the earlier fix was
   complete — 3 directories, 1.60x, no pool penalty, against `ignore`'s 0.18x on
   the same tree. Just above it a residual remained: at 16 directories holding 12
   files the pool started and could not pay for itself. The floor counted
   directories read, which says nothing about how much work is in them. Two
-  ferralk-side follow-ups came out of that thread,
+  Ferralk-side follow-ups came out of that thread,
   [#81](https://github.com/sebastian-software/ferralk/issues/81) and
   [#88](https://github.com/sebastian-software/ferralk/issues/88).
 
 ### Round 3 → #77, #78, #79
 
-Round 3 was the first arrangement in which ferralk's matcher decided alone, and
+Round 3 was the first arrangement in which Ferralk's matcher decided alone, and
 the three issues it named are what made that possible:
 
 - **[#79](https://github.com/sebastian-software/ferralk/issues/79) separator-crossing wildcard mode** retired both `GlobSet`s and the
@@ -140,7 +140,7 @@ the three issues it named are what made that possible:
   and a broken one is not, while an entry kind describes the link. Classifying a
   symlink by its target inside the walk deleted the last caller-side filter.
 - **[#94](https://github.com/sebastian-software/ferralk/issues/94) Windows backslash patterns** is the one finding still open, and it
-  is a documentation gap rather than a defect. palamedes builds patterns by
+  is a documentation gap rather than a defect. Palamedes builds patterns by
   joining `PathBuf`s, so on Windows they carry `\`, which a walker pattern reads
   as an escape: `C:\repo\app\**` compiled to the literal `C:repoapp**` and
   selected nothing. No error, just an empty result — `globset` had normalized
@@ -162,8 +162,8 @@ that stood before the branch, on four trees:
 | React/Next monorepo | 127,083 | 7,286 | 7,286 |
 
 The claim strengthened as the arrangement simplified. In rounds 1 and 2 a
-`GlobSet` stood behind ferralk, so parity only ever proved the backstop worked.
-From round 3 there was nothing behind it, and exact agreement means ferralk's
+`GlobSet` stood behind Ferralk, so parity only ever proved the backstop worked.
+From round 3 there was nothing behind it, and exact agreement means Ferralk's
 matcher and `globset` read this caller's real pattern catalog the same way.
 
 **The 13-versus-12 episode is the part worth recording.** Between 0.4.0 and
@@ -172,7 +172,7 @@ instead of 12, because a broken symlink counted as a source. That was #89, open
 at the time; it was parked with `#[ignore]`d tests rather than patched around
 locally, and both went green unchanged when 0.5.0 landed.
 
-The two real repositories never showed it. palamedes stayed at 986 and the
+The two real repositories never showed it. Palamedes stayed at 986 and the
 monorepo at 7,286 through the entire window, because neither happens to contain
 a broken symlink where a source pattern would reach it. Only the hand-built
 edge-case tree — hidden files, hidden directories, `node_modules` under a hidden
@@ -180,7 +180,7 @@ directory, gitignored sources, `.git` contents, a symlink to a file, a symlink t
 a directory, a broken symlink — caught it.
 
 That is the same lesson as round 1's 179 missing files, which were invisible to
-palamedes' entire test suite because no existing test used a hidden source file.
+Palamedes' entire test suite because no existing test used a hidden source file.
 A large real tree is a weak oracle: it exercises whatever it happens to contain,
 and it is silent about everything else. Both defects were found by a corpus
 built on purpose to contain the awkward cases, and both would have shipped had
@@ -197,7 +197,7 @@ the check been a file count rather than a path-by-path diff.
   `stat` per surviving entry and `resolve_symlink_kind` pays one back per
   *symlink* entry. These trees have almost none, so the trade was free here.
   Nothing measured says where it turns.
-- **One caller, one catalog shape.** palamedes' generated patterns are all
+- **One caller, one catalog shape.** Palamedes' generated patterns are all
   `**`-rooted, which cannot distinguish the two wildcard readings — telling them
   apart needed a hand-written single-star include in a fixture. A real tree would
   not have caught a wrong default.
@@ -205,7 +205,7 @@ the check been a file count rather than a path-by-path diff.
   repositories whose file count is dominated by `node_modules`. That shape is
   what makes subtree pruning decisive; a tree without it would rank differently.
 - **`globset` did not leave the caller.** Discovery no longer uses it, but
-  palamedes' file watcher still does, so it remains in that tree.
+  Palamedes' file watcher still does, so it remains in that tree.
 
 ## The integration
 
@@ -224,9 +224,9 @@ Walker::new(first)
 // collect()
 ```
 
-Three switches make ferralk read that catalog the way the previous stack did,
+Three switches make Ferralk read that catalog the way the previous stack did,
 and each has a test that fails without it: `wildcard_mode(SeparatorCrossing)`
-because `globset` as palamedes builds it lets an ordinary wildcard cross `/`,
+because `globset` as Palamedes builds it lets an ordinary wildcard cross `/`,
 `match_hidden(true)` because `globset` wildcards cover a leading period and this
 caller discovers hidden sources deliberately, and `resolve_symlink_kind(true)`
 for the `Path::is_file` reading. Builder order does not matter for any of
@@ -237,7 +237,7 @@ compile, so setting it before or after the pattern calls yields the same walk.
 
 Worth stating because the summary invites the opposite assumption. In the
 caller's discovery module, production code went from **136 lines to 148** — 12
-lines *larger* than before ferralk existed in it.
+lines *larger* than before Ferralk existed in it.
 
 What came out were concepts, not lines: both `GlobSet`s, the hand-written
 pattern rewrite and its five unit tests, the per-root loop, and the

@@ -40,3 +40,6 @@ See the [crate documentation](https://docs.rs/ferralk) for the full API, the
 for every default and switch, and the
 [Ferralk repository](https://github.com/sebastian-software/ferralk) for
 benchmarks, compatibility, and development documentation.
+
+Part of the [Ferramenta](https://ferramenta.dev) family of Rust developer tools
+by Sebastian Software.

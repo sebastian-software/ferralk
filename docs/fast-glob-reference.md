@@ -10,7 +10,7 @@ cases must use syntax shared by both engines and record a deliberate
 disagreement with `oracle_expected` when needed. This is not a replacement for
 the zlob oracle: fast-glob's documented `*` separator rule, leading `!`
 negation, validation model, and maximum brace nesting differ from zlob and
-from ferralk's documented compatibility profile.
+from Ferralk's documented compatibility profile.
 
 ## The shared subset
 
@@ -46,23 +46,23 @@ fast-glob answers `false` for a pattern that matches, rather than reporting that
 it gave up. The cap counts groups, not combinations — one group of two thousand
 alternatives is answered correctly, while eleven two-way groups miss even their
 first combination, which needs no backtracking at all. Found by the differential
-target on issue #42, once ferralk's own expansion budget replaced the cap the
+target on issue #42, once Ferralk's own expansion budget replaced the cap the
 fuzz harness used to apply to both engines; reported upstream:
 <https://github.com/oxc-project/fast-glob/issues/166>. It is the only reference
 that bounds brace expansion at all: zlob 1.6.3 and glibc `GLOB_BRACE` run until
-they exhaust the machine, and ferralk reports `too many brace alternatives`.
+they exhaust the machine, and Ferralk reports `too many brace alternatives`.
 
 The recursive-wildcard exclusion has one deliberately narrow shared case.
 Patterns such as `**/*.rs` and `src/**/*.rs` accept the same language after the
 leading-`./` candidate exclusion: the ordinary component-leading `*` can absorb
-every partial-component match that ferralk's recursive wildcard could add.
+every partial-component match that Ferralk's recursive wildcard could add.
 That reasoning does not extend to a literal, `?`, or class after `**/` —
 `a/**/b` versus `a/ab` is already a counterexample — nor to a trailing `**`.
 The classifier reads escapes and classes before recognizing a star pair, so an
 escaped or class-member `**` is not rejected as recursive syntax.
 
 Brace expansion happens before matching, so an alternative can concatenate
-with the surrounding text into a `**` that only ferralk reads recursively
+with the surrounding text into a `**` that only Ferralk reads recursively
 (`{*}*` vs `/`). A star next to brace punctuation is therefore excluded too.
 For the same reason, the `./` exclusion checks the expanded alternatives: an
 empty brace arm can expose a later prefix (`{x,}./`), while a dot arm can join
