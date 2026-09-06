@@ -22,7 +22,7 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | `indices` / `oracle_indices` | no | Ferralk and divergent-oracle input positions for a `match_path_indices` operation. |
 | `pattern` | yes | Glob or ignore expression using the byte codec below. |
 | `path` | yes | Candidate path using the byte codec below; empty for syntax-only records. |
-| `flags` | no | Ordered behaviour switches from the compatibility matrix. |
+| `flags` | no | Ordered behavior switches from the compatibility matrix. |
 | `ignore_rules` | no | Lines written to a synthetic `.gitignore` for an ignore case. |
 | `nested_ignore_rules` | no | Further `.gitignore` files below the root, each with its `directory` and `rules`. |
 | `exclude_rules` | no | Repository-wide rules written to `.git/info/exclude`; every ignore file overrides them. |
@@ -60,7 +60,7 @@ creates an isolated repository, writes those lines into `.gitignore`, creates
 directory-only rules tied to an actual directory entry;
 `candidate_is_symlink` verifies that a link to a directory remains a symlink
 candidate; `git_ignorecase` opts into Git's repository-local ASCII case
-folding. This keeps nested/negated behaviour tied to Git rather than to ferralk
+folding. This keeps nested/negated behavior tied to Git rather than to ferralk
 implementation details.
 
 `nested_ignore_rules` adds `.gitignore` files below the root. Git consults the
@@ -68,7 +68,7 @@ file closest to the candidate last, so a deeper file overrides a shallower one,
 and only these records can express that precedence.
 
 The oracle runs Git with `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and `HOME`
-neutralised. Without that the developer's own `core.excludesFile` decides
+neutralized. Without that the developer's own `core.excludesFile` decides
 corpus verdicts: a global `*.log` rule makes a case pass locally and fail in
 CI, or worse, pass in both for the wrong reason.
 

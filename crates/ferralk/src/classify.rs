@@ -367,7 +367,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
             // A link with nothing at the end of it is neither a file nor a
             // directory. That is an answer, not a failure: dangling links are
             // ordinary, and reporting one per link would flood the error
-            // channel and end an `Abort` walk over a build artefact.
+            // channel and end an `Abort` walk over a build artifact.
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => kind_is_dir = None,
             // Anything else leaves the kind genuinely unknown, which the error
             // policy gets to decide about. The entry is dropped either way,

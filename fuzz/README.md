@@ -74,5 +74,5 @@ fuzz run linux_dirent_parser` on Linux for the native record parser.
 
 Crash artifacts belong under fuzz/artifacts. Minimize a saved input with
 `cargo fuzz tmin` followed by the target and artifact, then convert the
-minimized behaviour into a source-linked corpus regression case before fixing
+minimized behavior into a source-linked corpus regression case before fixing
 it.

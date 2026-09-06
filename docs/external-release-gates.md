@@ -27,7 +27,7 @@ stable there — [ADR-0005](adr/0005-byte-matching-wtf8-on-windows.md) and
 reasoning.
 
 The native validation workflows run automatically for pull requests. Their
-purpose is safety and behavioural parity, not a performance threshold.
+purpose is safety and behavioral parity, not a performance threshold.
 
 Benchmark evidence lives in [benchmark evidence](benchmark-evidence.md): what
 each lane measures, how to reproduce it, and how ferralk compares with the Rust

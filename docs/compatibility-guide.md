@@ -2,7 +2,7 @@
 
 Ferralk is a safe, byte-first Rust replacement for the matcher and filesystem
 walking portions of zlob. It is not a source-compatible Rust facade and it
-does not expose zlob's C ABI. This guide maps supported behaviour and makes
+does not expose zlob's C ABI. This guide maps supported behavior and makes
 the intentional differences explicit. The authoritative feature-by-feature
 status remains the [compatibility matrix](compatibility-matrix.md); upstream
 coordinates and test provenance are in the
@@ -290,7 +290,7 @@ unchanged and match no candidate at all, because walk candidates are
 root-relative and never start with a separator. An absolute include therefore
 produced an empty walk and an absolute exclude did nothing. Nothing that
 previously selected entries selects different ones now; the patterns that
-change behaviour are the ones that selected nothing, which now either work or
+change behavior are the ones that selected nothing, which now either work or
 say why they cannot.
 
 ### Migrating patterns from globset or fast-glob
@@ -365,7 +365,7 @@ and covered by the cross-platform corpus. See the
   rejects `a` there. Ranges fold both bounds before comparing, as Bash does,
   so `[A-z]` and `[Z-a]` read the same way in both.
 - `ZLOB_TILDE` and `ZLOB_TILDE_CHECK` are out of scope. Callers resolve home
-  directories before constructing a `Walker` when that behaviour is wanted.
+  directories before constructing a `Walker` when that behavior is wanted.
 - `ZLOB_APPEND` and `ZLOB_DOOFFS` have no equivalent because Rust results are
   owned vectors, not caller-managed C buffers.
 - `ZLOB_NOCHECK` and `ZLOB_NOMAGIC` are result-shaping policies, not matcher
@@ -449,10 +449,10 @@ and covered by the cross-platform corpus. See the
 ## Contract-change audit since 0.9.0
 
 This table maps every consumer-visible `!` change from 0.9.0 through the final
-0.x contract work to the documentation that states the resulting behaviour.
+0.x contract work to the documentation that states the resulting behavior.
 It is an audit of the current contract, not a second changelog.
 
-| Release / change | Resulting documented behaviour |
+| Release / change | Resulting documented behavior |
 | --- | --- |
 | 0.9.0: matcher and walker resource limits | Compile budgets are described under [deliberate differences](#deliberate-differences); ignore-file and thread limits are in the [usage guide](usage.md#walk-filesystems-with-explicit-policy). |
 | 0.9.3: traverse every acyclic symlink alias | Each supplied or discovered acyclic alias remains independently traversable; see [several roots](#several-roots-in-one-walk) and the usage guide's symlink policy. |
@@ -467,7 +467,7 @@ It is an audit of the current contract, not a second changelog.
 | 0.11.0: normalized ignore roots | Trailing separators and parent-relative spellings resolve to the same repository while caller-visible entry spelling is preserved; see [Git filesystem adaptations](#git-filesystem-adaptations). |
 | 0.11.0: caller-source error offsets | `PatternError::offset()` identifies original pattern bytes after brace expansion or absolute-root rewriting; see [absolute patterns](#absolute-patterns-and-the-caller-side-rewrite-they-replace). |
 | 0.11.0: case-insensitive POSIX upper class | `upper` and `lower` fold symmetrically under `case_insensitive`; see [deliberate differences](#deliberate-differences). |
-| 0.11.0: Git 2.52 ignore behaviour | Attached star runs, escaped separators, and reversed ranges follow the pinned Git oracle; see [Git filesystem adaptations](#git-filesystem-adaptations). |
+| 0.11.0: Git 2.52 ignore behavior | Attached star runs, escaped separators, and reversed ranges follow the pinned Git oracle; see [Git filesystem adaptations](#git-filesystem-adaptations). |
 | Final 0.x: resumed native listing failures | A native serial listing that cannot be reopened or changed identity reports typed `ReadDir` through `ErrorPolicy`; see the usage guide's error policy and [platform support](usage.md#platform-support). |
 | Final 0.x: refused helper thread | `Collect`/`Skip` finish on existing workers; `Collect` records `SpawnWorker`, while `Abort` fails. See the usage guide's parallel-walk notes. |
 | Final 0.x: physical repository for symlink roots | Every spelling of a symlinked root is attributed to the repository physically containing the target; see [Git filesystem adaptations](#git-filesystem-adaptations). |

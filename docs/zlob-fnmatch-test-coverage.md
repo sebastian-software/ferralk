@@ -12,7 +12,7 @@ Every `testing.expect` assertion that invokes `fnmatchFull` or the
 [`corpus/fnmatch.jsonl`](../corpus/fnmatch.jsonl). This includes the final
 POSIX bracket-expression and `noescape` assertions at lines 560–618. The
 Corpus IDs intentionally preserve the source line, including duplicate input
-assertions, so an import is one-to-one rather than merely behaviourally
+assertions, so an import is one-to-one rather than merely behaviorally
 deduplicated.
 
 The Zig-backed oracle workflow verifies those cases against the pinned zlob crate. The
@@ -65,7 +65,7 @@ GitIgnore implementation, Ferralk's normative ignore oracle.
 The recursive, anchored, and brace-filtered traversal block in
 `test/test_walk.zig` is covered by the Walker regression fixture. In
 particular, terminal `src/**` matches `src` itself and all of its descendants,
-matching zlob's zero-component recursive-wildcard behaviour.
+matching zlob's zero-component recursive-wildcard behavior.
 
 ## Syntax preflight cases
 

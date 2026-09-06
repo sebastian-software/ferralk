@@ -4,7 +4,7 @@
   Zig-free preflight. Run it as written and do not copy its command list into
   another document. The development-only `oracle` package requires Zig 0.16
   and libclang; CI installs them for its additional coverage lane.
-- Read `docs/corpus-format.md` before adding or changing behavioural cases. The
+- Read `docs/corpus-format.md` before adding or changing behavioral cases. The
   checked-in JSONL corpus is the source of truth for portable and oracle
   parity.
 - Read `docs/adr/README.md` before proposing architectural changes. Accepted
@@ -13,7 +13,7 @@
   corresponding CI jobs cover the other platform and compile its cfg-gated
   fuzz targets.
 - Follow `CONTRIBUTING.md#communicate-pre-10-contract-changes`: PR titles use
-  Conventional Commit syntax, and a consumer-visible pre-1.0 behaviour change
+  Conventional Commit syntax, and a consumer-visible pre-1.0 behavior change
   needs both `!` and a filled-in `BREAKING CHANGE:` footer.
 - Preserve byte-first path handling, explicit wildcard semantics, and the
   existing documentation and benchmark evidence requirements.

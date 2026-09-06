@@ -90,7 +90,7 @@ result. This is the mapping.
   `.claude/`, `.agents/` and a nested worktree, every one of them a path
   component starting with `.`. `WalkOptions::skip_hidden(false)` does not help —
   it governs traversal, not what a wildcard may cover.
-- **[#64](https://github.com/sebastian-software/ferralk/issues/64) parallel per-entry visitor.** `collect()` materialised every entry
+- **[#64](https://github.com/sebastian-software/ferralk/issues/64) parallel per-entry visitor.** `collect()` materialized every entry
   and returned it, so a caller's own matcher ran single-threaded over the whole
   result while `stream()` was serial by design. That is what cost the parallel
   arms. The trial carried its own controlled proof: an arm doing the *identical*
@@ -105,7 +105,7 @@ result. This is the mapping.
 
 ### Round 2 → #73, #76
 
-- **[#73](https://github.com/sebastian-software/ferralk/issues/73) entry materialisation.** The visitor from #64 closed most of the gap
+- **[#73](https://github.com/sebastian-software/ferralk/issues/73) entry materialization.** The visitor from #64 closed most of the gap
   but not all of it, and the trial supplied two real-caller points that matched
   ferralk's own synthetic curve: ~6,000 surviving entries → 1.07x, ~15,000 →
   1.05x, against ferralk's own measurement of 25,600 → 0.96x. Monotone in
@@ -143,7 +143,7 @@ the three issues it named are what made that possible:
   is a documentation gap rather than a defect. palamedes builds patterns by
   joining `PathBuf`s, so on Windows they carry `\`, which a walker pattern reads
   as an escape: `C:\repo\app\**` compiled to the literal `C:repoapp**` and
-  selected nothing. No error, just an empty result — `globset` had normalised
+  selected nothing. No error, just an empty result — `globset` had normalized
   this internally, so it only surfaced once the walker did the matching, as 19
   failures on the windows-2025 CI leg. The caller's fix is one line. What makes
   it worth an issue on this side is that a rejected pattern is loud and this one

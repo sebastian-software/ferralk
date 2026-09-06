@@ -20,6 +20,6 @@ retained only as differential evidence.
 
 ## Consequences
 
-- Character-class behaviour agrees with the established shell and C-library
+- Character-class behavior agrees with the established shell and C-library
   references used by Ferralk.
 - Compatibility with zlob's class parser is deliberately not promised.
