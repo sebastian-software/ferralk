@@ -1,6 +1,10 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
+  "extends": [
+    "github>sebastian-software/renovate-config",
+    "github>sebastian-software/renovate-config:standards",
+    "helpers:pinGitHubActionDigests"
+  ],
   "labels": ["dependencies"],
   "rangeStrategy": "pin",
   "packageRules": [

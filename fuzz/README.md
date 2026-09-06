@@ -62,8 +62,8 @@ re-measuring fast-glob at the new limit.
 The glob targets run automatically: a short budget per pull request and a long
 nightly run, both from `.github/workflows/glob-fuzz.yml`. A failed scheduled
 run opens or refreshes the repository's nightly glob-fuzz tracking issue, in
-addition to uploading its reproducer. `fuzz.yml` runs one chosen target with a
-custom budget on demand.
+addition to uploading its reproducer. The same workflow runs on demand, where
+the dispatch inputs pick one target or all of them and set the budget.
 
 Install cargo-fuzz, then run cargo fuzz run pattern_parser, cargo fuzz run
 pattern_matcher, or cargo fuzz run ferralk_vs_fast_glob from the repository
