@@ -111,6 +111,31 @@ jobs:
       # invariants; keep every checked-in seed on the real comparison path.
       - run: cargo test --manifest-path fuzz/Cargo.toml --lib --locked
 
+  readme-family:
+    name: README family block
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The only Node lane in this workflow. The family block is generated
+      # from the registry in sebastian-software/ferramenta, so the check needs
+      # Node; keeping it in its own job leaves the Rust matrix Node-free.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24"
+      # The generator is fetched straight from Git with a `&path:` fragment,
+      # which is pnpm syntax, so `pnpm dlx` is what has to run it. Corepack
+      # ships with Node; pinning the pnpm version keeps this lane as
+      # reproducible as the action digests above.
+      - name: Activate the pinned pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@12.3.4 --activate
+      # The script holds the generator commit pin. A registry change reaches
+      # this repository by bumping that pin and re-running it with --write;
+      # CONTRIBUTING.md records the procedure.
+      - run: ./scripts/readme-family-block.sh --check
+
   test:
     name: test (${{ matrix.os }})
     if: github.event_name == 'pull_request' || github.event_name == 'push'

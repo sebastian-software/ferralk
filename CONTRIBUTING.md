@@ -85,6 +85,7 @@ cargo test --workspace --exclude oracle --locked
 cargo run -p harness -- corpus
 cargo check --manifest-path fuzz/Cargo.toml \
   --bin pattern_parser --bin pattern_matcher --bin ferralk_vs_fast_glob --locked
+./scripts/readme-family-block.sh --check
 ```
 
 This is the canonical portable preflight for a pull request and needs no Zig
@@ -112,6 +113,30 @@ does not add Zig to this local contributor preflight.
 Changes to the native backends also need `--features native-macos` or
 `--features native-linux` on the platform that has them; the corresponding CI
 jobs are the gate for the other one.
+
+### The Ferramenta family block
+
+The last preflight command is the only one that needs Node rather than Cargo:
+Node 22.13 or newer, pnpm, and network access. It checks the
+`<!-- ferramenta-family:start -->` block in `README.md` and in the two
+published crate READMEs, which is generated and never hand-edited. Its
+content — the member list, the job strings, the links — comes from the family
+registry in
+[sebastian-software/ferramenta](https://github.com/sebastian-software/ferramenta),
+the single source of truth for all of it. The root README carries the full
+block with one table per family group; the crate READMEs carry the two-line
+`registry` variant, because that is what crates.io renders and it needs no
+HTML. The CI job `README family block` runs the same check, so skipping the
+command locally on a change that touches no README costs nothing.
+
+Regenerate the blocks with `./scripts/readme-family-block.sh --write` and
+commit the result. The script pins the generator to one commit of that
+repository in `FERRAMENTA_PIN`, so a run is reproducible: the block CI blesses
+today is the one it blessed yesterday. A registry change — a new family
+member, a reworded job, a moved documentation URL — reaches this repository by
+bumping `FERRAMENTA_PIN` to the ferramenta commit that carries it, running the
+script with `--write`, and committing the pin and the regenerated blocks
+together. Because the blocks are generated, that diff shows exactly what moved.
 
 ## 1.0 release checklist
 

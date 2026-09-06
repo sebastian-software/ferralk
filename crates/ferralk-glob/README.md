@@ -33,5 +33,10 @@ For the full syntax, error contract, and compatibility notes, see the
 [usage guide](https://github.com/sebastian-software/ferralk/blob/main/docs/usage.md),
 and the [Ferralk repository](https://github.com/sebastian-software/ferralk).
 
-Part of the [Ferramenta](https://ferramenta.dev) family of Rust developer tools
-by Sebastian Software.
+<!-- ferramenta-family:start -->
+**ferralk** is part of the [Ferramenta](https://ferramenta.dev) family — Rust-native developer tools that keep the APIs the ecosystem already knows.
+
+Siblings: [ferroni](https://sebastian-software.github.io/ferroni/) · [ferriki](https://github.com/sebastian-software/ferriki) · [ferromark](https://sebastian-software.github.io/ferromark/) · [ferrolex](https://github.com/sebastian-software/ferrolex) · [ferrocat](https://ferrocat.dev) · [palamedes](https://palamedes.dev) · [ferrovia](https://github.com/sebastian-software/ferrovia) · [ferrugo](https://github.com/sebastian-software/ferrugo).
+<!-- ferramenta-family:end -->
+
+Built by [Sebastian Software](https://oss.sebastian-software.com).
