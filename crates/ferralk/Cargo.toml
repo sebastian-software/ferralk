@@ -1,6 +1,6 @@
 [package]
 name = "ferralk"
-description = "Parallel, Git-ignore-aware filesystem walker whose glob patterns prune the traversal."
+description = "Glob matching and parallel filesystem walking, byte-first, with an unsafe-free matcher."
 readme = "README.md"
 version.workspace = true
 authors.workspace = true
