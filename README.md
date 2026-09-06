@@ -64,9 +64,14 @@ compatible with zlob and deliberately has no C ABI.
 - **Nothing surprising is on by default.** Hidden files, symlink following,
   Git ignores, metadata, sorting, and error handling are explicit switches,
   and the [usage guide](docs/usage.md) documents each one with its default.
-- **Safe Rust.** The matcher crate forbids `unsafe`, the portable walker denies
-  it, and CI fails on any `unsafe` outside the two audited native-backend
-  modules, which are opt-in features.
+- **Safe Rust, with a named exception list.** The matcher crate forbids
+  `unsafe` outright; the workspace denies it, so every remaining occurrence
+  sits under an explicit `allow` in a file CI names with the reason it is
+  there: the two opt-in native backends and their parity fixtures, one
+  `sysctlbyname` query that sizes the default worker budget on Apple Silicon,
+  and two counting allocators that exist only in test targets. A file that
+  starts carrying `unsafe` fails CI, and so does a list entry that no longer
+  needs to be on it.
 - **Git is the oracle, not a spec someone read once.** The 822 checked-in
   behavioural cases are a machine-readable corpus rather than a side effect of
   the tests, and the ignore cases among them are replayed against
