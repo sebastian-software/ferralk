@@ -4,6 +4,7 @@
 #[cfg(test)]
 const DOCUMENTS: &[&str] = &[
     ".github/pull_request_template.md",
+    "AGENTS.md",
     "CHANGELOG.md",
     "CLAUDE.md",
     "CONTRIBUTING.md",
@@ -62,6 +63,12 @@ struct FencePolicy {
 const FENCE_POLICIES: &[FencePolicy] = &[
     FencePolicy {
         path: ".github/pull_request_template.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "AGENTS.md",
         compiled_rust_fences: 0,
         ignored_rust_fences: 0,
         intentional_text_fragments: &[],
@@ -316,6 +323,9 @@ const FENCE_POLICIES: &[FencePolicy] = &[
 
 #[doc = include_str!("../../../.github/pull_request_template.md")]
 pub mod pull_request_template {}
+
+#[doc = include_str!("../../../AGENTS.md")]
+pub mod agents {}
 
 #[doc = include_str!("../../../CHANGELOG.md")]
 pub mod changelog {}
