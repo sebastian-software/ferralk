@@ -1,6 +1,6 @@
 # zlob 1.6.3 compatibility matrix
 
-This is the living behavioural mapping from zlob's public surface to ferralk's
+This is the living behavioural mapping from zlob's public surface to Ferralk's
 safe Rust API. “Planned” is not a compatibility claim. Each accepted behaviour
 must have one or more corpus cases and every deliberate divergence must name
 its rationale. For migration examples and the consolidated divergence list,

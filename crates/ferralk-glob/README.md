@@ -32,3 +32,6 @@ For the full syntax, error contract, and compatibility notes, see the
 [crate documentation](https://docs.rs/ferralk-glob), the
 [usage guide](https://github.com/sebastian-software/ferralk/blob/main/docs/usage.md),
 and the [Ferralk repository](https://github.com/sebastian-software/ferralk).
+
+Part of the [Ferramenta](https://ferramenta.dev) family of Rust developer tools
+by Sebastian Software.
