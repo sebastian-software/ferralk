@@ -117,9 +117,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The only Node lane in this workflow. The family block is generated
-      # from the registry in sebastian-software/ferramenta, so the check needs
-      # Node; keeping it in its own job leaves the Rust matrix Node-free.
+      # One of the two Node lanes in this workflow, next to `standards`. The
+      # family block is generated from the registry in
+      # sebastian-software/ferramenta, so the check needs Node; keeping it in
+      # its own job leaves the Rust matrix Node-free.
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "24"
@@ -135,6 +136,38 @@ jobs:
       # this repository by bumping that pin and re-running it with --write;
       # CONTRIBUTING.md records the procedure.
       - run: ./scripts/readme-family-block.sh --check
+
+  standards:
+    name: standards drift
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # `standards apply` leaves this file behind when a version needs manual
+      # judgement steps that no CLI can do. Failing here keeps a half-applied
+      # migration from passing as compliant.
+      - name: "Guard: agent step not yet completed for this PR"
+        run: test ! -f .standards/pending.json
+
+      # The second Node lane, set up exactly like `README family block` above.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24"
+      - name: Activate the pinned pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@12.3.4 --activate
+      # This repository has no lockfile that could hold the CLI's version, so
+      # the pin lives here and Renovate's custom manager in renovate.json moves
+      # it. An unpinned `dlx` would run whatever was published minutes ago with
+      # this job's token. Raise the pin in the same pull request that runs
+      # `apply`, so the stamp and the CLI that checks it never disagree.
+      #
+      # minimum-release-age=0 stays: pnpm holds versions younger than 24 hours
+      # back, so a pin raised on the day of a standards release would otherwise
+      # not resolve at all.
+      - run: pnpm --config.minimum-release-age=0 dlx @sebastian-software/standards@0.9.0 check
 
   test:
     name: test (${{ matrix.os }})
