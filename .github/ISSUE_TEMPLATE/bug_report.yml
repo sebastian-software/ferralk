@@ -1,15 +1,44 @@
 name: Bug report
-description: Report a reproducible defect.
-title: "[Bug]: "
+description: Report incorrect matching, walking, or platform behaviour.
+title: "bug: "
 labels:
   - "type:bug"
 body:
-  - type: input
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Ferralk. For a suspected vulnerability, use the private security-reporting link instead of this public form.
+
+  - type: textarea
     id: summary
     attributes:
-      label: Summary
-      description: What went wrong?
-      placeholder: A short description of the unexpected behavior
+      label: What happened?
+      description: Describe the observable problem and why it appears incorrect.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the pattern, fixture tree, options, and smallest Rust example that reproduces the problem.
+      render: rust
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behaviour
+      description: State both results, including entry order or errors when relevant.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Ferralk version or commit
+      placeholder: "1.0.0-rc.1 or a commit SHA"
     validations:
       required: true
 
@@ -17,37 +46,15 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: Version or commit, operating system, and the toolchain or runtime version you used.
-      placeholder: |
-        version 1.2.3
-        Linux 6.12
-        Node 24
+      description: Include OS, architecture, Rust version, filesystem, and enabled features.
     validations:
       required: true
 
   - type: textarea
-    id: reproduction
+    id: context
     attributes:
-      label: Reproduction
-      description: The smallest command, input, or code sample that reproduces the problem.
-      render: shell
-    validations:
-      required: true
-
-  - type: textarea
-    id: expected
-    attributes:
-      label: Expected behavior
-    validations:
-      required: true
-
-  - type: textarea
-    id: actual
-    attributes:
-      label: Actual behavior
-      description: Include the full error output or log where you have one.
-    validations:
-      required: true
+      label: Additional context
+      description: Add logs, related issues, Git-oracle output, or a corpus case if available.
 
   - type: checkboxes
     id: checks
