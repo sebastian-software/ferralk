@@ -55,7 +55,7 @@ pub struct Case {
     pub pattern: String,
     /// Candidate path, encoded with [`decode_bytes`].
     pub path: String,
-    /// Behaviour switches in the compatibility matrix namespace.
+    /// Behavior switches in the compatibility matrix namespace.
     #[serde(default)]
     pub flags: Vec<String>,
     /// Newline-delimited rules placed in the synthetic `.gitignore` by the

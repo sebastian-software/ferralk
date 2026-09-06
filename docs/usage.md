@@ -379,14 +379,14 @@ with the directory, but pending traversal work is bounded by depth for
 `stream()` and by one batch per active worker for parallel collection. The
 batch is wide enough that an ordinary directory is classified in one piece, so
 its name buffers stay with the worker for the next directory instead of
-travelling into a continuation.
+traveling into a continuation.
 
 A long-running host should know one allocator effect of parallel walks. Each
 helper thread lands in its own glibc malloc arena, and the result vectors a
 large walk frees raise glibc's dynamic trim threshold, so after a parallel
 walk of a few hundred thousand entries the process can keep tens of megabytes
 of freed heap resident with almost nothing live; serial and `stream()` walks
-show no such retention. This is glibc's behaviour, not a leak. A daemon or
+show no such retention. This is glibc's behavior, not a leak. A daemon or
 language server that measures it can cap the arenas with `MALLOC_ARENA_MAX`
 or install a different global allocator.
 
@@ -458,7 +458,7 @@ same atomic final-component guarantee.
 
 Run the single canonical [pull-request preflight in
 CONTRIBUTING](../CONTRIBUTING.md#before-opening-a-pull-request) before changing
-matcher or walker behaviour. It covers both the root workspace and the
+matcher or walker behavior. It covers both the root workspace and the
 separate platform-neutral fuzz targets, while excluding the development-only
 `oracle` package so no Zig installation is needed. CI additionally exercises
 platform-specific, sanitizer, and coverage lanes; coverage includes `oracle`
@@ -473,7 +473,7 @@ minus two releases. The scheduled/manual policy check compares that field with
 Rust's official stable-channel metadata, so a new stable release turns drift
 into a targeted maintenance update rather than a surprise in ordinary CI.
 
-The checked-in JSONL corpus is the behavioural source of truth. Read
+The checked-in JSONL corpus is the behavioral source of truth. Read
 [corpus-format.md](corpus-format.md) before adding a case. Fuzz targets live in
 [`fuzz/`](../fuzz/README.md); benchmark evidence and other deferred follow-up
 are tracked in [GitHub](https://github.com/sebastian-software/ferralk/issues).

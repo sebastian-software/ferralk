@@ -1,7 +1,7 @@
 # zlob 1.6.3 compatibility matrix
 
-This is the living behavioural mapping from zlob's public surface to ferralk's
-safe Rust API. “Planned” is not a compatibility claim. Each accepted behaviour
+This is the living behavioral mapping from zlob's public surface to ferralk's
+safe Rust API. “Planned” is not a compatibility claim. Each accepted behavior
 must have one or more corpus cases and every deliberate divergence must name
 its rationale. For migration examples and the consolidated divergence list,
 read the [compatibility guide](compatibility-guide.md).
@@ -41,7 +41,7 @@ read the [compatibility guide](compatibility-guide.md).
 | `ZLOB_ERR` | `ErrorPolicy::{Abort,Skip,Collect}` | Implemented (M2) | `Collect` default. |
 | `ZLOB_APPEND`, `ZLOB_DOOFFS` | — | Deliberate divergence | C output-buffer ownership has no Rust equivalent. |
 | `zlob_at` | `Walker::new(path)` | Implemented (M2) | Root is an explicit path; Rust results avoid zlob's C output-buffer ownership. |
-| metadata masks | `WalkOptions::metadata` | Implemented (M2) | Opt-in `std::fs::Metadata` collection preserves the default no-extra-stat behaviour. |
+| metadata masks | `WalkOptions::metadata` | Implemented (M2) | Opt-in `std::fs::Metadata` collection preserves the default no-extra-stat behavior. |
 
 ## Inventory provenance
 

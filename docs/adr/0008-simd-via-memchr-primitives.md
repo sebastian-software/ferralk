@@ -31,7 +31,7 @@ considered only if profiling proves a gap these primitives cannot close.
 ## Evidence, 2026-08-19
 
 The Ferroni playbook this ADR follows is confirmed by measurement rather than
-by assumption. Prefilters and specialised paths built on `memchr` primitives
+by assumption. Prefilters and specialized paths built on `memchr` primitives
 carried an extglob case at 427× and cut the general path by about 70%, with no
 hand-written intrinsics written at any point. The escape hatch in the last
 consequence above stays unexercised, and `ferralk-glob` still compiles under

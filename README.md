@@ -31,7 +31,7 @@ pay for traversal dependencies:
 
 Ferralk is independently developed and inspired by
 [zlob 1.6.3](https://github.com/dmtrKovalenko/zlob). Its matcher and walker
-behaviour are checked against a frozen zlob reference, but it is not source
+behavior are checked against a frozen zlob reference, but it is not source
 compatible with zlob and deliberately has no C ABI.
 
 ## Why Ferralk
@@ -67,17 +67,18 @@ compatible with zlob and deliberately has no C ABI.
   it, and CI fails on any `unsafe` outside the two audited native-backend
   modules, which are opt-in features.
 - **Git is the oracle, not a spec someone read once.** The 822 checked-in
-  behavioural cases are a machine-readable corpus rather than a side effect of
+  behavioral cases are a machine-readable corpus rather than a side effect of
   the tests, and the ignore cases among them are replayed against
   `git check-ignore` itself, on Linux and on Windows, pinned to Git 2.52.0. If
   Git disagrees, CI fails; where Ferralk diverges on purpose, the case carries
   an ADR reference or a recorded oracle defect, and all 44 of them do.
 - **Verification beyond a test suite.** Seven fuzz targets, differential checks
   against `fast-glob` and the frozen zlob reference, AddressSanitizer, Miri,
-  and loom models of the scheduler protocol, across Linux, macOS, and Windows
-  — 32 checks on a pull request. Seventeen ADRs record the decisions rather
-  than leaving them to be rediscovered. Performance is measured on every pull
-  request and never used as a gate.
+  and loom models of the scheduler protocol, across Linux, macOS, and Windows.
+  [Verification depth](docs/verification-comparison.md#counts) counts what a
+  pull request actually runs, and how the count was taken. Seventeen ADRs
+  record the decisions rather than leaving them to be rediscovered. Performance
+  is measured on every pull request and never used as a gate.
 
 ### Next to the crates you may already use
 
@@ -209,6 +210,14 @@ against 7.61 ms for `ignore` with hand-written pruning — the second gap is the
 structural one, because it comes from never opening `node_modules` rather than
 from opening it faster.
 
+The two zlob versions in this README are deliberate: the semantic oracle stays
+frozen at 1.6.3, the source commit recorded in
+[NOTICE](https://github.com/sebastian-software/ferralk/blob/main/NOTICE) and
+[ADR-0007](docs/adr/0007-differential-corpus-and-dev-time-oracle.md), so the
+corpus never moves under an upstream release, while the rows below measure the
+latest release, 1.6.5, because a speed comparison is only useful against what a
+consumer would install today.
+
 Matcher values use the common `src/**/*.rs` syntax. The Rust and zlob rows are
 Criterion point estimates; the Node.js rows are medians of fifteen
 order-rotated samples, each containing 100,000 matches.
@@ -283,7 +292,7 @@ Contributing:
 
 - [Contributing](CONTRIBUTING.md) — the preflight, commit conventions, and
   the 1.0 release checklist.
-- [Corpus format](docs/corpus-format.md) — the JSONL behavioural test corpus
+- [Corpus format](docs/corpus-format.md) — the JSONL behavioral test corpus
   that is the source of truth for matcher and walker semantics.
 - [Architecture RFC](RFC-zig-free-zlob-port.md) and [ADRs](docs/adr/README.md)
   — design rationale and non-goals.

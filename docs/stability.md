@@ -100,7 +100,7 @@ and has stopped moving — the contract text, the public enum decisions, and the
 checked-in [`cargo public-api`](api/) listings are unchanged since
 `feat!: settle the v1.0 contract`, which was the last consumer-visible breaking
 change. The candidate exists so one more adversarial round runs against exactly
-the artefact that would become 1.0. Until `1.0.0` is tagged, this contract
+the artifact that would become 1.0. Until `1.0.0` is tagged, this contract
 describes what is intended, not what is guaranteed: a finding in that round can
 still change it, and that is the point of cutting a candidate rather than a
 release.

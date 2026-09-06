@@ -38,7 +38,7 @@ The portable-first bet is confirmed. On scoped queries — the shape a consumer
 actually issues — ferralk measures about 4.3× zlob, because pruning avoids the
 work rather than performing it faster. zlob leads by about 20%, and only on
 full traversal, where there is nothing to prune. Choosing a portable core with
-native backends as an optimisation, rather than the reverse, is what made the
+native backends as an optimization, rather than the reverse, is what made the
 pruning work available on every platform.
 
 Amendment only; the decision above is unchanged.

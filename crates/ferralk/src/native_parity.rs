@@ -8,7 +8,7 @@
 //! only compared entries would miss the more interesting half: the two readers
 //! reach failures by different syscalls.
 //!
-//! Malformed-record rejection stays in each backend module. Behaviour that can
+//! Malformed-record rejection stays in each backend module. Behavior that can
 //! change a completed walk — unknown-type classification, latched fallback,
 //! and deferred entry errors — also has a whole-tree family here, driven by
 //! narrow test-only backend hooks when an ordinary filesystem cannot expose

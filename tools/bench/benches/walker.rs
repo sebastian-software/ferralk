@@ -9,7 +9,7 @@
 //!
 //! **Cache assumption:** every fixture is written immediately before the
 //! measurement, so its directory entries and inodes are in the page cache.
-//! These numbers describe warm-cache traversal. Cold-cache behaviour is a
+//! These numbers describe warm-cache traversal. Cold-cache behavior is a
 //! different measurement and is not made here.
 
 use std::{
@@ -384,7 +384,7 @@ fn bench_multi_root(c: &mut Criterion, roots: &[Fixture]) {
 /// own and the walker only has to find the candidates.
 ///
 /// `collect_then_filter` is the arm the trial ran, and the one that lost to a
-/// hand-pruned parallel `ignore` at four threads — the walk parallelises and
+/// hand-pruned parallel `ignore` at four threads — the walk parallelizes and
 /// the caller's `GlobSet` then runs over every entry on one thread.
 /// `visit_in_worker` is the same matcher moved into the workers.
 fn bench_caller_matching(c: &mut Criterion, group: &str, fixture: &Fixture) {

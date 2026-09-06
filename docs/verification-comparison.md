@@ -2,12 +2,12 @@
 
 [Benchmark evidence](benchmark-evidence.md) answers how fast Ferralk is. This
 answers a different question a reader is entitled to ask before depending on a
-young library: how much checkable evidence stands behind its behaviour,
+young library: how much checkable evidence stands behind its behavior,
 compared with the crates it is measured against.
 
 It is a count of what each project has checked in, taken from the upstream
 repositories on 2026-09-04. Counts are a weak proxy for reliability and this
-document says where they mislead. Nothing here is a quality judgement of
+document says where they mislead. Nothing here is a quality judgment of
 another project.
 
 ## Method
@@ -48,10 +48,24 @@ that is the trap this table exists to avoid rather than to set.
 | `globwalk` | 11 | — | 11 | 0 |
 
 Documentation, counted as Markdown in the same repository scope: Ferralk has 41
-documents totalling 5,406 lines, including 17 ADRs. The next largest is
+documents totaling 5,406 lines, including 17 ADRs. The next largest is
 `jwalk` at 3 documents and 636 lines; `wax` has one 495-line README; the
-`ignore` crate ships a 59-line README. Continuous integration: 31 checks on a
-Ferralk pull request across 11 workflows, against 1 to 5 workflows elsewhere.
+`ignore` crate ships a 59-line README.
+
+Continuous integration: a Ferralk pull request runs **30 checks**. That is
+every job in the seven of the repository's eleven workflow files that a
+`pull_request` event triggers, expanded over its matrix and filtered by its
+`if:` condition — 14 from `ci.yml`, 4 glob-fuzz targets, 3 Linux native jobs,
+3 macOS native jobs, 4 walker-benchmark jobs, the loom models, and the
+zlob-oracle replay. Twenty-nine of those run on every pull request. The
+thirtieth, the oracle replay, is the only path-filtered one: it runs when the
+pull request touches `corpus/**`, `crates/ferralk-glob/**`, `tools/corpus/**`,
+`tools/oracle/**`, `Cargo.lock`, or `.github/workflows/oracle.yml`, and is not
+queued at all otherwise. The four workflows with no `pull_request` trigger
+(`fuzz.yml`, `publish.yml`, `release-please.yml`, `zlob-benchmark.yml`) and the
+jobs whose `if:` selects a schedule or a manual dispatch are excluded, because
+a check that never runs on a pull request is not evidence a reviewer gets.
+Comparable crates run 1 to 5 workflows.
 
 ## Where these counts mislead
 

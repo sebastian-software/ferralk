@@ -2,16 +2,12 @@
 
 ## Supported versions
 
-Security fixes are made for the latest published minor line. The currently
-supported release line is:
+The supported version is the latest published release. Earlier releases are not
+patched. A fix that is not published yet is available on the default branch
+until the next release carries it.
 
-| Version | Supported |
-| --- | --- |
-| 0.9.x | Yes |
-| Earlier versions | No |
-
-Ferralk is pre-1.0, so update to the latest patch release before reporting a
-problem that may already be fixed.
+Update to the latest release before reporting a problem that may already be
+fixed.
 
 ## Reporting a vulnerability
 

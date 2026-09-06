@@ -2,7 +2,7 @@
 #![warn(missing_docs)]
 #![doc = "Portable, byte-first glob matching."]
 
-//! Compiled, byte-first glob patterns with explicit behaviour-changing options.
+//! Compiled, byte-first glob patterns with explicit behavior-changing options.
 //!
 //! A [`Pattern`] is compiled once from any `AsRef<[u8]>` and matched many
 //! times against bytes, so filenames never pass through a lossy UTF-8
@@ -560,7 +560,7 @@ impl Pattern {
 
     /// Removes accelerated engines so a differential run can pin one engine.
     ///
-    /// `prefilters` neutralises the fixed-ends prefilter as well, which turns
+    /// `prefilters` neutralizes the fixed-ends prefilter as well, which turns
     /// the stripped pattern into the bare memoized engine — the oracle the
     /// prefilter and the sweep are both held against.
     #[cfg(any(test, feature = "unstable-test-hooks"))]
@@ -1220,7 +1220,7 @@ struct Scratch {
 /// The literal-skipping bookkeeping for one match, borrowed out of [`Scratch`].
 struct StarWork<'scratch> {
     /// Cached scans, one entry per token. Entries from an earlier match are
-    /// recognised by their generation and reset when first used, so starting a
+    /// recognized by their generation and reset when first used, so starting a
     /// match costs nothing per token.
     scans: &'scratch mut [StarScans],
     generation: u64,
@@ -3589,7 +3589,7 @@ const MAX_BRACE_ALTERNATIVES: usize = 1 << 12;
 /// whole pattern once per group it resolves, so a pattern of many one-way
 /// groups costs the square of its length while expanding to a single
 /// alternative: `{a}` repeated 200,000 times is 600 KB and took 11.8 s. And a
-/// pattern inside the alternative budget still materialises that budget times
+/// pattern inside the alternative budget still materializes that budget times
 /// its own length, so 4096 alternatives of a 100 KB pattern is 400 MB and a
 /// second, however few groups produced them.
 ///
@@ -8791,7 +8791,7 @@ mod tests {
         }
     }
 
-    /// The same pattern with the prefilter neutralised, so the engine decides
+    /// The same pattern with the prefilter neutralized, so the engine decides
     /// on its own.
     fn without_the_prefilter(pattern: &Pattern) -> Pattern {
         let mut unfiltered = pattern.clone();
@@ -8808,7 +8808,7 @@ mod tests {
     /// The prefilter may only reject what the general engine rejects.
     ///
     /// Every candidate is decided twice through the same engine — once with the
-    /// compiled prefilter in front of it, once with the prefilter neutralised —
+    /// compiled prefilter in front of it, once with the prefilter neutralized —
     /// across the three entry points that reach it, because each supplies its
     /// own `PatternOptions` and the prefilter is derived without them. The fast
     /// paths are removed from both copies so nothing routes around the engine
