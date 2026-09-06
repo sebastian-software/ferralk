@@ -6,6 +6,10 @@
 
 <!-- Link the issue and include tests, corpus cases, or before/after measurements. -->
 
+## Issue
+
+<!-- Closes #123, Refs #123, or a short note on why no issue exists. -->
+
 ## Checklist
 
 - [ ] The [canonical pull-request preflight](https://github.com/sebastian-software/ferralk/blob/main/CONTRIBUTING.md#before-opening-a-pull-request) passes.

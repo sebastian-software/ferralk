@@ -30,6 +30,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master branch
         with:
           toolchain: nightly-2026-08-04
+      # The seeded `rust-toolchain.toml` selects stable and outranks the
+      # rustup default this action sets; a directory override outranks the
+      # file. Without this line the job would silently run on stable.
+      - run: rustup override set nightly-2026-08-04
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
         with:
@@ -56,6 +60,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master branch
         with:
           toolchain: nightly-2026-08-04
+      # The seeded `rust-toolchain.toml` selects stable and outranks the
+      # rustup default this action sets; a directory override outranks the
+      # file. Without this line the job would silently run on stable.
+      - run: rustup override set nightly-2026-08-04
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run AddressSanitizer tests
         env:
