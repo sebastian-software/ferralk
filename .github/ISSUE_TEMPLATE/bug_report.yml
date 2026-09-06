@@ -1,0 +1,80 @@
+name: Bug report
+description: Report incorrect matching, walking, or platform behavior.
+title: "[Bug]: "
+labels:
+  - "type:bug"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Ferralk. For a suspected vulnerability, use the private security-reporting link instead of this public form.
+
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+      placeholder: A short description of the unexpected behavior
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Ferralk version or commit
+      placeholder: "0.9.4 or a commit SHA"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, architecture, Rust version, filesystem, and enabled features.
+      placeholder: |
+        Linux 6.12, x86_64
+        Rust 1.96.0
+        ext4, features = ["native-linux"]
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: The pattern, fixture tree, options, and smallest Rust example that reproduces the problem.
+      render: rust
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Include entry order or errors when they are relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the full error output or log where you have one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Logs, related issues, Git-oracle output, or a corpus case if available.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Triage checklist
+      options:
+        - label: I searched the existing issues for duplicates.
+          required: true
+        - label: I removed credentials and private data from this report.
+          required: true

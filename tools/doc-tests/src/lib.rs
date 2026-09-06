@@ -7,10 +7,12 @@ const DOCUMENTS: &[&str] = &[
     "AGENTS.md",
     "CHANGELOG.md",
     "CLAUDE.md",
+    "CODE_OF_CONDUCT.md",
     "CONTRIBUTING.md",
     "README.md",
     "RFC-zig-free-zlob-port.md",
     "SECURITY.md",
+    "SUPPORT.md",
     "crates/ferralk-glob/README.md",
     "crates/ferralk/README.md",
     "docs/README.md",
@@ -88,6 +90,12 @@ const FENCE_POLICIES: &[FencePolicy] = &[
         intentional_text_fragments: &[],
     },
     FencePolicy {
+        path: "CODE_OF_CONDUCT.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
         path: "CONTRIBUTING.md",
         compiled_rust_fences: 0,
         ignored_rust_fences: 0,
@@ -107,6 +115,12 @@ const FENCE_POLICIES: &[FencePolicy] = &[
     },
     FencePolicy {
         path: "SECURITY.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "SUPPORT.md",
         compiled_rust_fences: 0,
         ignored_rust_fences: 0,
         intentional_text_fragments: &[],
@@ -347,6 +361,9 @@ pub mod changelog {}
 #[doc = include_str!("../../../CLAUDE.md")]
 pub mod claude {}
 
+#[doc = include_str!("../../../CODE_OF_CONDUCT.md")]
+pub mod code_of_conduct {}
+
 #[doc = include_str!("../../../CONTRIBUTING.md")]
 pub mod contributing {}
 
@@ -358,6 +375,9 @@ pub mod rfc {}
 
 #[doc = include_str!("../../../SECURITY.md")]
 pub mod security {}
+
+#[doc = include_str!("../../../SUPPORT.md")]
+pub mod support {}
 
 #[doc = include_str!("../../../crates/ferralk-glob/README.md")]
 pub mod ferralk_glob_readme {}
