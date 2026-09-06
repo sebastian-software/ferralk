@@ -3,6 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/ferralk.svg)](https://crates.io/crates/ferralk)
 [![docs.rs](https://docs.rs/ferralk/badge.svg)](https://docs.rs/ferralk)
 [![CI](https://github.com/sebastian-software/ferralk/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sebastian-software/ferralk/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/sebastian-software/ferralk/branch/main/graph/badge.svg)](https://codecov.io/gh/sebastian-software/ferralk)
 [![MSRV 1.96](https://img.shields.io/badge/MSRV-1.96-blue.svg)](docs/adr/0004-msrv-stable-minus-two.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
@@ -63,9 +64,14 @@ compatible with zlob and deliberately has no C ABI.
 - **Nothing surprising is on by default.** Hidden files, symlink following,
   Git ignores, metadata, sorting, and error handling are explicit switches,
   and the [usage guide](docs/usage.md) documents each one with its default.
-- **Safe Rust.** The matcher crate forbids `unsafe`, the portable walker denies
-  it, and CI fails on any `unsafe` outside the two audited native-backend
-  modules, which are opt-in features.
+- **Safe Rust, with a named exception list.** The matcher crate forbids
+  `unsafe` outright; the workspace denies it, so every remaining occurrence
+  sits under an explicit `allow` in a file CI names with the reason it is
+  there: the two opt-in native backends and their parity fixtures, one
+  `sysctlbyname` query that sizes the default worker budget on Apple Silicon,
+  and two counting allocators that exist only in test targets. A file that
+  starts carrying `unsafe` fails CI, and so does a list entry that no longer
+  needs to be on it.
 - **Git is the oracle, not a spec someone read once.** The 822 checked-in
   behavioral cases are a machine-readable corpus rather than a side effect of
   the tests, and the ignore cases among them are replayed against
