@@ -1,0 +1,44 @@
+# Dependency policy for the Ferramenta family. Widen it with narrow, reviewed
+# exceptions — never by loosening the org allow-list below.
+
+[graph]
+# Development-only features count too: `bench` reaches zlob behind
+# `zlob-oracle`, and the native backends behind their own features.
+all-features = true
+
+[advisories]
+# A yanked crate still builds from Cargo.lock; it must not ship unnoticed.
+yanked = "deny"
+# Flag unmaintained crates anywhere in the graph, not only in the workspace.
+unmaintained = "all"
+# Each entry needs a comment naming the advisory and why it is accepted.
+ignore = []
+
+[licenses]
+# Permissive licenses compatible with `MIT OR Apache-2.0` distribution
+# (ADR-0018).
+allow = ["Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0", "Zlib"]
+# Crate-scoped grants that stay narrower than the allow-list above.
+exceptions = [
+    # MIT without the attribution clause, so strictly more permissive than
+    # MIT. Reached only by the development-only corpus harness, through
+    # jsonschema.
+    { allow = ["MIT-0"], crate = "borrow-or-share" },
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicates are surfaced for maintenance review without blocking a safe build.
+multiple-versions = "warn"
+wildcards = "deny"
+# The unpublished workspace members depend on each other by path alone, which
+# is a wildcard requirement Cargo never resolves from a registry.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# ADR-0007: the development-only oracle builds the frozen zlob source commit
+# recorded in NOTICE. It is never part of a published crate.
+allow-git = ["https://github.com/dmtrKovalenko/zlob"]

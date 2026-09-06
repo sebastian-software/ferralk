@@ -1,5 +1,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
+// docs.rs passes `--cfg docsrs` (see `[package.metadata.docs.rs]`), which is
+// what lets a feature-gated item render with the flags that gate it.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = "Portable filesystem walking."]
 
 //! Parallel filesystem walking with byte-first glob selection.
@@ -212,14 +215,38 @@ mod retained_directory_test {
 }
 #[cfg(all(feature = "native-linux", target_os = "linux"))]
 #[cfg(feature = "unstable-test-hooks")]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(all(
+        feature = "native-linux",
+        feature = "unstable-test-hooks",
+        target_os = "linux"
+    )))
+)]
 #[doc(hidden)]
 pub use linux_native::fuzz_validate_records as fuzz_validate_linux_dirent_records;
 #[cfg(all(feature = "native-macos", target_os = "macos"))]
 #[cfg(feature = "unstable-test-hooks")]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(all(
+        feature = "native-macos",
+        feature = "unstable-test-hooks",
+        target_os = "macos"
+    )))
+)]
 #[doc(hidden)]
 pub use macos_native::fuzz_validate_bulk_record as fuzz_validate_macos_bulk_record;
 #[cfg(all(feature = "native-macos", target_os = "macos"))]
 #[cfg(feature = "unstable-test-hooks")]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(all(
+        feature = "native-macos",
+        feature = "unstable-test-hooks",
+        target_os = "macos"
+    )))
+)]
 #[doc(hidden)]
 pub use macos_native::fuzz_validate_records as fuzz_validate_macos_dirent_records;
 mod absolute;

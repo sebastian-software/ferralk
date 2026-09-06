@@ -45,6 +45,8 @@ const DOCUMENTS: &[&str] = &[
     "docs/adr/0015-posix-escapes-in-bracket-classes.md",
     "docs/adr/0016-shell-star-runs-before-extglobs.md",
     "docs/adr/0017-caller-owned-list-api-conventions.md",
+    "docs/adr/0018-dual-mit-apache-license.md",
+    "docs/adr/0019-dependency-version-requirements.md",
     "fuzz/README.md",
 ];
 
@@ -314,6 +316,18 @@ const FENCE_POLICIES: &[FencePolicy] = &[
         intentional_text_fragments: &[],
     },
     FencePolicy {
+        path: "docs/adr/0018-dual-mit-apache-license.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/0019-dependency-version-requirements.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
         path: "fuzz/README.md",
         compiled_rust_fences: 0,
         ignored_rust_fences: 0,
@@ -447,6 +461,12 @@ pub mod adr_0016 {}
 #[doc = include_str!("../../../docs/adr/0017-caller-owned-list-api-conventions.md")]
 pub mod adr_0017 {}
 
+#[doc = include_str!("../../../docs/adr/0018-dual-mit-apache-license.md")]
+pub mod adr_0018 {}
+
+#[doc = include_str!("../../../docs/adr/0019-dependency-version-requirements.md")]
+pub mod adr_0019 {}
+
 #[doc = include_str!("../../../fuzz/README.md")]
 pub mod fuzzing {}
 
@@ -520,12 +540,13 @@ mod tests {
 
     /// Cargo does not package the repository root's license text, so each
     /// published crate carries its own copy. The copies are kept identical to
-    /// the root files rather than maintained twice.
+    /// the root files rather than maintained twice. Both halves of the
+    /// ADR-0018 dual license have to travel with the crate.
     #[test]
     fn published_crates_ship_the_repository_license_and_notice() {
         let repository_root = repository_root();
         for crate_directory in ["crates/ferralk-glob", "crates/ferralk"] {
-            for file in ["LICENSE", "NOTICE"] {
+            for file in ["LICENSE-MIT", "LICENSE-APACHE", "NOTICE"] {
                 let expected =
                     fs::read(repository_root.join(file)).expect("repository file is readable");
                 let actual = fs::read(repository_root.join(crate_directory).join(file))

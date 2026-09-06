@@ -4,7 +4,7 @@
 [![docs.rs](https://docs.rs/ferralk/badge.svg)](https://docs.rs/ferralk)
 [![CI](https://github.com/sebastian-software/ferralk/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sebastian-software/ferralk/actions/workflows/ci.yml)
 [![MSRV 1.96](https://img.shields.io/badge/MSRV-1.96-blue.svg)](docs/adr/0004-msrv-stable-minus-two.md)
-[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 Ferralk finds files. Give it a glob such as `{src,packages}/**/*.{ts,tsx}` and
 it walks the tree in parallel, applies `.gitignore` the way Git does, and opens
@@ -321,8 +321,10 @@ the corpus, fuzzing, and benchmark commands.
 
 ## License and attribution
 
-Ferralk is MIT licensed. It is an independent project inspired by zlob 1.6.3;
-provenance and attribution are recorded in
+Ferralk is dual-licensed under the [MIT license](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option. It is an
+independent project inspired by zlob 1.6.3; provenance and attribution are
+recorded in
 [NOTICE](https://github.com/sebastian-software/ferralk/blob/main/NOTICE) and the
 [frozen reference](docs/zlob-1.6.3-reference.md). Report vulnerabilities through
 the private process in [SECURITY.md](SECURITY.md).
