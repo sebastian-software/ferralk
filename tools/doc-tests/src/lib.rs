@@ -581,6 +581,32 @@ mod tests {
     }
 
     #[test]
+    fn semver_values_keep_prerelease_and_build_metadata() {
+        assert_eq!(semver_values("ferralk = \"1.0.0\""), vec!["1.0.0"]);
+        assert_eq!(
+            semver_values("1.0.0-rc.1 release line for applications."),
+            vec!["1.0.0-rc.1"]
+        );
+        assert_eq!(
+            semver_values("Ferralk 1.0.0-rc.1 is published."),
+            vec!["1.0.0-rc.1"]
+        );
+        assert_eq!(
+            semver_values("ferralk = { version = \"1.0.0-rc.1\", features = [] }"),
+            vec!["1.0.0-rc.1"]
+        );
+        assert_eq!(
+            semver_values("2.3.4+build.5 shipped"),
+            vec!["2.3.4+build.5"]
+        );
+        assert_eq!(
+            semver_values("0.1.2-alpha.1+build.7, then 1.2.3"),
+            vec!["0.1.2-alpha.1+build.7", "1.2.3"]
+        );
+        assert_eq!(semver_values("MSRV 1.96"), Vec::<&str>::new());
+    }
+
+    #[test]
     fn fence_scanner_matches_rustdoc_fence_classification_and_real_closers() {
         let fences = scan_fenced_code_blocks(
             "```\nlet bare: u8 = 1;\n```\n\
@@ -684,12 +710,65 @@ mod tests {
             while index < bytes.len() && bytes[index].is_ascii_digit() {
                 index += 1;
             }
-            if patch_start != index {
-                versions.push(&line[start..index]);
+            if patch_start == index {
+                continue;
             }
+            index = consume_semver_suffixes(bytes, index);
+            versions.push(&line[start..index]);
         }
 
         versions
+    }
+
+    /// Consumes an optional pre-release (`-rc.1`) and build-metadata
+    /// (`+build.5`) suffix that follows a `<major>.<minor>.<patch>` triple.
+    ///
+    /// Release Please writes the whole version into the annotated consumer
+    /// documentation lines, so during a pre-release train the annotation reads
+    /// `1.0.0-rc.1`. Stopping after the patch component would compare the
+    /// release line against the workspace version and fail on every
+    /// `-rc`/`-beta` release.
+    fn consume_semver_suffixes(bytes: &[u8], mut index: usize) -> usize {
+        // A pre-release comes first, build metadata second; both optional.
+        for separator in *b"-+" {
+            if index < bytes.len()
+                && bytes[index] == separator
+                && let Some(end) = consume_dot_separated_identifiers(bytes, index + 1)
+            {
+                index = end;
+            }
+        }
+
+        index
+    }
+
+    /// Returns the index just past the last complete `.`-separated SemVer
+    /// identifier, or `None` when the run does not start with one. Trailing
+    /// punctuation such as the full stop in `Ferralk 1.0.0-rc.1 is published.`
+    /// therefore stays outside the version.
+    fn consume_dot_separated_identifiers(bytes: &[u8], start: usize) -> Option<usize> {
+        let mut index = start;
+        let mut end = None;
+
+        loop {
+            let identifier_start = index;
+            while index < bytes.len() && is_semver_identifier_byte(bytes[index]) {
+                index += 1;
+            }
+            if index == identifier_start {
+                return end;
+            }
+            end = Some(index);
+            if index < bytes.len() && bytes[index] == b'.' {
+                index += 1;
+                continue;
+            }
+            return end;
+        }
+    }
+
+    fn is_semver_identifier_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'-'
     }
 
     fn assert_fence_policy(policy: &FencePolicy, fences: &[MarkdownFence]) {
