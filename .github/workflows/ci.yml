@@ -472,9 +472,11 @@ jobs:
     name: coverage
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
-    # The line-coverage floor is written down once, here. CONTRIBUTING points
-    # at this name, and the two steps below both read it, so the gate and the
-    # number reported in the run summary can never drift apart.
+    # The line-coverage floor is declared once, here. Both steps below read it,
+    # so the gate and the number reported in the run summary cannot drift
+    # apart, and `cargo test -p doc-tests` holds the README badge and the
+    # CONTRIBUTING command to this value: raise it here, and that contract
+    # names whatever else has to move.
     env:
       COVERAGE_MIN_LINES: 90
     steps:
