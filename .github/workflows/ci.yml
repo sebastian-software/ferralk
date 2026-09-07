@@ -472,6 +472,13 @@ jobs:
     name: coverage
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
+    # The line-coverage floor is declared once, here. Both steps below read it,
+    # so the gate and the number reported in the run summary cannot drift
+    # apart, and `cargo test -p doc-tests` holds the README badge and the
+    # CONTRIBUTING command to this value: raise it here, and that contract
+    # names whatever else has to move.
+    env:
+      COVERAGE_MIN_LINES: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
@@ -481,16 +488,30 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: taiki-e/install-action@fb8f18cbbad93e39d8b8d65145468a6b2c09877f # cargo-llvm-cov branch
       # ADR-0012's blueprint expects coverage to gate rather than only to
-      # report. Line coverage measured 92.7% on 2026-09-06; the floor sits
-      # below that so ordinary movement does not fail a pull request while a
-      # real regression still does. Raise it when the measured figure has
-      # settled higher, and say so in the pull request that raises it.
-      - run: >-
+      # report, and since that ADR's 2026-09-07 amendment this job is the whole
+      # gate: no external coverage service is involved. Line coverage measured
+      # 92.7% on 2026-09-06 and 92.73% on 2026-09-07; the floor sits below that
+      # so ordinary movement does not fail a pull request while a real
+      # regression still does. Raise it when the measured figure has settled
+      # higher; say so in the pull request that raises it, and move the
+      # README's coverage badge in the same change.
+      - name: Measure line coverage and enforce the floor
+        run: >-
           cargo llvm-cov --workspace --lcov --output-path lcov.info
-          --fail-under-lines 90
-      - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-        with:
-          files: lcov.info
-          # The threshold above is the blocking check. An upload outage on a
-          # third-party service must not make deterministic CI flaky.
-          fail_ci_if_error: false
+          --fail-under-lines "$COVERAGE_MIN_LINES"
+      # Report what the gate acted on, pass or fail, so the number is readable
+      # without opening the log or an external service. The percentage is summed
+      # straight out of the lcov report the step above wrote.
+      - name: Report the measured line coverage
+        if: always()
+        run: |
+          if [ ! -f lcov.info ]; then
+            echo "Line coverage: not measured (gate: ≥ ${COVERAGE_MIN_LINES}%)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          measured=$(awk -F: '
+            /^LF:/ { found += $2 }
+            /^LH:/ { hit += $2 }
+            END { if (found == 0) print "0.00"; else printf "%.2f", hit * 100 / found }
+          ' lcov.info)
+          echo "Line coverage: ${measured}% (gate: ≥ ${COVERAGE_MIN_LINES}%)" >> "$GITHUB_STEP_SUMMARY"

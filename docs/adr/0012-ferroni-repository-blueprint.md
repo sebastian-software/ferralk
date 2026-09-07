@@ -74,3 +74,30 @@ The lane lands non-gating. A threshold — provisionally 5% over the merge base 
 starts failing the job only after the harness is in the merge base and its
 repeatability has been observed across real pull requests, which is the
 sequencing #358 asks for and the discipline the CodSpeed experience was missing.
+
+## Amendment, 2026-09-07: Codecov removed, the gate is CI's own
+
+The blueprint's Codecov membership is withdrawn for this repository. The
+`codecov/codecov-action` upload is deleted from the `coverage` job and the
+badge in the README is replaced by one that names the enforced floor, so no
+part of CI reports to a third-party coverage service any more.
+
+Coverage enforcement is unchanged and stays where it already was. The
+`--fail-under-lines` floor in that job has been the blocking check since the
+job was written; Codecov only ever received a second, non-blocking copy of the
+same lcov report, with `fail_ci_if_error: false` precisely so a third-party
+outage could not make deterministic CI flaky. A signal that is not allowed to
+fail the build is not a gate, and a project this size does not need a hosted
+history of a number its own CI already refuses to let drop.
+
+What the removal costs is the per-line web view on pull requests. What it buys
+is one fewer third-party service between a pull request and its verdict, and a
+figure that is legible without leaving the run: the job now writes `Line
+coverage: X% (gate: ≥ N%)` into the step summary, on failure as well as on
+success. The floor itself is written down once, as `COVERAGE_MIN_LINES` in
+that job, and CONTRIBUTING names it and shows how to reproduce the check
+locally.
+
+This is a second deliberate divergence from the Ferroni blueprint, recorded
+here for the same reason as the CodSpeed one above. Everything else in the
+decision — release-please, renovate, the bench corpora — is unchanged.

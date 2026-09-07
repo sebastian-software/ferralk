@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/ferralk.svg)](https://crates.io/crates/ferralk)
 [![docs.rs](https://docs.rs/ferralk/badge.svg)](https://docs.rs/ferralk)
 [![CI](https://github.com/sebastian-software/ferralk/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sebastian-software/ferralk/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/sebastian-software/ferralk/branch/main/graph/badge.svg)](https://codecov.io/gh/sebastian-software/ferralk)
+[![coverage gate ≥ 90%](https://img.shields.io/badge/coverage%20gate-%E2%89%A5%2090%25-blue.svg)](.github/workflows/ci.yml)
 [![MSRV 1.96](https://img.shields.io/badge/MSRV-1.96-blue.svg)](docs/adr/0004-msrv-stable-minus-two.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 

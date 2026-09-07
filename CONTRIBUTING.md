@@ -110,6 +110,28 @@ CI has additional platform, sanitizer, coverage, and policy lanes. In
 particular, coverage includes `oracle` and installs Zig itself; that CI setup
 does not add Zig to this local contributor preflight.
 
+Coverage gates rather than only reports, and this repository's own `coverage`
+job is the whole gate — no external coverage service is involved. The job
+enforces the line floor with `--fail-under-lines` and writes
+`Line coverage: X% (gate: ≥ N%)` into the run summary whether it passes or
+fails, so the measured figure is readable from the run itself.
+
+The floor is declared once, as `COVERAGE_MIN_LINES` in that job in
+[.github/workflows/ci.yml](.github/workflows/ci.yml). The number in the command
+below and the one in the README's coverage badge repeat it, and
+`cargo test -p doc-tests` fails if either drifts from the workflow — so change
+the workflow first and let that contract point at the rest. Reproducing the
+gate locally is not part of the preflight above, but it is the same command:
+
+```sh
+cargo llvm-cov --workspace --lcov --output-path lcov.info \
+  --fail-under-lines 90
+```
+
+Without Zig 0.16 and libclang, add `--exclude oracle`; the resulting figure is
+then a little different from CI's, which measures the whole workspace. The
+`lcov.info` the run drops in the repository root is ignored by Git.
+
 Changes to the native backends also need `--features native-macos` or
 `--features native-linux` on the platform that has them; the corresponding CI
 jobs are the gate for the other one.

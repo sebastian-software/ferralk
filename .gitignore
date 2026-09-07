@@ -1,3 +1,4 @@
 /target/
 /tools/bench/node/node_modules/
 *.lcov
+/lcov.info

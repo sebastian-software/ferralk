@@ -631,6 +631,63 @@ mod tests {
         }
     }
 
+    /// The coverage floor is declared once, as `COVERAGE_MIN_LINES` in the
+    /// `coverage` job. Two documents restate it for readers, so this contract
+    /// holds them to the workflow instead of trusting them to be updated.
+    ///
+    /// Every comparison here is line by line, like the contracts above. The
+    /// repository has no `.gitattributes`, so a Windows checkout carries CRLF
+    /// and a needle containing a newline would match only on Unix.
+    #[test]
+    fn the_coverage_floor_is_declared_once_and_restated_consistently() {
+        let repository_root = repository_root();
+        let workflow = fs::read_to_string(repository_root.join(".github/workflows/ci.yml"))
+            .expect("CI workflow is readable");
+
+        let declarations = workflow
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("COVERAGE_MIN_LINES:"))
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declarations.len(),
+            1,
+            "the coverage floor must be declared exactly once, as COVERAGE_MIN_LINES"
+        );
+        let floor = declarations[0];
+        assert!(
+            workflow
+                .lines()
+                .any(|line| line.contains("--fail-under-lines \"$COVERAGE_MIN_LINES\"")),
+            "the coverage job must gate on COVERAGE_MIN_LINES, not on a literal floor"
+        );
+
+        let readme =
+            fs::read_to_string(repository_root.join("README.md")).expect("README is readable");
+        let badge = readme
+            .lines()
+            .find(|line| line.contains("img.shields.io/badge/coverage%20gate"))
+            .expect("the README carries the coverage-gate badge");
+        assert!(
+            badge.contains(&format!("\u{2265} {floor}%")),
+            "the README coverage badge must read {floor}% in its link text: {badge}"
+        );
+        assert!(
+            badge.contains(&format!("%20{floor}%25")),
+            "the README coverage badge must render {floor}% in its image: {badge}"
+        );
+
+        let contributing = fs::read_to_string(repository_root.join("CONTRIBUTING.md"))
+            .expect("CONTRIBUTING is readable");
+        let expected_argument = format!("--fail-under-lines {floor}");
+        assert!(
+            contributing
+                .lines()
+                .any(|line| line.trim().ends_with(&expected_argument)),
+            "the local coverage command in CONTRIBUTING must use the {floor}% floor"
+        );
+    }
+
     #[test]
     fn semver_values_keep_prerelease_and_build_metadata() {
         assert_eq!(semver_values("ferralk = \"1.0.0\""), vec!["1.0.0"]);
