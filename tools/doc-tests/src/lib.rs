@@ -634,6 +634,10 @@ mod tests {
     /// The coverage floor is declared once, as `COVERAGE_MIN_LINES` in the
     /// `coverage` job. Two documents restate it for readers, so this contract
     /// holds them to the workflow instead of trusting them to be updated.
+    ///
+    /// Every comparison here is line by line, like the contracts above. The
+    /// repository has no `.gitattributes`, so a Windows checkout carries CRLF
+    /// and a needle containing a newline would match only on Unix.
     #[test]
     fn the_coverage_floor_is_declared_once_and_restated_consistently() {
         let repository_root = repository_root();
@@ -652,7 +656,9 @@ mod tests {
         );
         let floor = declarations[0];
         assert!(
-            workflow.contains("--fail-under-lines \"$COVERAGE_MIN_LINES\""),
+            workflow
+                .lines()
+                .any(|line| line.contains("--fail-under-lines \"$COVERAGE_MIN_LINES\"")),
             "the coverage job must gate on COVERAGE_MIN_LINES, not on a literal floor"
         );
 
@@ -673,8 +679,11 @@ mod tests {
 
         let contributing = fs::read_to_string(repository_root.join("CONTRIBUTING.md"))
             .expect("CONTRIBUTING is readable");
+        let expected_argument = format!("--fail-under-lines {floor}");
         assert!(
-            contributing.contains(&format!("--fail-under-lines {floor}\n")),
+            contributing
+                .lines()
+                .any(|line| line.trim().ends_with(&expected_argument)),
             "the local coverage command in CONTRIBUTING must use the {floor}% floor"
         );
     }
