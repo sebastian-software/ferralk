@@ -167,7 +167,7 @@ jobs:
       # minimum-release-age=0 stays: pnpm holds versions younger than 24 hours
       # back, so a pin raised on the day of a standards release would otherwise
       # not resolve at all.
-      - run: pnpm --config.minimum-release-age=0 dlx @sebastian-software/standards@0.9.0 check
+      - run: pnpm --config.minimum-release-age=0 dlx @sebastian-software/standards@0.11.0 check
 
   test:
     name: test (${{ matrix.os }})

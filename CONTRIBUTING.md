@@ -136,7 +136,7 @@ Changes to the native backends also need `--features native-macos` or
 `--features native-linux` on the platform that has them; the corresponding CI
 jobs are the gate for the other one.
 
-### The Ferramenta family block
+#More from Ferramenta block
 
 The last preflight command is the only one that needs Node rather than Cargo:
 Node 22.13 or newer, pnpm, and network access. It checks the
@@ -200,3 +200,20 @@ protects is defined in [`docs/stability.md`](docs/stability.md).
   dialog silently drops it, Release Please proposes the ordinary bump instead,
   and the release pull request is the first place anyone notices. A one-line
   follow-up commit carrying only the footer fixes it.
+
+### Shared registry theme presentation
+
+The pinned Ferramenta generator supplies the compact family icon,
+“More from Ferramenta”, and visible descriptions for related tools. The current
+project is omitted from those links. Registry READMEs retain plain Markdown
+with descriptions; repository READMEs include the small icon.
+Keep theme branding subordinate to the project content. Regenerate through
+the existing family command after updating the pin, then run its check mode.
+
+The shared [living decision](https://github.com/sebastian-software/ferramenta/blob/main/docs/adr/0004-successor-copy-register.md)
+owns the family wording and hierarchy; the
+[composition decision](https://github.com/sebastian-software/ferramenta/blob/main/docs/adr/0001-decentralized-homepages-with-shared-family-package.md)
+owns membership and current-project exclusion.
+
+For the generated project README, see [README themes](docs/readme-theme.md).
+Edit `README.md.src`, then run `mise run readme:write`.

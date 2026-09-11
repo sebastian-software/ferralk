@@ -20,14 +20,14 @@ set -euo pipefail
 # The generator commit in sebastian-software/ferramenta. Pinned rather than
 # tracking `main` so a run is reproducible: the block CI blesses today is the
 # one it blessed yesterday. See CONTRIBUTING.md for the bump procedure.
-FERRAMENTA_PIN="d63a0b163ef3e5e68cd1c77e5c8871ac72c36b60"
+FERRAMENTA_PIN="05fadd21d86b69bb15179ef4461bef6b3b531f88"
 
 # The `&path:` fragment is required. Without it pnpm installs the site rather
 # than the package, and there is no `ferramenta-readme` binary to run.
-GENERATOR="github:sebastian-software/ferramenta#${FERRAMENTA_PIN}&path:/packages/ardo-config"
+GENERATOR="github:sebastian-software/ferramenta#${FERRAMENTA_PIN}&path:/packages/family"
 
-# The registry names this repository `ferralk`; the tool bolds that entry in
-# the GitHub tables and leaves it out of its own sibling list.
+# The registry names this repository `ferralk`; the generator excludes this project
+# from related links and includes each sibling description.
 CURRENT_TOOL="ferralk"
 
 mode="${1:---check}"
@@ -53,6 +53,6 @@ render() {
     --current "$CURRENT_TOOL" --variant "$variant" "$mode" "$readme"
 }
 
-render github README.md
+# The root README is generated separately: mise run readme:write/check.
 render registry crates/ferralk/README.md
 render registry crates/ferralk-glob/README.md
