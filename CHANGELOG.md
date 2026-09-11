@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1-rc.1](https://github.com/sebastian-software/ferralk/compare/v1.0.0-rc.1...v1.0.1-rc.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* **test:** keep the prerelease suffix in the versioned-consumer docs check ([#374](https://github.com/sebastian-software/ferralk/issues/374)) ([cdd7e8f](https://github.com/sebastian-software/ferralk/commit/cdd7e8f812f0eb6682b3d669ceddc95d47732921))
+
 ## [1.0.0-rc.1](https://github.com/sebastian-software/ferralk/compare/v0.12.0...v1.0.0-rc.1) (2026-09-04)
 
 
