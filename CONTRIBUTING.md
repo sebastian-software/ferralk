@@ -86,6 +86,7 @@ cargo run -p harness -- corpus
 cargo check --manifest-path fuzz/Cargo.toml \
   --bin pattern_parser --bin pattern_matcher --bin ferralk_vs_fast_glob --locked
 ./scripts/readme-family-block.sh --check
+mise run readme:check
 ```
 
 This is the canonical portable preflight for a pull request and needs no Zig

@@ -616,6 +616,7 @@ mod tests {
             .expect("Release Please package has extra files");
         let expected_documents = [
             ("README.md", 3_usize),
+            ("README.md.src", 3_usize),
             ("docs/usage.md", 1_usize),
             ("docs/external-release-gates.md", 1_usize),
         ];
