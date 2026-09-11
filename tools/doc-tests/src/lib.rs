@@ -49,6 +49,8 @@ const DOCUMENTS: &[&str] = &[
     "docs/adr/0017-caller-owned-list-api-conventions.md",
     "docs/adr/0018-dual-mit-apache-license.md",
     "docs/adr/0019-dependency-version-requirements.md",
+    "docs/readme-theme.md",
+    "docs/adr/readme-theme-composition.md",
     "fuzz/README.md",
 ];
 
@@ -342,6 +344,18 @@ const FENCE_POLICIES: &[FencePolicy] = &[
         intentional_text_fragments: &[],
     },
     FencePolicy {
+        path: "docs/readme-theme.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/adr/readme-theme-composition.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
         path: "fuzz/README.md",
         compiled_rust_fences: 0,
         ignored_rust_fences: 0,
@@ -486,6 +500,12 @@ pub mod adr_0018 {}
 
 #[doc = include_str!("../../../docs/adr/0019-dependency-version-requirements.md")]
 pub mod adr_0019 {}
+
+#[doc = include_str!("../../../docs/readme-theme.md")]
+pub mod readme_theme {}
+
+#[doc = include_str!("../../../docs/adr/readme-theme-composition.md")]
+pub mod readme_theme_composition {}
 
 #[doc = include_str!("../../../fuzz/README.md")]
 pub mod fuzzing {}
