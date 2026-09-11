@@ -28,3 +28,5 @@ Decisions from the end-to-end design review of 2026-08-18 (see
 Convention: [Nygard-style ADRs](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions),
 numbered sequentially, never rewritten once accepted — superseding decisions
 get a new ADR that links back.
+
+- [README theme composition](readme-theme-composition.md)
