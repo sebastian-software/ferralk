@@ -138,7 +138,7 @@ jobs:
       - run: ./scripts/readme-family-block.sh --check
 
   standards:
-    name: standards drift
+    name: Standards / Consistency
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
@@ -167,7 +167,7 @@ jobs:
       # minimum-release-age=0 stays: pnpm holds versions younger than 24 hours
       # back, so a pin raised on the day of a standards release would otherwise
       # not resolve at all.
-      - run: pnpm --config.minimum-release-age=0 dlx @sebastian-software/standards@0.11.1 check
+      - run: pnpm --config.minimum-release-age=0 dlx @sebastian-software/standards@0.13.0 check
 
   test:
     name: test (${{ matrix.os }})
