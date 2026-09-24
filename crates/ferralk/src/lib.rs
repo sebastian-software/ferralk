@@ -1784,16 +1784,18 @@ struct TraversalPattern {
 
 impl TraversalPattern {
     fn compile(source: &[u8], options: PatternOptions) -> Result<Self, PatternError> {
-        // Walker candidates are always root-relative, so retain zlob glob's
-        // conventional leading `./` spelling without making it part of the
-        // candidate path representation.
-        let pattern = source.strip_prefix(b"./").unwrap_or(source);
-        let directories_only = pattern.len() > 1 && pattern.ends_with(b"/");
+        let directories_only = source.len() > 1 && source.ends_with(b"/");
         let pattern = if directories_only {
-            &pattern[..pattern.len() - 1]
+            &source[..source.len() - 1]
         } else {
-            pattern
+            source
         };
+        // Walker candidates are always root-relative, so zlob glob's
+        // conventional leading `./` spelling is accepted without becoming part
+        // of the candidate path. The matcher's path readings ignore it once on
+        // every brace-expanded alternative, and the prefilters below do the
+        // same. Stripping it once from the source instead (#395) left the
+        // `./` arm of `{./src/*.rs,lib/*.rs}` pruned and unmatched.
         let subtree_root = pattern
             .strip_suffix(b"/**")
             .map(|root| Pattern::compile(root, options))
@@ -1802,7 +1804,14 @@ impl TraversalPattern {
         // derived from the same expansion, so `**/*.{ts,tsx}` keeps the
         // extension filter and `{src,lib}/**` keeps its roots. A pattern
         // without braces expands to itself, which is the previous behavior.
-        let alternatives = ferralk_glob::expand_braces(pattern, options)?;
+        // Each alternative loses its one leading `./` as the matcher reads it.
+        let alternatives = ferralk_glob::expand_braces(pattern, options)?
+            .into_iter()
+            .map(|alternative| match alternative.strip_prefix(b"./") {
+                Some(relative) => relative.to_vec(),
+                None => alternative,
+            })
+            .collect::<Vec<_>>();
         Ok(Self {
             source: source.to_vec(),
             matcher: Pattern::compile(pattern, options)?,
@@ -1844,7 +1853,7 @@ impl TraversalPattern {
         }
         match mode {
             WildcardMode::ComponentScoped => self.matcher.is_match_glob_path(path),
-            WildcardMode::SeparatorCrossing => self.matcher.is_match(path),
+            WildcardMode::SeparatorCrossing => self.matcher.is_match_crossing_path(path),
         }
     }
 
@@ -1862,7 +1871,7 @@ impl TraversalPattern {
         }
         self.subtree_root.as_ref().is_some_and(|root| match mode {
             WildcardMode::ComponentScoped => root.is_match_glob_path(path),
-            WildcardMode::SeparatorCrossing => root.is_match(path),
+            WildcardMode::SeparatorCrossing => root.is_match_crossing_path(path),
         })
     }
 
@@ -4606,7 +4615,6 @@ mod tests {
             "@(dead|src)/../main.rs",
             "src/@(./a.rs)",
             "@(./a.rs)",
-            "{./a.rs}",
             "src/?(./a.rs)",
             "src/*(./a.rs)",
             "src/?(./a.rs)/bar",
@@ -4639,7 +4647,6 @@ mod tests {
                 "@(dead|src)/../main.rs",
                 "src/@(./a.rs)",
                 "@(./a.rs)",
-                "{./a.rs}",
                 "src/?(./a.rs)",
                 "src/*(./a.rs)",
                 "src/?(./a.rs)/bar",
@@ -4711,6 +4718,160 @@ mod tests {
                 .include(pattern)
                 .unwrap_or_else(|error| panic!("{pattern} remains matcher text: {error}"));
         }
+    }
+
+    /// Issue #395: the path matchers ignore one leading `./` on every
+    /// brace-expanded alternative, so the walker does too. Before, it stripped
+    /// the prefix once per pattern source: an all-`./` brace was refused, and
+    /// a mixed one was accepted and silently dropped its `./` arms.
+    #[test]
+    fn a_leading_dot_slash_is_normalized_per_brace_alternative() {
+        let fixture = Fixture::new();
+        let files = ["docs/d.md", "lib/n.rs", "src/m.rs"];
+        for file in files {
+            fixture.write(file);
+        }
+        let both = &["lib/n.rs", "src/m.rs"][..];
+        let cases: [(&str, &[&str]); 13] = [
+            ("{src/*.rs,lib/*.rs}", both),
+            ("{./src/*.rs,lib/*.rs}", both),
+            ("{src/*.rs,./lib/*.rs}", both),
+            ("{./src/*.rs,./lib/*.rs}", both),
+            ("./{src,lib}/*.rs", both),
+            ("{./src,lib}/*.rs", both),
+            ("{./src,./lib}/**", both),
+            ("{./src,./lib}/**/*.rs", both),
+            // Nested groups expand before the prefix is looked at.
+            ("{{./src,lib}/*.rs,./nothing/*.md}", both),
+            ("{./{src,lib}/*.rs,x}", both),
+            // An empty arm can expose a `./` that no arm starts with in the
+            // source; the expanded alternative is what counts.
+            ("{x,}./src/*.rs", &["src/m.rs"][..]),
+            ("{./src/m.rs}", &["src/m.rs"][..]),
+            // Exactly one prefix per alternative, as the matcher reads it:
+            // `././src/*.rs` keeps a `.` component and selects nothing.
+            ("./{./src/*.rs,lib/*.rs}", &["lib/n.rs"][..]),
+        ];
+        let options = WalkOptions::default().sort(true).files_only(true);
+        for (pattern, expected) in cases {
+            let expected = expected.iter().map(PathBuf::from).collect::<Vec<_>>();
+            let matcher = Pattern::compile(pattern, traversal_pattern_options(false))
+                .expect("the case is valid matcher syntax");
+            let matched = files
+                .iter()
+                .filter(|file| matcher.is_match_glob_path(file))
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            assert_eq!(matched, expected, "the matcher reading of {pattern}");
+            let remaining = files
+                .iter()
+                .map(PathBuf::from)
+                .filter(|file| !expected.contains(file))
+                .collect::<Vec<_>>();
+            for mode in [
+                WildcardMode::ComponentScoped,
+                WildcardMode::SeparatorCrossing,
+            ] {
+                for threads in [1, 4] {
+                    let walker = || {
+                        Walker::new(&fixture.root)
+                            .wildcard_mode(mode)
+                            .threads(threads)
+                    };
+                    let included = walker()
+                        .include(pattern)
+                        .unwrap_or_else(|error| panic!("{pattern} is accepted: {error}"))
+                        .options(options)
+                        .collect()
+                        .expect("walk succeeds");
+                    assert_eq!(
+                        relative_paths(included.entries(), &fixture.root),
+                        expected,
+                        "include {pattern} under {mode:?} on {threads} threads"
+                    );
+                    let excluded = walker()
+                        .exclude(pattern)
+                        .unwrap_or_else(|error| panic!("{pattern} is accepted: {error}"))
+                        .options(options)
+                        .collect()
+                        .expect("walk succeeds");
+                    assert_eq!(
+                        relative_paths(excluded.entries(), &fixture.root),
+                        remaining,
+                        "exclude {pattern} under {mode:?} on {threads} threads"
+                    );
+                }
+            }
+        }
+
+        // An absolute pattern reaches the same per-alternative reading after
+        // its root is rewritten away.
+        let absolute = Walker::new(&fixture.root)
+            .include(fixture.absolute("/{./src/*.rs,lib/*.rs}"))
+            .expect("valid absolute include")
+            .options(options)
+            .collect()
+            .expect("walk succeeds");
+        assert_eq!(
+            relative_paths(absolute.entries(), &fixture.root),
+            both.iter().map(PathBuf::from).collect::<Vec<_>>()
+        );
+    }
+
+    /// A `./` that does not start an expanded alternative is an ordinary `.`
+    /// component to the matcher, so the walker keeps rejecting it when no
+    /// alternative is left to select anything, and reports where it is.
+    #[test]
+    fn a_dot_slash_after_the_first_component_stays_a_dot_component() {
+        let fixture = Fixture::new();
+        fixture.write("src/a/x.rs");
+        fixture.write("src/b/y.rs");
+
+        for (pattern, offset) in [
+            ("src/{./a,./b}/*.rs", 5),
+            ("{src,lib}/./*.rs", 10),
+            ("{./src/./a,./src/./b}/*.rs", 7),
+        ] {
+            for mode in [
+                WildcardMode::ComponentScoped,
+                WildcardMode::SeparatorCrossing,
+            ] {
+                for error in [
+                    Walker::new(&fixture.root)
+                        .wildcard_mode(mode)
+                        .include(pattern)
+                        .expect_err("an unnormalized `.` component is refused"),
+                    Walker::new(&fixture.root)
+                        .wildcard_mode(mode)
+                        .exclude(pattern)
+                        .expect_err("an unnormalized `.` component is refused"),
+                ] {
+                    assert!(
+                        error.message().contains("not normalized"),
+                        "{pattern}: {error}"
+                    );
+                    assert_eq!(error.offset(), offset, "{pattern} under {mode:?}");
+                }
+            }
+        }
+
+        // Beside a viable alternative the `.` arm selects nothing, which is
+        // also the matcher's verdict for it, so the walk and the matcher agree.
+        let pattern = "src/{./a,b}/*.rs";
+        let matcher = Pattern::compile(pattern, traversal_pattern_options(false))
+            .expect("valid matcher syntax");
+        assert!(!matcher.is_match_glob_path("src/a/x.rs"));
+        assert!(matcher.is_match_glob_path("src/b/y.rs"));
+        let result = Walker::new(&fixture.root)
+            .include(pattern)
+            .expect("one alternative is viable")
+            .options(WalkOptions::default().sort(true).files_only(true))
+            .collect()
+            .expect("walk succeeds");
+        assert_eq!(
+            relative_paths(result.entries(), &fixture.root),
+            vec![PathBuf::from("src/b/y.rs")]
+        );
     }
 
     #[test]
@@ -8255,7 +8416,14 @@ mod tests {
             (paths, reads)
         };
 
-        for (include, match_hidden) in [("**/*.{rs,toml}", false), ("**/*.{rs,toml}", true)] {
+        for (include, match_hidden) in [
+            ("**/*.{rs,toml}", false),
+            ("**/*.{rs,toml}", true),
+            // The conventional `./` prefix is ignored, never a hidden `.`
+            // component the walk would have to keep descending for (#395).
+            ("./**/*.{rs,toml}", false),
+            ("{./**/*.rs,**/*.toml}", false),
+        ] {
             let (paths, reads) = walk(include, match_hidden);
             assert_eq!(paths, [PathBuf::from("src/keep.rs")]);
             assert_eq!(

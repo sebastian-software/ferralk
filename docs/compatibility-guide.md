@@ -122,7 +122,9 @@ and not each other's inverse: `match_hidden` is matcher semantics, deciding
 whether a wildcard may cover a leading period, while `skip_hidden` is a
 traversal filter that removes hidden entries before any pattern is consulted.
 
-Walker include patterns are root-relative. A leading `./` is accepted, and a
+Walker include patterns are root-relative. A leading `./` is accepted, on the
+pattern and on each brace alternative (`{./src,lib}/*.rs`), and is ignored
+once per alternative exactly as `Pattern::is_match_glob_path` ignores it. A
 trailing `/` selects matching directories only. Ordinary wildcards stay inside
 one path component by default; use recursive `**` to select descendants, or
 switch the whole walk to crossing wildcards as described below. A pattern that
@@ -486,6 +488,7 @@ It is an audit of the current contract, not a second changelog.
 | Final 0.x: settle the 1.0 contract | `WalkError::operation()` is typed; the extensible enums require fallback match arms; compiled `Pattern` values have no representation equality; and extglobs obey the same entry-point rules as plain patterns, including depth-zero `**/@(x)`. See the [stability contract](stability.md#public-enum-policy), [usage guide](usage.md#match-paths-deliberately), and [matcher table](#matcher). |
 | 1.0.0: absolute patterns under a root with `..` | A walk root with a `..` component rejects every absolute include or exclude, from `include`, `exclude`, `add_root`, and their `try_` forms, instead of selecting nothing when the pattern diverged from the root's spelling before the `..`; relative patterns are unaffected. See [absolute patterns](#absolute-patterns-and-the-caller-side-rewrite-they-replace). |
 | 1.0.0: negated extglobs and hidden components | Without `match_hidden`, `!(…)` selects no hidden component, including one it reaches by crossing a separator; see [deliberate differences](#deliberate-differences) and the [usage guide](usage.md#hidden-paths-two-separate-switches). |
+| 1.0.0: walker `./` on brace alternatives | Includes and excludes ignore one leading `./` on every brace-expanded alternative, as the path matchers do: `{./src/*.rs,lib/*.rs}` selects from both directories instead of silently dropping the `./` alternative, and `{./src/*.rs,./lib/*.rs}` is accepted instead of rejected as an unnormalized `.` component. See [walking](#walking) and the [usage guide](usage.md#walk-filesystems-with-explicit-policy). |
 
 ## Defaults to review
 

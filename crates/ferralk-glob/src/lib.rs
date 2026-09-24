@@ -370,6 +370,12 @@ impl Pattern {
             )?;
             ensure_brace_compiled_ir_lower_bound(&expanded, parse_options, budget)?;
             for alternative in expanded {
+                // The path entry points ignore one leading `./` on every
+                // expanded alternative, not only at the start of the source,
+                // so the walker analysis reads each alternative's prefix the
+                // same way (#395).
+                let leading_dot_is_normalized =
+                    leading_dot_is_normalized || alternative.bytes.starts_with(b"./");
                 let compiled = Self::compile_within(
                     &alternative.bytes,
                     parse_options,
@@ -734,6 +740,35 @@ impl Pattern {
         Self::match_alternatives(&self.alternatives, options, path)
     }
 
+    /// Matches one root-relative path with the separator-crossing wildcards of
+    /// [`Pattern::is_match`], ignoring one leading `./` on the candidate and on
+    /// every brace-expanded alternative exactly as [`Pattern::is_match_path`]
+    /// and [`Pattern::is_match_glob_path`] do.
+    ///
+    /// Hidden: this is the separator-crossing walk's reading of an include or
+    /// exclude, which needs the path entry points' `./` rule without their
+    /// component-local wildcards.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_match_crossing_path(&self, path: impl AsRef<[u8]>) -> bool {
+        let path = without_leading_dot_slash(path.as_ref());
+        // The copies exist whenever an alternative has the prefix, so asking
+        // for them first spares most patterns the scan over alternatives.
+        if let Some(alternatives) = &self.path_filter_alternatives
+            && self
+                .alternatives
+                .iter()
+                .any(|alternative| alternative.raw.starts_with(b"./"))
+        {
+            // The path-filter copies differ from the alternatives only by the
+            // removed prefix. Their fast paths are the literal and
+            // fixed-width shapes, which read the same under either wildcard
+            // reach, and every other engine takes the reach from `options`.
+            return Self::match_alternatives(alternatives, self.options, path);
+        }
+        self.is_match(path)
+    }
+
     /// Returns the input paths accepted relative to `base_path`, preserving
     /// the original full paths and caller order. Candidates outside the base
     /// directory are ignored.
@@ -812,7 +847,7 @@ impl Pattern {
     ) -> Result<Self, PatternError> {
         let can_match_hidden_component_without_match_hidden = alternatives
             .iter()
-            .any(CompiledAlternative::can_match_hidden_component_without_match_hidden);
+            .any(CompiledAlternative::can_match_hidden_path_component_without_match_hidden);
         let alternative_fast_path =
             AlternativeFastPath::compile(&alternatives, options, budget)?.map(Box::new);
         let path_filter_alternatives = alternatives
@@ -1621,11 +1656,33 @@ struct CompiledAlternative {
 
 impl CompiledAlternative {
     fn can_match_hidden_component_without_match_hidden(&self) -> bool {
-        tokens_can_match_hidden_component_without_match_hidden(&self.tokens)
-            || self
-                .extglob
-                .as_ref()
-                .is_some_and(CompiledExtglob::can_match_hidden_component_without_match_hidden)
+        self.can_match_hidden_component_after(0)
+    }
+
+    /// The same summary for a top-level alternative, read the way the path
+    /// entry points read it: its one conventional leading `./` is ignored
+    /// rather than matched, so its `.` opts no hidden component in (#395).
+    /// Extglob branches keep reading a leading `./` as a real `.` component.
+    fn can_match_hidden_path_component_without_match_hidden(&self) -> bool {
+        let prefix = if self.raw.starts_with(b"./")
+            && matches!(
+                self.tokens.as_slice(),
+                [Token::Literal(dot), Token::Separator, ..] if dot == b"."
+            ) {
+            2
+        } else {
+            0
+        };
+        self.can_match_hidden_component_after(prefix)
+    }
+
+    /// `prefix` counts both the leading tokens and the source bytes skipped,
+    /// which coincide for the `./` prefix, the only one skipped.
+    fn can_match_hidden_component_after(&self, prefix: usize) -> bool {
+        tokens_can_match_hidden_component_without_match_hidden(&self.tokens[prefix..])
+            || self.extglob.as_ref().is_some_and(|program| {
+                program.can_match_hidden_component_without_match_hidden_from(prefix)
+            })
     }
 
     /// Removes accelerated engines, descending into extglob alternatives so a
@@ -1685,7 +1742,9 @@ fn tokens_can_match_hidden_component_without_match_hidden(tokens: &[Token]) -> b
 }
 
 impl CompiledExtglob {
-    fn can_match_hidden_component_without_match_hidden(&self) -> bool {
+    /// Whether the program can opt a hidden component in, reading its outer
+    /// steps from byte offset `start`, where a component begins.
+    fn can_match_hidden_component_without_match_hidden_from(&self, start: usize) -> bool {
         // Positive group alternatives are complete compiled branches. Inspect
         // them recursively so nested groups and hidden components after an
         // alternative's separator are represented by compiler semantics too.
@@ -1702,7 +1761,7 @@ impl CompiledExtglob {
         }
 
         let mut at_component_start = true;
-        let mut index = 0;
+        let mut index = start;
         while let Some(step) = self.steps.get(index) {
             match step {
                 ExtglobStep::Byte(b'/') => {
@@ -6817,6 +6876,106 @@ mod tests {
         }
     }
 
+    /// #395: the path entry points ignore one leading `./` on each expanded
+    /// alternative, so the walker summary and the separator-crossing walk
+    /// reading must too.
+    #[test]
+    fn a_leading_dot_slash_is_read_per_brace_alternative() {
+        let options = PatternOptions::default()
+            .braces(true)
+            .extglob(true)
+            .recursive_double_star(true);
+        let compile = |source: &str| Pattern::compile(source, options).expect("valid pattern");
+
+        for source in [
+            "{./src/*.rs,./lib/*.rs}",
+            "{./src/*.rs,lib/*.rs}",
+            "{./a.rs}",
+            "{x,}./src/*.rs",
+            "{{./src,lib}/*.rs,x}",
+            "./{src,lib}/*.rs",
+        ] {
+            assert_eq!(
+                compile(source).walker_path_viability(),
+                WalkerPathViability::Viable,
+                "{source}"
+            );
+        }
+        // Only one prefix per alternative, and only at its start.
+        for (source, offset) in [
+            ("{././a,././b}", 3),
+            ("src/{./a,./b}", 5),
+            ("{./src/./a,./lib/./b}", 7),
+        ] {
+            let pattern = compile(source);
+            assert_eq!(
+                pattern.walker_path_viability(),
+                WalkerPathViability::DotComponent,
+                "{source}"
+            );
+            assert_eq!(
+                pattern.walker_path_problem_offset(),
+                Some(offset),
+                "{source}"
+            );
+        }
+
+        for (source, path, expected) in [
+            ("{./src/*.rs,lib/*.rs}", "src/m.rs", true),
+            ("{./src/*.rs,lib/*.rs}", "lib/n.rs", true),
+            ("{./src/*.rs,./lib/*.rs}", "lib/n.rs", true),
+            ("{./src/*.rs,lib/*.rs}", "src/a/m.rs", true),
+            ("{./@(src|lib)/*.rs,x}", "lib/a/n.rs", true),
+            ("{x,}./src/*", "src/m.rs", true),
+            ("{./src,lib}", "src", true),
+            ("./{./src/*.rs,lib/*.rs}", "src/m.rs", false),
+            ("./{./src/*.rs,lib/*.rs}", "lib/n.rs", true),
+            ("src/{./a,b}/*.rs", "src/a/m.rs", false),
+            ("{./src/*.rs,lib/*.rs}", "docs/d.md", false),
+        ] {
+            let pattern = compile(source);
+            assert_eq!(
+                pattern.is_match_crossing_path(path),
+                expected,
+                "{source} vs {path}"
+            );
+            // The crossing reading differs from the component-local one only
+            // in how far an ordinary wildcard reaches.
+            if !path.contains("/a/") {
+                assert_eq!(
+                    pattern.is_match_glob_path(path),
+                    expected,
+                    "{source} vs {path}"
+                );
+            }
+        }
+        // An extglob branch is not a brace alternative: its `./` stays a real
+        // `.` component under every path reading.
+        let extglob = compile("@(./a.rs)");
+        assert!(!extglob.is_match_glob_path("a.rs"));
+        assert!(!extglob.is_match_crossing_path("a.rs"));
+        // Nor does the ignored prefix count as a hidden component a walker
+        // must keep descending for; a hidden component after it still does.
+        for (source, expected) in [
+            ("./src/**", false),
+            ("{./src,lib}/**", false),
+            ("{x,}./src/**", false),
+            ("./.git/**", true),
+            ("{./.git,lib}/**", true),
+            ("@(./a)", true),
+        ] {
+            assert_eq!(
+                compile(source).can_match_hidden_component_without_match_hidden(),
+                expected,
+                "{source}"
+            );
+        }
+        // Without a `./` alternative the crossing reading is `is_match`.
+        let plain = compile("src/*.rs");
+        assert!(plain.is_match_crossing_path("src/a/m.rs"));
+        assert!(!plain.is_match_glob_path("src/a/m.rs"));
+    }
+
     #[test]
     fn walker_path_viability_composes_extglob_quantifiers_without_state_products() {
         let options = PatternOptions::default().braces(true).extglob(true);
@@ -6857,13 +7016,13 @@ mod tests {
             WalkerPathViability::Viable
         );
 
-        // Only a raw spelling that starts with `./` is normalized by walker
-        // filters. A compiler-produced leading component is still a real
+        // Only a `./` that starts the source or a brace-expanded alternative
+        // is normalized, as the path entry points normalize it (`{./a.rs}` is
+        // viable, #395). An extglob-produced leading component is still a real
         // unmatchable dot component. Nor may a nullable arm use an empty
         // leading or interior component to escape that invalid positive arm.
         for source in [
             "@(./a.rs)",
-            "{./a.rs}",
             "src/?(./a.rs)",
             "src/*(./a.rs)",
             "src/?(./a.rs)/bar",
