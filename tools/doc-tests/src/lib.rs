@@ -53,10 +53,11 @@ const DOCUMENTS: &[&str] = &[
     "docs/readme-theme.md",
     "docs/adr/readme-theme-composition.md",
     "fuzz/README.md",
+    "skills/ferralk/SKILL.md",
 ];
 
 #[cfg(test)]
-const EXPECTED_COMPILED_RUST_FENCES: usize = 18;
+const EXPECTED_COMPILED_RUST_FENCES: usize = 21;
 
 #[cfg(test)]
 struct FencePolicy {
@@ -368,6 +369,12 @@ const FENCE_POLICIES: &[FencePolicy] = &[
         ignored_rust_fences: 0,
         intentional_text_fragments: &[],
     },
+    FencePolicy {
+        path: "skills/ferralk/SKILL.md",
+        compiled_rust_fences: 3,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
 ];
 
 #[doc = include_str!("../../../.github/pull_request_template.md")]
@@ -519,6 +526,9 @@ pub mod readme_theme_composition {}
 
 #[doc = include_str!("../../../fuzz/README.md")]
 pub mod fuzzing {}
+
+#[doc = include_str!("../../../skills/ferralk/SKILL.md")]
+pub mod consumer_skill {}
 
 #[cfg(test)]
 mod tests {

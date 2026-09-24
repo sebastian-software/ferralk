@@ -57,13 +57,335 @@
 //!
 //! Paths stay [`PathBuf`] throughout the public API. Patterns are matched
 //! against root-relative encoded path bytes; no filesystem result is converted
-//! through UTF-8. [`WalkEntry::path_bytes`] hands those bytes to a
+//! through UTF-8. An entry's [`path`](WalkEntry::path) is its root joined with
+//! that relative path, so `Walker::new(".")` yields `./src/lib.rs`;
+//! [`WalkEntry::path_bytes`] hands the whole path, root included, to a
 //! [`ferralk_glob::Pattern`] of your own without allocating.
 //!
 //! The [usage guide](https://github.com/sebastian-software/ferralk/blob/main/docs/usage.md)
 //! lists every default and the switch that changes it. The
 //! [stability contract](https://github.com/sebastian-software/ferralk/blob/main/docs/stability.md)
 //! states what 1.x promises.
+//!
+//! # Recipes
+//!
+//! Every recipe is a self-contained function you can copy, followed by a
+//! call to it; the hidden lines only build a small tree to call it on.
+//! Matching paths you already hold, without a filesystem, is covered by the
+//! [`ferralk_glob` recipes](ferralk_glob#recipes). The same recipes run as
+//! programs from
+//! [`crates/ferralk/examples`](https://github.com/sebastian-software/ferralk/tree/main/crates/ferralk/examples),
+//! for example `cargo run -p ferralk --example gitignore_walk -- <root>`.
+//!
+//! ## List files, respecting `.gitignore`
+//!
+//! Git ignore rules are off until asked for. With them on, the `.gitignore`
+//! and `.ignore` files in the root and below it apply whether or not the
+//! root is inside a Git repository; inside one, `.git/info/exclude` and the
+//! files between the repository root and the walk root apply too.
+//! [`Walker::respect_git_ignore`] has the details. (The tree built for the
+//! example below is not a repository.)
+//!
+//! ```
+//! use std::{
+//!     error::Error,
+//!     path::{Path, PathBuf},
+//! };
+//!
+//! use ferralk::{WalkOptions, Walker};
+//!
+//! /// Every `.rs` file below `root` that the ignore rules leave in, relative
+//! /// to `root` and sorted.
+//! fn rust_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
+//!     let result = Walker::new(root)
+//!         .include("**/*.rs")?
+//!         .respect_git_ignore(true)
+//!         .options(WalkOptions::default().files_only(true).sort(true))
+//!         .collect()?;
+//!
+//!     // `collect()` returned `Ok`, but a directory that could not be read is
+//!     // only reported here.
+//!     for error in result.errors() {
+//!         eprintln!("not walked: {error}");
+//!     }
+//!
+//!     // `path()` is the root joined with the relative path; strip the root
+//!     // to get the part the patterns matched.
+//!     let mut files = Vec::new();
+//!     for entry in result.entries() {
+//!         files.push(entry.path().strip_prefix(entry.root())?.to_path_buf());
+//!     }
+//!     Ok(files)
+//! }
+//! # let root = std::env::temp_dir().join(format!("ferralk-recipe-ignore-{}", std::process::id()));
+//! # let _ = std::fs::remove_dir_all(&root);
+//! # for (file, contents) in [
+//! #     (".gitignore", "target/\n"),
+//! #     ("src/lib.rs", ""),
+//! #     ("src/parser/mod.rs", ""),
+//! #     ("target/debug/build.rs", ""),
+//! # ] {
+//! #     let path = root.join(file);
+//! #     std::fs::create_dir_all(path.parent().expect("a file has a parent"))?;
+//! #     std::fs::write(path, contents)?;
+//! # }
+//!
+//! assert_eq!(
+//!     rust_files(&root)?,
+//!     [Path::new("src/lib.rs"), Path::new("src/parser/mod.rs")],
+//! );
+//! # std::fs::remove_dir_all(&root)?;
+//! # Ok::<(), Box<dyn Error + Send + Sync>>(())
+//! ```
+//!
+//! Without an include, every entry that is not ignored is returned,
+//! directories and hidden files such as `.gitignore` itself included.
+//! [`WalkOptions::files_only`] drops directories, and
+//! [`WalkOptions::skip_hidden`] drops hidden entries the way the `ignore`
+//! crate does by default. `sort(true)` orders the entries as
+//! [`WalkOptions::sort`] describes.
+//!
+//! ## Include and exclude lists
+//!
+//! Includes are OR-ed, and an entry that any exclude matches is left out; a
+//! directory an exclude matches is not even opened. A fast-glob or globby
+//! list marks its excludes with a leading `!`, which the walker rejects rather
+//! than reading as negation, so sort the list into the two calls:
+//!
+//! ```
+//! use std::{
+//!     error::Error,
+//!     path::{Path, PathBuf},
+//! };
+//!
+//! use ferralk::{WalkOptions, Walker};
+//!
+//! /// The files below `root` that a fast-glob style list selects, relative to
+//! /// `root` and sorted.
+//! fn select(root: &Path, globs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
+//!     let mut walker = Walker::new(root).options(WalkOptions::default().files_only(true).sort(true));
+//!     for glob in globs {
+//!         // `!(…)` is a negated extglob, not an exclude marker.
+//!         match glob.strip_prefix('!').filter(|rest| !rest.starts_with('(')) {
+//!             Some(excluded) => walker.try_exclude(excluded)?,
+//!             None => walker.try_include(glob)?,
+//!         };
+//!     }
+//!     let result = walker.collect()?;
+//!     for error in result.errors() {
+//!         eprintln!("not walked: {error}");
+//!     }
+//!     let mut files = Vec::new();
+//!     for entry in result.entries() {
+//!         files.push(entry.path().strip_prefix(entry.root())?.to_path_buf());
+//!     }
+//!     Ok(files)
+//! }
+//! # let root = std::env::temp_dir().join(format!("ferralk-recipe-lists-{}", std::process::id()));
+//! # let _ = std::fs::remove_dir_all(&root);
+//! # for file in [
+//! #     "src/app/main.ts",
+//! #     "src/app/main.test.ts",
+//! #     "src/generated/client.ts",
+//! #     "docs/guide.md",
+//! # ] {
+//! #     let path = root.join(file);
+//! #     std::fs::create_dir_all(path.parent().expect("a file has a parent"))?;
+//! #     std::fs::write(path, "")?;
+//! # }
+//!
+//! // For example from a configuration file.
+//! let globs = ["src/**/*.ts", "!src/**/*.test.ts", "!**/generated/**"];
+//! assert_eq!(select(&root, &globs)?, [Path::new("src/app/main.ts")]);
+//! # std::fs::remove_dir_all(&root)?;
+//! # Ok::<(), Box<dyn Error + Send + Sync>>(())
+//! ```
+//!
+//! Three things differ from fast-glob. Patterns are anchored at the root, so
+//! `target/**` excludes only the top-level `target` and `**/target/**` every
+//! one; see [`Walker::exclude`]. Directories are returned unless
+//! [`WalkOptions::files_only`] says otherwise, where fast-glob defaults to
+//! `onlyFiles: true`. And `try_include` and `try_exclude` borrow the walker, so
+//! a caller can report an invalid pattern and go on with the rest instead of
+//! returning at the first one, as the `include_exclude` example does.
+//!
+//! ## Stop early
+//!
+//! [`Walker::stream`] yields entries on the calling thread as it finds them,
+//! so ordinary iterator adapters end the walk. Errors are items too; decide
+//! what to do with them before counting, as [`WalkStream`] explains. Inside a
+//! parallel walk, [`Verdict::Stop`] from a [`Walker::visit`] predicate ends
+//! it; from outside, a [`CancellationToken`] does (see the next recipes).
+//!
+//! ```
+//! use std::{
+//!     error::Error,
+//!     ffi::OsStr,
+//!     path::{Path, PathBuf},
+//!     sync::OnceLock,
+//! };
+//!
+//! use ferralk::{Verdict, WalkEntry, Walker};
+//!
+//! /// The first `count` `.rs` files directly in `root`, skipping errors.
+//! fn first_rust_files(root: &Path, count: usize) -> Result<Vec<WalkEntry>, Box<dyn Error + Send + Sync>> {
+//!     Ok(Walker::new(root)
+//!         .include("*.rs")?
+//!         .stream()
+//!         .filter_map(Result::ok)
+//!         .take(count)
+//!         .collect())
+//! }
+//!
+//! /// Some `Cargo.toml` below `root`, ending the parallel walk at the first.
+//! fn any_manifest(root: &Path) -> Result<Option<PathBuf>, Box<dyn Error + Send + Sync>> {
+//!     let found = OnceLock::new();
+//!     let result = Walker::new(root).visit(|entry| {
+//!         if entry.basename() == Some(OsStr::new("Cargo.toml")) {
+//!             let _ = found.set(entry.path().to_path_buf());
+//!             Verdict::Stop
+//!         } else {
+//!             Verdict::Skip
+//!         }
+//!     })?;
+//!     debug_assert_eq!(result.was_cancelled(), found.get().is_some());
+//!     Ok(found.into_inner())
+//! }
+//! # let root = std::env::temp_dir().join(format!("ferralk-recipe-stop-{}", std::process::id()));
+//! # let _ = std::fs::remove_dir_all(&root);
+//! # for file in ["a.rs", "b.rs", "c.rs", "crates/cli/Cargo.toml"] {
+//! #     let path = root.join(file);
+//! #     std::fs::create_dir_all(path.parent().expect("a file has a parent"))?;
+//! #     std::fs::write(path, "")?;
+//! # }
+//!
+//! assert_eq!(first_rust_files(&root, 2)?.len(), 2);
+//! assert!(any_manifest(&root)?.is_some());
+//! # std::fs::remove_dir_all(&root)?;
+//! # Ok::<(), Box<dyn Error + Send + Sync>>(())
+//! ```
+//!
+//! ## Keep going when something cannot be read
+//!
+//! The default [`ErrorPolicy::Collect`] walks on past a directory it cannot
+//! read and reports it in [`WalkResult::errors`], a root that does not exist
+//! included, while `collect()` itself returns `Ok`. [`ErrorPolicy`] lists
+//! what `Skip` and `Abort` do instead. A [`WalkError`]'s `Display` names the
+//! operation and the path; the [`std::io::Error`] that says why is its
+//! `source()`.
+//!
+//! ```
+//! use std::{error::Error, io, path::Path};
+//!
+//! use ferralk::{WalkOperation, WalkResult, Walker};
+//!
+//! /// Walks every root that can be read and reports the ones that cannot.
+//! fn walk_all(roots: &[&Path]) -> Result<WalkResult, Box<dyn Error + Send + Sync>> {
+//!     let (first, rest) = roots.split_first().ok_or("no roots given")?;
+//!     let result = Walker::new(first).add_roots(rest.iter().copied())?.collect()?;
+//!     for error in result.errors() {
+//!         // Decide from the operation and the `io::ErrorKind`, never from the
+//!         // message text.
+//!         let kind = error
+//!             .source()
+//!             .and_then(|cause| cause.downcast_ref::<io::Error>())
+//!             .map(io::Error::kind);
+//!         let cause = error.source().map(ToString::to_string).unwrap_or_default();
+//!         match (error.operation(), kind) {
+//!             (WalkOperation::ReadDir, Some(io::ErrorKind::NotFound)) => {
+//!                 eprintln!("missing: {}", error.path().display());
+//!             }
+//!             _ => eprintln!("warning: {error}: {cause}"),
+//!         }
+//!     }
+//!     Ok(result)
+//! }
+//! # let root = std::env::temp_dir().join(format!("ferralk-recipe-errors-{}", std::process::id()));
+//! # let _ = std::fs::remove_dir_all(&root);
+//! # std::fs::create_dir_all(root.join("src"))?;
+//! # std::fs::write(root.join("src/lib.rs"), "")?;
+//!
+//! let missing = root.join("does-not-exist");
+//! let result = walk_all(&[&root, &missing])?;
+//! // The readable root was walked; the missing one is reported, not fatal.
+//! assert_eq!(result.entries().len(), 2); // `src` and `src/lib.rs`
+//! assert_eq!(result.errors().len(), 1);
+//! assert_eq!(result.errors()[0].path(), missing);
+//! # std::fs::remove_dir_all(&root)?;
+//! # Ok::<(), Box<dyn Error + Send + Sync>>(())
+//! ```
+//!
+//! ## Cancel a walk from another thread
+//!
+//! A walk blocks its thread until it is done. Give it a [`CancellationToken`]
+//! and keep a clone: whoever holds the clone can stop it, and
+//! [`WalkResult::was_cancelled`] tells the walk's owner that the entries are
+//! partial.
+//!
+//! ```
+//! use std::{
+//!     error::Error,
+//!     path::PathBuf,
+//!     thread::{self, JoinHandle},
+//! };
+//!
+//! use ferralk::{CancellationToken, WalkError, WalkResult, Walker};
+//!
+//! /// Starts a walk on its own thread; the returned token stops it.
+//! fn start_walk(root: PathBuf) -> (CancellationToken, JoinHandle<Result<WalkResult, WalkError>>) {
+//!     let token = CancellationToken::default();
+//!     let walker = Walker::new(root).cancellation(token.clone());
+//!     (token, thread::spawn(move || walker.collect()))
+//! }
+//! # let root = std::env::temp_dir().join(format!("ferralk-recipe-cancel-{}", std::process::id()));
+//! # std::fs::create_dir_all(root.join("src"))?;
+//! # std::fs::write(root.join("src/lib.rs"), "")?;
+//!
+//! let (token, walk) = start_walk(root.clone());
+//! // Later, from a UI, a timeout, or a shutdown hook:
+//! token.cancel();
+//! let result = walk.join().expect("the walk thread does not panic")?;
+//! if result.was_cancelled() {
+//!     eprintln!("stopped early after {} entries", result.entries().len());
+//! }
+//! # std::fs::remove_dir_all(&root)?;
+//! # Ok::<(), Box<dyn Error + Send + Sync>>(())
+//! ```
+//!
+//! ## Walk from async code
+//!
+//! There is no async API: a walk is blocking filesystem work, so run it on
+//! the runtime's blocking pool. With Tokio, `spawn_blocking` does that, and a
+//! guard that cancels the token on drop stops the walk when the future is
+//! dropped, for example by a timeout or a losing `select!` branch. A
+//! [`Walker`] is `Send`, so it moves into the closure. (Not compiled here:
+//! this crate does not depend on Tokio.)
+//!
+//! ```ignore
+//! use std::{error::Error, path::PathBuf};
+//!
+//! use ferralk::{CancellationToken, WalkResult, Walker};
+//!
+//! /// Cancels the walk when the future that owns this guard is dropped.
+//! struct CancelOnDrop(CancellationToken);
+//!
+//! impl Drop for CancelOnDrop {
+//!     fn drop(&mut self) {
+//!         self.0.cancel();
+//!     }
+//! }
+//!
+//! async fn rust_files(root: PathBuf) -> Result<WalkResult, Box<dyn Error + Send + Sync>> {
+//!     let token = CancellationToken::default();
+//!     let _cancel_on_drop = CancelOnDrop(token.clone());
+//!     let walker = Walker::new(root)
+//!         .include("**/*.rs")?
+//!         .respect_git_ignore(true)
+//!         .cancellation(token);
+//!     let result = tokio::task::spawn_blocking(move || walker.collect()).await??;
+//!     Ok(result)
+//! }
+//! ```
 
 use std::{
     borrow::Cow,
@@ -382,6 +704,30 @@ pub enum ErrorPolicy {
 /// A walker only observes this handle; internal aborts, worker startup
 /// failures, visitor stops, and panics never cancel it. This lets callers
 /// share one token across walks or reuse it after an individual walk fails.
+///
+/// Clones share one flag: hand one to the walker with
+/// [`Walker::cancellation`] and call [`cancel`](Self::cancel) on another,
+/// from any thread. A cancelled walk still returns `Ok`; it says so through
+/// [`WalkResult::was_cancelled`], and its entries are the ones found before
+/// it stopped. The crate-level recipes show a walk
+/// [cancelled from another thread](crate#cancel-a-walk-from-another-thread)
+/// and one [driven from async code](crate#walk-from-async-code).
+///
+/// ```
+/// use ferralk::{CancellationToken, Walker};
+///
+/// let token = CancellationToken::default();
+/// let walker = Walker::new(std::env::temp_dir()).cancellation(token.clone());
+///
+/// // A token cancelled before the walk starts stops it before the root is
+/// // opened. The flag stays set; use a fresh token for the next walk.
+/// token.cancel();
+/// let result = walker.collect()?;
+/// assert!(result.was_cancelled());
+/// assert!(result.entries().is_empty());
+/// assert!(token.is_cancelled());
+/// # Ok::<(), ferralk::WalkError>(())
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
@@ -419,8 +765,8 @@ impl CancellationToken {
 /// // a shell glob does, and `src/*.ts` selects one directly inside `src`.
 /// let scoped = Walker::new(".").include("*.ts")?;
 ///
-/// // A wildcard spans separators, the way `globset` and `fast-glob` read a
-/// // pattern by default: `*.ts` now also selects `a/b.ts`.
+/// // A wildcard spans separators, the way `globset` reads a pattern by
+/// // default: `*.ts` now also selects `a/b.ts`.
 /// let crossing = Walker::new(".")
 ///     .wildcard_mode(WildcardMode::SeparatorCrossing)
 ///     .include("*.ts")?;
@@ -434,8 +780,9 @@ pub enum WildcardMode {
     #[default]
     ComponentScoped,
     /// A wildcard spans separators: `*.ts` matches `main.ts` and `src/main.ts`
-    /// alike. This is how `globset` and `fast-glob` read an unconfigured
-    /// pattern, so it is the mode to pick when porting patterns from them.
+    /// alike. This is how `globset` reads an unconfigured pattern, so it is
+    /// the mode to pick when porting patterns from it. fast-glob and globby
+    /// keep `*` inside one component, as the default mode does.
     SeparatorCrossing,
 }
 
@@ -468,6 +815,13 @@ impl WalkOptions {
     }
 
     /// Sorts final entries by their native path representation.
+    ///
+    /// The order is [`Path`]'s [`Ord`]: component by component, each
+    /// component compared by its bytes. A directory therefore comes directly
+    /// before its contents, and `a/z` sorts before `a-b`, although `-` is a
+    /// smaller byte than `/`. The whole entry path is the key, root included,
+    /// so the entries of a multi-root walk are ordered by path rather than
+    /// grouped by the order the roots were added.
     ///
     /// Applies to [`Walker::collect`] and [`Walker::visit`] only.
     /// [`Walker::stream`] ignores it, silently: a stream yields each entry as
@@ -765,20 +1119,36 @@ impl fmt::Display for WalkOperation {
 /// as `anyhow`, `eyre`, or `std::error::Report`, print it exactly once. Code
 /// that formats a `WalkError` on its own should print the chain too:
 ///
-/// ```no_run
-/// use std::error::Error;
+/// ```
+/// use std::{error::Error, io};
 ///
-/// let result = ferralk::Walker::new(".").collect()?;
-/// for error in result.errors() {
-///     // Prints, for example, `read_dir ./locked: Permission denied (os error 13)`.
-///     let mut message = error.to_string();
-///     let mut cause = error.source();
-///     while let Some(inner) = cause {
-///         message = format!("{message}: {inner}");
-///         cause = inner.source();
-///     }
-///     eprintln!("{message}");
+/// use ferralk::{WalkOperation, Walker};
+///
+/// let missing = std::env::temp_dir().join("ferralk-doc-walk-error-missing-root");
+/// let result = Walker::new(&missing).collect()?;
+/// let error = &result.errors()[0];
+///
+/// // `Display` is the operation and the path, without the cause...
+/// assert_eq!(error.to_string(), format!("read_dir {}", missing.display()));
+///
+/// // ...so print the source chain after it, as a reporter would:
+/// // `read_dir /tmp/ferralk-doc-…: No such file or directory (os error 2)`.
+/// let mut message = error.to_string();
+/// let mut cause = error.source();
+/// while let Some(inner) = cause {
+///     message = format!("{message}: {inner}");
+///     cause = inner.source();
 /// }
+/// eprintln!("{message}");
+///
+/// // Branch on the typed parts, not on the text.
+/// assert_eq!(error.operation(), WalkOperation::ReadDir);
+/// assert_eq!(error.path(), missing);
+/// let kind = error
+///     .source()
+///     .and_then(|cause| cause.downcast_ref::<io::Error>())
+///     .map(io::Error::kind);
+/// assert_eq!(kind, Some(io::ErrorKind::NotFound));
 /// # Ok::<(), ferralk::WalkError>(())
 /// ```
 ///
@@ -1380,6 +1750,14 @@ impl Walker {
     /// Lets an ordinary wildcard cover a leading period, so `**/*.ts` also
     /// reaches `.react-router/routes.ts`. Off by default, per ADR-0011.
     ///
+    /// `**` counts as a wildcard here too: without this switch it does not
+    /// descend into a hidden directory, so `**/*.ts` misses both `.env.ts` and
+    /// everything below `.cache/`. The same holds for excludes: without an
+    /// include, a walk with `exclude("**/node_modules/**")` still returns
+    /// `.cache/node_modules/a.ts`, because the exclude's `**` does not cover
+    /// `.cache`. Turn this switch on, or add a literal exclude such as
+    /// `.cache/**`.
+    ///
     /// The switch is matcher semantics and applies to include and exclude
     /// patterns alike: what a wildcard may reach, a wildcard may also prune.
     /// It is not [`WalkOptions::skip_hidden`], which drops hidden entries from
@@ -1411,11 +1789,11 @@ impl Walker {
     /// the walk root and `src/*.ts` one directly inside `src`.
     ///
     /// [`WildcardMode::SeparatorCrossing`] lets them span separators, which is
-    /// how `globset` and `fast-glob` read a pattern that was not configured
-    /// otherwise. Under it `*.ts` also selects `src/deep/main.ts`. Patterns
-    /// carried over from those crates keep their meaning here instead of
-    /// quietly selecting less; see the migration note in the compatibility
-    /// guide.
+    /// how `globset` reads a pattern that was not configured otherwise. Under
+    /// it `*.ts` also selects `src/deep/main.ts`. Patterns carried over from
+    /// `globset` keep their meaning here instead of quietly selecting less;
+    /// patterns from fast-glob or globby already keep `*` in one component and
+    /// need the default. See the migration table in the compatibility guide.
     ///
     /// The mode applies to includes and excludes alike, and builder order does
     /// not matter.
@@ -1474,6 +1852,21 @@ impl Walker {
     }
 
     /// Applies `.gitignore` rules plus zlob-compatible `.ignore` supplements.
+    ///
+    /// Which files are read:
+    ///
+    /// - `.gitignore` and `.ignore` in the walk root and in every directory
+    ///   below it, whether or not the root is inside a Git repository. Unlike
+    ///   the `ignore` crate, no repository is required for these.
+    /// - When a repository is found, by looking for `.git` in the root and
+    ///   each parent directory up to the filesystem root: its
+    ///   `.git/info/exclude`, and the `.gitignore` and `.ignore` files in the
+    ///   directories from the repository root down to the walk root's parent.
+    ///   A subtree walk therefore sees the rules `git` would apply to it.
+    ///
+    /// Git's global excludes file (`core.excludesFile`) and system or global
+    /// configuration are not read. The rule closest to an entry decides, as
+    /// in Git.
     ///
     /// An explicitly supplied walk root is entered even when an inherited
     /// rule ignores that directory itself, matching ripgrep's explicit-root

@@ -1,0 +1,64 @@
+# Ferralk
+
+> Rust crates for finding files and matching globs, byte-first. `ferralk` walks a directory tree in parallel with root-relative include and exclude globs, optional `.gitignore` support, and pruning from the pattern itself. `ferralk-glob` compiles a glob once and matches it against paths or bytes you already hold; `ferralk` re-exports it as `ferralk::ferralk_glob`.
+
+Pick the crate by what you hold. Files on disk: `ferralk::Walker`. A path or string in memory: `ferralk_glob::Pattern`. Everything is synchronous; from async code, run a walk in `tokio::task::spawn_blocking` with a `CancellationToken` (recipe linked below).
+
+**Matcher entry points.** Compile with `Pattern::compile(glob, PatternOptions::walker())?`, then pick how far a wildcard reaches. The pattern `*.rs` against three candidates:
+
+| Candidate | `is_match` | `is_match_path` | `is_match_glob_path` |
+| --- | --- | --- | --- |
+| `lib.rs` | yes | yes | yes |
+| `src/lib.rs` | yes | yes | no |
+| `./lib.rs` | no | yes | yes |
+
+Use `is_match_glob_path` for paths: it reads a pattern as a shell and the walker do. `is_match` is for text in which `/` is not special. `is_match_path` and `filter_paths*` keep zlob's list rule, in which a wildcard in the first component crosses `/`.
+
+**Two dialects.** `PatternOptions::default()` reads `**`, `{a,b}` and extglobs as plain text, so `src/**/*.rs` does not match `src/lib.rs` under it. `PatternOptions::walker()` turns all three on, exactly as `Walker` compiles its patterns. Add `.match_hidden(true)` for fast-glob's `dot: true` and `.case_insensitive(true)` for ASCII case folding.
+
+**Walker defaults.** Each is off until asked for:
+
+| Default | Change it with |
+| --- | --- |
+| `.gitignore`, `.ignore`, `.git/info/exclude` not read | `Walker::respect_git_ignore(true)`. The files in the walk root and below apply even outside a repository; inside one, `.git/info/exclude` and the files from the repository root down apply too. The global excludes file never does. |
+| Files, directories and symlinks returned (never the root itself) | `WalkOptions::default().files_only(true)` |
+| Wildcards, `**` included, do not cover a leading `.`; hidden entries are still walked | `Walker::match_hidden(true)`; `WalkOptions::skip_hidden(true)` drops them |
+| `*` stays inside one path component | `Walker::wildcard_mode(WildcardMode::SeparatorCrossing)` for the `globset` reading |
+| Unsorted | `WalkOptions::sort(true)`, for `collect()` and `visit()` only; `Path` order, root included |
+| Recoverable errors collected in `WalkResult::errors()` | `Walker::error_policy(ErrorPolicy::Abort)` to fail fast |
+| Symlinks below the root not followed | `WalkOptions::follow_symlinks(true)` |
+
+**Traps that compile and return the wrong result:**
+
+1. `collect()?` returns `Ok` even when the root does not exist or a directory could not be read. Check `result.errors()`. `ErrorPolicy::Skip` discards errors below the root; the default `Collect` keeps them.
+2. Walker patterns are anchored at the root, unlike a slash-free `.gitignore` line: `exclude("target/**")` prunes only the top-level `target`. Write `**/target/**` for every depth.
+3. `*` never crosses `/` in the walker or `is_match_glob_path`, unlike `globset`: `*.rs` selects top-level files only; write `**/*.rs`.
+4. `**` is recursive only as a whole path component (`**`, `**/x`, `x/**`, `x/**/y`): `**/x` matches `x` and `a/x`, never `sx`. Elsewhere, as in `a**`, it is an ordinary star run.
+5. A leading `!` is not negation. `Walker::include` and `exclude` reject it and `Pattern::compile` reads a literal `!`. Split a fast-glob or globby list: entries with `!` go to `exclude()` without it, except `!(…)`, which is a negated extglob.
+6. `Walker::options(WalkOptions)` replaces every option; build one `WalkOptions` value and pass it once.
+7. `stream()` ignores `sort(true)`, and `take(n)` counts `Err` items: use `.filter_map(Result::ok).take(n)` or handle errors first.
+8. Returned paths include the root: `Walker::new(".")` yields `./src/lib.rs`. Use `entry.path().strip_prefix(entry.root())` for the relative path; `WalkEntry::path_bytes()` also includes the root.
+9. Patterns use `/` and `\` escapes on every platform, Windows included. Never build a pattern with `PathBuf::join`; keep the root in `Walker::new(root)`.
+10. Patterns and candidates are bytes. For a `Path`, pass `path.as_os_str().as_encoded_bytes()`; a `&str` works as it is.
+11. `**` does not enter hidden directories either. Without an include, `exclude("**/node_modules/**")` still returns `.cache/node_modules/a.ts`; turn on `match_hidden(true)` or exclude `.cache/**` literally.
+12. There is no pattern-set type like `globset::GlobSet`: keep a `Vec<Pattern>` and ask `iter().any(…)` or `position(…)`.
+
+## Recipes
+
+- [ferralk recipes](https://docs.rs/ferralk/latest/ferralk/#recipes): tested examples for listing files with `.gitignore`, include and exclude lists from a fast-glob style list, stopping early, continuing past errors, cancelling from another thread, and async use with `spawn_blocking`.
+- [ferralk-glob recipes](https://docs.rs/ferralk-glob/latest/ferralk_glob/#recipes): matching one path against several globs, porting a fast-glob `!` list, matching a `Path`, filtering lists, reporting an invalid pattern at its offset.
+- [Examples](https://github.com/sebastian-software/ferralk/tree/main/crates/ferralk/examples): one program per recipe, run as `cargo run -p ferralk --example <gitignore_walk|include_exclude|early_stop|keep_going> -- <root>`.
+- [Agent skill](https://raw.githubusercontent.com/sebastian-software/ferralk/main/skills/ferralk/SKILL.md): this guidance as a loadable skill for coding agents.
+
+## Docs
+
+- [Usage guide](https://raw.githubusercontent.com/sebastian-software/ferralk/main/docs/usage.md): every walker default and the switch that changes it, the matcher entry points and options, errors, cancellation, hidden files.
+- [Compatibility guide](https://raw.githubusercontent.com/sebastian-software/ferralk/main/docs/compatibility-guide.md): a migration table from `globset`, `glob`, fast-glob and globby, `ignore`, and `walkdir`, then the mapping from zlob 1.6.3.
+- [ferralk API](https://docs.rs/ferralk): `Walker`, `WalkOptions`, `WalkResult`, `WalkEntry`, `WalkError`, `ErrorPolicy`, `CancellationToken`.
+- [ferralk-glob API](https://docs.rs/ferralk-glob): `Pattern`, `PatternOptions`, `PatternError`.
+
+## Optional
+
+- [1.x stability contract](https://raw.githubusercontent.com/sebastian-software/ferralk/main/docs/stability.md): what 1.x promises and what it excludes.
+- [Public API listings](https://github.com/sebastian-software/ferralk/tree/main/docs/api): every public item of both crates, as `cargo public-api` prints it.
+- [README](https://raw.githubusercontent.com/sebastian-software/ferralk/main/README.md): positioning, comparison with other crates, and benchmarks.

@@ -210,8 +210,9 @@ Important defaults:
   a whole path component is recursive under either setting — `**/x` selects
   `x` and `a/x`, never `sx` — and
   `Walker::wildcard_mode(WildcardMode::SeparatorCrossing)` switches to the
-  reading `globset` and `fast-glob` use; see the
-  [compatibility guide](compatibility-guide.md).
+  reading `globset` uses. fast-glob and globby already keep `*` in one
+  component; see the
+  [migration table](compatibility-guide.md#coming-from-globset-glob-fast-glob-ignore-or-walkdir).
 
 - **Patterns use `/` on every platform, and `\` is the escape character** -
   on Windows too. A pattern built by joining `PathBuf`s therefore does not mean
