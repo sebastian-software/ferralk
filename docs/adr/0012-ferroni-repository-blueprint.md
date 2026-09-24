@@ -101,3 +101,38 @@ locally.
 This is a second deliberate divergence from the Ferroni blueprint, recorded
 here for the same reason as the CodSpeed one above. Everything else in the
 decision — release-please, renovate, the bench corpora — is unchanged.
+
+## Amendment, 2026-09-24: the reference point is the family baseline, not Ferroni
+
+The decision above measured this repository against one sibling, the Ferroni
+repository, and the amendments since were written against it. That reference
+point no longer exists in the form the decision assumed. The Ferramenta
+family review (sebastian-software/ferramenta#6) replaced "copy the neighbor
+that got it right" with a baseline defined once for every family repository:
+the repository-hygiene set in
+sebastian-software/ferramenta#11 — community files, agent guidance, the ADR
+convention, toolchain files — and the CI and release baseline in
+sebastian-software/ferramenta#13. Ferroni falls under that baseline like
+every other family repository; it is no longer the source.
+
+The baseline is not prose to be copied either. It ships as the
+`@sebastian-software/standards` package, and this repository is onboarded to
+it: `.repometa.json` records the standards version the repository is stamped
+at, the `standards` job in `.github/workflows/ci.yml` runs `standards check`
+with a pinned CLI on every pull request, managed files such as `rustfmt.toml`
+and the marker-delimited section of `AGENTS.md` are rewritten only by
+`standards apply`, and seeded files such as `rust-toolchain.toml`,
+`SECURITY.md` and the feature and question issue forms came from its reference
+copies and are maintained here. New standards versions arrive as Renovate pull
+requests and are adopted through the migration steps the package documents.
+
+From this amendment on, "the blueprint" in this record means that baseline.
+Where this repository deliberately deviates from it, the deviation is recorded
+in this ADR or in an ADR of its own, as the CodSpeed, Callgrind and Codecov
+amendments above already are. All three remain in force against the new
+reference point; the Codecov one matters most, since the baseline proposal in
+sebastian-software/ferramenta#13 still lists a Codecov upload. The rest of
+the original decision — release-please, Renovate and the bench corpora — is
+unchanged. What changes is only where a question of "how should this
+repository be set up" is answered first: in the standards package and the
+family baseline, not in another repository's tree.
