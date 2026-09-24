@@ -74,3 +74,4 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferralk_glob::PatternOptions
 impl core::panic::unwind_safe::UnwindSafe for ferralk_glob::PatternOptions
 pub const ferralk_glob::VERSION: &str
 pub fn ferralk_glob::expand_braces(impl core::convert::AsRef<[u8]>, ferralk_glob::PatternOptions) -> core::result::Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, ferralk_glob::PatternError>
+pub fn ferralk_glob::path_bytes(&impl core::convert::AsRef<std::ffi::os_str::OsStr> + ?core::marker::Sized) -> &[u8]

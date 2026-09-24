@@ -34,7 +34,7 @@ for error in result.errors() {
     eprintln!("not walked: {error}"); // `collect()` was `Ok` anyway
 }
 for entry in result.entries() {
-    println!("{}", entry.path().strip_prefix(entry.root())?.display());
+    println!("{}", entry.relative_path().display()); // `src/lib.rs`, as matched
 }
 # Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
 ```
@@ -101,15 +101,17 @@ These compile and return a plausible, wrong result:
 - A leading `!` is not negation: the walker rejects it and the matcher reads
   a literal `!`. Split lists as shown above; `!(…)` stays an extglob.
 - `collect()?` is `Ok` even for a missing root; the failure is in
-  `result.errors()`. `ErrorPolicy::Skip` discards errors below the root.
+  `result.errors()`, and `for item in result` yields it as an `Err` after
+  the entries. `ErrorPolicy::Skip` discards errors below the root. Branch on
+  `error.io_kind()`, not on the message.
 - `options()` replaces all `WalkOptions`; pass one value once.
 - `stream()` ignores `sort(true)`, and `take(n)` counts `Err` items.
 - Entry paths include the root (`./src/lib.rs` for `Walker::new(".")`), and so
-  does `path_bytes()`. Strip `entry.root()` before matching or printing
+  does `path_bytes()`. Use `entry.relative_path()` for matching or printing
   relative paths.
 - Directories are returned unless `files_only(true)`; the root never is.
 - Patterns use `/` and `\` escapes on every platform; never build one with
-  `PathBuf::join`. A `Path` is matched as `as_os_str().as_encoded_bytes()`.
+  `PathBuf::join`. Match a `Path` as `ferralk_glob::path_bytes(path)`.
 
 ## Before you finish
 

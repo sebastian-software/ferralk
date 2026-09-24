@@ -120,29 +120,29 @@
 //!
 //! ## Match a `Path`
 //!
-//! Patterns take bytes, and [`std::ffi::OsStr::as_encoded_bytes`] gives them
-//! without a lossy conversion. Match the part of the path the pattern is
-//! written for: a pattern is relative, so strip the directory it is relative
-//! to first.
+//! Patterns take bytes, and [`path_bytes`] gives them for a
+//! [`Path`](std::path::Path) or an [`OsStr`] without a lossy
+//! conversion. Match the part of the path the pattern is written for: a
+//! pattern is relative, so strip the directory it is relative to first.
 //!
 //! ```
 //! use std::path::Path;
 //!
-//! use ferralk_glob::{Pattern, PatternOptions};
+//! use ferralk_glob::{Pattern, PatternOptions, path_bytes};
 //!
 //! let pattern = Pattern::compile("src/**/*.rs", PatternOptions::walker())?;
 //! let root = Path::new("/work/project");
 //! let path = root.join("src").join("bin").join("main.rs");
 //!
 //! let relative = path.strip_prefix(root).expect("path is below the root");
-//! assert!(pattern.is_match_glob_path(relative.as_os_str().as_encoded_bytes()));
+//! assert!(pattern.is_match_glob_path(path_bytes(relative)));
 //! // The unstripped path starts with `/work`, which `src/**` does not.
-//! assert!(!pattern.is_match_glob_path(path.as_os_str().as_encoded_bytes()));
+//! assert!(!pattern.is_match_glob_path(path_bytes(&path)));
 //! # Ok::<(), ferralk_glob::PatternError>(())
 //! ```
 //!
-//! A path that `ferralk` walked already carries these bytes as
-//! `WalkEntry::path_bytes`; strip the walk root the same way.
+//! A path that `ferralk` walked already carries its root-relative part as
+//! `WalkEntry::relative_path`, the spelling the walker's own patterns match.
 //!
 //! ## Filter a list of paths
 //!
@@ -166,6 +166,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, HashSet},
     error::Error,
+    ffi::OsStr,
     fmt,
     hash::{Hash, Hasher},
 };
@@ -1167,7 +1168,7 @@ impl Pattern {
     ///
     /// This is how a shell and the `ferralk` walker read a pattern, and the
     /// entry point to use for a path relative to where the pattern is
-    /// anchored.
+    /// anchored. Pass a [`Path`](std::path::Path) as [`path_bytes`]`(path)`.
     ///
     /// ```
     /// use ferralk_glob::{Pattern, PatternOptions};
@@ -4397,6 +4398,53 @@ impl ProvenanceBudget {
             }),
         }
     }
+}
+
+/// The bytes a [`Pattern`] matches for a path: [`OsStr::as_encoded_bytes`] of
+/// anything that is `AsRef<OsStr>`.
+///
+/// Every matching entry point takes `impl AsRef<[u8]>`, which a [`&str`](str)
+/// already is and a [`Path`](std::path::Path) is not. This is the one
+/// conversion for the rest, so `path.as_os_str().as_encoded_bytes()` need not
+/// be spelled out at every call site. It borrows and never converts: raw
+/// filesystem bytes on Unix and lossless WTF-8 on Windows (ADR-0005), where
+/// the matcher reads both `/` and `\` as a separator. It works with
+/// [`Pattern::is_match`], [`Pattern::is_match_path`],
+/// [`Pattern::is_match_glob_path`], and, mapped over a list, with
+/// [`Pattern::filter_path_indices`].
+///
+/// A pattern is relative to wherever it is anchored, so pass the part of the
+/// path below that directory; a path that `ferralk` walked has it as
+/// `WalkEntry::relative_path`.
+///
+/// ```
+/// use std::path::{Path, PathBuf};
+///
+/// use ferralk_glob::{Pattern, PatternOptions, path_bytes};
+///
+/// let pattern = Pattern::compile("src/**/*.rs", PatternOptions::walker())?;
+///
+/// let path: PathBuf = ["src", "bin", "main.rs"].iter().collect();
+/// assert!(pattern.is_match_glob_path(path_bytes(&path)));
+///
+/// let root = Path::new("/work/project");
+/// let joined = root.join(&path);
+/// let relative = joined.strip_prefix(root).expect("joined below the root");
+/// assert!(pattern.is_match_glob_path(path_bytes(relative)));
+/// // The joined path starts with `/work`, which `src/**` does not.
+/// assert!(!pattern.is_match_glob_path(path_bytes(&joined)));
+///
+/// // A list of paths, answered by index into it.
+/// let paths = [Path::new("src/lib.rs"), Path::new("README.md")];
+/// let selected = pattern.filter_path_indices(paths.iter().map(path_bytes));
+/// assert_eq!(selected, [0]);
+/// # Ok::<(), ferralk_glob::PatternError>(())
+/// ```
+///
+/// [`OsStr::as_encoded_bytes`]: std::ffi::OsStr::as_encoded_bytes
+#[must_use]
+pub fn path_bytes(path: &(impl AsRef<OsStr> + ?Sized)) -> &[u8] {
+    path.as_ref().as_encoded_bytes()
 }
 
 /// Expands brace alternatives into the plain patterns a pattern stands for.

@@ -24,8 +24,8 @@ use std::{
 #[cfg(not(windows))]
 use super::glob_bytes;
 use super::{
-    AncestorChain, DirectoryBackend, DirectoryOpen, ListedEntry, Listing, WalkEntry, WalkOperation,
-    Walker,
+    AncestorChain, DirectoryBackend, DirectoryOpen, ListedEntry, Listing, SharedRoot, WalkEntry,
+    WalkOperation, Walker,
     gitignore::{IgnoreReadError, IgnoreScope},
     has_hidden_component, should_skip_git_directory,
 };
@@ -66,7 +66,7 @@ pub(crate) struct EmittedEntry {
     pub(crate) metadata: Option<Box<fs::Metadata>>,
     /// The root this entry was found under, shared with every other entry from
     /// the same root rather than copied per entry.
-    pub(crate) root: Arc<Path>,
+    pub(crate) root: Arc<SharedRoot>,
 }
 
 impl EmittedEntry {
@@ -440,7 +440,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         is_symlink: entry.is_symlink(),
         depth,
         metadata,
-        root: Arc::clone(&plan.shared_path),
+        root: Arc::clone(&plan.shared),
     };
     if descend {
         EntryAction::DescendAndEmit(emitted, task())

@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let result = walker.collect()?;
     for entry in result.entries() {
-        println!("{}", entry.path().strip_prefix(entry.root())?.display());
+        println!("{}", entry.relative_path().display());
     }
     for error in result.errors() {
         match error.source() {
