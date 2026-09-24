@@ -309,10 +309,12 @@ Important defaults:
   caller holding absolute patterns does not have to strip the root itself. A
   pattern about a different tree selects nothing rather than erroring; a
   wildcard at or above the root, a `..`, and a pattern naming the root itself
-  are rejected. A walk root with a `..` component rejects every absolute
-  pattern, including one about a different tree, because the root cannot be
-  related to any absolute path without resolving it; relative patterns work
-  under such a root as usual. The conventional leading `./` is ignored once on
+  are rejected. A root whose name contains pattern syntax is spelled with that
+  syntax escaped: `/work/a\[1\]/**` selects everything under `/work/a[1]`.
+  A walk root with a `..` component rejects every absolute pattern, including
+  one about a different tree, because the root cannot be related to any
+  absolute path without resolving it; relative patterns work under such a
+  root as usual. The conventional leading `./` is ignored once on
   every brace alternative, as the path matchers ignore it, so
   `{./src,lib}/*.ts` selects from both directories. Relative patterns receive
   the same guardrails: `.` and `./` name the root, and a `.` component after
