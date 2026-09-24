@@ -9,3 +9,4 @@
 {"id":"fold-brace-alternative","kind":"matcher","pattern":"{FOO,BAR}.md","path":"bar.md","flags":["case_insensitive","braces"],"expected":true,"source":"handwritten"}
 {"id":"fold-extglob-alternative","kind":"matcher","pattern":"@(FOO|BAR).md","path":"foo.md","flags":["case_insensitive","extglob"],"expected":true,"source":"handwritten"}
 {"id":"fold-non-ascii-stays-distinct","kind":"matcher","pattern":"caf\\xC3\\x89*","path":"caf\\xC3\\xA9.txt","flags":["case_insensitive"],"expected":false,"source":"handwritten","note":"Folding is ASCII-only, so U+00C9 and U+00E9 remain distinct."}
+{"id":"fold-interior-literal","kind":"matcher","pattern":"**/node_modules/**","path":"a/NODE_MODULES/b","flags":["recursive_double_star","case_insensitive"],"expected":true,"source":"handwritten","note":"A byte search cannot fold case, so the interior-literal prefilter stands aside under case_insensitive."}
