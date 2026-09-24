@@ -27,6 +27,7 @@ excluded by the input shape, so a fuzz failure is always a new finding.
 | Leading `!` reads as negation | `!a` vs `b` | `false` | `true` | Patterns starting with `!` |
 | A trailing `**` component elides to nothing | `a/**` vs `a` | `true` | `false` | A whole-component `**` at the end of a pattern that has anything before it |
 | A whole-component run of three or more stars stays recursive | `***/a` vs `b/c/a` | `true` | `false` | A star run longer than two that is a whole component |
+| An attached `**` hands over to a following `/**/` without its separator | `x**/**/*` vs `xa` | `false` | `true` | A component ending in an attached two-star run, followed by `/**/` |
 | A backslash before an ordinary byte unescapes it | `\b` vs `b` | `true` | `false` | `\` only before `* ? [ ] { } \` |
 | A class may accept a separator | `[/]` vs `/`, `[.-r]` vs `/` | `false` | `true` | `/` inside a class, a range spanning `/`, and every negated class |
 | POSIX class names | `[[:alpha:]]` vs `a` | `true` | `false` | `[:` at the start of a class |

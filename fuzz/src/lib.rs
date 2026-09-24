@@ -166,7 +166,16 @@ fn double_star_is_shared(pattern: &[u8], index: usize) -> bool {
     let starts_component = index == 0 || pattern[index - 1] == b'/';
     let ends_component = pattern.get(end).is_none_or(|&byte| byte == b'/');
     if !(starts_component && ends_component) {
-        return true;
+        // fast-glob 1.1.1 lets a component that ends in an attached `**` run
+        // hand straight over to a following `/**/`, as if the separator
+        // between them were optional: `x**/**/*` accepts `xa`, while
+        // `x**/*`, `x*/**/*` and `x***/**/*` do not. ferralk requires the
+        // separator (#419), as Bash globstar does.
+        let attached_pair_before_globstar = !starts_component
+            && end - index == 2
+            && pattern.get(end) == Some(&b'/')
+            && pattern[end + 1..].starts_with(b"**/");
+        return !attached_pair_before_globstar;
     }
     end - index == 2 && (end < pattern.len() || index == 0)
 }
@@ -326,6 +335,9 @@ mod tests {
             b"**b",
             b"a/**b",
             b"a***b",
+            b"x*/**/*",
+            b"x***/**/*",
+            b"x**/b/**/*",
         ] {
             assert!(
                 in_shared_subset(pattern, b"src/main.rs"),
@@ -338,6 +350,9 @@ mod tests {
             b"***",
             b"***/a",
             b"a/***/b",
+            b"x**/**/*",
+            b"*x**/**/*",
+            b"a/x**/**/a",
         ] {
             assert!(
                 !in_shared_subset(pattern, b"a/ab"),
