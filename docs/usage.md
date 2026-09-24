@@ -33,7 +33,7 @@ switch that changes it; the sections below explain the semantics.
 | Ordering | Unsorted | `WalkOptions::sort(true)`, for `collect()` and `visit()`; `stream()` ignores it |
 | Metadata | Not fetched | `WalkOptions::metadata(true)` |
 | Recoverable errors | Collected next to the entries | `Walker::error_policy(ErrorPolicy::Skip)` or `ErrorPolicy::Abort` |
-| Threads | Available parallelism, clamped to `1..=256` | `Walker::threads(n)`; `stream()` is always single-threaded |
+| Threads | Available parallelism, held to one performance cluster on Apple Silicon macOS and clamped to `1..=256` | `Walker::threads(n)`; `stream()` is always single-threaded |
 | Wildcard scope | Component-local, as in a shell | `Walker::wildcard_mode(WildcardMode::SeparatorCrossing)` for `globset`-style patterns |
 | Stopping early | Runs to completion | `Walker::cancellation(token)`, or `Verdict::Stop` from a `visit` predicate |
 

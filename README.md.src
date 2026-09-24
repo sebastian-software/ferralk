@@ -176,8 +176,9 @@ for error in result.errors() {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-`collect()` uses available parallelism by default; use `threads(1)` for a
-single-threaded collection. Worker budgets are clamped to `1..=256` to bound
+`collect()` sizes its workers to the host by default: available parallelism,
+held to one performance cluster on Apple Silicon macOS. Use `threads(n)` to
+choose a budget, or `threads(1)` for a single-threaded collection. Worker budgets are clamped to `1..=256` to bound
 per-walk queues and operating-system threads. `stream()` is intentionally
 single-threaded and unsorted so it can yield entries incrementally.
 

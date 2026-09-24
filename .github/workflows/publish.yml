@@ -38,7 +38,7 @@ jobs:
       - name: Validate the workspace
         run: cargo test --locked
 
-      # The corpus is the behavioural contract, so a release cannot ship
+      # The corpus is the behavioral contract, so a release cannot ship
       # while it disagrees with the matcher.
       - name: Replay the checked-in corpus
         run: |
