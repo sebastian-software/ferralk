@@ -2148,6 +2148,9 @@ fn compile_sweep(
 /// have to contain that `RecursiveStar`, which is neither a literal nor a
 /// separator. It can sit at the end of a *leading* run, and `min_length`
 /// counts it, so both of those subtract it explicitly.
+///
+/// A fourth fact covers the fixed runs in between: `**/node_modules/**` has no
+/// fixed end, yet every match contains `node_modules`. See [`InteriorLiteral`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Prefilter {
     /// Bytes every match starts with, one per byte of the leading
@@ -2157,7 +2160,49 @@ struct Prefilter {
     suffix: Vec<u8>,
     /// Bytes the pattern consumes even when every star consumes nothing.
     min_length: usize,
+    /// The longest fixed run strictly between the leading and trailing runs,
+    /// which every match contains somewhere. Boxed because a searcher is much
+    /// larger than the pointer, and most alternatives have none.
+    interior: Option<Box<InteriorLiteral>>,
 }
+
+/// A byte string every match contains, with its searcher built once.
+///
+/// Between two wildcards a run of `Literal`/`Separator` tokens is consumed as
+/// a unit: a literal token only ever advances over exactly its own bytes and a
+/// separator token over exactly one separator byte, so every accepted
+/// candidate holds the run's bytes contiguously somewhere. Where it sits is up
+/// to the wildcards around it, which is why this is a substring search rather
+/// than an anchored comparison.
+///
+/// What the run may contain is narrower than what the fixed ends may:
+///
+/// - The separator before a terminal `**` may consume nothing, so it ends a
+///   run instead of joining it. The `/` of a `**/` belongs to that wildcard
+///   token, which is free to consume nothing, so it never joins either.
+/// - On Windows a separator token also accepts `\`, which one needle byte
+///   cannot express, so a separator ends a run there as well. An escaped `/`
+///   inside a literal token is compared byte for byte and may stay.
+/// - Case-insensitive matching compares folded bytes, which `memmem` cannot,
+///   so [`Prefilter::rejects`] skips the search when folding is on. The needle
+///   is derived without options, so the check has to be made per call.
+///
+/// Every other option changes what wildcards accept, never what a literal or
+/// separator token consumes, and the prefilter is consulted on exactly the
+/// candidate the engine then walks. That holds for every entry point: the
+/// list-filter copies strip a leading `./` from their own tokens and from the
+/// candidate before either reaches here, and an extglob sub-match asks about
+/// the slice it is matching.
+#[derive(Debug, Clone)]
+struct InteriorLiteral(memmem::Finder<'static>);
+
+impl PartialEq for InteriorLiteral {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.needle() == other.0.needle()
+    }
+}
+
+impl Eq for InteriorLiteral {}
 
 impl Prefilter {
     fn compile(tokens: &[Token]) -> Self {
@@ -2180,6 +2225,8 @@ impl Prefilter {
             prefix: run_bytes(&tokens[..leading]),
             suffix: run_bytes(&tokens[tokens.len() - trailing..]),
             min_length,
+            interior: interior_literal(tokens, leading, trailing, elidable_separator)
+                .map(|needle| Box::new(InteriorLiteral(memmem::Finder::new(&needle).into_owned()))),
         };
         debug_assert!(
             prefilter.min_length >= prefilter.prefix.len()
@@ -2198,6 +2245,58 @@ impl Prefilter {
         let tail = path.len() - self.suffix.len();
         !run_matches(&self.prefix, &path[..self.prefix.len()], case_insensitive)
             || !run_matches(&self.suffix, &path[tail..], case_insensitive)
+            || !case_insensitive
+                && self
+                    .interior
+                    .as_ref()
+                    .is_some_and(|interior| interior.0.find(path).is_none())
+    }
+}
+
+/// The longest run of bytes every match contains that the fixed ends do not
+/// already check, if one holds a byte other than a separator.
+///
+/// `leading` and `trailing` are the token counts of the prefix and suffix
+/// runs; their bytes are compared in place and would add nothing here. A lone
+/// separator is left out because nearly every path contains one. Ties go to
+/// the earlier run. See [`InteriorLiteral`] for what may join a run.
+fn interior_literal(
+    tokens: &[Token],
+    leading: usize,
+    trailing: usize,
+    elidable_separator: bool,
+) -> Option<Vec<u8>> {
+    let interior_end = tokens.len() - trailing;
+    let mut best: Option<Vec<u8>> = None;
+    let mut run = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let joins = index >= leading && index < interior_end;
+        match token {
+            Token::Literal(literal) if joins => run.extend_from_slice(literal),
+            Token::Separator
+                if joins
+                    && !cfg!(windows)
+                    && !(elidable_separator && index + 2 == tokens.len()) =>
+            {
+                run.push(b'/');
+            }
+            _ => {
+                keep_longer_run(&mut best, &mut run);
+            }
+        }
+    }
+    keep_longer_run(&mut best, &mut run);
+    best
+}
+
+/// Moves `run` into `best` when it is strictly longer and not separators only,
+/// and leaves `run` empty for the next one.
+fn keep_longer_run(best: &mut Option<Vec<u8>>, run: &mut Vec<u8>) {
+    if run.len() > best.as_ref().map_or(0, Vec::len) && run.iter().any(|&byte| !is_separator(byte))
+    {
+        *best = Some(std::mem::take(run));
+    } else {
+        run.clear();
     }
 }
 
@@ -10023,7 +10122,8 @@ mod tests {
         let plain = PatternOptions::default();
         let recursive = PatternOptions::default().recursive_double_star(true);
         let folded = recursive.case_insensitive(true);
-        let cases: [(&str, PatternOptions); 16] = [
+        let escaped = plain.escape(true);
+        let cases: [(&str, PatternOptions); 24] = [
             // The bench case: nothing in the engine consults the trailing `b`.
             ("a*a*a*a*b", plain),
             ("*a*a*", plain),
@@ -10041,11 +10141,22 @@ mod tests {
             ("A/**/*.B", folded),
             ("A*A*B", folded),
             ("./a/**/b", recursive),
+            // Interior runs: fixed bytes with a wildcard on both sides.
+            ("**/ab/**", recursive),
+            ("**/a/*.b", recursive),
+            ("*/ab/*", plain),
+            ("*ab*", plain),
+            ("*a\\/b*", escaped),
+            ("./**/b./**", recursive),
+            ("**/AB/**", folded),
+            ("*A.B*", folded),
         ];
         let mut candidates = byte_words(b"ab./", 4);
         candidates.push(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec());
         candidates.push(b"a/b/a/b/a/b.b".to_vec());
         candidates.push(b"A/B/A.B".to_vec());
+        candidates.push(b"a/AB/b".to_vec());
+        candidates.push(b"./a/b./b".to_vec());
 
         for (source, options) in cases {
             let mut filtered = Pattern::compile(source, options).expect("case pattern compiles");
@@ -10110,6 +10221,178 @@ mod tests {
         assert_eq!(prefilter.prefix, b"a");
         assert_eq!(prefilter.suffix, b"d");
         assert_eq!(prefilter.min_length, 4);
+    }
+
+    /// The needle an interior run leaves, on the shapes that decide it.
+    #[test]
+    fn the_prefilter_searches_for_the_longest_interior_run() {
+        let recursive = PatternOptions::default().recursive_double_star(true);
+        let needle = |source: &str, options: PatternOptions| {
+            let pattern = Pattern::compile(source, options).expect("needle pattern compiles");
+            pattern.alternatives[0]
+                .prefilter
+                .interior
+                .as_ref()
+                .map(|interior| interior.0.needle().to_vec())
+        };
+        // Neither separator joins: `**/` may consume nothing at the start and
+        // the terminal separator may consume nothing at the end.
+        assert_eq!(
+            needle("**/node_modules/**", recursive).as_deref(),
+            Some(b"node_modules".as_slice())
+        );
+        // A separator between the run and a wildcard is consumed as a byte,
+        // except on Windows, where it also accepts `\\`.
+        let lib = if cfg!(windows) { "lib" } else { "lib/" };
+        assert_eq!(
+            needle("**/lib/*.js", recursive).as_deref(),
+            Some(lib.as_bytes())
+        );
+        assert_eq!(
+            needle("src/**/test/*.rs", recursive).as_deref(),
+            Some(if cfg!(windows) {
+                b"test".as_slice()
+            } else {
+                b"test/"
+            })
+        );
+        // The longest run wins, the earlier one on a tie.
+        assert_eq!(
+            needle("*a*bcd*ef*", PatternOptions::default()).as_deref(),
+            Some(b"bcd".as_slice())
+        );
+        assert_eq!(
+            needle("*ab*cd*", PatternOptions::default()).as_deref(),
+            Some(b"ab".as_slice())
+        );
+        // An escaped separator is a literal byte, compared exactly everywhere.
+        assert_eq!(
+            needle("*a\\/b*", PatternOptions::default().escape(true)).as_deref(),
+            Some(b"a/b".as_slice())
+        );
+        // Fixed ends are compared in place, and a lone separator or the
+        // elidable one carries nothing worth a search.
+        assert_eq!(needle("ab/**", recursive), None);
+        assert_eq!(needle("ab*cd", PatternOptions::default()), None);
+        assert_eq!(needle("src/main.rs", PatternOptions::default()), None);
+        assert_eq!(needle("*/*", PatternOptions::default()), None);
+        assert_eq!(needle("**/*", recursive), None);
+
+        let excluded = Pattern::compile("**/node_modules/**", recursive).unwrap();
+        let prefilter = &excluded.alternatives[0].prefilter;
+        assert!(prefilter.rejects(b"src/lib/index.js", false));
+        assert!(!prefilter.rejects(b"a/node_modules/b", false));
+        assert!(!prefilter.rejects(b"node_modules", false));
+        // Folding has no `memmem` form, so the search stands aside.
+        assert!(!prefilter.rejects(b"a/NODE_MODULES/b", true));
+    }
+
+    /// The prefilter may only reject what the engines behind it reject, over
+    /// generated patterns and paths.
+    ///
+    /// The fragments lean on multi-byte literals next to every wildcard,
+    /// separator and group form, so interior runs start and end in every
+    /// position, and the path pieces reuse the same literals so a good share
+    /// of candidates contain the needle and reach the engine. Both copies keep
+    /// the sweep and every extglob program and only differ in their
+    /// prefilters, nested extglob alternatives included; the fast paths are
+    /// stripped from both so nothing answers before the prefilter is asked.
+    #[test]
+    fn the_prefilter_agrees_with_the_unfiltered_engines_over_randomized_patterns() {
+        let fragments: &[&[u8]] = &[
+            b"ab",
+            b"nm",
+            b"a",
+            b"B",
+            b".",
+            b"/",
+            b"./",
+            b"*",
+            b"?",
+            b"**",
+            b"**/",
+            b"/**",
+            b"[ab]",
+            b"[!a]",
+            b"{ab,B}",
+            b"{a/b,nm}",
+            b"\\/",
+            b"\\*",
+            b"@(ab|B)",
+            b"!(nm)",
+            b"+(a)",
+            b"*(ab/)",
+        ];
+        let path_pieces: &[&[u8]] = &[
+            b"a", b"b", b"B", b"ab", b"AB", b"nm", b"NM", b".", b"/", b"./", b"a/b",
+        ];
+        // The same reproducible generator as the sweep's randomized test.
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move |bound: usize| {
+            seed = seed.wrapping_mul(0x2545_F491_4F6C_DD1D).wrapping_add(1);
+            (usize::try_from(seed >> 33).expect("31 bits fit a usize")) % bound
+        };
+        let mut searched = 0_usize;
+        for _ in 0..3_000 {
+            let mut pattern = Vec::new();
+            for _ in 0..1 + next(7) {
+                pattern.extend_from_slice(fragments[next(fragments.len())]);
+            }
+            let options = PatternOptions::default()
+                .braces(next(2) == 0)
+                .recursive_double_star(next(4) != 0)
+                .extglob(next(3) == 0)
+                .match_hidden(next(2) == 0)
+                .case_insensitive(next(4) == 0)
+                .escape(next(2) == 0);
+            let Ok(mut filtered) = Pattern::compile(&pattern, options) else {
+                continue;
+            };
+            filtered.strip_engines(true, false, false);
+            let mut unfiltered = filtered.clone();
+            unfiltered.strip_engines(false, false, true);
+            searched += usize::from(
+                filtered
+                    .alternatives
+                    .iter()
+                    .any(|alternative| alternative.prefilter.interior.is_some()),
+            );
+            for _ in 0..32 {
+                let mut path = Vec::new();
+                for _ in 0..next(9) {
+                    path.extend_from_slice(path_pieces[next(path_pieces.len())]);
+                }
+                let shown = || {
+                    format!(
+                        "{:?} against {:?} under {options:?}",
+                        String::from_utf8_lossy(&pattern),
+                        String::from_utf8_lossy(&path)
+                    )
+                };
+                assert_eq!(
+                    filtered.is_match(&path),
+                    unfiltered.is_match(&path),
+                    "is_match: {}",
+                    shown()
+                );
+                assert_eq!(
+                    filtered.is_match_path(&path),
+                    unfiltered.is_match_path(&path),
+                    "is_match_path: {}",
+                    shown()
+                );
+                assert_eq!(
+                    filtered.is_match_glob_path(&path),
+                    unfiltered.is_match_glob_path(&path),
+                    "is_match_glob_path: {}",
+                    shown()
+                );
+            }
+        }
+        assert!(
+            searched > 500,
+            "only {searched} generated patterns carry an interior search"
+        );
     }
 
     /// Asserts that the sweep engine and the memoized matcher agree on every
