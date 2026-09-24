@@ -3,6 +3,10 @@
 ## [1.0.0](https://github.com/sebastian-software/ferralk/compare/v1.0.0-rc.1...v1.0.0) (2026-09-24)
 
 
+### Licensing
+
+* Both crates are now dual-licensed under `MIT OR Apache-2.0`; `1.0.0-rc.1` and earlier releases were published under `MIT` alone. See [ADR-0018](https://github.com/sebastian-software/ferralk/blob/main/docs/adr/0018-dual-mit-apache-license.md) ([#378](https://github.com/sebastian-software/ferralk/issues/378)).
+
 ### ⚠ BREAKING CHANGES
 
 * **walker:** A wildcard in a `Walker::exclude` pattern now covers a leading period whatever `Walker::match_hidden` says, so excludes apply inside hidden directories the way `.gitignore` lines do. Before, without `match_hidden(true)`, `exclude("**/node_modules/**")` kept `.cache/node_modules/a.ts` and `exclude("*.log")` kept `.debug.log`; both are now removed, and a covering exclude such as `x/**` also removes, and prunes, hidden descendants an include names literally (`include(".github/**")` with `exclude("**/*.yml")` now drops `.github/workflows/ci.yml`). What an include selects is unchanged, and `WalkOptions::skip_hidden` still drops hidden entries before any pattern runs.
