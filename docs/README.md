@@ -13,6 +13,7 @@ grouped by what you are trying to do.
 | [Agent skill](../skills/ferralk/SKILL.md) | The same guidance as a skill an agent can load: which crate for what, recipes, and traps. |
 | [Usage guide](usage.md) | Every walker default and the switch that changes it, the three matcher entry points, error handling, cancellation, and platform notes. Start here after the README. |
 | [1.x stability contract](stability.md) | What 1.x promises: public API, corpus semantics, MSRV policy, Windows tier, and the explicit exclusions. |
+| [Consumer pattern contract](consumer-contract.md) | For a program that passes its users' globs to Ferralk: which pattern language 1.x covers per dialect and entry point, validating a pattern, escaping literal text, stable error information, and porting from `globset`. |
 | [Benchmark evidence](benchmark-evidence.md) | What is measured, how to reproduce it, what scoped queries mean, and how Ferralk compares with Rust, Node.js, and zlob libraries. |
 | [Palamedes adoption](palamedes-adoption.md) | A consumer integration measured over four releases on two real repositories, and which finding produced which change here. |
 | [Verification depth](verification-comparison.md) | How much checkable evidence stands behind the behavior, counted next to comparable crates, and where those counts mislead. |

@@ -32,7 +32,8 @@ would one by one, and asks only those whose literals a path contains.
 
 For the full syntax, error contract, compatibility notes, and
 [tested recipes](https://docs.rs/ferralk-glob/latest/ferralk_glob/#recipes)
-(matching against several globs, porting a fast-glob list), see the
+(matching against several globs, porting a fast-glob list, escaping literal
+text), see the
 [crate documentation](https://docs.rs/ferralk-glob), the
 [usage guide](https://github.com/sebastian-software/ferralk/blob/main/docs/usage.md),
 and the [Ferralk repository](https://github.com/sebastian-software/ferralk).

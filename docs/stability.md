@@ -46,6 +46,23 @@ releases.
   `PatternError::offset()`, `PatternSetError::index()`, and
   `WalkError::operation()` for program logic.
 
+## Consumer pattern contract
+
+For a program that passes its own users' patterns to Ferralk, the
+[consumer pattern contract](consumer-contract.md) spells out what the bullets
+above mean for that program. It shows which syntax each `PatternOptions`
+preset and entry point covers and how to validate a user's pattern with
+`Pattern::validate` or `Walker::try_include`. It also covers escaping literal
+text with `ferralk_glob::escape`, and porting from `globset`. In short:
+
+- Everything a pattern means under a given dialect and entry point is
+  covered, including the walker's own rules.
+- `escape` and `escape_str` promise a literal result under every option
+  combination with escaping enabled. The exact set of escaped bytes is not
+  promised: it grows if the pattern language gains syntax.
+- `PatternError::offset()` is stable program-facing error information.
+  `message()` and `Display` are not, as listed below.
+
 ## Public enum policy
 
 | Enum | 1.0 decision |

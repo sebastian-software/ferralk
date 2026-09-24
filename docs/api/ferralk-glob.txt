@@ -124,5 +124,7 @@ impl core::marker::UnsafeUnpin for ferralk_glob::PatternSetError
 impl core::panic::unwind_safe::RefUnwindSafe for ferralk_glob::PatternSetError
 impl core::panic::unwind_safe::UnwindSafe for ferralk_glob::PatternSetError
 pub const ferralk_glob::VERSION: &str
+pub fn ferralk_glob::escape(impl core::convert::AsRef<[u8]>) -> alloc::vec::Vec<u8>
+pub fn ferralk_glob::escape_str(&str) -> alloc::string::String
 pub fn ferralk_glob::expand_braces(impl core::convert::AsRef<[u8]>, ferralk_glob::PatternOptions) -> core::result::Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, ferralk_glob::PatternError>
 pub fn ferralk_glob::path_bytes(&impl core::convert::AsRef<std::ffi::os_str::OsStr> + ?core::marker::Sized) -> &[u8]

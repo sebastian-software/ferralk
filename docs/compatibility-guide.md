@@ -213,13 +213,14 @@ there a file may genuinely be named `src*.ts`.
 **Converting a path you already hold.** Replace the separators, and remember
 that a path is not automatically a valid pattern: if any component contains
 pattern syntax such as `*`, `?`, `[` or `{`, those bytes need escaping with
-`\`. [Absolute patterns](#absolute-patterns-and-the-caller-side-rewrite-they-replace)
-lists every byte that does.
+`\`. `ferralk_glob::escape_str` does that for every such byte, and the
+absolute-pattern rewrite reads the escaped spelling as the root's name.
 
 ```rust,no_run
 # use ferralk::Walker;
+# use ferralk::ferralk_glob::escape_str;
 # let root = std::path::PathBuf::from(".");
-let as_pattern = root.to_string_lossy().replace('\\', "/");
+let as_pattern = escape_str(&root.to_string_lossy().replace('\\', "/"));
 let walker = Walker::new(&root).include(format!("{as_pattern}/src/**/*.ts"))?;
 # Ok::<(), ferralk::ferralk_glob::PatternError>(())
 ```
