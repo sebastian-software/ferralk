@@ -6,7 +6,9 @@ young library: how much checkable evidence stands behind its behavior,
 compared with the crates it is measured against.
 
 It is a count of what each project has checked in, taken from the upstream
-repositories on 2026-09-04. Counts are a weak proxy for reliability and this
+repositories on 2026-09-04; Ferralk's test and corpus counts in the table were
+recounted for 1.0.0 on 2026-09-24, while its documentation and CI figures
+below are still the 2026-09-04 snapshot. Counts are a weak proxy for reliability and this
 document says where they mislead. Nothing here is a quality judgment of
 another project.
 
@@ -38,7 +40,7 @@ that is the trap this table exists to avoid rather than to set.
 
 | Project | Test functions | Data-driven cases | Total | Fuzz targets |
 | --- | ---: | ---: | ---: | ---: |
-| ferralk | 392 | 822 | **1,214** | 7 |
+| ferralk | 423 | 994 | **1,417** | 7 |
 | `wax` | 0 | 599 | 599 | 0 |
 | `ignore` | 106 | — | 106 | — |
 | `jwalk` | 52 | — | 52 | 0 |
@@ -93,7 +95,7 @@ the ordinary and reasonable choice.
 Ferralk instead treats `git check-ignore` as the oracle, pinned to Git 2.52.0
 and replayed in CI on Linux and on Windows, with `git ls-files` covering root
 spellings. Where it diverges deliberately, the corpus case carries an ADR
-reference or a recorded oracle defect, and all 44 divergences carry exactly
+reference or a recorded oracle defect, and all 76 divergences carry exactly
 one. See [ADR-0006](adr/0006-git-normative-ignore-semantics.md) and the
 [corpus format](corpus-format.md).
 

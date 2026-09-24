@@ -171,8 +171,12 @@ pins and outputs together. Never edit generated family text by hand.
 
 ## 1.0 release checklist
 
-Use this checklist for the 1.0 release train; the compatibility promise it
-protects is defined in [`docs/stability.md`](docs/stability.md).
+This is the checklist the 1.0 release train was planned with; the
+compatibility promise it protects is defined in
+[`docs/stability.md`](docs/stability.md). `1.0.0` was released directly after
+the fixes for the `1.0.0-rc.1` round, without the further clean round the
+cadence below asks for, by maintainer decision on 2026-09-24;
+[`docs/stability.md`](docs/stability.md#releasing-10) records why.
 
 - [ ] Every child of epic #342 is closed, and every external-oracle divergence
   in the corpus has exactly one `adr` or `oracle_defect` marker.
