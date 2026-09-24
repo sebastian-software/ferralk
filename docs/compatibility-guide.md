@@ -341,6 +341,34 @@ The mode governs excludes as well as includes, so a walk reads every pattern the
 same way. It is a matching policy, independent of `match_hidden` and of
 `WalkOptions::skip_hidden`.
 
+A pattern list from fast-glob or globby also carries negations: a leading `!`
+turns a pattern into an ignore. The walker has two lists instead of one, so the
+translation sorts the entries rather than rewriting them:
+
+```rust
+use ferralk::Walker;
+
+// fast-glob: ["src/**/*.ts", "!src/**/*.test.ts", "!**/generated/**"]
+let walker = Walker::new(".")
+    .include("src/**/*.ts")?
+    .exclude("src/**/*.test.ts")?
+    .exclude("**/generated/**")?;
+# Ok::<(), ferralk::ferralk_glob::PatternError>(())
+```
+
+`include` and `exclude` reject a pattern that starts with `!` rather than read
+it as a literal first byte, which used to select nothing without an error.
+fast-glob expands braces before it sorts its list, so a brace alternative that
+starts with `!` (`{!a,b}/**`) is rejected the same way, at the offset of that
+`!`. The rule reads the pattern as the caller wrote it: `!(…)` is the negated
+extglob, as it is in fast-glob, `\!` asks for a literal `!`, an interior `!`
+is an ordinary byte, and an absolute pattern's `!` below the walk root
+(`/repo/!src/**` for a root of `/repo`) names a literal component. A
+`!` that re-admits entries into an ignore list, the way `.gitignore` uses it,
+has no counterpart among walker excludes, because an entry any exclude matches
+is not emitted: narrow the exclude instead, or keep such rules in a
+`.gitignore` and use `respect_git_ignore`.
+
 ## Windows verification
 
 Windows is a tier-2 target for the portable backend. CI replays the complete
@@ -489,6 +517,7 @@ It is an audit of the current contract, not a second changelog.
 | 1.0.0: absolute patterns under a root with `..` | A walk root with a `..` component rejects every absolute include or exclude, from `include`, `exclude`, `add_root`, and their `try_` forms, instead of selecting nothing when the pattern diverged from the root's spelling before the `..`; relative patterns are unaffected. See [absolute patterns](#absolute-patterns-and-the-caller-side-rewrite-they-replace). |
 | 1.0.0: negated extglobs and hidden components | Without `match_hidden`, `!(…)` selects no hidden component, including one it reaches by crossing a separator; see [deliberate differences](#deliberate-differences) and the [usage guide](usage.md#hidden-paths-two-separate-switches). |
 | 1.0.0: walker `./` on brace alternatives | Includes and excludes ignore one leading `./` on every brace-expanded alternative, as the path matchers do: `{./src/*.rs,lib/*.rs}` selects from both directories instead of silently dropping the `./` alternative, and `{./src/*.rs,./lib/*.rs}` is accepted instead of rejected as an unnormalized `.` component. See [walking](#walking) and the [usage guide](usage.md#walk-filesystems-with-explicit-policy). |
+| 1.0.0: leading `!` in walker patterns | `include`, `exclude`, and their `try_` forms reject a pattern or brace alternative that starts with `!` not followed by `(`, instead of compiling it as a literal `!` that selects nothing; `\!` and `!(…)` are unchanged. See [migrating from fast-glob](#migrating-patterns-from-globset-or-fast-glob). |
 
 ## Defaults to review
 

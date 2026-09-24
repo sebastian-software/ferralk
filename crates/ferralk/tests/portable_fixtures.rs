@@ -994,3 +994,87 @@ fn a_walk_root_with_dot_dot_rejects_every_absolute_pattern() {
         vec![PathBuf::from("y.txt")]
     );
 }
+
+/// A leading `!` is list negation in fast-glob, globby and `.gitignore`, and
+/// the walker has none, so the ported pattern used to compile, ask for a
+/// directory literally named `!src`, and select nothing (#397). It is now
+/// refused through every builder entry point, while the spellings that mean
+/// something here keep their meaning.
+#[test]
+fn a_leading_bang_is_refused_instead_of_selecting_nothing() {
+    const LEADING: &str = "a leading `!` does not negate a walker pattern; pass the pattern without it to `exclude()` instead, or write `\\!` for a literal `!`";
+    const ALTERNATIVE: &str = "a brace alternative starting with `!` does not negate a walker pattern; pass that alternative without it to `exclude()` instead, or write `\\!` for a literal `!`";
+    let fixture = Fixture::new();
+    fixture.write("src/a.ts");
+    fixture.write("!src/b.ts");
+    fixture.write("lib/c.ts");
+
+    for (pattern, offset, message) in [
+        ("!src/**", 0, LEADING),
+        ("!*.ts", 0, LEADING),
+        ("!", 0, LEADING),
+        ("{!src,lib}/**", 1, ALTERNATIVE),
+    ] {
+        for add in [Walker::include, Walker::exclude] {
+            let error = add(Walker::new(&fixture.root), pattern)
+                .err()
+                .unwrap_or_else(|| panic!("{pattern} was accepted"));
+            assert_eq!(
+                (error.offset(), error.message()),
+                (offset, message),
+                "{pattern}"
+            );
+        }
+
+        // The borrowed forms leave the configured walker as it was.
+        let mut walker = Walker::new(&fixture.root);
+        walker.try_include("lib/**").expect("valid include");
+        assert!(walker.try_include(pattern).is_err(), "{pattern}");
+        assert!(walker.try_exclude(pattern).is_err(), "{pattern}");
+        let files = walker
+            .options(WalkOptions::default().files_only(true).sort(true))
+            .collect()
+            .expect("collect succeeds")
+            .entries()
+            .iter()
+            .map(|entry| {
+                entry
+                    .path()
+                    .strip_prefix(&fixture.root)
+                    .unwrap()
+                    .to_path_buf()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(files, [Path::new("lib/c.ts")], "{pattern}");
+    }
+
+    let files = |configure: &dyn Fn(Walker) -> Walker| {
+        paths_from_every_frontend_with(
+            WalkOptions::default().files_only(true),
+            configure,
+            &fixture.root,
+        )
+    };
+    // The escape spells the literal directory, as it always did.
+    assert_eq!(
+        files(&|walker| walker.include(r"\!src/**").expect("escaped `!`")),
+        [PathBuf::from("!src/b.ts")]
+    );
+    // `!(` is the negated extglob, which is a pattern and not list negation.
+    assert_eq!(
+        files(&|walker| walker.include("!(src)/**").expect("negated extglob")),
+        [PathBuf::from("!src/b.ts"), PathBuf::from("lib/c.ts")]
+    );
+    // What the ported list meant, written as the walker spells it.
+    assert_eq!(
+        files(&|walker| walker.exclude("src/**").expect("plain exclude")),
+        [PathBuf::from("!src/b.ts"), PathBuf::from("lib/c.ts")]
+    );
+    // Below an absolute pattern's root the `!` starts no pattern anyone
+    // wrote, so it stays a literal component.
+    let absolute = format!("{}/!src/**", pattern_spelling(&fixture.root));
+    assert_eq!(
+        files(&|walker| walker.include(absolute.as_str()).expect("absolute pattern")),
+        [PathBuf::from("!src/b.ts")]
+    );
+}

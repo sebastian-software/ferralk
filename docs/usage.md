@@ -172,6 +172,14 @@ Important defaults:
   could never match, with a message saying so; see the
   [compatibility guide](compatibility-guide.md#patterns-are-written-with--on-every-platform).
 
+- **A leading `!` is not negation.** fast-glob, globby, and `.gitignore` read
+  `!src/**` as "not `src/**`"; a walker pattern list has no negation, so
+  `include` and `exclude` reject a pattern, or a brace alternative, that
+  starts with `!` instead of silently asking for a directory literally named
+  `!src`. Pass what should be left out to `exclude("src/**")`. `!(…)` is
+  still the negated extglob, and `\!` still spells a literal `!`; see the
+  [compatibility guide](compatibility-guide.md#migrating-patterns-from-globset-or-fast-glob).
+
 - A walk may have several roots. `Walker::new(first).add_root(second)?` walks
   both trees with one thread pool, and `WalkEntry::root` says which root an
   entry came from. Patterns apply under every root, `depth` is counted from the
