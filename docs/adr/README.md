@@ -24,6 +24,7 @@ Decisions from the end-to-end design review of 2026-08-18 (see
 | [0017](0017-caller-owned-list-api-conventions.md) | Caller-owned list API conventions |
 | [0018](0018-dual-mit-apache-license.md) | Dual MIT or Apache-2.0 license (supersedes the license clause of 0001) |
 | [0019](0019-dependency-version-requirements.md) | Caret requirements in the published crates, exact pins everywhere else |
+| [0020](0020-double-star-only-as-a-whole-component.md) | `**` is recursive only as a whole path component (deliberate divergence from zlob) |
 
 Convention: [Nygard-style ADRs](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions),
 numbered sequentially, never rewritten once accepted — superseding decisions

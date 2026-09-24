@@ -29,14 +29,14 @@ assert!(pattern.is_match("src/lib.rs"));
 | --- | --- |
 | `ZLOB_BRACE` | `PatternOptions::braces(true)` |
 | `ZLOB_EXTGLOB` | `PatternOptions::extglob(true)` |
-| recursive `**` | `PatternOptions::recursive_double_star(true)` |
+| recursive `**` | `PatternOptions::recursive_double_star(true)`; only a whole-component `**` is recursive ([ADR-0020](adr/0020-double-star-only-as-a-whole-component.md)) |
 | `ZLOB_PERIOD` | `PatternOptions::match_hidden(true)` |
 | `ZLOB_NOESCAPE` | `PatternOptions::escape(false)` |
 | case-insensitive matching | `PatternOptions::case_insensitive(true)` |
 | syntax validation | `Pattern::validate` |
 | syntax preflight | `Pattern::has_wildcards` |
 | single filesystem-glob candidate | `Pattern::is_match_glob_path` (all ordinary wildcards are component-local) |
-| `zlob_match_paths` / `_at` and index variants | `Pattern::{is_match_path,filter_paths,filter_paths_at,filter_path_indices,filter_path_indices_at}` (stable input order; a `*`, `?`, or class directly after `/` is component-local and a later wildcard in that component may cross again, as zlob does; `**` is recursive only with `recursive_double_star`, otherwise two ordinary stars) |
+| `zlob_match_paths` / `_at` and index variants | `Pattern::{is_match_path,filter_paths,filter_paths_at,filter_path_indices,filter_path_indices_at}` (stable input order; a `*`, `?`, or class directly after `/` is component-local and a later wildcard in that component may cross again, as zlob does; `**` is recursive only with `recursive_double_star` and only as a whole path component, otherwise two ordinary stars) |
 
 Ferralk accepts raw bytes (`AsRef<[u8]>`) for patterns and candidate paths, so
 callers do not need lossy UTF-8 conversion.
@@ -52,6 +52,17 @@ run of two or more reads as in plain syntax. Each brace alternative is judged
 on its own, so a sibling never changes its verdict.
 With recursive double stars enabled, `**/@(x)` matches at depth zero (`x`) as
 well as below a directory (`a/x`).
+
+With `recursive_double_star` enabled, `**` is recursive only as a whole path
+component: bounded by an unescaped `/` or an end of the pattern on both sides,
+as in `**`, `**/x`, `x/**`, and `x/**/y`. A recursive `**/` may match zero
+directories but hands over only at a component start, so `**/x` rejects `sx`
+and `a/**/b` rejects `a/xb`. Any other run (`a**`, `**b`, `a**/b`, `**.ts`) is
+ordinary stars, exactly as with the option disabled. Brace alternatives are
+judged after expansion, and an extglob alternative takes its group's position:
+`@(**)/y` is recursive, `x@(**)/y` is not. This is the reading of gitignore,
+Bash `globstar`, `globset`, and `fast-glob`; the zlob differences it implies
+are listed under [deliberate differences](#deliberate-differences).
 
 ## Walking
 
@@ -339,8 +350,9 @@ What the two modes select, for the same pattern:
 | `src/*.ts` | `other/main.ts` | not selected | not selected |
 | `**/*.ts` | `src/deep/main.ts` | selected | selected |
 
-Two things carry over unchanged. `**` is recursive under either mode, so a
-pattern already written with `**` means the same thing in both. And a literal
+Two things carry over unchanged. A whole-component `**` is recursive under
+either mode, so a pattern already written with `**/` means the same thing in
+both, and in both `**/x` selects `x` and `a/x` but never `sx`. And a literal
 prefix is still a literal prefix: `src/*.ts` never reaches outside `src/`, which
 is why the walker can still skip sibling directories without opening them.
 
@@ -452,12 +464,25 @@ and covered by the cross-platform corpus. See the
   reads the suffix as literal `(a)`. The shell-compatible reading is recorded
   with ADR-0016 provenance beside the zlob verdicts in
   `extsuite-*star-run-before-zero-or-more` (issue #305).
+- `**` is recursive only as a whole path component, the reading of gitignore,
+  Bash `globstar`, `globset`, and `fast-glob` (maintainer decision of
+  2026-09-24, issue #419, [ADR-0020](adr/0020-double-star-only-as-a-whole-component.md)).
+  zlob 1.6.3 has no single reading to follow. Its `matchPaths` already refuses
+  `**/x` against `sx`, but once a pattern holds a whole `**` it matches every
+  other component on its own, so an attached run stays in one component there:
+  `a**/y` rejects `a/x/y` and `**.ts` rejects `src/a.ts`, where Ferralk's
+  `is_match` reads the run as ordinary separator-crossing stars. Its segment
+  split also ignores extglob groups, so `@(**)/y` and `@(**/x|z)` are not
+  recursive there. A trailing `**/` accepts `a/b` against `a/**/` there, while
+  Ferralk demands the final separator. zlob's filesystem glob treats any `**`
+  substring as recursive and can drop the text beside it. The corpus records
+  these verdicts in `globstar-*` with `adr: "0020"`.
 - Ferralk list APIs preserve caller order, normalize one leading `./` on the
   pattern and candidates, and never synthesize a `NOCHECK` result that the
   caller did not supply. ADR-0017 records these Rust API conventions.
 - Four zlob verdicts contradict its own frozen tests: the public matcher's two
   escape results and the list matcher's two leading repeating-extglob results.
-  Nine fast-glob differences reflect defects or documented limits in that
+  Eight fast-glob differences reflect defects or documented limits in that
   secondary oracle. These records carry `oracle_defect: true`; the exact IDs
   and rationale are listed in the
   [corpus format](corpus-format.md#evidence-and-disputes), so none represents
@@ -526,6 +551,7 @@ It is an audit of the current contract, not a second changelog.
 | 1.0.0: walker `./` on brace alternatives | Includes and excludes ignore one leading `./` on every brace-expanded alternative, as the path matchers do: `{./src/*.rs,lib/*.rs}` selects from both directories instead of silently dropping the `./` alternative, and `{./src/*.rs,./lib/*.rs}` is accepted instead of rejected as an unnormalized `.` component. See [walking](#walking) and the [usage guide](usage.md#walk-filesystems-with-explicit-policy). |
 | 1.0.0: leading `!` in walker patterns | `include`, `exclude`, and their `try_` forms reject a pattern or brace alternative that starts with `!` not followed by `(`, instead of compiling it as a literal `!` that selects nothing; `\!` and `!(…)` are unchanged. See [migrating from fast-glob](#migrating-patterns-from-globset-or-fast-glob). |
 | 1.0.0: extglob position rule in path filters | Under `is_match_path` a group directly after `/` is component-local like a wildcard there (for a repeated group only its first iteration), and brace alternatives are judged independently; under both path entry points a separator-crossing star before a component-local one keeps its backtrack point (`**/*.@(ts\|js)` reaches every depth), a separator or recursive `**` inside a group can cross components, and a star run such as `***` reads as it does outside a group. See the [matcher table](#matcher) and [usage guide](usage.md#match-paths-deliberately). |
+| 1.0.0: `**` only as a whole path component | With `recursive_double_star`, `**` is recursive only when bounded by `/` or a pattern end on both sides; `**/x` no longer matches `sx`, `a/**/b` no longer matches `a/xb`, and a walker exclude `**/node_modules/**` no longer prunes `my_node_modules`. Any other `**` run is ordinary stars. See the [matcher section](#matcher), [deliberate differences](#deliberate-differences), [ADR-0020](adr/0020-double-star-only-as-a-whole-component.md), and the [usage guide](usage.md#match-paths-deliberately). |
 
 ## Defaults to review
 

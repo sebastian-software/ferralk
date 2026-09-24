@@ -144,32 +144,31 @@ pub fn in_shared_subset(pattern: &[u8], path: &[u8]) -> bool {
     brace_depth == 0 && !has_leading_dot_slash_alternative(pattern)
 }
 
-/// Whether one syntactic `**` is confined to a shape both engines accept.
+/// Whether one syntactic star run starting with `**` reads the same in both
+/// engines.
 ///
-/// Ferralk lets recursive `**` consume part of a path component, while
-/// fast-glob requires a complete component. The languages still agree for a
-/// bare `**`, and when a complete `**/` component is followed by an ordinary
-/// component-leading `*`: that star can absorb every partial-component match
-/// ferralk's recursive wildcard could otherwise contribute. Other positions
-/// retain the documented structural exclusion.
+/// Both engines read `**` as recursive only when it is a whole path component
+/// and as an ordinary star anywhere else (#419). Two whole-component shapes
+/// still differ: a trailing `/**` elides to nothing in ferralk while fast-glob
+/// requires a component, and a whole-component run of three or more stars
+/// stays recursive in ferralk while fast-glob reads it as ordinary stars. The
+/// classifier sees each star of a run, so a run is judged once, at its first
+/// star.
 fn double_star_is_shared(pattern: &[u8], index: usize) -> bool {
+    if index > 0 && pattern[index - 1] == b'*' {
+        return true;
+    }
+    let end = index
+        + pattern[index..]
+            .iter()
+            .take_while(|&&byte| byte == b'*')
+            .count();
     let starts_component = index == 0 || pattern[index - 1] == b'/';
-    if !starts_component {
-        return false;
+    let ends_component = pattern.get(end).is_none_or(|&byte| byte == b'/');
+    if !(starts_component && ends_component) {
+        return true;
     }
-
-    let after_pair = index + 2;
-    if after_pair == pattern.len() {
-        return index == 0;
-    }
-    if pattern.get(after_pair) != Some(&b'/') {
-        return false;
-    }
-
-    let following_star = after_pair + 1;
-    pattern.get(following_star) == Some(&b'*')
-        && pattern.get(following_star + 1) != Some(&b'*')
-        && pattern.get(following_star + 1) != Some(&b'(')
+    end - index == 2 && (end < pattern.len() || index == 0)
 }
 
 /// Whether brace expansion exposes a current-directory prefix.
@@ -317,6 +316,16 @@ mod tests {
             b"**/*.rs",
             b"src/**/*.rs",
             b"a/**/*",
+            b"**/a",
+            b"a/**/b",
+            b"a/**/?b",
+            b"a/**/[ab]",
+            b"a/**/**/*.rs",
+            b"**/.*",
+            b"a**/*.rs",
+            b"**b",
+            b"a/**b",
+            b"a***b",
         ] {
             assert!(
                 in_shared_subset(pattern, b"src/main.rs"),
@@ -324,14 +333,11 @@ mod tests {
             );
         }
         for pattern in [
-            b"**/a".as_slice(),
-            b"a/**",
-            b"a/**/b",
-            b"a**/*.rs",
-            b"a/**/?b",
-            b"a/**/[ab]",
-            b"a/**/**/*.rs",
-            b"**/.*",
+            b"a/**".as_slice(),
+            b"a/**/**",
+            b"***",
+            b"***/a",
+            b"a/***/b",
         ] {
             assert!(
                 !in_shared_subset(pattern, b"a/ab"),

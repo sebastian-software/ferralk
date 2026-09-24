@@ -1888,6 +1888,9 @@ impl TraversalPattern {
         // `./` arm of `{./src/*.rs,lib/*.rs}` pruned and unmatched.
         let subtree_root = pattern
             .strip_suffix(b"/**")
+            // Behind an escaped `/` the `**` is an ordinary star run, not a
+            // whole component (#419), so it covers no subtree.
+            .filter(|root| root.iter().rev().take_while(|&&byte| byte == b'\\').count() % 2 == 0)
             .map(|root| Pattern::compile(root, options))
             .transpose()?;
         // The matcher expands braces before it compiles; the prefilters are
@@ -4330,6 +4333,82 @@ mod tests {
             vec![PathBuf::from("src/main.rs")]
         );
         assert!(result.errors().is_empty());
+    }
+
+    /// `**` is recursive only as a whole path component (#419): an include
+    /// does not select a name that merely ends in its literal, and a covering
+    /// exclude neither prunes nor drops a directory whose name only ends in it.
+    #[test]
+    fn double_star_includes_and_excludes_match_whole_components_only() {
+        let fixture = Fixture::new();
+        for path in [
+            "x",
+            "sx",
+            "a/x",
+            "a/sx",
+            "node_modules/a.js",
+            "pkg/node_modules/b.js",
+            "my_node_modules/c.js",
+            "pkg/my_node_modules/d.js",
+        ] {
+            fixture.write(path);
+        }
+
+        for (threads, mode) in [
+            (1, WildcardMode::ComponentScoped),
+            (4, WildcardMode::ComponentScoped),
+            (1, WildcardMode::SeparatorCrossing),
+        ] {
+            let included = Walker::new(&fixture.root)
+                .threads(threads)
+                .wildcard_mode(mode)
+                .include("**/x")
+                .expect("valid include")
+                .options(WalkOptions::default().sort(true))
+                .collect()
+                .expect("walk succeeds");
+            assert_eq!(
+                relative_paths(included.entries(), &fixture.root),
+                [PathBuf::from("a/x"), PathBuf::from("x")],
+                "threads = {threads}, {mode:?}"
+            );
+
+            let excluded = Walker::new(&fixture.root)
+                .threads(threads)
+                .wildcard_mode(mode)
+                .include("**/*.js")
+                .expect("valid include")
+                .exclude("**/node_modules/**")
+                .expect("valid exclude")
+                .options(WalkOptions::default().sort(true))
+                .collect()
+                .expect("walk succeeds");
+            assert_eq!(
+                relative_paths(excluded.entries(), &fixture.root),
+                [
+                    PathBuf::from("my_node_modules/c.js"),
+                    PathBuf::from("pkg/my_node_modules/d.js"),
+                ],
+                "threads = {threads}, {mode:?}"
+            );
+        }
+
+        let scoped = WildcardMode::ComponentScoped;
+        let exclude = traversal_pattern(b"**/node_modules/**");
+        assert!(exclude.covers_subtree(b"node_modules", scoped));
+        assert!(exclude.covers_subtree(b"pkg/node_modules", scoped));
+        assert!(!exclude.covers_subtree(b"my_node_modules", scoped));
+        assert!(!exclude.covers_subtree(b"pkg/my_node_modules", scoped));
+        assert!(
+            !exclude.covers_subtree(b"my_node_modules", WildcardMode::SeparatorCrossing),
+            "the crossing reading applies the same component rule to `**`"
+        );
+        // Behind an escaped separator `**` is no component, so the exclude
+        // covers no subtree, whatever its literal prefix spells.
+        let escaped = traversal_pattern(br"a\/**");
+        assert!(!escaped.covers_subtree(br"a\", scoped));
+        assert!(!escaped.covers_subtree(b"a", scoped));
+        assert!(traversal_pattern(br"a\\/**").covers_subtree(br"a\", scoped));
     }
 
     #[test]

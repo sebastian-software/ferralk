@@ -41,11 +41,11 @@ const NARROW_IR_UNITS: usize = size_of::<NarrowSweepEngine>().div_ceil(size_of::
 
 /// Persistent and temporary word rows allocated while compiling a wide sweep.
 ///
-/// The byte table owns 256 rows, the engine keeps seven policy/state rows, and
-/// compilation uses two more rows for the wildcard sets. Charging the peak
-/// before allocation keeps the existing compiled-IR budget meaningful for a
-/// literal whose bytes expand to many sweep positions.
-const WIDE_WORD_ROWS_AT_COMPILE: usize = 256 + 7 + 2;
+/// The byte table owns 256 rows, the engine keeps nine policy/state rows, and
+/// compilation uses three more rows for the wildcard and recursive-prefix
+/// sets. Charging the peak before allocation keeps the existing compiled-IR
+/// budget meaningful for a literal whose bytes expand to many sweep positions.
+const WIDE_WORD_ROWS_AT_COMPILE: usize = 256 + 9 + 3;
 
 /// A compiled Shift-And automaton for one alternative's token list.
 ///
@@ -78,6 +78,12 @@ pub(crate) struct NarrowSweepEngine {
     table: [u64; 256],
     /// Positions that repeat and may be skipped: every star-like token.
     stars: u64,
+    /// `stars` without the `RecursivePrefix` positions: the closure after a
+    /// byte that is not a separator, where the next byte does not start a
+    /// component. A `**/` prefix may only hand over at a component start, so
+    /// its skip edge is taken only after a separator or at a component-start
+    /// candidate start.
+    stars_mid_component: u64,
     /// Positions a separator byte never reaches under `component_wildcards`
     /// without `root_component_wildcards`: wildcards directly after an
     /// explicit separator.
@@ -96,8 +102,12 @@ pub(crate) struct NarrowSweepEngine {
     /// boundary, plus the boundary before a trailing `Separator` +
     /// `RecursiveStar` pair — `src/**` accepts `src` itself.
     accept: u64,
-    /// The epsilon closure of the start boundary.
+    /// The epsilon closure of the start boundary, for a candidate that starts
+    /// a component.
     initial: u64,
+    /// The same closure for a candidate that starts inside a component, where
+    /// a leading `RecursivePrefix` cannot hand over yet.
+    initial_mid_component: u64,
     /// The option the leading-dot rule was folded in under, pinned so a
     /// mismatched match-time option is caught in debug builds.
     match_hidden: bool,
@@ -138,12 +148,14 @@ impl SweepEngine {
         let mut engine = NarrowSweepEngine {
             table: [0_u64; 256],
             stars: 0,
+            stars_mid_component: 0,
             sep_block_component: 0,
             sep_block_glob: 0,
             dot_block: 0,
             dot_stop_block: 0,
             accept: 1_u64 << position_count,
             initial: 0,
+            initial_mid_component: 0,
             match_hidden: options.match_hidden,
             case_insensitive: options.case_insensitive,
             root_wildcard: root_wildcard(tokens),
@@ -155,6 +167,7 @@ impl SweepEngine {
         // exactly its members.
         let mut wildcards = 0_u64;
         let mut consume_any = 0_u64;
+        let mut recursive_prefixes = 0_u64;
         let mut position = 0_usize;
         for (token_index, token) in tokens.iter().enumerate() {
             let bit = 1_u64 << position;
@@ -230,6 +243,7 @@ impl SweepEngine {
                 }
                 Token::RecursivePrefix => {
                     engine.stars |= bit;
+                    recursive_prefixes |= bit;
                     wildcards |= bit;
                     consume_any |= bit;
                 }
@@ -237,6 +251,7 @@ impl SweepEngine {
             position += 1;
         }
         debug_assert_eq!(position, position_count);
+        engine.stars_mid_component = engine.stars & !recursive_prefixes;
 
         for entry in &mut engine.table {
             *entry |= consume_any;
@@ -251,6 +266,7 @@ impl SweepEngine {
             engine.accept |= 1_u64 << (position_count - 2);
         }
         engine.initial = eclose(1, engine.stars);
+        engine.initial_mid_component = eclose(1, engine.stars_mid_component);
         Ok(Some(Box::new(Self::Narrow(Box::new(engine)))))
     }
 
@@ -261,7 +277,7 @@ impl SweepEngine {
     /// they never change between entry points of one [`Pattern`](crate::Pattern).
     pub(crate) fn is_match(&self, path: &[u8], options: PatternOptions) -> bool {
         let mut state = self.empty_state();
-        self.inject_start(&mut state);
+        self.inject_start(&mut state, options.candidate_starts_component);
         let mut at_component_start = options.candidate_starts_component;
         for &byte in path {
             if !self.advance(&mut state, byte, at_component_start, options) {
@@ -293,7 +309,7 @@ impl SweepEngine {
                 state
             }
         };
-        self.inject_start(state);
+        self.inject_start(state, options.candidate_starts_component);
         if self.accepts(state) {
             output.push(base);
         }
@@ -356,11 +372,24 @@ impl SweepEngine {
         }
     }
 
-    pub(crate) fn inject_start(&self, state: &mut SweepState) {
+    /// Adds the start boundary, closed for a candidate offset that does or
+    /// does not start a path component.
+    pub(crate) fn inject_start(&self, state: &mut SweepState, starts_component: bool) {
         match (self, state) {
-            (Self::Narrow(engine), SweepState::Narrow(state)) => *state |= engine.initial,
+            (Self::Narrow(engine), SweepState::Narrow(state)) => {
+                *state |= if starts_component {
+                    engine.initial
+                } else {
+                    engine.initial_mid_component
+                };
+            }
             (Self::Wide(engine), SweepState::Wide { state, .. }) => {
-                for (state, initial) in state.iter_mut().zip(&engine.initial) {
+                let initial = if starts_component {
+                    &engine.initial
+                } else {
+                    &engine.initial_mid_component
+                };
+                for (state, initial) in state.iter_mut().zip(initial) {
                     *state |= *initial;
                 }
             }
@@ -431,9 +460,16 @@ impl NarrowSweepEngine {
             mask &= !self.dot_block;
         }
         let consuming = state & mask;
+        // The byte after a separator starts a component, and only there may a
+        // `**/` prefix hand over.
+        let closure = if separator {
+            self.stars
+        } else {
+            self.stars_mid_component
+        };
         eclose(
             ((consuming & !self.stars) << 1) | (consuming & self.stars),
-            self.stars,
+            closure,
         )
     }
 }
@@ -461,12 +497,14 @@ fn position_count(tokens: &[Token]) -> Result<usize, PatternError> {
 pub(crate) struct WideSweepEngine {
     table: Vec<u64>,
     stars: Vec<u64>,
+    stars_mid_component: Vec<u64>,
     sep_block_component: Vec<u64>,
     sep_block_glob: Vec<u64>,
     dot_block: Vec<u64>,
     dot_stop_block: Vec<u64>,
     accept: Vec<u64>,
     initial: Vec<u64>,
+    initial_mid_component: Vec<u64>,
     match_hidden: bool,
     case_insensitive: bool,
     /// See [`NarrowSweepEngine::root_wildcard`].
@@ -495,12 +533,14 @@ impl WideSweepEngine {
         let mut engine = Self {
             table: vec![0; table_len],
             stars: vec![0; word_count],
+            stars_mid_component: vec![0; word_count],
             sep_block_component: vec![0; word_count],
             sep_block_glob: vec![0; word_count],
             dot_block: vec![0; word_count],
             dot_stop_block: vec![0; word_count],
             accept: vec![0; word_count],
             initial: vec![0; word_count],
+            initial_mid_component: vec![0; word_count],
             match_hidden: options.match_hidden,
             case_insensitive: options.case_insensitive,
             root_wildcard: root_wildcard(tokens),
@@ -509,6 +549,7 @@ impl WideSweepEngine {
 
         let mut wildcards = vec![0_u64; word_count];
         let mut consume_any = vec![0_u64; word_count];
+        let mut recursive_prefixes = vec![0_u64; word_count];
         let mut position = 0_usize;
         for (token_index, token) in tokens.iter().enumerate() {
             let after_separator =
@@ -573,6 +614,7 @@ impl WideSweepEngine {
                 }
                 Token::RecursivePrefix => {
                     set_bit(&mut engine.stars, position);
+                    set_bit(&mut recursive_prefixes, position);
                     set_bit(&mut wildcards, position);
                     set_bit(&mut consume_any, position);
                 }
@@ -580,6 +622,14 @@ impl WideSweepEngine {
             position += 1;
         }
         debug_assert_eq!(position, position_count);
+        for ((mid, stars), prefixes) in engine
+            .stars_mid_component
+            .iter_mut()
+            .zip(&engine.stars)
+            .zip(&recursive_prefixes)
+        {
+            *mid = stars & !prefixes;
+        }
 
         for row in engine.table.chunks_exact_mut(word_count) {
             for (word, any) in row.iter_mut().zip(&consume_any) {
@@ -593,7 +643,14 @@ impl WideSweepEngine {
             set_bit(&mut engine.accept, position_count - 2);
         }
         set_bit(&mut engine.initial, 0);
+        engine
+            .initial_mid_component
+            .copy_from_slice(&engine.initial);
         eclose_wide(&mut engine.initial, &engine.stars);
+        eclose_wide(
+            &mut engine.initial_mid_component,
+            &engine.stars_mid_component,
+        );
         Ok(engine)
     }
 
@@ -669,7 +726,14 @@ impl WideSweepEngine {
             state.fill(0);
             return false;
         }
-        eclose_wide(next, &self.stars);
+        eclose_wide(
+            next,
+            if separator {
+                &self.stars
+            } else {
+                &self.stars_mid_component
+            },
+        );
         std::mem::swap(state, next);
         next.fill(0);
         true

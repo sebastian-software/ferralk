@@ -1,0 +1,2 @@
+**/node_modules/**/*.js
+my_node_modules/a.js
