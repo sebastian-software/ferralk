@@ -295,7 +295,7 @@ fn finish(shared: Arc<Shared>, mut entries: Vec<WalkEntry>) -> Result<WalkResult
         return Err(error);
     }
     if shared.walker.options.sort {
-        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        crate::sort_order::sort_entries(&shared.walker, &mut entries);
     }
     Ok(WalkResult {
         entries,
