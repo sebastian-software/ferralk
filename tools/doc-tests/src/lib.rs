@@ -598,10 +598,12 @@ mod tests {
         );
     }
 
-    /// Cargo does not package the repository root's license text, so each
-    /// published crate carries its own copy. The copies are kept identical to
-    /// the root files rather than maintained twice. Both halves of the
-    /// ADR-0018 dual license have to travel with the crate.
+    /// Cargo packages a crate's own directory, so `ferralk-glob` carries a
+    /// copy of the repository's license texts and notice. ADR-0018 keeps the
+    /// same copies next to the `ferralk` sources in `crates/ferralk/`. The
+    /// copies are kept identical to the root files rather than maintained
+    /// twice. Both halves of the ADR-0018 dual license have to travel with
+    /// each crate.
     #[test]
     fn published_crates_ship_the_repository_license_and_notice() {
         let repository_root = repository_root();
@@ -621,15 +623,137 @@ mod tests {
         }
     }
 
+    /// `ferralk` is the root package, so its tarball is cut from the
+    /// repository root and takes the root license texts and notice directly.
+    /// Its `include` list is what puts them there. The patterns are anchored
+    /// with a leading `/`: `include` uses gitignore syntax, where a bare
+    /// `LICENSE-MIT` also matches the ADR-0018 copies under `crates/`.
+    #[test]
+    fn the_root_package_packages_the_repository_license_and_notice() {
+        let manifest = fs::read_to_string(repository_root().join("Cargo.toml"))
+            .expect("root manifest is readable");
+        let include = manifest
+            .lines()
+            .skip_while(|line| line.trim() != "include = [")
+            .skip(1)
+            .take_while(|line| line.trim() != "]")
+            .map(|line| line.trim().trim_end_matches(','))
+            .collect::<Vec<_>>();
+        for file in ["LICENSE-MIT", "LICENSE-APACHE", "NOTICE"] {
+            assert!(
+                include.contains(&format!("\"/{file}\"").as_str()),
+                "the root ferralk package must include the repository {file}: {include:?}"
+            );
+        }
+    }
+
+    /// The org product template (`sebastian-software/standards`,
+    /// `reference/release-please/rust-product-release-config.json`): one
+    /// component at `.`, the `rust` strategy, and no Cargo manifest in
+    /// `extra-files`. The strategy versions the root package, every listed
+    /// workspace member, their internal requirements, and the root
+    /// `Cargo.lock` itself; it can do that only for members listed by explicit
+    /// path and carrying a concrete `version`.
+    #[test]
+    fn release_please_versions_the_workspace_through_the_rust_strategy() {
+        let repository_root = repository_root();
+        let release_please = release_please_config(&repository_root);
+        let packages = release_please["packages"]
+            .as_object()
+            .expect("Release Please configuration lists packages");
+        assert_eq!(
+            packages.keys().collect::<Vec<_>>(),
+            vec!["."],
+            "Release Please must release one product component at the repository root"
+        );
+        assert_eq!(release_please["release-type"], "rust");
+        assert_eq!(packages["."]["component"], "ferralk");
+        assert!(
+            packages["."].get("version-file").is_none()
+                && packages["."].get("release-type").is_none(),
+            "the root component must take the top-level rust strategy, not a version file"
+        );
+
+        // The fuzz workspace keeps its own lockfile, which the strategy does
+        // not see, so those three lockfile entries are the only Cargo files
+        // Release Please is pointed at directly.
+        let cargo_extra_files = packages["."]["extra-files"]
+            .as_array()
+            .expect("Release Please package has extra files")
+            .iter()
+            .filter(|entry| entry["type"] != "generic")
+            .map(|entry| format!("{} {}", entry["path"], entry["jsonpath"]))
+            .collect::<Vec<_>>();
+        let expected_cargo_extra_files = ["ferralk", "ferralk-glob", "corpus"]
+            .map(|name| {
+                format!(
+                    "\"fuzz/Cargo.lock\" \"$.package[?(@.name.value==\\\"{name}\\\")].version\""
+                )
+            })
+            .to_vec();
+        assert_eq!(
+            cargo_extra_files, expected_cargo_extra_files,
+            "only the separate fuzz workspace's lockfile may be a typed extra file"
+        );
+
+        let product_version = product_version(&repository_root);
+        let root_manifest = fs::read_to_string(repository_root.join("Cargo.toml"))
+            .expect("root manifest is readable");
+        let members = root_manifest
+            .lines()
+            .skip_while(|line| line.trim() != "members = [")
+            .skip(1)
+            .take_while(|line| line.trim() != "]")
+            .map(|line| line.trim().trim_end_matches(',').trim_matches('"'))
+            .collect::<Vec<_>>();
+        assert!(
+            members.contains(&"crates/ferralk-glob"),
+            "ferralk-glob must stay a workspace member: {members:?}"
+        );
+        for member in members {
+            assert!(
+                !member.contains('*'),
+                "Release Please does not expand member globs: {member}"
+            );
+            let manifest = fs::read_to_string(repository_root.join(member).join("Cargo.toml"))
+                .unwrap_or_else(|error| panic!("{member}/Cargo.toml is readable: {error}"));
+            assert_eq!(
+                package_version(&manifest),
+                Some(product_version.as_str()),
+                "{member} must carry the product version as a concrete `version`"
+            );
+        }
+
+        assert!(
+            root_manifest.lines().any(|line| line
+                == format!(
+                    "ferralk-glob = {{ path = \"crates/ferralk-glob\", version = \"{product_version}\" }}"
+                )),
+            "ferralk must require ferralk-glob at the product version by both path and version"
+        );
+
+        let fuzz_lock = fs::read_to_string(repository_root.join("fuzz/Cargo.lock"))
+            .expect("fuzz lockfile is readable");
+        for name in ["ferralk", "ferralk-glob", "corpus"] {
+            let entry = format!("name = \"{name}\"");
+            let version = fuzz_lock
+                .lines()
+                .skip_while(|line| *line != entry)
+                .nth(1)
+                .unwrap_or_else(|| panic!("fuzz/Cargo.lock locks {name}"));
+            assert_eq!(
+                version,
+                format!("version = \"{product_version}\""),
+                "fuzz/Cargo.lock must lock {name} at the product version"
+            );
+        }
+    }
+
     #[test]
     fn release_please_versioned_consumer_docs_match_the_workspace() {
         let repository_root = repository_root();
-        let workspace_version = workspace_version(&repository_root);
-        let release_please =
-            fs::read_to_string(repository_root.join(".release-please-config.json"))
-                .expect("Release Please configuration is readable");
-        let release_please: Value =
-            serde_json::from_str(&release_please).expect("Release Please configuration is JSON");
+        let workspace_version = product_version(&repository_root);
+        let release_please = release_please_config(&repository_root);
 
         let extra_files = release_please["packages"]["."]["extra-files"]
             .as_array()
@@ -881,19 +1005,36 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
-    fn workspace_version(repository_root: &Path) -> String {
-        fs::read_to_string(repository_root.join("Cargo.toml"))
-            .expect("workspace manifest is readable")
+    fn release_please_config(repository_root: &Path) -> Value {
+        let release_please =
+            fs::read_to_string(repository_root.join(".release-please-config.json"))
+                .expect("Release Please configuration is readable");
+        serde_json::from_str(&release_please).expect("Release Please configuration is JSON")
+    }
+
+    /// The product version: the root `ferralk` package's own `version`, which
+    /// Release Please's `rust` strategy rewrites on every release.
+    fn product_version(repository_root: &Path) -> String {
+        let manifest = fs::read_to_string(repository_root.join("Cargo.toml"))
+            .expect("workspace manifest is readable");
+        package_version(&manifest)
+            .map(str::to_owned)
+            .expect("the root package declares a concrete version")
+    }
+
+    /// The concrete `version` in a manifest's `[package]` table, or `None`
+    /// when it is missing or inherited from the workspace.
+    fn package_version(manifest: &str) -> Option<&str> {
+        manifest
             .lines()
-            .skip_while(|line| line.trim() != "[workspace.package]")
+            .skip_while(|line| line.trim() != "[package]")
             .skip(1)
+            .take_while(|line| !line.trim_start().starts_with('['))
             .find_map(|line| {
                 line.trim()
                     .strip_prefix("version = \"")
                     .and_then(|value| value.strip_suffix('\"'))
             })
-            .map(str::to_owned)
-            .expect("workspace package declares a version")
     }
 
     fn semver_values(line: &str) -> Vec<&str> {

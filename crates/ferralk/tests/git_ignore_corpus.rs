@@ -73,7 +73,7 @@ fn relative_paths(entries: &[WalkEntry], root: &Path) -> Vec<PathBuf> {
 const KNOWN_WALKER_GAPS: &[&str] = &[];
 
 fn corpus_cases(kind: corpus::CaseKind) -> Vec<corpus::Case> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
     let mut files = fs::read_dir(root)
         .expect("read corpus directory")
         .map(|entry| entry.expect("read corpus entry").path())

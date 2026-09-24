@@ -1,18 +1,144 @@
+# `ferralk` is the root package so Release Please's `rust` strategy can version
+# the product natively: it bumps this `[package]`, every workspace member, the
+# `ferralk-glob` requirement below and `Cargo.lock` in one release pull
+# request. The sources stay under `crates/ferralk/`; `include` keeps the
+# published tarball to the crate's own files plus the repository's license
+# texts and notice.
+[package]
+name = "ferralk"
+description = "Glob matching and parallel filesystem walking, byte-first, with an unsafe-free matcher."
+# Release Please rewrites this line and every member's `version`; members and
+# internal requirements carry concrete versions rather than inheriting one,
+# because it cannot rewrite an inherited `version.workspace = true`.
+version = "1.0.0"
+readme = "crates/ferralk/README.md"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/ferralk"
+keywords.workspace = true
+categories.workspace = true
+# The corpus replays need the unpublished `corpus` package, a path-only
+# dev-dependency that Cargo strips when packaging. Their test files are left
+# out of this list so `cargo test` builds from the published crate.
+include = [
+    "crates/ferralk/src/**",
+    "crates/ferralk/examples/**",
+    "crates/ferralk/tests/allocation_regression.rs",
+    "crates/ferralk/tests/parallel_allocation_regression.rs",
+    "crates/ferralk/tests/portable_fixtures.rs",
+    "crates/ferralk/tests/wide_frontier_regression.rs",
+    "crates/ferralk/README.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/NOTICE",
+]
+
+[lib]
+path = "crates/ferralk/src/lib.rs"
+
+[[example]]
+name = "early_stop"
+path = "crates/ferralk/examples/early_stop.rs"
+
+[[example]]
+name = "find"
+path = "crates/ferralk/examples/find.rs"
+
+[[example]]
+name = "gitignore_walk"
+path = "crates/ferralk/examples/gitignore_walk.rs"
+
+[[example]]
+name = "include_exclude"
+path = "crates/ferralk/examples/include_exclude.rs"
+
+[[example]]
+name = "keep_going"
+path = "crates/ferralk/examples/keep_going.rs"
+
+[[test]]
+name = "allocation_regression"
+path = "crates/ferralk/tests/allocation_regression.rs"
+
+[[test]]
+name = "git_ignore_corpus"
+path = "crates/ferralk/tests/git_ignore_corpus.rs"
+
+[[test]]
+name = "parallel_allocation_regression"
+path = "crates/ferralk/tests/parallel_allocation_regression.rs"
+
+[[test]]
+name = "portable_fixtures"
+path = "crates/ferralk/tests/portable_fixtures.rs"
+
+[[test]]
+name = "walker_pattern_preset"
+path = "crates/ferralk/tests/walker_pattern_preset.rs"
+
+[[test]]
+name = "wide_frontier_regression"
+path = "crates/ferralk/tests/wide_frontier_regression.rs"
+
+# docs.rs builds on Linux, where `native-macos` compiles to nothing, so the
+# rendered documentation covers the Linux backend and the portable walker.
+# `--cfg docsrs` turns on the `doc_cfg` annotations that name the feature and
+# target a gated item needs.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# Experimental native backends. Their names and selected implementations are
+# outside the 1.x semver contract and may change in a minor release.
+native-linux = []
+native-macos = []
+# Development-only corpus and fuzz hooks. No item enabled by this feature is
+# covered by the 1.x semver contract.
+unstable-test-hooks = ["ferralk-glob/unstable-test-hooks"]
+
+[dependencies]
+crossbeam-deque = "0.8.7"
+ferralk-glob = { path = "crates/ferralk-glob", version = "1.0.0" }
+memchr = "2.8.3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+unicode-normalization = "0.1.25"
+
+[dev-dependencies]
+allocation-counter = "=0.8.1"
+corpus = { path = "tools/corpus" }
+# The engine ADR-0014 replaced, kept for the test that compares the two rule
+# matchers over generated rules and paths.
+ignore = "=0.4.33"
+loom = "=0.7.2"
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
 [workspace]
+# Explicit paths, no globs: Release Please reads each listed member's
+# `Cargo.toml` directly. The root package is a member implicitly.
 members = [
     "crates/ferralk-glob",
-    "crates/ferralk",
     "tools/corpus",
     "tools/harness",
     "tools/oracle",
     "tools/bench",
     "tools/doc-tests",
 ]
-default-members = ["crates/ferralk-glob", "crates/ferralk"]
+default-members = [".", "crates/ferralk-glob"]
 resolver = "3"
 
 [workspace.package]
-version = "1.0.0"
 edition = "2024"
 rust-version = "1.96"
 authors = ["Sebastian Software GmbH"]

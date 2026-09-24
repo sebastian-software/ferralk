@@ -87,7 +87,7 @@ fn relative_paths(entries: &[WalkEntry], root: &Path) -> BTreeSet<PathBuf> {
 /// list operations strip a base directory first and add nothing a walk root
 /// does not already express.
 fn corpus_inputs() -> (BTreeSet<String>, BTreeSet<(String, String)>) {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
     let mut files = fs::read_dir(root)
         .expect("read corpus directory")
         .map(|entry| entry.expect("read corpus entry").path())

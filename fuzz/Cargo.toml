@@ -16,10 +16,10 @@ libfuzzer-sys = "=0.4.13"
 serde_json = "=1.0.151"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-ferralk = { path = "../crates/ferralk", features = ["native-macos", "unstable-test-hooks"] }
+ferralk = { path = "..", features = ["native-macos", "unstable-test-hooks"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-ferralk = { path = "../crates/ferralk", features = ["native-linux", "unstable-test-hooks"] }
+ferralk = { path = "..", features = ["native-linux", "unstable-test-hooks"] }
 
 [[bin]]
 name = "ignore_rule_parser"
