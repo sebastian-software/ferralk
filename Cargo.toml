@@ -29,6 +29,7 @@ include = [
     "crates/ferralk/examples/**",
     "crates/ferralk/tests/allocation_regression.rs",
     "crates/ferralk/tests/parallel_allocation_regression.rs",
+    "crates/ferralk/tests/pattern_memory_regression.rs",
     "crates/ferralk/tests/portable_fixtures.rs",
     "crates/ferralk/tests/wide_frontier_regression.rs",
     "crates/ferralk/README.md",
@@ -71,6 +72,10 @@ path = "crates/ferralk/tests/git_ignore_corpus.rs"
 [[test]]
 name = "parallel_allocation_regression"
 path = "crates/ferralk/tests/parallel_allocation_regression.rs"
+
+[[test]]
+name = "pattern_memory_regression"
+path = "crates/ferralk/tests/pattern_memory_regression.rs"
 
 [[test]]
 name = "portable_fixtures"
