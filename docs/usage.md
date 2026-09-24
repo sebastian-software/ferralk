@@ -73,12 +73,8 @@ enabled.
 ```rust
 use ferralk_glob::{Pattern, PatternOptions};
 
-let options = PatternOptions::default()
-    .braces(true)
-    .extglob(true)
-    .recursive_double_star(true)
-    .match_hidden(false);
-let pattern = Pattern::compile("{src,tests}/**/*.rs", options)?;
+// Braces, extglobs and a recursive `**`; wildcards skip a leading period.
+let pattern = Pattern::compile("{src,tests}/**/*.rs", PatternOptions::walker())?;
 
 assert!(pattern.is_match_glob_path("src/lib.rs"));
 assert!(pattern.is_match_glob_path("tests/unit/parser.rs"));
@@ -86,16 +82,25 @@ assert!(!pattern.is_match_glob_path(".cache/src/lib.rs"));
 # Ok::<(), ferralk_glob::PatternError>(())
 ```
 
-The `PatternOptions` default is intentionally conservative:
+`PatternOptions` has two named starting points. `PatternOptions::walker()` is
+the dialect `Walker` compiles its include and exclude patterns in, and the
+walker builds its own options from it: recursive `**`, braces, and extglobs on,
+everything else at its default, as the table below shows. Chain
+`.match_hidden(true)` to mirror `Walker::match_hidden(true)`, and match with
+`is_match_glob_path`, or with `is_match` under
+`WildcardMode::SeparatorCrossing`, to answer as the walker does for a
+root-relative path. `PatternOptions::default()` is intentionally conservative:
+under it `src/**/*.rs` does not match `src/lib.rs`, nor `*.{rs,toml}`
+`lib.rs`, until the matching switch is enabled.
 
-| Option | Default | Effect when enabled |
-| --- | --- | --- |
-| `braces` | off | Enables nested `{a,b}` alternatives. |
-| `recursive_double_star` | off | Gives consecutive `**` recursive semantics; while off, a star run is equivalent to `*`. |
-| `extglob` | off | Enables Bash-style `@()`, `?()`, `*()`, `+()`, and `!()`. |
-| `match_hidden` | off | Allows wildcard tokens to match a leading period. |
-| `case_insensitive` | off | Uses ASCII-only case folding. |
-| `escape` | on | Interprets backslash as an escape. |
+| Option | `default()` | `walker()` | Effect when enabled |
+| --- | --- | --- | --- |
+| `braces` | off | on | Enables nested `{a,b}` alternatives. |
+| `recursive_double_star` | off | on | Gives consecutive `**` recursive semantics; while off, a star run is equivalent to `*`. |
+| `extglob` | off | on | Enables Bash-style `@()`, `?()`, `*()`, `+()`, and `!()`. |
+| `match_hidden` | off | off | Allows wildcard tokens to match a leading period. |
+| `case_insensitive` | off | off | Uses ASCII-only case folding. |
+| `escape` | on | on | Interprets backslash as an escape. |
 
 Use `Pattern::validate` for syntax-only checks and `Pattern::has_wildcards` to
 choose between a literal and glob path without compiling an application-level

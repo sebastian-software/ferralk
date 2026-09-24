@@ -129,17 +129,14 @@ hold. For an unreleased Git dependency, pin a revision for repeatable builds.
 ## Quick start
 
 Compile a pattern once and match it many times. Syntax that changes meaning is
-always opt-in:
+always opt-in: `PatternOptions::default()` reads `**`, braces, and extglobs as
+ordinary text, and `PatternOptions::walker()` enables all three, exactly as the
+walker does:
 
 ```rust
 use ferralk_glob::{Pattern, PatternOptions};
 
-let source_file = Pattern::compile(
-    "src/**/*.{rs,toml}",
-    PatternOptions::default()
-        .recursive_double_star(true)
-        .braces(true),
-)?;
+let source_file = Pattern::compile("src/**/*.{rs,toml}", PatternOptions::walker())?;
 
 assert!(source_file.is_match_glob_path("src/lib.rs"));
 assert!(!source_file.is_match_glob_path("src/generated/lib.rs.bak"));
@@ -194,7 +191,8 @@ The source is in [`crates/ferralk/examples/find.rs`](crates/ferralk/examples/fin
 1. **Ordinary wildcards stay inside one path component.** `*.ts` selects
    `main.ts` in the walk root and not `src/main.ts`; write `**/*.ts` for
    descendants. The walker enables `**`, braces, and extglobs for you, while
-   `ferralk-glob` leaves each one opt-in through `PatternOptions`.
+   `ferralk-glob` leaves each one opt-in through `PatternOptions`;
+   `PatternOptions::walker()` selects the walker's dialect in one call.
 2. **Wildcards do not cover a leading period.** `**/*.ts` skips
    `.cache/routes.ts` and the whole `.cache` subtree. Opt in with
    `Walker::match_hidden(true)`, or drop hidden entries before any pattern is

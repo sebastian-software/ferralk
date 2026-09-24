@@ -946,6 +946,12 @@ impl Walker {
     /// Adds an OR-ed include pattern and returns the builder for consuming
     /// chains. No includes means every non-excluded entry is returned.
     ///
+    /// Include and exclude patterns share one dialect, which
+    /// [`PatternOptions::walker`] names: recursive `**`, braces and extglobs,
+    /// with [`Walker::match_hidden`] deciding whether a wildcard covers a
+    /// leading period. Compile a pattern with that preset to check or match it
+    /// the way the walker will.
+    ///
     /// The pattern may be absolute. See [`Walker::exclude`] for what that
     /// means and when it is rejected.
     ///
@@ -1836,15 +1842,14 @@ fn reject_unwalkable_relative_pattern(
     Err(PatternError::new(offset.unwrap_or(0), message))
 }
 
-/// The pattern dialect every walker pattern is compiled in. Only
-/// `match_hidden` is caller-selectable; the other three are what a filesystem
-/// glob means here and are not negotiable per walk.
+/// The pattern dialect every walker pattern is compiled in.
+///
+/// [`PatternOptions::walker`] is the public name for it, so a consumer who
+/// validates or re-matches a walker pattern gets the same semantics. Only
+/// `match_hidden` is caller-selectable; the rest of the preset is what a
+/// filesystem glob means here and is not negotiable per walk.
 fn traversal_pattern_options(match_hidden: bool) -> PatternOptions {
-    PatternOptions::default()
-        .braces(true)
-        .recursive_double_star(true)
-        .extglob(true)
-        .match_hidden(match_hidden)
+    PatternOptions::walker().match_hidden(match_hidden)
 }
 
 #[derive(Debug, Clone)]

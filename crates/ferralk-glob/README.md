@@ -7,12 +7,7 @@ Syntax that changes meaning stays explicit through `PatternOptions`.
 ```rust
 use ferralk_glob::{Pattern, PatternOptions};
 
-let source_file = Pattern::compile(
-    "src/**/*.{rs,toml}",
-    PatternOptions::default()
-        .recursive_double_star(true)
-        .braces(true),
-)?;
+let source_file = Pattern::compile("src/**/*.{rs,toml}", PatternOptions::walker())?;
 
 assert!(source_file.is_match_glob_path("src/lib.rs"));
 assert!(!source_file.is_match_glob_path("src/generated/lib.rs.bak"));
@@ -27,6 +22,9 @@ separators but wildcards after an explicit separator are component-local. With
 `recursive_double_star` disabled, `**` is equivalent to `*`; enable it for
 recursive separator crossing. Braces, extglobs, hidden-name matching, ASCII
 case folding, and changed escaping remain explicit opt-ins.
+`PatternOptions::default()` enables none of them; `PatternOptions::walker()`
+enables recursive `**`, braces, and extglobs, the dialect the `ferralk` walker
+reads its include and exclude patterns in.
 
 For the full syntax, error contract, and compatibility notes, see the
 [crate documentation](https://docs.rs/ferralk-glob), the
