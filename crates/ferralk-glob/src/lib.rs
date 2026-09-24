@@ -8,17 +8,14 @@
 //! times against bytes, so filenames never pass through a lossy UTF-8
 //! conversion. Syntax that changes meaning is opt-in through
 //! [`PatternOptions`]: recursive `**`, braces, extglobs, hidden-name matching,
-//! and ASCII case folding are off until asked for.
+//! and ASCII case folding are off in [`PatternOptions::default`] until asked
+//! for. [`PatternOptions::walker`] asks for the first three at once, which is
+//! the dialect the `ferralk` walker reads its patterns in.
 //!
 //! ```
 //! use ferralk_glob::{Pattern, PatternOptions};
 //!
-//! let pattern = Pattern::compile(
-//!     "src/**/*.{rs,toml}",
-//!     PatternOptions::default()
-//!         .recursive_double_star(true)
-//!         .braces(true),
-//! )?;
+//! let pattern = Pattern::compile("src/**/*.{rs,toml}", PatternOptions::walker())?;
 //!
 //! assert!(pattern.is_match_glob_path("src/lib.rs"));
 //! assert!(pattern.is_match_glob_path("src/parser/Cargo.toml"));
@@ -174,6 +171,12 @@ impl PathFilter {
 }
 
 /// Explicit switches that affect glob interpretation.
+///
+/// Two starting points have names. [`PatternOptions::default`] is the
+/// conservative reading: `**`, braces and extglobs are ordinary text until a
+/// switch enables them. [`PatternOptions::walker`] is the dialect the `ferralk`
+/// walker compiles its include and exclude patterns in. Either one can be
+/// adjusted further with the builder methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatternOptions {
     braces: bool,
@@ -197,22 +200,89 @@ pub struct PatternOptions {
 
 impl Default for PatternOptions {
     fn default() -> Self {
-        Self {
-            braces: false,
-            recursive_double_star: false,
-            extglob: false,
-            match_hidden: false,
-            case_insensitive: false,
-            escape: true,
-            component_wildcards: false,
-            root_component_wildcards: false,
-            candidate_root_component_wildcard: false,
-            candidate_starts_component: true,
-        }
+        Self::CONSERVATIVE
     }
 }
 
 impl PatternOptions {
+    /// The value [`Default::default`] returns, spelled as a constant so that
+    /// [`Self::walker`] can build on it in a `const fn`.
+    const CONSERVATIVE: Self = Self {
+        braces: false,
+        recursive_double_star: false,
+        extglob: false,
+        match_hidden: false,
+        case_insensitive: false,
+        escape: true,
+        component_wildcards: false,
+        root_component_wildcards: false,
+        candidate_root_component_wildcard: false,
+        candidate_starts_component: true,
+    };
+
+    /// The dialect `ferralk::Walker` compiles its include and exclude patterns
+    /// in: [`default`](Self::default) with recursive `**`, braces and extglobs
+    /// enabled.
+    ///
+    /// Compile a walker pattern with these options to validate it up front or
+    /// to match it again with the walker's semantics, for instance inside a
+    /// `visit` predicate or over paths that never touched a filesystem. The
+    /// walker builds its own options from this constructor, so the two cannot
+    /// drift apart.
+    ///
+    /// Every other switch keeps its default. In particular a wildcard does not
+    /// cover a leading period, which matches the walker's default; chain
+    /// [`match_hidden(true)`](Self::match_hidden) to mirror
+    /// `Walker::match_hidden(true)`. Case folding and escaping are not walker
+    /// settings and stay at their defaults there too.
+    ///
+    /// Options select syntax, and the entry point selects how far a wildcard
+    /// reaches. For a root-relative path, [`Pattern::is_match_glob_path`]
+    /// answers as the walker does under its default
+    /// `WildcardMode::ComponentScoped`, and [`Pattern::is_match`] as it does
+    /// under `WildcardMode::SeparatorCrossing`. A few walker rules sit outside
+    /// the pattern dialect: the walker reads a trailing `/` as "directories
+    /// only", rewrites an absolute pattern against its root, and refuses a
+    /// pattern no walk can match, such as one with a `..` component, which
+    /// [`Pattern::compile`] accepts as matcher text.
+    ///
+    /// ```
+    /// use ferralk_glob::{Pattern, PatternOptions};
+    ///
+    /// let walker = PatternOptions::walker();
+    /// let conservative = PatternOptions::default();
+    ///
+    /// // `**` crosses directories only in the walker dialect; by default it
+    /// // is two ordinary stars that stay inside one component.
+    /// let recursive = Pattern::compile("src/**/*.rs", walker)?;
+    /// assert!(recursive.is_match_glob_path("src/lib.rs"));
+    /// assert!(recursive.is_match_glob_path("src/parser/token.rs"));
+    /// let plain = Pattern::compile("src/**/*.rs", conservative)?;
+    /// assert!(!plain.is_match_glob_path("src/lib.rs"));
+    ///
+    /// // Braces are alternatives in the walker dialect and literal text by
+    /// // default.
+    /// let either = Pattern::compile("*.{rs,toml}", walker)?;
+    /// assert!(either.is_match_glob_path("lib.rs"));
+    /// assert!(either.is_match_glob_path("Cargo.toml"));
+    /// let literal = Pattern::compile("*.{rs,toml}", conservative)?;
+    /// assert!(!literal.is_match_glob_path("lib.rs"));
+    /// assert!(literal.is_match_glob_path("odd.{rs,toml}"));
+    ///
+    /// // Like the walker, the preset leaves hidden names to an explicit opt-in.
+    /// assert!(!recursive.is_match_glob_path("src/.cache/lib.rs"));
+    /// let hidden = Pattern::compile("src/**/*.rs", walker.match_hidden(true))?;
+    /// assert!(hidden.is_match_glob_path("src/.cache/lib.rs"));
+    /// # Ok::<(), ferralk_glob::PatternError>(())
+    /// ```
+    #[must_use]
+    pub const fn walker() -> Self {
+        Self::CONSERVATIVE
+            .recursive_double_star(true)
+            .braces(true)
+            .extglob(true)
+    }
+
     /// Enables nested brace alternatives.
     #[must_use]
     pub const fn braces(mut self, enabled: bool) -> Self {
@@ -362,12 +432,7 @@ impl Pattern {
     /// ```
     /// use ferralk_glob::{Pattern, PatternOptions};
     ///
-    /// let source_file = Pattern::compile(
-    ///     "src/**/*.{rs,toml}",
-    ///     PatternOptions::default()
-    ///         .recursive_double_star(true)
-    ///         .braces(true),
-    /// )?;
+    /// let source_file = Pattern::compile("src/**/*.{rs,toml}", PatternOptions::walker())?;
     ///
     /// assert!(source_file.is_match_glob_path("src/lib.rs"));
     /// assert!(!source_file.is_match_glob_path("src/generated/lib.rs.bak"));
@@ -6860,6 +6925,20 @@ mod tests {
         // but an earlier one still is.
         assert!(compile("*b.ts").is_match("bb.ts"));
         assert!(!compile("*x.ts").is_match(".a/x.ts"));
+    }
+
+    /// The walker preset is the conservative default with exactly the three
+    /// syntax switches a filesystem glob needs; hidden names, case folding and
+    /// escaping keep their defaults.
+    #[test]
+    fn walker_preset_enables_exactly_the_walker_syntax() {
+        assert_eq!(
+            PatternOptions::walker(),
+            PatternOptions::default()
+                .recursive_double_star(true)
+                .braces(true)
+                .extglob(true)
+        );
     }
 
     #[test]

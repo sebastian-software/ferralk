@@ -12,10 +12,10 @@ homepage.workspace = true
 documentation = "https://docs.rs/ferralk"
 keywords.workspace = true
 categories.workspace = true
-# The Git-verified ignore corpus replay needs the unpublished `corpus`
-# package, a path-only dev-dependency that Cargo strips when packaging. Keep
-# that test out of the tarball so `cargo test` builds from the published crate.
-exclude = ["tests/git_ignore_corpus.rs"]
+# The corpus replays need the unpublished `corpus` package, a path-only
+# dev-dependency that Cargo strips when packaging. Keep those tests out of the
+# tarball so `cargo test` builds from the published crate.
+exclude = ["tests/git_ignore_corpus.rs", "tests/walker_pattern_preset.rs"]
 
 # docs.rs builds on Linux, where `native-macos` compiles to nothing, so the
 # rendered documentation covers the Linux backend and the portable walker.

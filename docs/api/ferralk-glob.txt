@@ -53,6 +53,7 @@ pub const fn ferralk_glob::PatternOptions::escape(self, bool) -> Self
 pub const fn ferralk_glob::PatternOptions::extglob(self, bool) -> Self
 pub const fn ferralk_glob::PatternOptions::match_hidden(self, bool) -> Self
 pub const fn ferralk_glob::PatternOptions::recursive_double_star(self, bool) -> Self
+pub const fn ferralk_glob::PatternOptions::walker() -> Self
 impl core::clone::Clone for ferralk_glob::PatternOptions
 pub fn ferralk_glob::PatternOptions::clone(&self) -> ferralk_glob::PatternOptions
 impl core::cmp::Eq for ferralk_glob::PatternOptions
