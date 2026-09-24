@@ -73,6 +73,11 @@ Run `cargo fuzz run macos_dirent_parser` or `cargo fuzz run
 macos_bulk_record_parser` on macOS for the native record parsers. Run `cargo
 fuzz run linux_dirent_parser` on Linux for the native record parser.
 
+cargo-fuzz needs a nightly compiler, and the root `rust-toolchain.toml`
+selects stable, so name the nightly CI uses:
+`cargo +"$(cat .github/nightly-toolchain)" fuzz run pattern_parser`, and the
+same prefix for every other target. CONTRIBUTING describes that pin.
+
 Crash artifacts belong under fuzz/artifacts. Minimize a saved input with
 `cargo fuzz tmin` followed by the target and artifact, then convert the
 minimized behavior into a source-linked corpus regression case before fixing

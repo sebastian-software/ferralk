@@ -143,6 +143,18 @@ Without Zig 0.16 and libclang, add `--exclude oracle`; the resulting figure is
 then a little different from CI's, which measures the whole workspace. The
 `lcov.info` the run drops in the repository root is ignored by Git.
 
+The lanes that need a nightly toolchain — the fuzz targets, the
+AddressSanitizer and Miri jobs, and the public API snapshot check in the `lint`
+job — all use the one nightly named in
+[.github/nightly-toolchain](.github/nightly-toolchain). Every job reads that
+file into `NIGHTLY_TOOLCHAIN` rather than restating the date, and
+`cargo test -p doc-tests` fails if a workflow names a dated nightly itself.
+Locally, pass the same toolchain explicitly, for example
+`cargo +"$(cat .github/nightly-toolchain)" fuzz run pattern_parser`; the
+seeded `rust-toolchain.toml` selects stable for everything else. Bumping the
+pin changes the rustdoc JSON the public API snapshots are rendered from, so a
+bump regenerates `docs/api/` in the same pull request.
+
 Changes to the native backends also need `--features native-macos` or
 `--features native-linux` on the platform that has them; the corresponding CI
 jobs are the gate for the other one.
@@ -184,9 +196,8 @@ cadence below asks for, by maintainer decision on 2026-09-24;
   consumer-visible breaking change.
 - [ ] Run the canonical preflight above on the release candidate commit and
   verify all platform, oracle, semver, and policy CI jobs.
-- [ ] Using `cargo-public-api` 0.52.0 and the nightly pinned as
-  `PUBLIC_API_NIGHTLY` in the `lint` job of `.github/workflows/ci.yml`,
-  regenerate `docs/api/ferralk.txt` and `docs/api/ferralk-glob.txt` with
+- [ ] Using `cargo-public-api` 0.52.0 and the nightly pinned in
+  `.github/nightly-toolchain`, regenerate `docs/api/ferralk.txt` and `docs/api/ferralk-glob.txt` with
   `cargo +<that nightly> public-api -p <crate> --simplified --color never`;
   review every changed line as API rather than accepting generated output
   mechanically.
