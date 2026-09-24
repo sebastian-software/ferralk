@@ -9,7 +9,9 @@ description: Use when Rust code finds files or matches glob patterns with the fe
 
 - Files on disk: `ferralk::Walker`, with root-relative `include` and `exclude`
   globs. Excludes prune: an excluded directory is never opened.
-- A path or string you already hold: `ferralk_glob::Pattern`. Depend on
+- A path or string you already hold: `ferralk_glob::Pattern`, or
+  `ferralk_glob::PatternSet` for a list of globs (the `globset::GlobSet`
+  counterpart). Depend on
   `ferralk-glob` alone if you never walk; `ferralk` re-exports it as
   `ferralk::ferralk_glob`.
 - Both are synchronous. From async code, run the walk in
@@ -57,21 +59,22 @@ let result = walker.collect()?;
 # Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
 ```
 
-Match paths you hold against several globs:
+Match paths you hold against several globs with a `PatternSet`, not a loop:
 
 ```rust
-use ferralk_glob::{Pattern, PatternError, PatternOptions};
+use ferralk_glob::{PatternOptions, PatternSet, PatternSetError};
 
-let patterns = ["src/**/*.rs", "*.toml"]
-    .iter()
-    .map(|glob| Pattern::compile(glob, PatternOptions::walker()))
-    .collect::<Result<Vec<_>, PatternError>>()?;
-let is_selected = |path: &str| patterns.iter().any(|pattern| pattern.is_match_glob_path(path));
+let globs = ["src/**/*.rs", "*.toml"];
+let set = PatternSet::new(globs, PatternOptions::walker())?; // error.index() names the bad glob
 
-assert!(is_selected("src/parser/lexer.rs"));
-assert!(is_selected("Cargo.toml"));
-assert!(!is_selected("crates/cli/Cargo.toml"));
-# Ok::<(), PatternError>(())
+assert!(set.is_match_glob_path("src/parser/lexer.rs"));
+assert!(set.is_match_glob_path("Cargo.toml"));
+assert!(!set.is_match_glob_path("crates/cli/Cargo.toml"));
+
+let mut which = Vec::new(); // cleared and refilled, in ascending order
+set.matches_glob_path_into("Cargo.toml", &mut which);
+assert_eq!(which, [1]);
+# Ok::<(), PatternSetError>(())
 ```
 
 More, all tested: [ferralk recipes](https://docs.rs/ferralk/latest/ferralk/#recipes)

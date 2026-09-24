@@ -38,11 +38,13 @@ releases.
 - The `unstable-test-hooks` feature and every item enabled only by it. It
   exists for the repository's corpus and fuzz harnesses and is not a consumer
   API.
-- Human-readable diagnostic text: `PatternError::message()`, `WalkError`'s
-  `Display` output, and the messages of underlying `std::io::Error` values.
+- Human-readable diagnostic text: `PatternError::message()`, the `Display`
+  output of `PatternError`, `PatternSetError`, and `WalkError`, and the
+  messages of underlying `std::io::Error` values.
   Corpus `error_message` fields keep diagnostics reviewable inside this
   repository, but do not turn the wording into a semver promise. Use
-  `PatternError::offset()` and `WalkError::operation()` for program logic.
+  `PatternError::offset()`, `PatternSetError::index()`, and
+  `WalkError::operation()` for program logic.
 
 ## Public enum policy
 

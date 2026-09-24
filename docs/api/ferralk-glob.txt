@@ -15,6 +15,8 @@ impl core::clone::Clone for ferralk_glob::Pattern
 pub fn ferralk_glob::Pattern::clone(&self) -> ferralk_glob::Pattern
 impl core::fmt::Debug for ferralk_glob::Pattern
 pub fn ferralk_glob::Pattern::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::iter::traits::collect::FromIterator<ferralk_glob::Pattern> for ferralk_glob::PatternSet
+pub fn ferralk_glob::PatternSet::from_iter<I: core::iter::traits::collect::IntoIterator<Item = ferralk_glob::Pattern>>(I) -> Self
 impl core::marker::Freeze for ferralk_glob::Pattern
 impl core::marker::Send for ferralk_glob::Pattern
 impl core::marker::Sync for ferralk_glob::Pattern
@@ -72,6 +74,55 @@ impl core::marker::Unpin for ferralk_glob::PatternOptions
 impl core::marker::UnsafeUnpin for ferralk_glob::PatternOptions
 impl core::panic::unwind_safe::RefUnwindSafe for ferralk_glob::PatternOptions
 impl core::panic::unwind_safe::UnwindSafe for ferralk_glob::PatternOptions
+pub struct ferralk_glob::PatternSet
+impl ferralk_glob::PatternSet
+pub fn ferralk_glob::PatternSet::is_empty(&self) -> bool
+pub fn ferralk_glob::PatternSet::is_match(&self, impl core::convert::AsRef<[u8]>) -> bool
+pub fn ferralk_glob::PatternSet::is_match_glob_path(&self, impl core::convert::AsRef<[u8]>) -> bool
+pub fn ferralk_glob::PatternSet::is_match_path(&self, impl core::convert::AsRef<[u8]>) -> bool
+pub fn ferralk_glob::PatternSet::len(&self) -> usize
+pub fn ferralk_glob::PatternSet::matches_glob_path_into(&self, impl core::convert::AsRef<[u8]>, &mut alloc::vec::Vec<usize>)
+pub fn ferralk_glob::PatternSet::matches_into(&self, impl core::convert::AsRef<[u8]>, &mut alloc::vec::Vec<usize>)
+pub fn ferralk_glob::PatternSet::matches_path_into(&self, impl core::convert::AsRef<[u8]>, &mut alloc::vec::Vec<usize>)
+pub fn ferralk_glob::PatternSet::new<I>(I, ferralk_glob::PatternOptions) -> core::result::Result<Self, ferralk_glob::PatternSetError> where I: core::iter::traits::collect::IntoIterator, <I as core::iter::traits::collect::IntoIterator>::Item: core::convert::AsRef<[u8]>
+impl core::clone::Clone for ferralk_glob::PatternSet
+pub fn ferralk_glob::PatternSet::clone(&self) -> ferralk_glob::PatternSet
+impl core::default::Default for ferralk_glob::PatternSet
+pub fn ferralk_glob::PatternSet::default() -> ferralk_glob::PatternSet
+impl core::fmt::Debug for ferralk_glob::PatternSet
+pub fn ferralk_glob::PatternSet::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::iter::traits::collect::FromIterator<ferralk_glob::Pattern> for ferralk_glob::PatternSet
+pub fn ferralk_glob::PatternSet::from_iter<I: core::iter::traits::collect::IntoIterator<Item = ferralk_glob::Pattern>>(I) -> Self
+impl core::marker::Freeze for ferralk_glob::PatternSet
+impl core::marker::Send for ferralk_glob::PatternSet
+impl core::marker::Sync for ferralk_glob::PatternSet
+impl core::marker::Unpin for ferralk_glob::PatternSet
+impl core::marker::UnsafeUnpin for ferralk_glob::PatternSet
+impl core::panic::unwind_safe::RefUnwindSafe for ferralk_glob::PatternSet
+impl core::panic::unwind_safe::UnwindSafe for ferralk_glob::PatternSet
+pub struct ferralk_glob::PatternSetError
+impl ferralk_glob::PatternSetError
+pub const fn ferralk_glob::PatternSetError::error(&self) -> &ferralk_glob::PatternError
+pub const fn ferralk_glob::PatternSetError::index(&self) -> usize
+impl core::clone::Clone for ferralk_glob::PatternSetError
+pub fn ferralk_glob::PatternSetError::clone(&self) -> ferralk_glob::PatternSetError
+impl core::cmp::Eq for ferralk_glob::PatternSetError
+impl core::cmp::PartialEq for ferralk_glob::PatternSetError
+pub fn ferralk_glob::PatternSetError::eq(&self, &ferralk_glob::PatternSetError) -> bool
+impl core::error::Error for ferralk_glob::PatternSetError
+pub fn ferralk_glob::PatternSetError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for ferralk_glob::PatternSetError
+pub fn ferralk_glob::PatternSetError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for ferralk_glob::PatternSetError
+pub fn ferralk_glob::PatternSetError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for ferralk_glob::PatternSetError
+impl core::marker::Freeze for ferralk_glob::PatternSetError
+impl core::marker::Send for ferralk_glob::PatternSetError
+impl core::marker::Sync for ferralk_glob::PatternSetError
+impl core::marker::Unpin for ferralk_glob::PatternSetError
+impl core::marker::UnsafeUnpin for ferralk_glob::PatternSetError
+impl core::panic::unwind_safe::RefUnwindSafe for ferralk_glob::PatternSetError
+impl core::panic::unwind_safe::UnwindSafe for ferralk_glob::PatternSetError
 pub const ferralk_glob::VERSION: &str
 pub fn ferralk_glob::expand_braces(impl core::convert::AsRef<[u8]>, ferralk_glob::PatternOptions) -> core::result::Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, ferralk_glob::PatternError>
 pub fn ferralk_glob::path_bytes(&impl core::convert::AsRef<std::ffi::os_str::OsStr> + ?core::marker::Sized) -> &[u8]

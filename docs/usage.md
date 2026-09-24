@@ -130,6 +130,46 @@ Use `Pattern::validate` for syntax-only checks and `Pattern::has_wildcards` to
 choose between a literal and glob path without compiling an application-level
 policy twice.
 
+### Match against a list of globs
+
+`PatternSet` is the counterpart of `globset::GlobSet`. It answers exactly what
+asking each member `Pattern` in turn would, through the same three entry
+points: `is_match`, `is_match_path`, and `is_match_glob_path` are the OR of the
+members' verdicts, and `matches_into`, `matches_path_into`, and
+`matches_glob_path_into` refill a caller's `Vec<usize>` with the index of every
+member that matches, in ascending order.
+
+```rust
+use ferralk_glob::{PatternOptions, PatternSet};
+
+let excludes = ["**/node_modules/**", "**/*.d.ts", "dist/**"];
+let set = PatternSet::new(excludes, PatternOptions::walker().match_hidden(true))?;
+
+assert!(set.is_match_glob_path("web/node_modules/pkg/index.js"));
+assert!(!set.is_match_glob_path("src/main.ts"));
+
+let mut matched = Vec::new();
+set.matches_glob_path_into("dist/types/api.d.ts", &mut matched);
+assert_eq!(matched, [1, 2]);
+# Ok::<(), ferralk_glob::PatternSetError>(())
+```
+
+`PatternSet::new` compiles every glob with one `PatternOptions`; a glob that
+does not compile is reported as a `PatternSetError` whose `index()` is its
+position in the list and whose `error()` is the usual `PatternError`. For
+per-glob options, compile the `Pattern`s yourself and `collect()` them into a
+set.
+
+The set is faster than a loop, never different from one. At construction each
+member is filed under a literal that every match must contain in a fixed
+place: its final extension (`**/*.rs`), a whole path component
+(`**/node_modules/**`, `dist/**`), or a fixed suffix or prefix. A path then
+asks only the members whose literal it has. A member without such a literal
+— `*`, `**/*x*`, or an extglob — is asked for every path, as a loop would ask
+it; with many of those, `globset`'s regex set is ahead, because this
+crate does not translate globs into a regex
+([ADR-0013](adr/0013-no-glob-to-regex-translation.md)).
+
 ## Walk filesystems with explicit policy
 
 `Walker` filters paths relative to its root. Include patterns are OR-ed; no

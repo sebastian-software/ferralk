@@ -36,6 +36,10 @@ name = "matcher"
 harness = false
 
 [[bench]]
+name = "pattern_set"
+harness = false
+
+[[bench]]
 name = "walker"
 harness = false
 

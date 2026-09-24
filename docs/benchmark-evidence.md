@@ -18,6 +18,7 @@ same distinction for releases.
 | --- | --- | --- | --- |
 | Allocation regression | Zero allocations for warmed compiled matches; steady-state serial-walker growth above the platform's portable `std::fs` floor, with and without Git ignore rules, and the same growth on the parallel route over wide sibling directories | [`allocation_regression.rs`](../crates/ferralk/tests/allocation_regression.rs), every platform test and both native-backend jobs | Yes |
 | Matcher, wall time | Compiled-pattern matching and compilation, against `globset`, `fast-glob`, and `wax` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
+| Pattern set, wall time | `PatternSet` against a loop over its `Pattern`s and against `globset::GlobSet`, on 10-, 100- and 1000-glob lists | [`pattern_set.rs`](../tools/bench/benches/pattern_set.rs), run locally back to back and reported in the pull request | No |
 | Walker, wall time | Warm-cache traversal of synthetic trees, including serial, parallel, and `stream()` over the 53k-file repository shape, a deep chain, nested Git-ignore rules with negations, include-plus-covering-exclude pruning, and comparisons with `ignore` parallel | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request compares the merge base and head back to back in one job for every shipped backend; medians and head/base ratios are published in the job summary and as artifacts | No |
 | Walker, wall time on Windows | The same benches on the portable backend, as a snapshot rather than a comparison | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), push and manual dispatch | No |
 | User-space CPU | Instructions executed by one serial and one four-thread walk of the repository shape, pull-request head and merge base in the same job. The first run measured 66,744,131 instructions serial and 69,160,696 on four threads, so parallelism costs 3.6% more user-space work on this shape | [`cpu_walk.rs`](../tools/bench/src/bin/cpu_walk.rs) under Callgrind in [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request against its merge base; push and manual runs publish counts only. Linux only | Yes: a pull request fails when either arm is more than 2% over its merge base; see [the gate](#the-user-space-cpu-gate) |
@@ -190,6 +191,9 @@ Rust-only, no extra toolchain:
 # Matcher, against globset and fast-glob. Add --output-format bencher for one
 # line per benchmark instead of criterion's reports.
 cargo bench -p bench --bench matcher
+
+# Pattern sets against a loop of patterns and globset::GlobSet.
+cargo bench -p bench --bench pattern_set -- --output-format bencher
 
 # Walker wall time, the shape the pull-request lane measures.
 cargo bench -p bench --bench walker -- --warm-up-time 1 --measurement-time 5 --sample-size 20
@@ -1198,6 +1202,47 @@ where the baselines pay for path normalization Ferralk does not do.
 
 Pattern compilation is measured separately (`compile/*` in the same bench) and
 is not compared against the baselines, whose builders accept different syntax.
+
+## Pattern sets, against a loop and `globset`
+
+`PatternSet` answers exactly what a loop over its `Pattern`s answers, so the
+loop is its before-state and `GlobSet` the external baseline. Every arm asks
+the same 64 root-relative paths; the table divides each run by 64. `globset`
+is built with `literal_separator(true)`, the reading of `is_match_glob_path`.
+Apple M1 Pro, macOS, rustc 1.98.1, one `--output-format bencher` run with every
+arm interleaved, on a host that was loaded (load average 6 to 12), which is why
+only ratios within this run are claimed.
+
+The *keyed* list rotates the shapes long include and exclude lists are made of —
+`**/*.extN`, `dirN/**`, `**/nameN/**`, `**/FileN.txt`, `prefixN*` — so every
+member has a literal extension, component, or prefix. The *unkeyed* list is
+`**/*xNy*` only: a literal with a wildcard on either side, which the set cannot
+index and asks for every path, exactly as the loop does.
+
+| Per path | 10 globs | 100 globs | 1000 globs |
+| --- | ---: | ---: | ---: |
+| keyed, any match: loop of `Pattern`s | 86 ns | 779 ns | 7,974 ns |
+| keyed, any match: `PatternSet` | **39 ns** | **49 ns** | **54 ns** |
+| keyed, any match: `GlobSet` | 86 ns | 88 ns | 91 ns |
+| keyed, all matches: `PatternSet` | **41 ns** | **53 ns** | **57 ns** |
+| keyed, all matches: `GlobSet` | 104 ns | 141 ns | 308 ns |
+| unkeyed, any match: loop of `Pattern`s | 122 ns | 1,118 ns | 11,189 ns |
+| unkeyed, any match: `PatternSet` | 122 ns | 1,149 ns | 11,670 ns |
+| unkeyed, any match: `GlobSet` | **52 ns** | **52 ns** | **52 ns** |
+| unkeyed, all matches: `PatternSet` | 134 ns | 1,222 ns | 12,414 ns |
+| unkeyed, all matches: `GlobSet` | **83 ns** | **132 ns** | **517 ns** |
+
+On keyed lists the set is flat in the list length: a path costs one extension
+lookup, one lookup per component, and the few members those lookups name,
+2.2 times less than the loop at 10 globs, 16 times at 100 and 148 times at
+1000, and ahead of `GlobSet` at every size.
+On the unkeyed list the set is the loop plus about 3%, and `GlobSet`'s regex set
+is ahead by the list length. Closing that gap needs a multi-literal substring
+screen (Aho-Corasick, or rolling hashes over the candidate) for interior
+literals; it is not built, because lists made only of infix globs are rare and
+ADR-0013 rules out the regex route. Building a 100-glob keyed set took 97 µs
+against 75 µs to compile the same patterns for a loop and 283 µs for the
+`GlobSet`.
 
 ## Limitations
 
