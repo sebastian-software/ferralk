@@ -320,13 +320,39 @@ previously selected entries selects different ones now; the patterns that
 change behavior are the ones that selected nothing, which now either work or
 say why they cannot.
 
+### Coming from globset, glob, fast-glob, ignore, or walkdir
+
+The defaults below are the ones that make a port compile and then return a
+different result. Each Ferralk cell names the switch or the idiom that
+restores the old behavior; the section after the table covers pattern lists
+in detail, and the crate documentation has tested recipes for
+[walking](https://docs.rs/ferralk/latest/ferralk/#recipes) and for
+[matching](https://docs.rs/ferralk-glob/latest/ferralk_glob/#recipes).
+
+| Concern | `globset`, `glob` | fast-glob, globby | `ignore`, `walkdir` | Ferralk |
+| --- | --- | --- | --- | --- |
+| Does `*` cross `/`? | `globset`: yes, unless `literal_separator(true)`. `glob::Pattern::matches`: yes, unless `require_literal_separator`; `glob::glob()` matches per component. | No. | `ignore` overrides and `.gitignore`: no. `walkdir` takes no patterns. | No, in `Walker` and `Pattern::is_match_glob_path`. `Pattern::is_match` crosses. `Walker::wildcard_mode(WildcardMode::SeparatorCrossing)` gives a walk the `globset` reading. |
+| A slash-free pattern such as `*.rs` or `target` | `globset`: matches at any depth, because `*` crosses. | Top level only. | `.gitignore` and overrides: at any depth. | Top level only: walker patterns are anchored at the root. Write `**/*.rs` or `**/target/**` for any depth. |
+| `**` | Recursive only as a whole component. Elsewhere `globset` reads two `*`, and `glob` rejects it. | Recursive only as a whole component. | `.gitignore` rules. | Recursive only as a whole path component (`**`, `**/x`, `x/**`, `x/**/y`): `**/x` matches `x` and `a/x`, never `sx`. Any other star run is ordinary stars. `Walker` always reads it this way; `ferralk-glob` only with `recursive_double_star(true)`, which `PatternOptions::walker()` sets. `PatternOptions::default()` reads `**` as `*`. |
+| Braces `{a,b}` | `globset`: on. `glob`: not supported. | On. | – | On in `Walker`. In `ferralk-glob` only with `braces(true)` or `PatternOptions::walker()`; `default()` reads `{` literally. |
+| A leading `.` | `globset` and `glob`: `*` matches it, unless `glob`'s `require_literal_leading_dot`. | Not matched unless `dot: true`. | `ignore` skips hidden entries entirely unless `hidden(false)`. `walkdir` yields them. | A wildcard does not cover it, so `**/*.ts` skips `.cache/x.ts`; opt in with `Walker::match_hidden(true)` or `PatternOptions::match_hidden(true)`. Hidden entries are still walked and returned when no pattern leaves them out; `WalkOptions::skip_hidden(true)` drops them as `ignore` does. |
+| A leading `!` | Not negation (`[!a]` is a negated class). | Marks an ignore pattern. | Overrides: marks an exclude. `.gitignore`: re-includes. | Not negation. `Walker::include` and `exclude` reject it, and `ferralk-glob` reads it as a literal `!`, so split the list into includes and excludes (below). `!(…)` is a negated extglob. `.gitignore` files keep Git's `!` under `respect_git_ignore(true)`. |
+| Several patterns at once | `globset::GlobSet`, with `matches` for the indices. | An array of patterns. | `OverrideBuilder`. | `Walker`: one `include` or `exclude` call per pattern; includes are OR-ed. `ferralk-glob`: a `Vec<Pattern>` asked with `iter().any` or `position`. There is no set type yet ([#405](https://github.com/sebastian-software/ferralk/issues/405)). |
+| Which entries are returned | `glob::glob()`: matching files and directories. | Files only (`onlyFiles: true`). | Every entry, the root itself first at depth 0. | Files, directories, and symlinks that the patterns select, never the root itself. `WalkOptions::files_only(true)` matches fast-glob's default, `directories_only(true)` its `onlyDirectories`. |
+| Shape of a returned path | – | Relative to `cwd`, without `./`. | The root joined with the relative path. | The root joined with the relative path: `Walker::new(".")` yields `./src/lib.rs`, `Walker::new("src")` yields `src/lib.rs`. `entry.path().strip_prefix(entry.root())` is the relative part. |
+| `.gitignore` | Not read. | Not read (globby: `gitignore: true`). | `ignore`: read by default inside a Git repository, with the global excludes file. `walkdir`: not read. | Not read until `Walker::respect_git_ignore(true)`, which reads `.gitignore`, `.ignore`, and `.git/info/exclude`, from the repository root down. Git's global excludes file is not read. |
+| Order | `glob::glob()`: sorted. | Unordered. | Unordered unless a `sort_by` option is set. | Unordered. `WalkOptions::sort(true)` sorts `collect()` and `visit()`; `stream()` ignores it. |
+| Errors | `glob::glob()`: `GlobError` items. | Rejects, except for `ENOENT`, unless `suppressErrors: true`. | `Result` items. | `collect()` returns `Ok` and lists every recoverable error in `WalkResult::errors()`, a missing root included; `stream()` yields them as `Err` items. `ErrorPolicy::Abort` stops at the first one. |
+| Matching a `Path` | `is_match` takes `AsRef<Path>`. | Strings. | – | Patterns take bytes: `path.as_os_str().as_encoded_bytes()`, or `WalkEntry::path_bytes()` for a walked entry. A `&str` works as it is. Match the path relative to where the pattern is anchored. |
+
 ### Migrating patterns from globset or fast-glob
 
-`globset` and `fast-glob` read an unconfigured `*` as crossing separators, so
-`*.ts` selects `src/deep/main.ts` there. Ferralk's walker reads patterns as
-filesystem globs by default, where `*.ts` selects only what sits in the walk
-root. Carrying a pattern over unchanged therefore used to select strictly less,
-without saying so.
+`globset` reads an unconfigured `*` as crossing separators, so `*.ts` selects
+`src/deep/main.ts` there. fast-glob and globby keep `*` inside one component,
+as Ferralk does, so their patterns need no mode change. Ferralk's walker reads
+patterns as filesystem globs by default, where `*.ts` selects only what sits in
+the walk root. Carrying a `globset` pattern over unchanged therefore used to
+select strictly less, without saying so.
 
 `Walker::wildcard_mode` makes the choice explicit:
 

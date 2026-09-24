@@ -188,6 +188,11 @@ cargo run --example find -- 'src/**/*.rs'
 ```
 
 The source is in [`crates/ferralk/examples/find.rs`](crates/ferralk/examples/find.rs).
+The other [examples](crates/ferralk/examples) each run one recipe from the
+crate documentation against a root you name, for instance
+`cargo run -p ferralk --example gitignore_walk -- . '**/*.rs'`:
+`gitignore_walk`, `include_exclude` (a fast-glob style list with `!`
+excludes), `early_stop`, and `keep_going` (errors that do not end the walk).
 
 ### Four things worth knowing on day one
 
@@ -298,11 +303,21 @@ Using Ferralk:
   measured over four releases on two real repositories, and what each round
   changed here.
 
+Using Ferralk from a coding agent:
+
+- [`llms.txt`](llms.txt) — one screen with the defaults, the three matcher
+  entry points, the traps that compile but return wrong results, and links
+  to the tested recipes on docs.rs.
+- [Agent skill](skills/ferralk/SKILL.md) — the same guidance as a loadable
+  skill; copy `skills/ferralk` into your agent's skills directory, for
+  example `.claude/skills/`.
+
 Coming from another library:
 
 - [Migration guide](docs/compatibility-guide.md) — mapping from zlob 1.6.3,
-  porting patterns from `globset` and `fast-glob`, and the deliberate
-  differences.
+  a [migration table](docs/compatibility-guide.md#coming-from-globset-glob-fast-glob-ignore-or-walkdir)
+  for `globset`, `glob`, fast-glob, `ignore`, and `walkdir`, and the
+  deliberate differences.
 - [Compatibility matrix](docs/compatibility-matrix.md) — feature-level status
   against zlob.
 

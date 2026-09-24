@@ -9,6 +9,8 @@ grouped by what you are trying to do.
 
 | Document | Use it for |
 | --- | --- |
+| [`llms.txt`](../llms.txt) | One screen for coding agents and hurried readers: the defaults, the three matcher entry points, the traps that compile but return wrong results, and links to the tested recipes. |
+| [Agent skill](../skills/ferralk/SKILL.md) | The same guidance as a skill an agent can load: which crate for what, recipes, and traps. |
 | [Usage guide](usage.md) | Every walker default and the switch that changes it, the three matcher entry points, error handling, cancellation, and platform notes. Start here after the README. |
 | [1.x stability contract](stability.md) | What 1.x promises: public API, corpus semantics, MSRV policy, Windows tier, and the explicit exclusions. |
 | [Benchmark evidence](benchmark-evidence.md) | What is measured, how to reproduce it, what scoped queries mean, and how Ferralk compares with Rust, Node.js, and zlob libraries. |
@@ -19,7 +21,7 @@ grouped by what you are trying to do.
 
 | Document | Use it for |
 | --- | --- |
-| [Compatibility guide](compatibility-guide.md) | Migrating zlob 1.6.3 usage to the Ferralk API, porting patterns from `globset` and `fast-glob`, the deliberate differences, and the audit of every contract change since 0.9.0. |
+| [Compatibility guide](compatibility-guide.md) | Migrating zlob 1.6.3 usage to the Ferralk API, a migration table for `globset`, `glob`, fast-glob, `ignore`, and `walkdir`, the deliberate differences, and the audit of every contract change since 0.9.0. |
 | [Compatibility matrix](compatibility-matrix.md) | A capability-by-capability status against zlob. |
 | [fast-glob reference](fast-glob-reference.md) | The pinned `fast-glob` reference and the divergences the differential fuzzer excludes by shape. |
 

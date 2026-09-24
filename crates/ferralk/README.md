@@ -44,7 +44,9 @@ are off until asked for, and recoverable errors are collected next to the
 entries by default. Portable `std::fs` traversal is the default, with optional
 native Linux and macOS backends for platform-specific performance work.
 
-See the [crate documentation](https://docs.rs/ferralk) for the full API, the
+See the [crate documentation](https://docs.rs/ferralk) for the full API and
+[tested recipes](https://docs.rs/ferralk/latest/ferralk/#recipes) (Git ignore
+rules, include and exclude lists, stopping early, errors, async use), the
 [usage guide](https://github.com/sebastian-software/ferralk/blob/main/docs/usage.md)
 for every default and switch, and the
 [Ferralk repository](https://github.com/sebastian-software/ferralk) for

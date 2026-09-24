@@ -28,7 +28,9 @@ case folding, and changed escaping remain explicit opt-ins.
 enables recursive `**`, braces, and extglobs, the dialect the `ferralk` walker
 reads its include and exclude patterns in.
 
-For the full syntax, error contract, and compatibility notes, see the
+For the full syntax, error contract, compatibility notes, and
+[tested recipes](https://docs.rs/ferralk-glob/latest/ferralk_glob/#recipes)
+(matching against several globs, porting a fast-glob list), see the
 [crate documentation](https://docs.rs/ferralk-glob), the
 [usage guide](https://github.com/sebastian-software/ferralk/blob/main/docs/usage.md),
 and the [Ferralk repository](https://github.com/sebastian-software/ferralk).

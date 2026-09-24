@@ -32,11 +32,131 @@
 //! - [`Pattern::is_match_path`] and the [`Pattern::filter_paths`] family keep
 //!   zlob's list-filter rule for callers porting from it.
 //!
+//! The same pattern, `*.rs`, asked through each of them:
+//!
+//! | Candidate | [`is_match`](Pattern::is_match) | [`is_match_path`](Pattern::is_match_path) | [`is_match_glob_path`](Pattern::is_match_glob_path) |
+//! | --- | --- | --- | --- |
+//! | `lib.rs` | yes | yes | yes |
+//! | `src/lib.rs` | yes: `*` crosses `/` | yes: a wildcard in the first component crosses | no: `*` stays in one component |
+//! | `./lib.rs` | no: `./` is compared literally | yes: one leading `./` is ignored | yes: one leading `./` is ignored |
+//!
 //! The matcher covers literals, `*`, `?`, `**`, character
 //! classes, escapes, leading-period handling, ASCII case folding, nested brace
 //! expansion, and Bash-style extglobs. The
 //! [usage guide](https://github.com/sebastian-software/ferralk/blob/main/docs/usage.md)
 //! documents each option with its default.
+//!
+//! # Recipes
+//!
+//! Every recipe below is a tested example. Finding files on disk is the
+//! `ferralk` crate's job; its
+//! [recipes](https://docs.rs/ferralk/latest/ferralk/#recipes) cover
+//! `.gitignore`, include and exclude lists, early termination, errors, and
+//! async use.
+//!
+//! ## Match a path against several configured globs
+//!
+//! There is no pattern-set type like `globset::GlobSet`. Compile every glob
+//! once, keep the [`Pattern`]s in a `Vec`, and ask them in turn; `position`
+//! answers which one matched.
+//!
+//! ```
+//! use ferralk_glob::{Pattern, PatternError, PatternOptions};
+//!
+//! let globs = ["src/**/*.rs", "tests/**/*.rs", "*.toml"];
+//! let patterns = globs
+//!     .iter()
+//!     .map(|glob| Pattern::compile(glob, PatternOptions::walker()))
+//!     .collect::<Result<Vec<_>, PatternError>>()?;
+//!
+//! let is_selected = |path: &str| patterns.iter().any(|pattern| pattern.is_match_glob_path(path));
+//! assert!(is_selected("src/parser/lexer.rs"));
+//! assert!(is_selected("Cargo.toml"));
+//! // `*` stays in its component, so `*.toml` names the top level only.
+//! assert!(!is_selected("crates/cli/Cargo.toml"));
+//!
+//! let which = patterns.iter().position(|pattern| pattern.is_match_glob_path("tests/cli.rs"));
+//! assert_eq!(which, Some(1));
+//! # Ok::<(), PatternError>(())
+//! ```
+//!
+//! ## Port a fast-glob or globby list with `!` negations
+//!
+//! A leading `!` is not negation here: the matcher reads it as a literal `!`,
+//! so `!**/*.test.ts` compiles and matches nothing. Split such a list into
+//! includes and excludes first. fast-glob itself keeps `!(…)` as a negated
+//! extglob, and so does the split below.
+//!
+//! ```
+//! use ferralk_glob::{Pattern, PatternError, PatternOptions};
+//!
+//! fn compile_list(globs: &[&str]) -> Result<(Vec<Pattern>, Vec<Pattern>), PatternError> {
+//!     let options = PatternOptions::walker();
+//!     let (mut include, mut exclude) = (Vec::new(), Vec::new());
+//!     for glob in globs {
+//!         match glob.strip_prefix('!').filter(|rest| !rest.starts_with('(')) {
+//!             Some(negated) => exclude.push(Pattern::compile(negated, options)?),
+//!             None => include.push(Pattern::compile(glob, options)?),
+//!         }
+//!     }
+//!     Ok((include, exclude))
+//! }
+//!
+//! let (include, exclude) =
+//!     compile_list(&["src/**/*.ts", "!src/**/*.test.ts", "!**/generated/**"])?;
+//! let is_selected = |path: &str| {
+//!     include.iter().any(|pattern| pattern.is_match_glob_path(path))
+//!         && !exclude.iter().any(|pattern| pattern.is_match_glob_path(path))
+//! };
+//! assert!(is_selected("src/app/main.ts"));
+//! assert!(!is_selected("src/app/main.test.ts"));
+//! assert!(!is_selected("src/generated/client.ts"));
+//! # Ok::<(), PatternError>(())
+//! ```
+//!
+//! fast-glob's `dot: true` is [`PatternOptions::match_hidden`]`(true)`, and
+//! its `caseSensitiveMatch: false` is
+//! [`PatternOptions::case_insensitive`]`(true)`. A walker takes the same
+//! list through `include` and `exclude`, and rejects a leading `!` instead of
+//! reading it literally.
+//!
+//! ## Match a `Path`
+//!
+//! Patterns take bytes, and [`std::ffi::OsStr::as_encoded_bytes`] gives them
+//! without a lossy conversion. Match the part of the path the pattern is
+//! written for: a pattern is relative, so strip the directory it is relative
+//! to first.
+//!
+//! ```
+//! use std::path::Path;
+//!
+//! use ferralk_glob::{Pattern, PatternOptions};
+//!
+//! let pattern = Pattern::compile("src/**/*.rs", PatternOptions::walker())?;
+//! let root = Path::new("/work/project");
+//! let path = root.join("src").join("bin").join("main.rs");
+//!
+//! let relative = path.strip_prefix(root).expect("path is below the root");
+//! assert!(pattern.is_match_glob_path(relative.as_os_str().as_encoded_bytes()));
+//! // The unstripped path starts with `/work`, which `src/**` does not.
+//! assert!(!pattern.is_match_glob_path(path.as_os_str().as_encoded_bytes()));
+//! # Ok::<(), ferralk_glob::PatternError>(())
+//! ```
+//!
+//! A path that `ferralk` walked already carries these bytes as
+//! `WalkEntry::path_bytes`; strip the walk root the same way.
+//!
+//! ## Filter a list of paths
+//!
+//! [`Pattern::filter_paths`] keeps zlob's list rule, in which a wildcard in
+//! the first component crosses separators. For shell semantics, filter with
+//! [`Pattern::is_match_glob_path`] instead; both are shown on
+//! [`Pattern::filter_paths`].
+//!
+//! ## Report an invalid pattern
+//!
+//! [`PatternError::offset`] is a byte offset into the pattern, so a caller
+//! can point at the problem; see [`PatternError`].
 //!
 //! Provenance: semantics are ported and differentially checked against zlob
 //! v1.6.3, source commit 4bc4da2cbc823d3911b4a1436448687c398977dd, primarily
@@ -177,6 +297,30 @@ impl PathFilter {
 /// switch enables them. [`PatternOptions::walker`] is the dialect the `ferralk`
 /// walker compiles its include and exclude patterns in. Either one can be
 /// adjusted further with the builder methods.
+///
+/// ```
+/// use ferralk_glob::{Pattern, PatternOptions};
+///
+/// // `walker()` is `default()` with three switches turned on.
+/// assert_eq!(
+///     PatternOptions::walker(),
+///     PatternOptions::default()
+///         .recursive_double_star(true)
+///         .braces(true)
+///         .extglob(true),
+/// );
+///
+/// // The same text is a different pattern under each of them.
+/// let walker = Pattern::compile("*.{rs,toml}", PatternOptions::walker())?;
+/// let conservative = Pattern::compile("*.{rs,toml}", PatternOptions::default())?;
+/// assert!(walker.is_match_glob_path("Cargo.toml"));
+/// assert!(!conservative.is_match_glob_path("Cargo.toml"));
+///
+/// // Further switches chain onto either one.
+/// let loose = PatternOptions::walker().match_hidden(true).case_insensitive(true);
+/// assert!(Pattern::compile("*.RS", loose)?.is_match_glob_path(".build.rs"));
+/// # Ok::<(), ferralk_glob::PatternError>(())
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatternOptions {
     braces: bool,
@@ -360,6 +504,25 @@ impl PatternOptions {
 }
 
 /// An error returned when a pattern is not syntactically valid.
+///
+/// [`offset`](Self::offset) is a zero-based byte offset into the pattern, so
+/// a caller can point at the construct that failed. `Display` reads
+/// `<message> at byte <offset>`; the message is diagnostic text, while the
+/// offset is the stable part.
+///
+/// ```
+/// use ferralk_glob::{Pattern, PatternOptions};
+///
+/// let source = "src/[a-z/*.rs";
+/// let error = Pattern::compile(source, PatternOptions::walker()).unwrap_err();
+/// assert_eq!(error.offset(), 4); // the `[` that is never closed
+///
+/// // A byte offset is a column only for ASCII; count the characters before it
+/// // to place a marker under any pattern.
+/// let column = source[..error.offset()].chars().count();
+/// let report = format!("{error}\n{source}\n{:>width$}", "^", width = column + 1);
+/// assert!(report.ends_with("src/[a-z/*.rs\n    ^"));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatternError {
     offset: usize,
@@ -740,6 +903,23 @@ impl Pattern {
     /// Matches the entire candidate byte sequence. Ordinary wildcards may
     /// cross separators, and a leading `./` is compared literally.
     ///
+    /// Use it for text in which `/` is not special. For a filesystem path,
+    /// [`Self::is_match_glob_path`] is usually the entry point you want; the
+    /// same three candidates are shown on each of the three.
+    ///
+    /// ```
+    /// use ferralk_glob::{Pattern, PatternOptions};
+    ///
+    /// let pattern = Pattern::compile("*.rs", PatternOptions::walker())?;
+    ///
+    /// assert!(pattern.is_match("lib.rs"));
+    /// // `*` crosses the separator.
+    /// assert!(pattern.is_match("src/lib.rs"));
+    /// // `./` is compared literally, and `*` does not cover its leading period.
+    /// assert!(!pattern.is_match("./lib.rs"));
+    /// # Ok::<(), ferralk_glob::PatternError>(())
+    /// ```
+    ///
     /// Extglob patterns that fall back to the retained interpreter can still
     /// spend quadratic time on one adversarially long component. For
     /// untrusted path-shaped input, prefer a component-scoped entry point
@@ -916,6 +1096,35 @@ impl Pattern {
     /// order. Wildcards after an explicit separator stay within that path
     /// component; recursive `**` is the separator-crossing form. The returned
     /// references borrow the caller-owned path list.
+    ///
+    /// Each path is asked through [`Self::is_match_path`], zlob's list rule,
+    /// under which a wildcard in the first component crosses separators. For
+    /// shell semantics, filter with [`Self::is_match_glob_path`] yourself:
+    ///
+    /// ```
+    /// use ferralk_glob::{Pattern, PatternOptions};
+    ///
+    /// let paths = ["lib.rs", "src/lib.rs", "src/bin/main.rs", "README.md"];
+    ///
+    /// // A wildcard directly behind `/` stays in its component...
+    /// let direct = Pattern::compile("src/*.rs", PatternOptions::walker())?;
+    /// assert_eq!(direct.filter_paths(&paths), [&"src/lib.rs"]);
+    ///
+    /// // ...while one in the first component crosses separators.
+    /// let top = Pattern::compile("*.rs", PatternOptions::walker())?;
+    /// assert_eq!(
+    ///     top.filter_paths(&paths),
+    ///     [&"lib.rs", &"src/lib.rs", &"src/bin/main.rs"],
+    /// );
+    ///
+    /// // Shell semantics: `*.rs` names the top level only.
+    /// let shell: Vec<_> = paths
+    ///     .iter()
+    ///     .filter(|path| top.is_match_glob_path(path))
+    ///     .collect();
+    /// assert_eq!(shell, [&"lib.rs"]);
+    /// # Ok::<(), ferralk_glob::PatternError>(())
+    /// ```
     #[must_use]
     pub fn filter_paths<'a, T>(&self, paths: impl IntoIterator<Item = &'a T>) -> Vec<&'a T>
     where
@@ -931,6 +1140,23 @@ impl Pattern {
     /// [`Pattern::filter_paths`]. A root wildcard may cross separators, while
     /// wildcards after an explicit separator are component-local. One leading
     /// `./` is ignored on both the pattern and candidate.
+    ///
+    /// ```
+    /// use ferralk_glob::{Pattern, PatternOptions};
+    ///
+    /// let pattern = Pattern::compile("*.rs", PatternOptions::walker())?;
+    ///
+    /// assert!(pattern.is_match_path("lib.rs"));
+    /// // A wildcard in the first component crosses the separator.
+    /// assert!(pattern.is_match_path("src/lib.rs"));
+    /// // One leading `./` is ignored.
+    /// assert!(pattern.is_match_path("./lib.rs"));
+    ///
+    /// // A wildcard directly behind `/` stays in its component.
+    /// let nested = Pattern::compile("src/*.rs", PatternOptions::walker())?;
+    /// assert!(!nested.is_match_path("src/bin/main.rs"));
+    /// # Ok::<(), ferralk_glob::PatternError>(())
+    /// ```
     #[must_use]
     pub fn is_match_path(&self, path: impl AsRef<[u8]>) -> bool {
         self.matches_path_filter(path.as_ref())
@@ -941,6 +1167,27 @@ impl Pattern {
     /// separator-crossing form. This is stricter than [`Pattern::is_match_path`]
     /// at the root component and is suitable for traversal filters. One
     /// leading `./` is ignored on both the pattern and candidate.
+    ///
+    /// This is how a shell and the `ferralk` walker read a pattern, and the
+    /// entry point to use for a path relative to where the pattern is
+    /// anchored.
+    ///
+    /// ```
+    /// use ferralk_glob::{Pattern, PatternOptions};
+    ///
+    /// let pattern = Pattern::compile("*.rs", PatternOptions::walker())?;
+    ///
+    /// assert!(pattern.is_match_glob_path("lib.rs"));
+    /// // `*` stays in one component; write `**/*.rs` for every depth.
+    /// assert!(!pattern.is_match_glob_path("src/lib.rs"));
+    /// // One leading `./` is ignored.
+    /// assert!(pattern.is_match_glob_path("./lib.rs"));
+    ///
+    /// let recursive = Pattern::compile("**/*.rs", PatternOptions::walker())?;
+    /// assert!(recursive.is_match_glob_path("lib.rs"));
+    /// assert!(recursive.is_match_glob_path("src/lib.rs"));
+    /// # Ok::<(), ferralk_glob::PatternError>(())
+    /// ```
     #[must_use]
     pub fn is_match_glob_path(&self, path: impl AsRef<[u8]>) -> bool {
         let path = without_leading_dot_slash(path.as_ref());
@@ -1006,6 +1253,26 @@ impl Pattern {
     /// Returns the input paths accepted relative to `base_path`, preserving
     /// the original full paths and caller order. Candidates outside the base
     /// directory are ignored.
+    ///
+    /// ```
+    /// use ferralk_glob::{Pattern, PatternOptions};
+    ///
+    /// let pattern = Pattern::compile("src/*.rs", PatternOptions::walker())?;
+    /// let paths = [
+    ///     "crates/app/src/lib.rs",
+    ///     "crates/app/README.md",
+    ///     "crates/cli/src/main.rs",
+    ///     "crates/application/src/lib.rs",
+    /// ];
+    ///
+    /// // Each path is matched below the base and returned in full; a path
+    /// // outside it, `crates/application` included, is left out.
+    /// assert_eq!(
+    ///     pattern.filter_paths_at("crates/app", &paths),
+    ///     [&"crates/app/src/lib.rs"],
+    /// );
+    /// # Ok::<(), ferralk_glob::PatternError>(())
+    /// ```
     #[must_use]
     pub fn filter_paths_at<'a, T>(
         &self,
@@ -1027,6 +1294,19 @@ impl Pattern {
 
     /// Returns the indices of input paths accepted by this compiled pattern,
     /// in their original input order.
+    ///
+    /// Useful when the paths live beside other data, such as a list of
+    /// records, and the caller wants positions rather than borrowed paths.
+    ///
+    /// ```
+    /// use ferralk_glob::{Pattern, PatternOptions};
+    ///
+    /// let pattern = Pattern::compile("src/**/*.rs", PatternOptions::walker())?;
+    /// let files = ["README.md", "src/lib.rs", "src/bin/main.rs"].map(String::from);
+    ///
+    /// assert_eq!(pattern.filter_path_indices(&files), [1, 2]);
+    /// # Ok::<(), ferralk_glob::PatternError>(())
+    /// ```
     #[must_use]
     pub fn filter_path_indices<'a, T>(&self, paths: impl IntoIterator<Item = &'a T>) -> Vec<usize>
     where
@@ -1041,6 +1321,19 @@ impl Pattern {
 
     /// Returns the indices of full input paths accepted relative to
     /// `base_path`, in their original input order.
+    ///
+    /// ```
+    /// use ferralk_glob::{Pattern, PatternOptions};
+    ///
+    /// let pattern = Pattern::compile("*.toml", PatternOptions::walker())?;
+    /// let paths = ["crates/app/Cargo.toml", "Cargo.toml", "crates/app/src/x.toml"];
+    ///
+    /// // `Cargo.toml` is outside the base. `src/x.toml` is selected because a
+    /// // wildcard in the first component crosses separators under the list
+    /// // rule of `filter_paths`.
+    /// assert_eq!(pattern.filter_path_indices_at("crates/app", &paths), [0, 2]);
+    /// # Ok::<(), ferralk_glob::PatternError>(())
+    /// ```
     #[must_use]
     pub fn filter_path_indices_at<'a, T>(
         &self,
