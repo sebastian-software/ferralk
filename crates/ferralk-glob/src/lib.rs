@@ -54,29 +54,32 @@
 //!
 //! ## Match a path against several configured globs
 //!
-//! There is no pattern-set type like `globset::GlobSet`. Compile every glob
-//! once, keep the [`Pattern`]s in a `Vec`, and ask them in turn; `position`
-//! answers which one matched.
+//! A [`PatternSet`] is the counterpart of `globset::GlobSet`: it compiles a
+//! list once and answers whether any glob matches, or which ones do, by
+//! their position in the list. It asks only the globs whose literal
+//! extension, component, prefix or suffix the path has, so a long list costs
+//! little more per path than a short one.
 //!
 //! ```
-//! use ferralk_glob::{Pattern, PatternError, PatternOptions};
+//! use ferralk_glob::{PatternOptions, PatternSet, PatternSetError};
 //!
 //! let globs = ["src/**/*.rs", "tests/**/*.rs", "*.toml"];
-//! let patterns = globs
-//!     .iter()
-//!     .map(|glob| Pattern::compile(glob, PatternOptions::walker()))
-//!     .collect::<Result<Vec<_>, PatternError>>()?;
+//! let set = PatternSet::new(globs, PatternOptions::walker())?;
 //!
-//! let is_selected = |path: &str| patterns.iter().any(|pattern| pattern.is_match_glob_path(path));
-//! assert!(is_selected("src/parser/lexer.rs"));
-//! assert!(is_selected("Cargo.toml"));
+//! assert!(set.is_match_glob_path("src/parser/lexer.rs"));
+//! assert!(set.is_match_glob_path("Cargo.toml"));
 //! // `*` stays in its component, so `*.toml` names the top level only.
-//! assert!(!is_selected("crates/cli/Cargo.toml"));
+//! assert!(!set.is_match_glob_path("crates/cli/Cargo.toml"));
 //!
-//! let which = patterns.iter().position(|pattern| pattern.is_match_glob_path("tests/cli.rs"));
-//! assert_eq!(which, Some(1));
-//! # Ok::<(), PatternError>(())
+//! let mut which = Vec::new();
+//! set.matches_glob_path_into("tests/cli.rs", &mut which);
+//! assert_eq!(which, [1]);
+//! # Ok::<(), PatternSetError>(())
 //! ```
+//!
+//! [`PatternSetError::index`] names the glob that failed to compile. For
+//! globs with different options, collect compiled [`Pattern`]s into the set
+//! instead; [`PatternSet`] shows both.
 //!
 //! ## Port a fast-glob or globby list with `!` negations
 //!
@@ -86,9 +89,9 @@
 //! extglob, and so does the split below.
 //!
 //! ```
-//! use ferralk_glob::{Pattern, PatternError, PatternOptions};
+//! use ferralk_glob::{Pattern, PatternError, PatternOptions, PatternSet};
 //!
-//! fn compile_list(globs: &[&str]) -> Result<(Vec<Pattern>, Vec<Pattern>), PatternError> {
+//! fn compile_list(globs: &[&str]) -> Result<(PatternSet, PatternSet), PatternError> {
 //!     let options = PatternOptions::walker();
 //!     let (mut include, mut exclude) = (Vec::new(), Vec::new());
 //!     for glob in globs {
@@ -97,15 +100,13 @@
 //!             None => include.push(Pattern::compile(glob, options)?),
 //!         }
 //!     }
-//!     Ok((include, exclude))
+//!     Ok((include.into_iter().collect(), exclude.into_iter().collect()))
 //! }
 //!
 //! let (include, exclude) =
 //!     compile_list(&["src/**/*.ts", "!src/**/*.test.ts", "!**/generated/**"])?;
-//! let is_selected = |path: &str| {
-//!     include.iter().any(|pattern| pattern.is_match_glob_path(path))
-//!         && !exclude.iter().any(|pattern| pattern.is_match_glob_path(path))
-//! };
+//! let is_selected =
+//!     |path: &str| include.is_match_glob_path(path) && !exclude.is_match_glob_path(path);
 //! assert!(is_selected("src/app/main.ts"));
 //! assert!(!is_selected("src/app/main.test.ts"));
 //! assert!(!is_selected("src/generated/client.ts"));
@@ -173,10 +174,12 @@ use std::{
 
 use memchr::{memchr, memchr2, memchr3, memmem};
 
+mod set;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 mod suffix_word;
 mod sweep;
 
+pub use set::{PatternSet, PatternSetError};
 use sweep::{SweepEngine, SweepState};
 
 /// A compiled glob pattern.

@@ -26,7 +26,9 @@ Braces, extglobs, hidden-name matching, ASCII
 case folding, and changed escaping remain explicit opt-ins.
 `PatternOptions::default()` enables none of them; `PatternOptions::walker()`
 enables recursive `**`, braces, and extglobs, the dialect the `ferralk` walker
-reads its include and exclude patterns in.
+reads its include and exclude patterns in. For a list of globs, `PatternSet`
+is the `globset::GlobSet` counterpart: it answers exactly as its patterns
+would one by one, and asks only those whose literals a path contains.
 
 For the full syntax, error contract, compatibility notes, and
 [tested recipes](https://docs.rs/ferralk-glob/latest/ferralk_glob/#recipes)

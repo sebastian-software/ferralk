@@ -2,7 +2,7 @@
 
 > Rust crates for finding files and matching globs, byte-first. `ferralk` walks a directory tree in parallel with root-relative include and exclude globs, optional `.gitignore` support, and pruning from the pattern itself. `ferralk-glob` compiles a glob once and matches it against paths or bytes you already hold; `ferralk` re-exports it as `ferralk::ferralk_glob`.
 
-Pick the crate by what you hold. Files on disk: `ferralk::Walker`. A path or string in memory: `ferralk_glob::Pattern`. Everything is synchronous; from async code, run a walk in `tokio::task::spawn_blocking` with a `CancellationToken` (recipe linked below).
+Pick the crate by what you hold. Files on disk: `ferralk::Walker`. A path or string in memory: `ferralk_glob::Pattern`, or `ferralk_glob::PatternSet` for a list of globs. Everything is synchronous; from async code, run a walk in `tokio::task::spawn_blocking` with a `CancellationToken` (recipe linked below).
 
 **Matcher entry points.** Compile with `Pattern::compile(glob, PatternOptions::walker())?`, then pick how far a wildcard reaches. The pattern `*.rs` against three candidates:
 
@@ -42,7 +42,7 @@ Use `is_match_glob_path` for paths: it reads a pattern as a shell and the walker
 9. Patterns use `/` and `\` escapes on every platform, Windows included. Never build a pattern with `PathBuf::join`; keep the root in `Walker::new(root)`.
 10. Patterns and candidates are bytes. For a `Path`, pass `ferralk_glob::path_bytes(path)`; a `&str` works as it is.
 11. An include's `**` does not enter hidden directories: `include("**/*.ts")` misses `.cache/x.ts` until `match_hidden(true)`. Excludes are the opposite and cover hidden names as `.gitignore` lines do, even against an include that names one literally: `include(".github/**")` with `exclude("**/*.yml")` drops `.github/workflows/ci.yml`.
-12. There is no pattern-set type like `globset::GlobSet`: keep a `Vec<Pattern>` and ask `iter().any(…)` or `position(…)`.
+12. For a list of globs use `ferralk_glob::PatternSet`, the `globset::GlobSet` counterpart: `PatternSet::new(globs, PatternOptions::walker())?`, then `is_match_glob_path(path)` or `matches_glob_path_into(path, &mut indices)`. Its methods read patterns like the `Pattern` entry point of the same name, so `PatternSet::is_match` crosses `/`; a looped `Vec<Pattern>` answers the same, only slower.
 13. `Verdict::Skip` from `visit()` drops an entry but still walks a directory's subtree; `Verdict::Prune` drops it and does not walk below it.
 
 ## Recipes
@@ -57,7 +57,7 @@ Use `is_match_glob_path` for paths: it reads a pattern as a shell and the walker
 - [Usage guide](https://raw.githubusercontent.com/sebastian-software/ferralk/main/docs/usage.md): every walker default and the switch that changes it, the matcher entry points and options, errors, cancellation, hidden files.
 - [Compatibility guide](https://raw.githubusercontent.com/sebastian-software/ferralk/main/docs/compatibility-guide.md): a migration table from `globset`, `glob`, fast-glob and globby, `ignore`, and `walkdir`, then the mapping from zlob 1.6.3.
 - [ferralk API](https://docs.rs/ferralk): `Walker`, `WalkOptions`, `WalkResult`, `WalkEntry`, `WalkError`, `ErrorPolicy`, `CancellationToken`.
-- [ferralk-glob API](https://docs.rs/ferralk-glob): `Pattern`, `PatternOptions`, `PatternError`.
+- [ferralk-glob API](https://docs.rs/ferralk-glob): `Pattern`, `PatternSet`, `PatternOptions`, `PatternError`, `PatternSetError`.
 
 ## Optional
 

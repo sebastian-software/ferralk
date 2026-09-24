@@ -1,7 +1,9 @@
 # Fuzzing ferralk-glob
 
 `pattern_parser` and `pattern_matcher` exercise parsing and matching with
-arbitrary bytes and option combinations. Their checked-in seeds derive from the
+arbitrary bytes and option combinations. `pattern_matcher` also holds a
+one-member `PatternSet` to its member's verdicts, so the set's literal index
+never skips a pattern that matches. Their checked-in seeds derive from the
 executable matcher corpus. On macOS, `macos_dirent_parser` and
 `macos_bulk_record_parser` separately fuzz the feature-gated `getdirentries64`
 and `getattrlistbulk` record validators without issuing syscalls or touching
