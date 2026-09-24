@@ -21,13 +21,26 @@ your local clone on this project's behalf.
 
 ## Performance evidence
 
-There is no continuous wall-time threshold. The deterministic allocation-count
-test in
+There is no continuous wall-time threshold. Two deterministic counts do gate.
+The allocation-count test in
 [`allocation_regression.rs`](crates/ferralk/tests/allocation_regression.rs)
-does gate matcher, serial-walker, and parallel wide-sibling hot-path allocation
-floors on every platform and native backend. The walker wall-time lane in
-[`walker-bench.yml`](.github/workflows/walker-bench.yml) remains non-gating: it
-runs on every pull request and publishes medians as a job summary and artifact.
+gates matcher, serial-walker, and parallel wide-sibling hot-path allocation
+floors on every platform and native backend. The user-space CPU lane in
+[`walker-bench.yml`](.github/workflows/walker-bench.yml) counts the
+instructions one serial and one four-thread walk execute under Callgrind, and
+fails a pull request when either count is more than 2% over its merge base.
+That number and the data it was derived from are in
+[the user-space CPU gate](docs/benchmark-evidence.md#the-user-space-cpu-gate).
+It counts work, not time, so it cannot say that a change is faster or slower.
+The walker wall-time lane in the same workflow remains non-gating: it runs on
+every pull request and publishes medians as a job summary and artifact.
+
+When a change adds instructions on purpose — a new correctness check in the
+walk, say — and trips the CPU gate, put a line in the pull-request body that
+starts with `CPU-Increase-Accepted:` and gives the reason, then re-run the
+failed job. The job reads the body when it runs, so the re-run passes and
+publishes the reason beside the counts. A marker without a reason accepts
+nothing.
 
 A change that claims a performance effect carries its own evidence: run the
 relevant bench before and after on one machine, back to back, and put both

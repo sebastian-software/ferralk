@@ -136,3 +136,16 @@ the original decision — release-please, Renovate and the bench corpora — is
 unchanged. What changes is only where a question of "how should this
 repository be set up" is answered first: in the standards package and the
 family baseline, not in another repository's tree.
+
+## Amendment, 2026-09-24: the user-space CPU gate is on, at 2%
+
+The lane ran on 97 pull-request runs before the threshold was chosen. With the
+walk unchanged, the serial count moved by less than a hundred instructions in
+66.7 million and the four-thread ratio by at most 0.55%, so the lane now fails
+a pull request when either arm is more than 2% over its merge base, not the
+provisional 5%. The derivation and the data are in
+[benchmark evidence](../benchmark-evidence.md#the-user-space-cpu-gate). An
+intended increase is accepted with a `CPU-Increase-Accepted:` line in the
+pull-request body, as CONTRIBUTING describes. Everything else in the
+2026-09-04 amendment stands: this is a user-space work gate, not a speed gate,
+and it does not gate a release.

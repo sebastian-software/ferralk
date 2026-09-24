@@ -5,9 +5,12 @@ runs, how to reproduce it, and what it does not establish.
 
 Wall-time numbers are decision support: no CI job fails on a timing threshold,
 no release is blocked on a benchmark measurement, and nothing here is a claim
-to be the fastest library. Deterministic allocation-count invariants are the
-exception and run as ordinary tests. [Deferred follow-up](external-release-gates.md)
-records the same distinction for releases.
+to be the fastest library. Two deterministic counts are the exception, and
+neither is a timing threshold: allocation-count invariants run as ordinary
+tests, and the [user-space CPU gate](#the-user-space-cpu-gate) fails a pull
+request whose walk executes more instructions than its merge base by more than
+a documented margin. [Deferred follow-up](external-release-gates.md) records the
+same distinction for releases.
 
 ## The lanes
 
@@ -17,14 +20,14 @@ records the same distinction for releases.
 | Matcher, wall time | Compiled-pattern matching and compilation, against `globset`, `fast-glob`, and `wax` | [`matcher.rs`](../tools/bench/benches/matcher.rs), run locally back to back and reported in the pull request | No |
 | Walker, wall time | Warm-cache traversal of synthetic trees, including serial, parallel, and `stream()` over the 53k-file repository shape, a deep chain, nested Git-ignore rules with negations, include-plus-covering-exclude pruning, and comparisons with `ignore` parallel | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request compares the merge base and head back to back in one job for every shipped backend; medians and head/base ratios are published in the job summary and as artifacts | No |
 | Walker, wall time on Windows | The same benches on the portable backend, as a snapshot rather than a comparison | [`walker-bench.yml`](../.github/workflows/walker-bench.yml), push and manual dispatch | No |
-| User-space CPU | Instructions executed by one serial and one four-thread walk of the repository shape, merge base and head in the same job. The first run measured 66,744,131 instructions serial and 69,160,696 on four threads, so parallelism costs 3.6% more user-space work on this shape | [`cpu_walk.rs`](../tools/bench/src/bin/cpu_walk.rs) under Callgrind in [`walker-bench.yml`](../.github/workflows/walker-bench.yml), Linux only | Not yet |
+| User-space CPU | Instructions executed by one serial and one four-thread walk of the repository shape, pull-request head and merge base in the same job. The first run measured 66,744,131 instructions serial and 69,160,696 on four threads, so parallelism costs 3.6% more user-space work on this shape | [`cpu_walk.rs`](../tools/bench/src/bin/cpu_walk.rs) under Callgrind in [`walker-bench.yml`](../.github/workflows/walker-bench.yml), every pull request against its merge base; push and manual runs publish counts only. Linux only | Yes: a pull request fails when either arm is more than 2% over its merge base; see [the gate](#the-user-space-cpu-gate) |
 | Engine comparison | One repository shape with unscoped include, scoped include, include-plus-exclude, and gitignore-pruned queries | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs), locally on demand and by manual dispatch of [`walker-bench.yml`](../.github/workflows/walker-bench.yml) on Linux | No |
 | Thread scaling | Ferralk and, when enabled, zlob over the unscoped 53k-file query at 1, 2, 4, 8, and `available_parallelism` threads; the evidence behind the default worker budget | [`walker_palamedes.rs`](../tools/bench/benches/walker_palamedes.rs) with `thread-sweep`, local or manual zlob dispatch | No |
 | zlob ablations | Ferralk and zlob on one fixed fixture, split into traversal, filtering, result retention, and path-representation costs | [`walker_zlob_ablation.rs`](../tools/bench/benches/walker_zlob_ablation.rs), run on demand | No |
 | zlob context | The matcher smoke fixture and 53k-file engine comparison against zlob 1.6.5 | [`zlob-benchmark.yml`](../.github/workflows/zlob-benchmark.yml), manual dispatch on Linux only | No |
 | Node.js ecosystem context | The same matcher cases and repository-shaped walker fixture against current locked Node libraries | [`tools/bench/node`](../tools/bench/node), run on demand | No |
 
-**Why every benchmark lane measures wall time.** An earlier revision ran the matcher
+**Why the timing lanes measure wall time.** An earlier revision ran the matcher
 under CodSpeed's simulation instrument, which counts instructions in a virtual
 machine. It was removed on 2026-08-19: over the period it ran it produced four
 false alarms and no true finding, every one of them a stale baseline rather
@@ -37,7 +40,11 @@ visibility but does not fail on it; push and manual runs publish one snapshot.
 
 That instrument was never right for the walker in any case: it serializes
 threads and does not model syscall cost, so a parallel-versus-serial comparison
-there measures instruction count rather than speedup.
+there measures instruction count rather than speedup. The user-space CPU lane
+counts instructions on purpose, for the question wall time cannot answer, and
+against a merge base built in the same job rather than a stored baseline; the
+2026-09-04 amendment to
+[ADR-0012](adr/0012-ferroni-repository-blueprint.md) records why it returned.
 
 **What each lane does not establish.** The matcher lane says nothing about
 syscall-bound work. The walker lanes
@@ -47,6 +54,133 @@ is not made anywhere here. Shared runners are noisy: compare arms measured in
 the same invocation, not numbers from different runs. And no lane says anything
 about API or semantic scope — the engines compared below do not all offer the
 same guarantees, and speed is one input among several.
+
+### The user-space CPU gate
+
+On a pull request the CPU lane builds `cpu_walk` twice, from the pull
+request's head commit and from its merge base, walks one fixture with each
+binary under Callgrind, and fails when either arm's head count exceeds its
+merge-base count by more than **2%**. The threshold is declared once, as
+`CPU_GATE_PERCENT` in [`walker-bench.yml`](../.github/workflows/walker-bench.yml);
+the comparison lives in
+[`compare_callgrind.rs`](../tools/bench/src/bin/compare_callgrind.rs). A
+decrease of any size passes. A merge base too old to build the harness is
+reported without a comparison rather than gated, and push and manual runs have
+no merge base and publish counts only.
+
+The head is the pull request's own commit, as in the wall-time lane, not the
+merge commit GitHub checks out. Against the merge base, a merge commit would
+also carry everything that landed on `main` since the branch forked, and the
+gate would charge that work to the pull request.
+
+**How 2% was chosen.** Issue #358 proposed 5% as a starting point and issue
+#365 asked for the number to come from observed variance instead. The data is
+every pull-request run of the lane from when it landed in #364 to the day the
+gate was enabled: 97 runs across 39 pull requests between 2026-09-04 and
+2026-09-24, plus 34 push runs on `main`, all on `ubuntu-latest` with Rust
+1.98.1. Each count is the `summary:` total from the run's `walker-cpu-portable`
+artifact.
+
+- **One thread is exact for practical purposes.** In the 35 runs whose diff
+  touches no file the harness compiles — anything outside `crates/*/src`, the
+  manifests, `Cargo.lock`, `rust-toolchain.toml`, and `tools/bench/src` — head
+  and merge base differed by 31 to 84 instructions out of 66.7 million, and the
+  ratio rounds to 1.00000 in every one. The same holds in all 83 runs whose
+  serial count did not move, which adds pull requests that touched those
+  files without changing what the walk executes: doc comments, version bumps,
+  attributes, code the harness does not call.
+- **Four threads carries work-stealing noise.** In the same 35 runs the ratio
+  ranged from 0.9984 to 1.0025, standard deviation 0.10%; across the 83 runs
+  from 0.9962 to 1.0055, standard deviation 0.15%. One code state measured 124
+  times — both arms of every run on the 1.0.0-rc.1-era `main` — spans 0.35%
+  with a standard deviation of 0.08%, so the ratio's spread is what two such
+  draws produce. The serial arm of the same runs does not move, which places
+  the noise in how work is distributed between threads.
+- **Real changes are small and legible.** #425 made excludes apply inside
+  hidden directories and added 1.06% serial and 1.15% on four threads; #415
+  added up to 0.38% and 0.55%; #413 removed 1.34% and 1.46%. The regression
+  this lane exists for is of another order: after #352 a four-thread walk
+  executed 40% more instructions than a serial one, 244 M against 174 M,
+  measured locally before the lane existed, and the fix removed a third of the
+  four-thread count.
+
+2% is 3.6 times the largest four-thread deviation any unchanged walk produced
+and about thirteen standard deviations, above every legitimate increase seen,
+and a small fraction of #352's. One number serves both arms: the serial arm has no
+noise to clear, so its threshold is a judgement about effect size, and the same
+margin leaves the four-thread arm well clear of its noise. The data does not
+support 5%, which would pass a walk that executes 4% more for no reason.
+
+Replaying the gate over all 131 runs confirms the choice: at 2% none fails; at
+1% only #425 does, twice; at 0.5% #415 and #416 join it, the second an
+attribute-and-documentation change that moved only the four-thread arm, by
+0.53%; at 0.25%,
+seven runs fail. The documentation-, CI-, and test-only pull requests of
+2026-09-24 — #412, #426, and #427 — measured at most +0.25%, and the ones
+whose diff reached source files without changing code — #406, #414, #416, and
+#421 — at most +0.53%.
+
+**Accepting an intended increase.** A pull request that legitimately adds
+work — a new correctness check per entry, say — puts a line starting
+`CPU-Increase-Accepted:` followed by the reason in its body, then re-runs the
+failed job. The job reads the body when it evaluates the gate rather than from
+the event, which a re-run replays unchanged, and publishes the reason beside
+the counts. The marker without a reason accepts nothing. The check is not a
+required status, so a maintainer can still merge past it, but the marker is the
+documented path because it writes the reason down where the increase is
+reviewed.
+
+**When to revisit the number.** The comparison is immune to toolchain updates,
+because both revisions build with the same compiler in the same job, but not to
+a harness or scheduler change that alters how much the four-thread arm moves.
+If an unchanged walk ever lands within half a percentage point of the gate,
+collect the ratios again and re-derive it here.
+
+The per-pull-request data, as head over merge base (ranges cover every run of
+that pull request, and runs of the same pull request can have different heads
+or merge bases):
+
+| Pull request | Diff reaches compiled files | Runs | 1 thread | 4 threads |
+| --- | --- | ---: | ---: | ---: |
+| #427 `test(fuzz)` | no | 1 | 0.00% | +0.25% |
+| #426 `docs` | no | 2 | 0.00% | -0.08% to +0.23% |
+| #425 `fix(walker)!` | yes | 2 | +1.06% | +1.01% to +1.15% |
+| #423 `fix(glob)!` | yes | 2 | 0.00% | -0.04% to +0.14% |
+| #421 `docs` | yes | 2 | 0.00% | -0.38% to -0.04% |
+| #420 `fix(glob)!` | yes | 2 | +0.02% | -0.03% to -0.01% |
+| #418 `perf(glob)` | yes | 4 | -0.01% to +0.27% | -0.16% to +0.36% |
+| #417 `fix(walker)!` | yes | 1 | 0.00% | -0.18% |
+| #416 `fix(walker)` | yes | 2 | 0.00% | +0.15% to +0.53% |
+| #415 `fix(glob)!` | yes | 4 | +0.00% to +0.38% | -0.16% to +0.55% |
+| #414 `chore` | yes | 16 | 0.00% | -0.32% to +0.22% |
+| #413 `fix(walker)!` | yes | 2 | -1.34% | -1.46% to -1.34% |
+| #412 `ci` | no | 1 | 0.00% | 0.00% |
+| #411 `fix(walker)` | yes | 2 | 0.00% | +0.03% to +0.11% |
+| #410 `perf(walker)` | yes | 2 | 0.00% | +0.14% to +0.19% |
+| #409 `feat(glob)` | yes | 3 | 0.00% | -0.10% to +0.18% |
+| #408 `fix(glob)!` | yes | 2 | 0.00% | +0.11% to +0.23% |
+| #407 `fix(walker)!` | yes | 2 | 0.00% | +0.06% to +0.07% |
+| #406 `docs` | yes | 2 | 0.00% | -0.18% to -0.14% |
+| #392 `chore` | no | 4 | 0.00% | -0.14% to +0.11% |
+| #390 `docs` | no | 2 | 0.00% | +0.04% to +0.11% |
+| #389 `chore` | no | 2 | 0.00% | +0.02% to +0.13% |
+| #388 `docs` | no | 1 | 0.00% | +0.22% |
+| #387 `docs` | no | 1 | 0.00% | +0.01% |
+| #386 `chore` | no | 3 | 0.00% | -0.05% to +0.11% |
+| #385 `ci` | no | 3 | 0.00% | -0.07% to +0.14% |
+| #384 `chore` | no | 3 | 0.00% | -0.03% to +0.01% |
+| #383 `chore` | no | 1 | 0.00% | +0.13% |
+| #382 `docs(readme)` | no | 1 | 0.00% | +0.05% |
+| #381 `chore` | yes | 1 | 0.00% | 0.00% |
+| #380 `chore` | yes | 3 | 0.00% | -0.16% to +0.17% |
+| #379 `ci` | no | 3 | 0.00% | -0.06% to +0.02% |
+| #378 `chore(cargo)` | yes | 2 | 0.00% | +0.09% to +0.10% |
+| #377 `docs` | no | 3 | 0.00% | -0.16% to -0.01% |
+| #376 `docs` | yes | 2 | 0.00% | +0.03% to +0.09% |
+| #375 `chore` | yes | 4 | 0.00% | -0.06% to +0.12% |
+| #374 `fix(test)` | no | 1 | 0.00% | +0.09% |
+| #373 `chore` | no | 2 | 0.00% | -0.12% to -0.03% |
+| #360 `chore` | yes | 1 | 0.00% | -0.03% |
 
 ## Reproducing
 
