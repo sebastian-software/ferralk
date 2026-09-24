@@ -77,17 +77,17 @@ compatible with zlob and deliberately has no C ABI.
   and two counting allocators that exist only in test targets. A file that
   starts carrying `unsafe` fails CI, and so does a list entry that no longer
   needs to be on it.
-- **Git is the oracle, not a spec someone read once.** The 822 checked-in
+- **Git is the oracle, not a spec someone read once.** The 994 checked-in
   behavioral cases are a machine-readable corpus rather than a side effect of
   the tests, and the ignore cases among them are replayed against
   `git check-ignore` itself, on Linux and on Windows, pinned to Git 2.52.0. If
   Git disagrees, CI fails; where Ferralk diverges on purpose, the case carries
-  an ADR reference or a recorded oracle defect, and all 44 of them do.
+  an ADR reference or a recorded oracle defect, and all 76 of them do.
 - **Verification beyond a test suite.** Seven fuzz targets, differential checks
   against `fast-glob` and the frozen zlob reference, AddressSanitizer, Miri,
   and loom models of the scheduler protocol, across Linux, macOS, and Windows.
   [Verification depth](docs/verification-comparison.md#counts) counts what a
-  pull request actually runs, and how the count was taken. Seventeen ADRs
+  pull request actually runs, and how the count was taken. Twenty ADRs
   record the decisions rather than leaving them to be rediscovered. Performance
   is measured on every pull request and never used as a gate.
 
@@ -102,16 +102,16 @@ compatible with zlob and deliberately has no C ABI.
 
 ## Status
 
-Ferralk is in its 1.0 release candidate. The
-[1.x stability contract](docs/stability.md) is settled and unchanged since it
-was written: it states which public API, corpus semantics, entry-point rules,
-platform tier, and MSRV policy become stable at 1.0, and which implementation
-details and feature flags do not. The checked-in
-[`cargo public-api` listings](docs/api/) have not moved either, and no
-consumer-visible breaking change has landed since the contract was settled.
+Ferralk is stable. From 1.0.0 on, the
+[1.x stability contract](docs/stability.md) is in force: it states which public
+API, corpus semantics, entry-point rules, platform tier, and MSRV policy are
+covered by semantic versioning, and which implementation details and feature
+flags are not. The checked-in [`cargo public-api` listings](docs/api/) are the
+API it covers, and a consumer-visible change to any of it is a major release.
 
-What the candidate is for is one more adversarial review round. Until `1.0.0`
-itself is tagged, treat the guarantee as intended rather than in force. Both
+1.0.0 settles the findings of the adversarial round run against
+`1.0.0-rc.1`; the [compatibility guide](docs/compatibility-guide.md#contract-change-audit-since-090)
+lists every behavior change since 0.9.0, including the ones 1.0.0 makes. Both
 crates are published on crates.io; use the current
 1.0.0-rc.1 release line for applications. <!-- x-release-please-version -->
 

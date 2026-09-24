@@ -90,17 +90,21 @@ yet.
 ## Releasing 1.0
 
 The mechanical checklist lives in
-[`CONTRIBUTING.md`](../CONTRIBUTING.md#10-release-checklist). The essential
-cadence is two consecutive adversarial review rounds without a consumer-visible
-breaking change, then `1.0.0-rc.1`, then one more clean adversarial round before
-`1.0.0`.
+[`CONTRIBUTING.md`](../CONTRIBUTING.md#10-release-checklist). The planned
+cadence was two consecutive adversarial review rounds without a
+consumer-visible breaking change, then `1.0.0-rc.1`, then one more clean round
+before `1.0.0`.
 
-`1.0.0-rc.1` is the current step. Everything this document promises is in place
-and has stopped moving — the contract text, the public enum decisions, and the
-checked-in [`cargo public-api`](api/) listings are unchanged since
-`feat!: settle the v1.0 contract`, which was the last consumer-visible breaking
-change. The candidate exists so one more adversarial round runs against exactly
-the artifact that would become 1.0. Until `1.0.0` is tagged, this contract
-describes what is intended, not what is guaranteed: a finding in that round can
-still change it, and that is the point of cutting a candidate rather than a
-release.
+`1.0.0-rc.1` was cut before those rounds, and the round run against it
+(2026-09-04) was not clean: it found four consumer-visible defects (#393–#396).
+The 1.0 readiness review of 2026-09-24 added decisions that could only be made
+before the freeze — rejecting a leading `!` in walker patterns (#397), a
+recursive `**` only as a whole path component (#419, ADR-0020), and excludes
+that apply inside hidden directories (#424). All of them landed as `!` changes
+listed in the
+[contract-change audit](compatibility-guide.md#contract-change-audit-since-090).
+On 2026-09-24 the maintainer decided to release `1.0.0` directly after that
+round of fixes instead of cutting another candidate and waiting for a further
+clean round; later defects ship as 1.x patch releases where they are fixes to
+the documented contract, and as a major release where they would change it.
+From `1.0.0` on, this contract is in force.
