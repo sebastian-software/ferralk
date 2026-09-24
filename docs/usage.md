@@ -30,10 +30,10 @@ switch that changes it; the sections below explain the semantics.
 | Symlink kind for `files_only` and `directories_only` | The listing's kind: a symlink is a symlink | `WalkOptions::resolve_symlink_kind(true)` classifies by target |
 | Entry kinds | Files, directories, and symlinks | `WalkOptions::files_only(true)` or `directories_only(true)` |
 | Depth | Unlimited | `WalkOptions::max_depth(n)` |
-| Ordering | Unsorted | `WalkOptions::sort(true)`, for `collect()` and `visit()`; `stream()` ignores it |
+| Ordering | Unsorted | `WalkOptions::sort(true)`, for `collect()` and `visit()`; `stream()` and `stream_parallel()` ignore it |
 | Metadata | Not fetched | `WalkOptions::metadata(true)` |
 | Recoverable errors | Collected next to the entries | `Walker::error_policy(ErrorPolicy::Skip)` or `ErrorPolicy::Abort` |
-| Threads | Available parallelism, held to one performance cluster on Apple Silicon macOS and clamped to `1..=256` | `Walker::threads(n)`; `stream()` is always single-threaded |
+| Threads | Available parallelism, held to one performance cluster on Apple Silicon macOS and clamped to `1..=256` | `Walker::threads(n)`, for `collect()`, `visit()` and `stream_parallel()`; `stream()` is always single-threaded |
 | Wildcard scope | Component-local, as in a shell | `Walker::wildcard_mode(WildcardMode::SeparatorCrossing)` for `globset`-style patterns |
 | Stopping early | Runs to completion | `Walker::cancellation(token)`, or `Verdict::Stop` from a `visit` predicate |
 
@@ -427,13 +427,17 @@ Important defaults:
   roots continue, so a multi-root walk can return their entries alongside the
   failed root's error. `Skip` is not "skip but tell me": use `Collect` for
   that. `visit()` follows the same table. `stream()` yields each kept error as
-  an item in place; under `Abort` the first error is its last item.
+  an item in place; `stream_parallel()` yields it as an item as soon as a
+  worker meets it, which can be before entries of the directory it belongs to
+  or of that directory's siblings. Under `Abort` the first error is the last
+  item of either stream, unless a cancellation request is observed first, in
+  which case the stream ends without it and `was_cancelled()` is true.
   Ignore-rule read and safety-limit failures use the `read_ignore` operation;
   under `Skip` they are discarded like other descendant-level recoverable
   failures.
 - Results are unsorted unless `WalkOptions::sort(true)` is set. `stream()`
-  ignores that switch without a diagnostic; use `collect()` when the order
-  matters.
+  and `stream_parallel()` ignore that switch without a diagnostic; use
+  `collect()` when the order matters.
 - Metadata is not fetched unless `WalkOptions::metadata(true)` is set.
 - `stream()` yields entries and recoverable errors incrementally. It is
   single-threaded and cannot provide global sorting. Because errors are items,
@@ -441,6 +445,15 @@ Important defaults:
   entries. Decide what an error means before counting, with
   `.filter_map(Result::ok).take(10)` to drop errors or
   `.take(10).collect::<Result<Vec<_>, _>>()` to stop at the first one.
+- `stream_parallel()` yields the same items from the walk `collect()` runs, on
+  `threads(n)` workers of its own, through a bounded channel to the thread that
+  iterates it. Entries arrive in no particular order: workers interleave, so a
+  directory is not necessarily yielded before its subtree. Workers pause while
+  the consumer is behind, and dropping the stream stops the walk and joins its
+  threads before `drop` returns. A worker panic resumes on the iterating
+  thread. Nothing starts before the first item; with `threads(1)` it is
+  `stream()` itself, and otherwise it starts one thread even for a tiny tree,
+  where `stream()` is cheaper.
 - A `WalkResult` iterates with the same item type, owned or borrowed:
   `for item in walker.collect()?` yields every entry as `Ok`, in the order of
   `entries()`, and then every error as `Err`, so a loop cannot pass over the
@@ -468,7 +481,10 @@ filesystem operations. `collect()`, serial and parallel alike, reads the token
 when a worker takes a directory and then once every 64 entries while it works
 through the listing, so a cancelled walk classifies at most that many more
 entries per worker before stopping and never opens another directory.
-`stream()` reads it before every entry it yields. `Verdict::Stop` reaches a
+`stream()` reads it before every entry it yields. `stream_parallel()` does
+both: its workers read it as `collect()`'s do, and the iterating thread reads
+it before every item, so nothing found before the request is yielded after it.
+`Verdict::Stop` reaches a
 parallel walk's workers, the one that returned it included, at that same
 granularity; a serial walk stops at the very next entry, because there the
 verdict is a local flag rather than shared state.

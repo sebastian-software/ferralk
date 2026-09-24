@@ -37,7 +37,7 @@ Use `is_match_glob_path` for paths: it reads a pattern as a shell and the walker
 4. `**` is recursive only as a whole path component (`**`, `**/x`, `x/**`, `x/**/y`): `**/x` matches `x` and `a/x`, never `sx`. Elsewhere, as in `a**`, it is an ordinary star run.
 5. A leading `!` is not negation. `Walker::include` and `exclude` reject it and `Pattern::compile` reads a literal `!`. Split a fast-glob or globby list: entries with `!` go to `exclude()` without it, except `!(…)`, which is a negated extglob.
 6. `Walker::options(WalkOptions)` replaces every option; build one `WalkOptions` value and pass it once.
-7. `stream()` ignores `sort(true)`, and `take(n)` counts `Err` items: use `.filter_map(Result::ok).take(n)` or handle errors first.
+7. `stream()` ignores `sort(true)`, and `take(n)` counts `Err` items: use `.filter_map(Result::ok).take(n)` or handle errors first. `stream()` is single-threaded whatever `threads(n)` says; `stream_parallel()` walks on `threads(n)` workers, yields the same items in no particular order, and has the same two traps.
 8. Returned paths include the root: `Walker::new(".")` yields `./src/lib.rs`. `entry.relative_path()` is `src/lib.rs`, the spelling the patterns matched; `WalkEntry::path_bytes()` also includes the root.
 9. Patterns use `/` and `\` escapes on every platform, Windows included. Never build a pattern with `PathBuf::join`; keep the root in `Walker::new(root)`. To put a path or user text into a pattern literally, use `ferralk_glob::escape_str` (or `escape` for bytes); on Windows replace `\` with `/` first.
 10. Patterns and candidates are bytes. For a `Path`, pass `ferralk_glob::path_bytes(path)`; a `&str` works as it is.

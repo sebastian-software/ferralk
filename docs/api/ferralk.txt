@@ -134,6 +134,21 @@ impl core::marker::Unpin for ferralk::CancellationToken
 impl core::marker::UnsafeUnpin for ferralk::CancellationToken
 impl core::panic::unwind_safe::RefUnwindSafe for ferralk::CancellationToken
 impl core::panic::unwind_safe::UnwindSafe for ferralk::CancellationToken
+pub struct ferralk::ParallelWalkStream
+impl ferralk::ParallelWalkStream
+pub fn ferralk::ParallelWalkStream::was_cancelled(&self) -> bool
+impl core::fmt::Debug for ferralk::ParallelWalkStream
+pub fn ferralk::ParallelWalkStream::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::iter::traits::iterator::Iterator for ferralk::ParallelWalkStream
+pub type ferralk::ParallelWalkStream::Item = core::result::Result<ferralk::WalkEntry, ferralk::WalkError>
+pub fn ferralk::ParallelWalkStream::next(&mut self) -> core::option::Option<Self::Item>
+impl core::marker::Freeze for ferralk::ParallelWalkStream
+impl core::marker::Send for ferralk::ParallelWalkStream
+impl !core::marker::Sync for ferralk::ParallelWalkStream
+impl core::marker::Unpin for ferralk::ParallelWalkStream
+impl core::marker::UnsafeUnpin for ferralk::ParallelWalkStream
+impl !core::panic::unwind_safe::RefUnwindSafe for ferralk::ParallelWalkStream
+impl !core::panic::unwind_safe::UnwindSafe for ferralk::ParallelWalkStream
 pub struct ferralk::WalkEntry
 impl ferralk::WalkEntry
 pub fn ferralk::WalkEntry::basename(&self) -> core::option::Option<&std::ffi::os_str::OsStr>
@@ -299,6 +314,7 @@ pub const fn ferralk::Walker::options(self, ferralk::WalkOptions) -> Self
 pub const fn ferralk::Walker::respect_git_ignore(self, bool) -> Self
 pub fn ferralk::Walker::roots(&self) -> impl core::iter::traits::exact_size::ExactSizeIterator<Item = &std::path::Path>
 pub fn ferralk::Walker::stream(self) -> ferralk::WalkStream
+pub fn ferralk::Walker::stream_parallel(self) -> ferralk::ParallelWalkStream
 pub const fn ferralk::Walker::threads(self, usize) -> Self
 pub fn ferralk::Walker::try_add_root(&mut self, impl core::convert::Into<std::path::PathBuf>) -> core::result::Result<&mut Self, ferralk_glob::PatternError>
 pub fn ferralk::Walker::try_exclude(&mut self, impl core::convert::AsRef<[u8]>) -> core::result::Result<&mut Self, ferralk_glob::PatternError>

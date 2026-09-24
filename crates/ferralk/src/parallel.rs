@@ -1,4 +1,5 @@
-//! Parallel `collect()` implementation built on the crate-local scheduler.
+//! Parallel `collect()` and `stream_parallel()` implementation built on the
+//! crate-local scheduler.
 
 use std::{
     any::Any,
@@ -20,7 +21,9 @@ use super::{
     AncestorChain, CANCELLATION_STRIDE, CYCLE_KEY_OPERATION, DirectoryBackend, EntryVisitor,
     ErrorPolicy, Listing, Verdict, WalkEntry, WalkError, WalkOperation, WalkResult, Walker,
     classify::{DirectoryTask, EmittedEntry, EntryAction, TraversalContext, classify_entry},
-    own_path, push_entry_name, reset_to_directory,
+    own_path,
+    parallel_stream::{StreamControl, StreamMessage, StreamSink},
+    push_entry_name, reset_to_directory,
     scheduler::{CacheLine, Coordinator, Scheduler, WorkerSlot},
 };
 
@@ -31,6 +34,51 @@ pub(super) fn collect<B: DirectoryBackend + Sync>(
 ) -> Result<WalkResult, WalkError> {
     let walker = Arc::new(walker);
     let shared = Arc::new(Shared::new(Arc::clone(&walker), backend, visitor));
+    run(&walker, backend, shared)
+}
+
+/// Runs the walk [`collect`] runs, but hands entries and kept errors to
+/// `sink` as the workers produce them instead of retaining them.
+///
+/// This is what `Walker::stream_parallel` runs on its driver thread, which is
+/// the walk's caller worker. Only the output differs: scheduling, the helper
+/// floors, cancellation and panic capture are the ones `collect` uses. Returns
+/// the error that ended the walk under `ErrorPolicy::Abort`.
+///
+/// The consumer's side of the sink is given a way to stop this walk: the same
+/// [`Shared::stop`] an abort or a panic uses, which wakes parked workers at
+/// once rather than at their next poll. The backend is `'static` so that the
+/// handle can outlive this call without borrowing anything.
+pub(super) fn stream<B: DirectoryBackend + Sync + 'static>(
+    walker: Walker,
+    backend: &'static B,
+    sink: StreamSink,
+) -> Result<(), WalkError> {
+    let walker = Arc::new(walker);
+    let control = sink.control();
+    let mut shared = Shared::new(Arc::clone(&walker), backend, &super::keep_every_entry);
+    shared.sink = Some(sink);
+    let shared = Arc::new(shared);
+    attach_stop(&shared, &control);
+    run(&walker, backend, shared).map(drop)
+}
+
+/// Gives the consumer's side of a stream the walk's own stop. The handle is
+/// weak, so a consumer that outlives the walk keeps nothing of it alive.
+fn attach_stop(shared: &Arc<Shared<'static>>, control: &StreamControl) {
+    let walk = Arc::downgrade(shared);
+    control.attach(Box::new(move || {
+        if let Some(shared) = walk.upgrade() {
+            shared.stop();
+        }
+    }));
+}
+
+fn run<B: DirectoryBackend + Sync>(
+    walker: &Walker,
+    backend: &B,
+    shared: Arc<Shared<'_>>,
+) -> Result<WalkResult, WalkError> {
     let mut caller = WorkerScratch::new(0);
     let caller_slot = shared.coordinator.claim_caller_slot();
 
@@ -222,6 +270,21 @@ const HELPER_LISTING_FLOOR: usize = 1024;
 /// thousand tasks.
 const LISTING_BATCH_SIZE: usize = 1024;
 
+/// Kept entries a streaming worker buffers before it hands them to the
+/// consumer in one channel message.
+///
+/// A worker also hands over whatever it holds when it finishes a directory, so
+/// this bounds only a wide listing: a sparse match in a large tree reaches the
+/// consumer when its directory is done rather than when a batch fills. One
+/// message per entry would put every entry through the channel's shared state,
+/// which every worker and the consumer contend on.
+///
+/// The size is checked at the [`CANCELLATION_STRIDE`] rather than per entry,
+/// where the worker already stops to read shared state, so that `collect()`
+/// carries no per-entry test for a stream it does not have. A batch therefore
+/// holds fewer than this plus one stride of entries.
+pub(super) const STREAM_BATCH_SIZE: usize = 256;
+
 impl<'scope, 'env> HelperPool<'scope, 'env> {
     /// Starts helpers while queued directories outnumber the running workers
     /// and the thread budget has room. Cheap enough to call after every
@@ -338,6 +401,9 @@ struct Shared<'backend> {
     /// every later directory boundary from asking the operating system again.
     helpers_capped: AtomicBool,
     panic: Mutex<Option<Box<dyn Any + Send + 'static>>>,
+    /// Where a streaming walk sends its entries and kept errors. `None` for
+    /// `collect()` and `visit()`, which retain them for the `WalkResult`.
+    sink: Option<StreamSink>,
 }
 
 impl<'backend> Shared<'backend> {
@@ -360,6 +426,7 @@ impl<'backend> Shared<'backend> {
             abort_error: Mutex::new(None),
             helpers_capped: AtomicBool::new(false),
             panic: Mutex::new(None),
+            sink: None,
         }
     }
 
@@ -433,6 +500,34 @@ impl<'backend> Shared<'backend> {
         }
     }
 
+    /// Hands a streaming worker's buffered entries to the consumer.
+    ///
+    /// The send blocks while the channel is full, which is the stream's
+    /// backpressure: a worker holds at most one batch beyond what the channel
+    /// holds. A consumer that went away fails the send and stops the walk.
+    /// Entries buffered after the walk stopped are dropped, so none of them
+    /// trails the error that ended it under `ErrorPolicy::Abort`.
+    ///
+    /// Callers test `self.sink` first and pass it in, once per directory or
+    /// per cancellation stride, so a collecting walk never gets this far and
+    /// pays nothing per entry for the stream's existence.
+    fn flush_stream(&self, sink: &StreamSink, worker: &mut WorkerScratch) {
+        if worker.entries.is_empty() {
+            return;
+        }
+        if self.should_stop() {
+            worker.entries.clear();
+            return;
+        }
+        // Sized after the batch it replaces: a narrow directory does not pay
+        // for a full batch, and a wide listing keeps a full-batch buffer.
+        let capacity = worker.entries.len();
+        let batch = std::mem::replace(&mut worker.entries, Vec::with_capacity(capacity));
+        if !sink.send(StreamMessage::Entries(batch)) {
+            self.stop();
+        }
+    }
+
     fn record_error(
         &self,
         operation: WalkOperation,
@@ -450,7 +545,16 @@ impl<'backend> Shared<'backend> {
                 }
             }
             ErrorPolicy::Skip if !is_root => {}
-            ErrorPolicy::Skip | ErrorPolicy::Collect => lock(&self.errors).push(error),
+            ErrorPolicy::Skip | ErrorPolicy::Collect => match &self.sink {
+                None => lock(&self.errors).push(error),
+                // A stream delivers a kept error in band, when it happens,
+                // rather than after the walk.
+                Some(sink) => {
+                    if !sink.send(StreamMessage::Error(error)) {
+                        self.stop();
+                    }
+                }
+            },
         }
     }
 
@@ -682,7 +786,22 @@ fn try_take(
         })
 }
 
+/// Walks one task and, for a streaming walk, hands what it kept to the
+/// consumer: a directory's entries reach the consumer when the directory is
+/// done, however few of them there are.
 fn process_directory(
+    shared: &Shared,
+    worker: &mut WorkerScratch,
+    task: ParallelTask,
+    pool: Option<HelperPool<'_, '_>>,
+) {
+    walk_directory(shared, worker, task, pool);
+    if let Some(sink) = &shared.sink {
+        shared.flush_stream(sink, worker);
+    }
+}
+
+fn walk_directory(
     shared: &Shared,
     worker: &mut WorkerScratch,
     task: ParallelTask,
@@ -787,6 +906,11 @@ fn process_directory(
             if let Some(pool) = pool {
                 pool.grow();
             }
+            if let Some(sink) = &shared.sink
+                && worker.entries.len() >= STREAM_BATCH_SIZE
+            {
+                shared.flush_stream(sink, worker);
+            }
         }
         // The entry's path exists only for as long as it is being decided
         // about; anything that outlives that copies it out.
@@ -858,7 +982,7 @@ fn act(shared: &Shared, worker: &mut WorkerScratch, action: EntryAction) {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(super) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -873,12 +997,12 @@ std::thread_local! {
 }
 
 #[cfg(test)]
-fn fail_next_worker_spawn() {
+pub(super) fn fail_next_worker_spawn() {
     FAIL_NEXT_WORKER_SPAWN.with(|failure| failure.set(true));
 }
 
 #[cfg(test)]
-fn should_fail_next_worker_spawn() -> bool {
+pub(super) fn should_fail_next_worker_spawn() -> bool {
     FAIL_NEXT_WORKER_SPAWN.with(std::cell::Cell::take)
 }
 
@@ -894,20 +1018,29 @@ fn take_worker_spawn_attempts() -> usize {
 
 /// Directory whose traversal panics once, on whichever worker picks it up.
 /// The trigger is process-wide because helper threads own their tasks, and it
-/// matches one absolute path so concurrent tests stay independent.
+/// matches absolute paths so concurrent tests stay independent. A set rather
+/// than one slot, so two tests arming it at once do not disarm each other.
 #[cfg(test)]
-static PANIC_IN_DIRECTORY: Mutex<Option<PathBuf>> = Mutex::new(None);
+static PANIC_IN_DIRECTORY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 #[cfg(test)]
-fn panic_in_directory(directory: PathBuf) {
-    *lock(&PANIC_IN_DIRECTORY) = Some(directory);
+pub(super) fn panic_in_directory(directory: PathBuf) {
+    lock(&PANIC_IN_DIRECTORY).push(directory);
+}
+
+/// Whether the panic armed for `directory` has not fired yet.
+#[cfg(test)]
+pub(super) fn panic_in_directory_is_armed(directory: &std::path::Path) -> bool {
+    lock(&PANIC_IN_DIRECTORY)
+        .iter()
+        .any(|target| target == directory)
 }
 
 #[cfg(test)]
 fn should_panic_in_directory(directory: &std::path::Path) -> bool {
-    let mut target = lock(&PANIC_IN_DIRECTORY);
-    if target.as_deref() == Some(directory) {
-        *target = None;
+    let mut targets = lock(&PANIC_IN_DIRECTORY);
+    if let Some(index) = targets.iter().position(|target| target == directory) {
+        targets.swap_remove(index);
         return true;
     }
     false
@@ -935,7 +1068,7 @@ static WORKER_RENDEZVOUS: Mutex<Option<WorkerRendezvous>> = Mutex::new(None);
 /// an empty slot. libtest runs tests on parallel threads, so that is the
 /// default rather than the exception once more than one test uses it.
 #[cfg(test)]
-static WORKER_RENDEZVOUS_GUARD: Mutex<()> = Mutex::new(());
+pub(super) static WORKER_RENDEZVOUS_GUARD: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 static WORKER_RENDEZVOUS_WAKE: std::sync::Condvar = std::sync::Condvar::new();
@@ -950,7 +1083,7 @@ const WORKER_RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from
 const WORKER_RENDEZVOUS_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[cfg(test)]
-fn expect_worker_threads(root: PathBuf, expected: usize) {
+pub(super) fn expect_worker_threads(root: PathBuf, expected: usize) {
     *lock(&WORKER_RENDEZVOUS) = Some(WorkerRendezvous {
         root,
         expected,
@@ -960,7 +1093,7 @@ fn expect_worker_threads(root: PathBuf, expected: usize) {
 }
 
 #[cfg(test)]
-fn observed_worker_threads() -> usize {
+pub(super) fn observed_worker_threads() -> usize {
     lock(&WORKER_RENDEZVOUS)
         .take()
         .map_or(0, |rendezvous| rendezvous.threads.len())
@@ -1211,6 +1344,44 @@ mod tests {
             shared.tree_is_worth_helpers(),
             "a single huge directory is worth helpers even with an empty queue"
         );
+    }
+
+    /// A worker whose directories match nothing never sends, so it cannot
+    /// learn from a failed send that the consumer went away, and a parked one
+    /// would sleep until its next poll. Closing the stream has to stop the
+    /// walk itself, the way an abort does, without touching a caller token -
+    /// whether the consumer closes before the driver attached or after.
+    #[test]
+    fn a_closed_stream_stops_the_walk_itself() {
+        for close_first in [false, true] {
+            let cancellation = CancellationToken::default();
+            let walker = Arc::new(Walker::new(".").cancellation(cancellation.clone()));
+            let mut shared = Shared::new(walker, &crate::SystemBackend, &crate::keep_every_entry);
+            let (sink, receiver) = crate::parallel_stream::test_sink(1);
+            let control = sink.control();
+            shared.sink = Some(sink);
+            let shared = Arc::new(shared);
+
+            if close_first {
+                crate::parallel_stream::close_test_sink(&control);
+                assert!(!shared.should_stop(), "nothing to stop before attaching");
+            }
+            super::attach_stop(&shared, &control);
+            if !close_first {
+                assert!(!shared.should_stop());
+                crate::parallel_stream::close_test_sink(&control);
+            }
+            assert!(
+                shared.stopped.load(Ordering::Acquire),
+                "close_first={close_first}: closing sets the walk's own stop, which wakes parked workers"
+            );
+            assert!(shared.should_stop());
+            assert!(
+                !cancellation.is_cancelled(),
+                "the caller's token is untouched"
+            );
+            drop(receiver);
+        }
     }
 
     #[test]

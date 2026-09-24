@@ -45,11 +45,15 @@
 //! [`Walker::options`]. The table on [`ErrorPolicy`] shows which errors each
 //! policy collects, discards, or returns as `Err`.
 //!
-//! Three ways to consume a walk:
+//! Four ways to consume a walk:
 //!
 //! - [`Walker::collect`] walks in parallel and returns every entry and every
 //!   recoverable error in one [`WalkResult`].
-//! - [`Walker::stream`] yields entries one at a time on the calling thread.
+//! - [`Walker::stream`] walks on the calling thread and yields entries one at
+//!   a time, in traversal order.
+//! - [`Walker::stream_parallel`] walks in parallel on threads of its own and
+//!   yields entries one at a time on the calling thread, in no particular
+//!   order.
 //! - [`Walker::visit`] runs a predicate on the worker that found each entry,
 //!   so a caller-side filter does not become a serial pass afterwards.
 //!
@@ -612,8 +616,11 @@ pub use ignore_rules::fuzz_rule as fuzz_ignore_rule;
 #[cfg(feature = "unstable-test-hooks")]
 pub use ignore_rules::fuzz_rule_bytes as fuzz_ignore_rule_bytes;
 mod parallel;
+mod parallel_stream;
 mod scheduler;
 mod sort_order;
+
+pub use parallel_stream::ParallelWalkStream;
 
 use classify::{DirectoryTask, EmittedEntry, EntryAction, TraversalContext, classify_entry};
 use gitignore::{IgnoreReadError, IgnoreScope};
@@ -2510,9 +2517,9 @@ impl Walker {
         self
     }
 
-    /// Limits `collect()` to this many workers. Values are clamped to
-    /// `1..=256`; `stream()` remains single-threaded to preserve incremental
-    /// delivery. The upper bound caps the queues, scratch buffers, and
+    /// Limits `collect()`, `visit()` and `stream_parallel()` to this many
+    /// workers. Values are clamped to `1..=256`; `stream()` remains
+    /// single-threaded and walks on the thread that iterates it. The upper bound caps the queues, scratch buffers, and
     /// potential operating-system threads one walk can reserve. It is a
     /// ceiling, not a promise: a helper the operating system refuses to start
     /// leaves the walk to the workers already running, see
@@ -2681,6 +2688,80 @@ impl Walker {
             cancelled: false,
             stopped: false,
         }
+    }
+
+    /// Starts an incremental traversal that walks on the configured workers
+    /// and yields their entries on the calling thread.
+    ///
+    /// [`Walker::stream`] walks on the thread that iterates it. This runs the
+    /// walk [`Walker::collect`] runs — the same work-stealing pool, the same
+    /// [`Walker::threads`] budget, the same floor below which a small tree
+    /// stays on one worker — on threads of its own, and hands the entries to
+    /// the iterating thread through a bounded channel. Use it when a consumer
+    /// wants entries as they are found from a tree large enough that one
+    /// thread is the bottleneck.
+    ///
+    /// It keeps the stream's contract, with the parallel walk's order:
+    ///
+    /// - Items are `Result<WalkEntry, WalkError>`. A recoverable error arrives
+    ///   in band when a worker meets it, under the same [`ErrorPolicy`] table
+    ///   `collect()` follows: every error under `Collect`, only a root that
+    ///   cannot be opened under `Skip`, and under `Abort` the first error as
+    ///   the stream's last item. Unlike `stream()`, an error is not held back
+    ///   until its directory's entries have been yielded: it can arrive before
+    ///   entries of its own directory and of that directory's siblings.
+    /// - Entries arrive in no particular order, and [`WalkOptions::sort`] is
+    ///   ignored as it is for `stream()`.
+    /// - The [`CancellationToken`] is read before every item; a cancelled
+    ///   stream ends, and [`ParallelWalkStream::was_cancelled`] reports it.
+    ///   When the token fires as an `Abort` error ends the walk, the request
+    ///   can be observed first: the stream then ends without yielding that
+    ///   error and `was_cancelled()` is `true`, as for [`WalkStream`].
+    /// - Workers pause while the consumer is behind, so the entries in flight
+    ///   are bounded by a few batches per worker, not by the tree.
+    /// - Dropping the stream stops the walk and joins its threads before
+    ///   `drop` returns.
+    /// - A panic inside a worker stops the walk and resumes on the iterating
+    ///   thread, from `next()` or from `drop`, as it would from `collect()`.
+    ///
+    /// Nothing starts until the first item is asked for. With `threads(1)`
+    /// no thread is started at all and the stream is exactly `stream()`.
+    /// Otherwise one thread is started even for a tiny tree, where that start
+    /// costs more than `stream()` would; the walk's helpers still start only
+    /// once the tree is worth them. A thread the operating system refuses to
+    /// start leaves the walk to `stream()` on the calling thread and is
+    /// reported as one recoverable `spawn_worker` error, as it is for
+    /// [`Walker::collect`].
+    ///
+    /// ```
+    /// use ferralk::Walker;
+    ///
+    /// # let root = std::env::temp_dir().join(format!("ferralk-doc-stream-parallel-{}", std::process::id()));
+    /// # let _ = std::fs::remove_dir_all(&root);
+    /// # for file in ["src/lib.rs", "src/parser/mod.rs", "README.md"] {
+    /// #     let path = root.join(file);
+    /// #     std::fs::create_dir_all(path.parent().expect("a file has a parent"))?;
+    /// #     std::fs::write(path, "")?;
+    /// # }
+    /// let mut rust_files = Vec::new();
+    /// for item in Walker::new(&root)
+    ///     .include("**/*.rs")?
+    ///     .threads(4)
+    ///     .stream_parallel()
+    /// {
+    ///     match item {
+    ///         Ok(entry) => rust_files.push(entry.relative_path().to_path_buf()),
+    ///         Err(error) => eprintln!("not walked: {error}"),
+    ///     }
+    /// }
+    /// // Workers interleave, so sort before comparing.
+    /// rust_files.sort();
+    /// assert_eq!(rust_files, ["src/lib.rs", "src/parser/mod.rs"].map(std::path::PathBuf::from));
+    /// # std::fs::remove_dir_all(&root)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn stream_parallel(self) -> ParallelWalkStream {
+        ParallelWalkStream::new(self)
     }
 
     fn may_descend_into(&self, root: usize, relative: &[u8]) -> bool {
@@ -4147,7 +4228,8 @@ impl DirectoryBackend for SystemBackend {
 /// Every form returns fewer than ten entries when the tree has fewer.
 ///
 /// A stream is single-threaded and never sorted; [`WalkOptions::sort`] does
-/// not apply to it.
+/// not apply to it. [`Walker::stream_parallel`] yields the same items from a
+/// walk on the configured workers.
 #[must_use = "a walk stream does nothing unless iterated"]
 #[derive(Debug)]
 pub struct WalkStream {
@@ -5371,7 +5453,7 @@ mod tests {
     }
 
     fn stream_outcome(
-        stream: super::WalkStream,
+        stream: impl IntoIterator<Item = Result<WalkEntry, super::WalkError>>,
         root: &Path,
         policy: ErrorPolicy,
     ) -> FrontendOutcome {
@@ -5423,6 +5505,20 @@ mod tests {
                 streamed, serial,
                 "{label}: stream and serial disagree under {policy:?}"
             );
+            for threads in [1, 2, 8] {
+                let streamed = stream_outcome(
+                    build()
+                        .threads(threads)
+                        .error_policy(policy)
+                        .stream_parallel(),
+                    root,
+                    policy,
+                );
+                assert_eq!(
+                    streamed, serial,
+                    "{label}: stream_parallel on {threads} threads and serial disagree under {policy:?}"
+                );
+            }
 
             for threads in [1, 4] {
                 let visited = collect_outcome(

@@ -246,10 +246,25 @@ fn bench_repository_shape(c: &mut Criterion) {
                 count + 1
             })
     };
+    // The same stream walked on four workers. Counting items rather than
+    // entries would hide an error, so every item is checked like above.
+    let stream_parallel = || {
+        Walker::new(fixture.root())
+            .threads(4)
+            .include(TYPESCRIPT_PATTERN)
+            .expect("benchmark include is valid")
+            .options(WalkOptions::default())
+            .stream_parallel()
+            .fold(0, |count, entry| {
+                entry.expect("benchmark stream succeeds");
+                count + 1
+            })
+    };
     let expected = collect(1);
     assert_eq!(expected, 7_400);
     assert_eq!(collect(4), expected);
     assert_eq!(stream(), expected);
+    assert_eq!(stream_parallel(), expected);
 
     c.bench_function(&format!("{LANE}/repository/unscoped/serial"), |benchmark| {
         benchmark.iter(|| black_box(collect(1)))
@@ -261,6 +276,10 @@ fn bench_repository_shape(c: &mut Criterion) {
     c.bench_function(&format!("{LANE}/repository/unscoped/stream"), |benchmark| {
         benchmark.iter(|| black_box(stream()))
     });
+    c.bench_function(
+        &format!("{LANE}/repository/unscoped/stream_parallel"),
+        |benchmark| benchmark.iter(|| black_box(stream_parallel())),
+    );
 }
 
 /// The cheapest per-PR guard for include-plus-exclude pruning. The include
