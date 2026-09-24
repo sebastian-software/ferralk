@@ -156,7 +156,7 @@ assert_eq!(matched, [1, 2]);
 
 `PatternSet::new` compiles every glob with one `PatternOptions`; a glob that
 does not compile is reported as a `PatternSetError` whose `index()` is its
-position in the list and whose `error()` is the usual `PatternError`. For
+position in the list and whose `pattern_error()` is the usual `PatternError`. For
 per-glob options, compile the `Pattern`s yourself and `collect()` them into a
 set.
 

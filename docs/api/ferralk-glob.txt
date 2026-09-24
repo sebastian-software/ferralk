@@ -102,8 +102,8 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferralk_glob::PatternSet
 impl core::panic::unwind_safe::UnwindSafe for ferralk_glob::PatternSet
 pub struct ferralk_glob::PatternSetError
 impl ferralk_glob::PatternSetError
-pub const fn ferralk_glob::PatternSetError::error(&self) -> &ferralk_glob::PatternError
 pub const fn ferralk_glob::PatternSetError::index(&self) -> usize
+pub const fn ferralk_glob::PatternSetError::pattern_error(&self) -> &ferralk_glob::PatternError
 impl core::clone::Clone for ferralk_glob::PatternSetError
 pub fn ferralk_glob::PatternSetError::clone(&self) -> ferralk_glob::PatternSetError
 impl core::cmp::Eq for ferralk_glob::PatternSetError

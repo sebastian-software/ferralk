@@ -169,7 +169,7 @@ impl PatternSet {
     ///
     /// Returns a [`PatternSetError`] for the first glob that does not compile.
     /// [`PatternSetError::index`] is that glob's position in `patterns`, and
-    /// [`PatternSetError::error`] the [`PatternError`] that
+    /// [`PatternSetError::pattern_error`] the [`PatternError`] that
     /// [`Pattern::compile`] reported for it.
     ///
     /// ```
@@ -178,7 +178,7 @@ impl PatternSet {
     /// let error = PatternSet::new(["src/**", "[a-", "*.md"], PatternOptions::walker())
     ///     .expect_err("the class is never closed");
     /// assert_eq!(error.index(), 1);
-    /// assert_eq!(error.error().offset(), 0);
+    /// assert_eq!(error.pattern_error().offset(), 0);
     /// ```
     pub fn new<I>(patterns: I, options: PatternOptions) -> Result<Self, PatternSetError>
     where
@@ -450,7 +450,7 @@ impl FromIterator<Pattern> for PatternSet {
 ///
 /// assert_eq!(globs[error.index()], "src/[a-z*");
 /// // The byte offset points into that glob, as for `Pattern::compile`.
-/// assert_eq!(error.error().offset(), 4);
+/// assert_eq!(error.pattern_error().offset(), 4);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatternSetError {
@@ -468,7 +468,7 @@ impl PatternSetError {
 
     /// The compile error of that glob, with its byte offset into it.
     #[must_use]
-    pub const fn error(&self) -> &PatternError {
+    pub const fn pattern_error(&self) -> &PatternError {
         &self.error
     }
 }
@@ -1015,14 +1015,14 @@ mod tests {
             .expect_err("the class is never closed");
         assert_eq!(error.index(), 2);
         assert_eq!(
-            error.error(),
+            error.pattern_error(),
             &Pattern::compile("[a-", PatternOptions::walker()).expect_err("same error")
         );
         assert!(error.to_string().starts_with("pattern 2: "));
         assert!(
             error
                 .source()
-                .is_some_and(|source| source.to_string() == error.error().to_string())
+                .is_some_and(|source| source.to_string() == error.pattern_error().to_string())
         );
     }
 
