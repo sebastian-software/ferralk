@@ -22,7 +22,7 @@ switch that changes it; the sections below explain the semantics.
 | Concern | Default | Switch |
 | --- | --- | --- |
 | Which entries qualify | Every non-excluded entry when no include is set; otherwise any include, OR-ed | `Walker::include`, `Walker::exclude`, and the borrowed `try_` forms |
-| Wildcards and a leading period | Not matched, so `**/*.ts` skips `.cache/x.ts` | `Walker::match_hidden(true)` |
+| Wildcards and a leading period | Not matched by an include, so `**/*.ts` skips `.cache/x.ts`; always matched by an exclude, as in `.gitignore` | `Walker::match_hidden(true)` for includes |
 | Hidden entries at all | Traversed and reported | `WalkOptions::skip_hidden(true)` drops them before any pattern runs |
 | `.gitignore`, `.ignore`, `.git/info/exclude` | Not read | `Walker::respect_git_ignore(true)` |
 | The `.git` directory under Git ignores | Skipped | `WalkOptions::keep_git_dir(true)` |
@@ -105,7 +105,9 @@ assert!(!pattern.is_match_glob_path(".cache/src/lib.rs"));
 the dialect `Walker` compiles its include and exclude patterns in, and the
 walker builds its own options from it: recursive `**`, braces, and extglobs on,
 everything else at its default, as the table below shows. Chain
-`.match_hidden(true)` to mirror `Walker::match_hidden(true)`, and match with
+`.match_hidden(true)` to mirror `Walker::match_hidden(true)` for an include,
+and always for an exclude, which covers a leading period under either
+setting. Match with
 `is_match_glob_path`, or with `is_match` under
 `WildcardMode::SeparatorCrossing`, to answer as the walker does for a
 root-relative path. `PatternOptions::default()` is intentionally conservative:
@@ -486,7 +488,7 @@ too: `*.rs` matches `.rs` only with `match_hidden(true)`. A negated extglob
 is an ordinary wildcard for this rule: `!(x)` covers neither `.env` nor the
 hidden component of `a/.env`, and naming a hidden exception, as in `!(.env)`,
 opts no other hidden name in.
-`Walker::match_hidden(true)` opts in for include and exclude patterns alike:
+`Walker::match_hidden(true)` opts in for include patterns:
 
 ```rust,no_run
 use ferralk::{WalkOptions, Walker};
@@ -501,14 +503,25 @@ let result = Walker::new("workspace")
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Builder order does not matter; patterns added before the call are recompiled.
+Builder order does not matter; includes added before the call are recompiled.
 A literal period is not a wildcard, so `.claude/**` selects a hidden directory
 with either setting.
+
+Excludes are not subject to this rule. They apply in every directory the walk
+enters, hidden ones included, the way a `.gitignore` line does: a wildcard in
+an exclude, `**` included, covers a leading period whatever `match_hidden`
+says. Without any include, `exclude("**/node_modules/**")` removes
+`.cache/node_modules/a.ts` too, and `exclude("*.log")` removes `.debug.log` as
+well as `debug.log`. An exclude also wins over an include that names a hidden
+entry literally: `include(".github/**")` with `exclude("**/*.yml")` drops
+`.github/workflows/ci.yml`. `match_hidden` therefore decides what a walk can
+select, never what an exclude removes.
 
 `WalkOptions::skip_hidden(true)` is a different mechanism, not the inverse of
 this one. It is a traversal filter: it drops every entry with a leading-period
 component and never descends into a hidden directory, before any pattern is
-consulted. `match_hidden` only decides what a wildcard is allowed to cover.
+consulted. `match_hidden` only decides what a wildcard in an include is
+allowed to cover.
 With `skip_hidden` enabled no hidden path survives long enough for
 `match_hidden` to matter.
 

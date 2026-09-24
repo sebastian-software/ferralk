@@ -92,9 +92,10 @@ These compile and return a plausible, wrong result:
 - Walker patterns are anchored at the root: `exclude("target/**")` prunes only
   the top-level `target`; `**/target/**` prunes every one.
 - `**` is recursive only as a whole path component: `**/x` never matches `sx`.
-- Wildcards, `**` included, skip a leading `.`: `**/*.ts` misses `.cache/x.ts`,
-  and `exclude("**/node_modules/**")` misses `.cache/node_modules`. Use
-  `match_hidden(true)` or a literal `.cache/**`.
+- Include wildcards, `**` included, skip a leading `.`: `**/*.ts` misses
+  `.cache/x.ts`. Use `match_hidden(true)` or a literal `.cache/**`. Excludes
+  cover hidden names either way, as `.gitignore` lines do:
+  `exclude("**/node_modules/**")` also removes `.cache/node_modules`.
 - `respect_git_ignore(true)` applies the ignore files in the walk root and
   below even outside a Git repository, unlike the `ignore` crate.
 - A leading `!` is not negation: the walker rejects it and the matcher reads

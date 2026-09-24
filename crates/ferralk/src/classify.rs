@@ -164,8 +164,9 @@ fn should_emit(
 
 /// Whether an exclude is strong enough to close a directory before it is
 /// opened. Literal and directory-only matches need every include ruled out;
-/// a `/**` covering exclude already rejects every visible descendant, so only
-/// an explicitly hidden include can reach its default-policy blind spot.
+/// a `/**` covering exclude already rejects every descendant. Excludes cover
+/// a leading period whatever `match_hidden` says, so that includes hidden
+/// ones and leaves no include anything to re-admit.
 fn exclude_proves_no_re_admission(
     walker: &Walker,
     root: usize,
@@ -173,20 +174,11 @@ fn exclude_proves_no_re_admission(
     excluded: bool,
     no_include_can_re_admit: bool,
 ) -> bool {
-    let plan = &walker.roots[root];
-    let covers_subtree = plan
-        .excludes
-        .iter()
-        .any(|pattern| pattern.covers_subtree(bytes, walker.wildcard_mode));
-    if no_include_can_re_admit && (excluded || covers_subtree) {
-        return true;
-    }
-    covers_subtree
-        && (walker.match_hidden
-            || !plan
-                .includes
-                .iter()
-                .any(|pattern| pattern.could_match_hidden_descendant(bytes)))
+    (no_include_can_re_admit && excluded)
+        || walker.roots[root]
+            .excludes
+            .iter()
+            .any(|pattern| pattern.covers_subtree(bytes, walker.wildcard_mode))
 }
 
 /// Whether resolving a path-excluded link proves that it has no reachable

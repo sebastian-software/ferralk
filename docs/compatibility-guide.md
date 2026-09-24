@@ -91,7 +91,7 @@ let result = Walker::new(".")
 | `ZLOB_GITIGNORE` | `Walker::respect_git_ignore(true)` (`.git/info/exclude`, then `.gitignore`, then zlob-compatible `.ignore`) |
 | `ZLOB_WALK_KEEP_GIT_DIR` | `WalkOptions::keep_git_dir(true)` |
 | `ZLOB_SKIP_HIDDEN` | `WalkOptions::skip_hidden(true)` |
-| `ZLOB_PERIOD` on a walk | `Walker::match_hidden(true)` (include and exclude patterns alike) |
+| `ZLOB_PERIOD` on a walk | `Walker::match_hidden(true)` for include patterns; exclude patterns always cover a leading period |
 | `ZLOB_FOLLOW_SYMLINKS` | `WalkOptions::follow_symlinks(true)` |
 | `ZLOB_ERR` | `ErrorPolicy::{Abort, Skip, Collect}` |
 | `ZLOB_ONLYDIR` | `WalkOptions::directories_only(true)` |
@@ -139,8 +139,11 @@ variant as an ordinary file.
 
 `Walker::match_hidden` and `WalkOptions::skip_hidden` are separate mechanisms
 and not each other's inverse: `match_hidden` is matcher semantics, deciding
-whether a wildcard may cover a leading period, while `skip_hidden` is a
-traversal filter that removes hidden entries before any pattern is consulted.
+whether a wildcard in an include may cover a leading period, while
+`skip_hidden` is a traversal filter that removes hidden entries before any
+pattern is consulted. A wildcard in an exclude covers a leading period under
+either `match_hidden` setting, so excludes apply inside hidden directories the
+way `.gitignore` lines do.
 
 Walker include patterns are root-relative. A leading `./` is accepted, on the
 pattern and on each brace alternative (`{./src,lib}/*.rs`), and is ignored
@@ -335,7 +338,7 @@ in detail, and the crate documentation has tested recipes for
 | A slash-free pattern such as `*.rs` or `target` | `globset`: matches at any depth, because `*` crosses. | Top level only. | `.gitignore` and overrides: at any depth. | Top level only: walker patterns are anchored at the root. Write `**/*.rs` or `**/target/**` for any depth. |
 | `**` | Recursive only as a whole component. Elsewhere `globset` reads two `*`, and `glob` rejects it. | Recursive only as a whole component. | `.gitignore` rules. | Recursive only as a whole path component (`**`, `**/x`, `x/**`, `x/**/y`): `**/x` matches `x` and `a/x`, never `sx`. Any other star run is ordinary stars. `Walker` always reads it this way; `ferralk-glob` only with `recursive_double_star(true)`, which `PatternOptions::walker()` sets. `PatternOptions::default()` reads `**` as `*`. |
 | Braces `{a,b}` | `globset`: on. `glob`: not supported. | On. | – | On in `Walker`. In `ferralk-glob` only with `braces(true)` or `PatternOptions::walker()`; `default()` reads `{` literally. |
-| A leading `.` | `globset` and `glob`: `*` matches it, unless `glob`'s `require_literal_leading_dot`. | Not matched unless `dot: true`. | `ignore` skips hidden entries entirely unless `hidden(false)`. `walkdir` yields them. | A wildcard does not cover it, so `**/*.ts` skips `.cache/x.ts`; opt in with `Walker::match_hidden(true)` or `PatternOptions::match_hidden(true)`. Hidden entries are still walked and returned when no pattern leaves them out; `WalkOptions::skip_hidden(true)` drops them as `ignore` does. |
+| A leading `.` | `globset` and `glob`: `*` matches it, unless `glob`'s `require_literal_leading_dot`. | Not matched unless `dot: true`. | `ignore` skips hidden entries entirely unless `hidden(false)`. `walkdir` yields them. | An include wildcard does not cover it, so `**/*.ts` skips `.cache/x.ts`; opt in with `Walker::match_hidden(true)` or `PatternOptions::match_hidden(true)`. An exclude covers it either way, as a `.gitignore` line does, so `**/node_modules/**` also removes `.cache/node_modules`. Hidden entries are still walked and returned when no pattern leaves them out; `WalkOptions::skip_hidden(true)` drops them as `ignore` does. |
 | A leading `!` | Not negation (`[!a]` is a negated class). | Marks an ignore pattern. | Overrides: marks an exclude. `.gitignore`: re-includes. | Not negation. `Walker::include` and `exclude` reject it, and `ferralk-glob` reads it as a literal `!`, so split the list into includes and excludes (below). `!(…)` is a negated extglob. `.gitignore` files keep Git's `!` under `respect_git_ignore(true)`. |
 | Several patterns at once | `globset::GlobSet`, with `matches` for the indices. | An array of patterns. | `OverrideBuilder`. | `Walker`: one `include` or `exclude` call per pattern; includes are OR-ed. `ferralk-glob`: a `Vec<Pattern>` asked with `iter().any` or `position`. There is no set type yet ([#405](https://github.com/sebastian-software/ferralk/issues/405)). |
 | Which entries are returned | `glob::glob()`: matching files and directories. | Files only (`onlyFiles: true`). | Every entry, the root itself first at depth 0. | Files, directories, and symlinks that the patterns select, never the root itself. `WalkOptions::files_only(true)` matches fast-glob's default, `directories_only(true)` its `onlyDirectories`. |
@@ -438,8 +441,9 @@ and covered by the cross-platform corpus. See the
   Rust crates `ferralk-glob` and `ferralk` instead (ADR-0003).
 - Direct matching excludes leading-period path components by default. Enable
   `PatternOptions::match_hidden` for a compiled pattern, or
-  `Walker::match_hidden` for a whole walk, to opt in; this is the
-  POSIX-conservative default selected by ADR-0011. It holds inside one
+  `Walker::match_hidden` for a walk's includes, to opt in; this is the
+  POSIX-conservative default selected by ADR-0011. A walker exclude always
+  covers a leading period, as a `.gitignore` line does. It holds inside one
   component too: `*.rs` matches `.rs` only with `match_hidden` enabled. A
   negated extglob such as `!(x)` is an ordinary wildcard for this rule: it
   crosses a separator like `*` in the fnmatch reading, but neither consumes a
@@ -579,8 +583,9 @@ It is an audit of the current contract, not a second changelog.
 | 1.0.0: walker `./` on brace alternatives | Includes and excludes ignore one leading `./` on every brace-expanded alternative, as the path matchers do: `{./src/*.rs,lib/*.rs}` selects from both directories instead of silently dropping the `./` alternative, and `{./src/*.rs,./lib/*.rs}` is accepted instead of rejected as an unnormalized `.` component. See [walking](#walking) and the [usage guide](usage.md#walk-filesystems-with-explicit-policy). |
 | 1.0.0: leading `!` in walker patterns | `include`, `exclude`, and their `try_` forms reject a pattern or brace alternative that starts with `!` not followed by `(`, instead of compiling it as a literal `!` that selects nothing; `\!` and `!(…)` are unchanged. See [migrating from fast-glob](#migrating-patterns-from-globset-or-fast-glob). |
 | 1.0.0: extglob position rule in path filters | Under `is_match_path` a group directly after `/` is component-local like a wildcard there (for a repeated group only its first iteration), and brace alternatives are judged independently; under both path entry points a separator-crossing star before a component-local one keeps its backtrack point (`**/*.@(ts\|js)` reaches every depth), a separator or recursive `**` inside a group can cross components, and a star run such as `***` reads as it does outside a group. See the [matcher table](#matcher) and [usage guide](usage.md#match-paths-deliberately). |
+| 1.0.0: excludes inside hidden directories | A walker exclude covers a leading period whatever `Walker::match_hidden` says, so `exclude("**/node_modules/**")` removes `.cache/node_modules/a.ts` and `exclude("*.log")` removes `.debug.log`; a covering exclude such as `x/**` also removes, and prunes, hidden descendants an include names literally. What an include selects is unchanged. See the [usage guide](usage.md#hidden-paths-two-separate-switches). |
 | 1.0.0: `**` only as a whole path component | With `recursive_double_star`, `**` is recursive only when bounded by `/` or a pattern end on both sides; `**/x` no longer matches `sx`, `a/**/b` no longer matches `a/xb`, and a walker exclude `**/node_modules/**` no longer prunes `my_node_modules`. Any other `**` run is ordinary stars. See the [matcher section](#matcher), [deliberate differences](#deliberate-differences), [ADR-0020](adr/0020-double-star-only-as-a-whole-component.md), and the [usage guide](usage.md#match-paths-deliberately). |
-| 1.0.0: extglob groups beside a whole-component `**` | A group reads like its alternatives written in its place: before a trailing `/**` it accepts the path without that suffix (`@(x)/**`, `!(y)/**`, and `*(a)/**` accept `x`, `x`, and `a`), a trailing group holding `**` does the same (`x/@(**)` accepts `x`), and a `**` ending an alternative in front of `/` may stand for no directory (`@(**)/y` accepts `y`, `a/@(**)/b` accepts `a/b`). A walker exclude such as `@(a\|b)/**` therefore excludes `a` itself, and a subtree cover prunes only a directory the exclude matches, so `a/**/**` without `match_hidden` no longer drops `a/.h`. See the [usage guide](usage.md#match-paths-deliberately). |
+| 1.0.0: extglob groups beside a whole-component `**` | A group reads like its alternatives written in its place: before a trailing `/**` it accepts the path without that suffix (`@(x)/**`, `!(y)/**`, and `*(a)/**` accept `x`, `x`, and `a`), a trailing group holding `**` does the same (`x/@(**)` accepts `x`), and a `**` ending an alternative in front of `/` may stand for no directory (`@(**)/y` accepts `y`, `a/@(**)/b` accepts `a/b`). A walker exclude such as `@(a\|b)/**` therefore excludes `a` itself, and a subtree cover prunes only a directory the exclude matches, so `a/**/**` no longer drops `a` itself. See the [usage guide](usage.md#match-paths-deliberately). |
 
 ## Defaults to review
 

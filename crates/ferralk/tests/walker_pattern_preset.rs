@@ -5,9 +5,12 @@
 //! front or match it again away from the walk. That promise holds only if a
 //! pattern compiled with the preset answers every root-relative path exactly
 //! as `Walker::include` does, so this replays the corpus patterns and paths
-//! through both and compares the selections. The corpus verdicts themselves
-//! are not consulted: each case was recorded under its own flags, and the
-//! question here is whether the walker and the preset agree.
+//! through both and compares the selections. `Walker::exclude` is replayed the
+//! same way against the preset with `match_hidden(true)`, the dialect every
+//! exclude is compiled in whatever the walker's own `match_hidden` says
+//! (#424). The corpus verdicts themselves are not consulted: each case was
+//! recorded under its own flags, and the question here is whether the walker
+//! and the preset agree.
 //!
 //! An integration test rather than a unit test because it needs the
 //! unpublished `corpus` package. Cargo strips that path-only dev-dependency
@@ -252,12 +255,17 @@ fn preset_rejections_are_walker_rejections() {
     assert!(checked > 0, "the corpus supplies rejected patterns");
 }
 
-/// A pattern the walker accepts selects exactly the entries the preset
-/// matches: through `is_match_glob_path` under the default wildcard mode and,
-/// under the separator-crossing one, through `is_match` with the path entry
-/// points' per-alternative `./` rule (`is_match_crossing_path`, #395).
-#[test]
-fn preset_matches_what_the_walker_selects() {
+/// The preset's verdict on `path` under the walker's wildcard `mode`.
+fn preset_matches(matcher: &Pattern, path: &str, mode: WildcardMode) -> bool {
+    match mode {
+        WildcardMode::ComponentScoped => matcher.is_match_glob_path(path),
+        _ => matcher.is_match_crossing_path(path),
+    }
+}
+
+/// Calls `check` once per corpus pattern and walkable path, with a fixture
+/// holding exactly that path, and returns how many comparisons it reported.
+fn for_each_corpus_fixture(mut check: impl FnMut(&str, &Fixture, &[String]) -> usize) -> usize {
     let (_, pairs) = corpus_inputs();
     let mut checked = 0;
     for (pattern, path) in &pairs {
@@ -271,6 +279,19 @@ fn preset_matches_what_the_walker_selects() {
             // name, as Windows does for a trailing period.
             continue;
         }
+        checked += check(pattern, &fixture, &entries);
+    }
+    checked
+}
+
+/// A pattern the walker accepts selects exactly the entries the preset
+/// matches: through `is_match_glob_path` under the default wildcard mode and,
+/// under the separator-crossing one, through `is_match` with the path entry
+/// points' per-alternative `./` rule (`is_match_crossing_path`, #395).
+#[test]
+fn preset_matches_what_the_walker_selects() {
+    let checked = for_each_corpus_fixture(|pattern, fixture, entries| {
+        let mut checked = 0;
         for match_hidden in [false, true] {
             let options = PatternOptions::walker().match_hidden(match_hidden);
             let Ok(matcher) = Pattern::compile(pattern, options) else {
@@ -286,35 +307,90 @@ fn preset_matches_what_the_walker_selects() {
                         .match_hidden(match_hidden)
                         .wildcard_mode(mode)
                 };
-                if base().include(pattern.as_str()).is_err() {
+                if base().include(pattern).is_err() {
                     // A walker-only refusal, such as a `..` component, which
                     // the preset documents as outside the dialect.
                     continue;
                 }
                 let expected = entries
                     .iter()
-                    .filter(|entry| match mode {
-                        WildcardMode::ComponentScoped => matcher.is_match_glob_path(entry),
-                        _ => matcher.is_match_crossing_path(entry),
-                    })
+                    .filter(|entry| preset_matches(&matcher, entry, mode))
                     .map(PathBuf::from)
                     .collect::<BTreeSet<_>>();
                 let walker = || {
                     base()
-                        .include(pattern.as_str())
+                        .include(pattern)
                         .expect("the walker accepted this include above")
                 };
                 for (frontend, selected) in walks(walker, &fixture.root) {
                     assert_eq!(
                         selected, expected,
-                        "{frontend}: include {pattern:?} over {path:?} under {mode:?}, \
+                        "{frontend}: include {pattern:?} over {entries:?} under {mode:?}, \
                          match_hidden {match_hidden}"
                     );
                 }
                 checked += 1;
             }
         }
-    }
+        checked
+    });
+    assert!(
+        checked > 1000,
+        "only {checked} corpus comparisons reached the walker"
+    );
+}
+
+/// A pattern the walker accepts as an exclude removes exactly what the preset
+/// with `match_hidden(true)` matches, under either walker `match_hidden`: the
+/// matching entries and, with no include to re-admit anything, everything
+/// below a matching directory.
+#[test]
+fn preset_with_hidden_matching_is_what_the_walker_excludes() {
+    let options = PatternOptions::walker().match_hidden(true);
+    let checked = for_each_corpus_fixture(|pattern, fixture, entries| {
+        let Ok(matcher) = Pattern::compile(pattern, options) else {
+            // Rejected patterns belong to the rejection test.
+            return 0;
+        };
+        let mut checked = 0;
+        for match_hidden in [false, true] {
+            for mode in [
+                WildcardMode::ComponentScoped,
+                WildcardMode::SeparatorCrossing,
+            ] {
+                let base = || {
+                    Walker::new(&fixture.root)
+                        .match_hidden(match_hidden)
+                        .wildcard_mode(mode)
+                };
+                if base().exclude(pattern).is_err() {
+                    // A walker-only refusal, as for includes.
+                    continue;
+                }
+                // `entries` lists every ancestor before its descendants, so
+                // the first match removes the rest of the chain.
+                let expected = entries
+                    .iter()
+                    .take_while(|entry| !preset_matches(&matcher, entry, mode))
+                    .map(PathBuf::from)
+                    .collect::<BTreeSet<_>>();
+                let walker = || {
+                    base()
+                        .exclude(pattern)
+                        .expect("the walker accepted this exclude above")
+                };
+                for (frontend, kept) in walks(walker, &fixture.root) {
+                    assert_eq!(
+                        kept, expected,
+                        "{frontend}: exclude {pattern:?} over {entries:?} under {mode:?}, \
+                         match_hidden {match_hidden}"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        checked
+    });
     assert!(
         checked > 1000,
         "only {checked} corpus comparisons reached the walker"

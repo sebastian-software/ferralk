@@ -909,10 +909,11 @@ impl WalkOptions {
     /// This is a traversal filter, not matcher semantics, and therefore not the
     /// same switch as [`Walker::match_hidden`]: it removes hidden entries from
     /// the walk before any include or exclude pattern is consulted, while
-    /// `match_hidden` decides whether a wildcard is allowed to cover a leading
-    /// period at all. They compose in one direction only - with `skip_hidden`
-    /// enabled no hidden path survives long enough for `match_hidden` to have
-    /// anything to say about it.
+    /// `match_hidden` decides whether a wildcard in an include is allowed to
+    /// cover a leading period at all. (An exclude always covers one; see
+    /// [`Walker::exclude`].) They compose in one direction only - with
+    /// `skip_hidden` enabled no hidden path survives long enough for
+    /// `match_hidden` to have anything to say about it.
     #[must_use]
     pub const fn skip_hidden(mut self, enabled: bool) -> Self {
         self.skip_hidden = enabled;
@@ -1396,10 +1397,12 @@ impl Walker {
     /// chains. No includes means every non-excluded entry is returned.
     ///
     /// Include and exclude patterns share one dialect, which
-    /// [`PatternOptions::walker`] names: recursive `**`, braces and extglobs,
-    /// with [`Walker::match_hidden`] deciding whether a wildcard covers a
-    /// leading period. Compile a pattern with that preset to check or match it
-    /// the way the walker will.
+    /// [`PatternOptions::walker`] names: recursive `**`, braces and extglobs.
+    /// For an include, [`Walker::match_hidden`] decides whether a wildcard
+    /// covers a leading period; an exclude always covers one, as
+    /// [`Walker::exclude`] describes. Compile a pattern with that preset, and
+    /// `.match_hidden(true)` for an exclude, to check or match it the way the
+    /// walker will.
     ///
     /// The pattern may be absolute. See [`Walker::exclude`] for what that
     /// means and when it is rejected.
@@ -1480,7 +1483,8 @@ impl Walker {
         let pattern = pattern.as_ref();
         // Compiled for every root before any of them is changed, so a pattern
         // one root rejects leaves the walker as it was rather than half updated.
-        let compiled = self.compile_for_every_root(pattern)?;
+        let compiled =
+            self.compile_for_every_root(pattern, traversal_pattern_options(self.match_hidden))?;
         for (root, pattern) in self.roots.iter_mut().zip(compiled) {
             root.includes.push(pattern);
         }
@@ -1494,6 +1498,17 @@ impl Walker {
     /// Like an include, an exclude that starts with `!` is rejected: there is
     /// no negation to re-admit what another exclude matched. See
     /// [`Walker::include`].
+    ///
+    /// # Hidden entries
+    ///
+    /// An exclude applies in every directory the walk enters, hidden ones
+    /// included, the way a `.gitignore` line does: its wildcards, `**`
+    /// included, cover a leading period whatever [`Walker::match_hidden`]
+    /// says. `**/node_modules/**` therefore also removes
+    /// `.cache/node_modules/a.ts`, and `*.log` removes `.debug.log` as well as
+    /// `debug.log`. [`Walker::match_hidden`] governs only what an include
+    /// selects, so an exclude never makes a walk select more; to keep hidden
+    /// entries out of the walk entirely, use [`WalkOptions::skip_hidden`].
     ///
     /// # Patterns are relative to the root
     ///
@@ -1629,7 +1644,7 @@ impl Walker {
     /// root.
     pub fn try_exclude(&mut self, pattern: impl AsRef<[u8]>) -> Result<&mut Self, PatternError> {
         let pattern = pattern.as_ref();
-        let compiled = self.compile_for_every_root(pattern)?;
+        let compiled = self.compile_for_every_root(pattern, exclude_pattern_options())?;
         for (root, pattern) in self.roots.iter_mut().zip(compiled) {
             root.excludes.push(pattern);
         }
@@ -1725,15 +1740,21 @@ impl Walker {
     /// already configured cannot be rewritten for the new root.
     pub fn try_add_root(&mut self, root: impl Into<PathBuf>) -> Result<&mut Self, PatternError> {
         let mut plan = RootPlan::new(root.into());
-        let options = traversal_pattern_options(self.match_hidden);
+        let include_options = traversal_pattern_options(self.match_hidden);
         let root_bytes = glob_path_bytes(&plan.path);
         for source in &self.include_sources {
-            plan.includes
-                .push(compile_for_root(source, root_bytes.as_ref(), options)?);
+            plan.includes.push(compile_for_root(
+                source,
+                root_bytes.as_ref(),
+                include_options,
+            )?);
         }
         for source in &self.exclude_sources {
-            plan.excludes
-                .push(compile_for_root(source, root_bytes.as_ref(), options)?);
+            plan.excludes.push(compile_for_root(
+                source,
+                root_bytes.as_ref(),
+                exclude_pattern_options(),
+            )?);
         }
         drop(root_bytes);
         self.roots.push(plan);
@@ -1766,33 +1787,33 @@ impl Walker {
     fn compile_for_every_root(
         &self,
         pattern: &[u8],
+        options: PatternOptions,
     ) -> Result<Vec<TraversalPattern>, PatternError> {
-        let options = traversal_pattern_options(self.match_hidden);
         self.roots
             .iter()
             .map(|root| compile_for_root(pattern, glob_path_bytes(&root.path).as_ref(), options))
             .collect()
     }
 
-    /// Lets an ordinary wildcard cover a leading period, so `**/*.ts` also
-    /// reaches `.react-router/routes.ts`. Off by default, per ADR-0011.
+    /// Lets an ordinary wildcard in an include cover a leading period, so
+    /// `**/*.ts` also reaches `.react-router/routes.ts`. Off by default, per
+    /// ADR-0011.
     ///
     /// `**` counts as a wildcard here too: without this switch it does not
     /// descend into a hidden directory, so `**/*.ts` misses both `.env.ts` and
-    /// everything below `.cache/`. The same holds for excludes: without an
-    /// include, a walk with `exclude("**/node_modules/**")` still returns
-    /// `.cache/node_modules/a.ts`, because the exclude's `**` does not cover
-    /// `.cache`. Turn this switch on, or add a literal exclude such as
-    /// `.cache/**`.
+    /// everything below `.cache/`.
     ///
-    /// The switch is matcher semantics and applies to include and exclude
-    /// patterns alike: what a wildcard may reach, a wildcard may also prune.
-    /// It is not [`WalkOptions::skip_hidden`], which drops hidden entries from
-    /// the traversal before any pattern sees them; a literal `.cache/**`
-    /// selects a hidden path with either setting, because a literal period is
-    /// not a wildcard.
+    /// The switch is matcher semantics for include patterns only. Excludes
+    /// cover a leading period with either setting, so they apply inside
+    /// hidden directories the way `.gitignore` lines do:
+    /// `exclude("**/node_modules/**")` removes `.cache/node_modules/a.ts`
+    /// whether this switch is on or off; see [`Walker::exclude`]. It is not
+    /// [`WalkOptions::skip_hidden`], which drops hidden entries from the
+    /// traversal before any pattern sees them; a literal `.cache/**` selects
+    /// a hidden path with either setting, because a literal period is not a
+    /// wildcard.
     ///
-    /// Builder order does not matter: patterns added before this call are
+    /// Builder order does not matter: includes added before this call are
     /// recompiled under the new setting.
     #[must_use]
     pub fn match_hidden(mut self, enabled: bool) -> Self {
@@ -1802,7 +1823,7 @@ impl Walker {
         self.match_hidden = enabled;
         let options = traversal_pattern_options(enabled);
         for root in &mut self.roots {
-            for pattern in root.includes.iter_mut().chain(root.excludes.iter_mut()) {
+            for pattern in &mut root.includes {
                 pattern.recompile(options);
             }
         }
@@ -2421,7 +2442,7 @@ fn reject_unwalkable_relative_pattern(
     Err(PatternError::new(offset.unwrap_or(0), message))
 }
 
-/// The pattern dialect every walker pattern is compiled in.
+/// The pattern dialect every walker include is compiled in.
 ///
 /// [`PatternOptions::walker`] is the public name for it, so a consumer who
 /// validates or re-matches a walker pattern gets the same semantics. Only
@@ -2431,11 +2452,23 @@ fn traversal_pattern_options(match_hidden: bool) -> PatternOptions {
     PatternOptions::walker().match_hidden(match_hidden)
 }
 
+/// The dialect every walker exclude is compiled in: the include dialect with
+/// `match_hidden` always on.
+///
+/// An exclude applies in every directory the walk enters, hidden ones
+/// included, the way a `.gitignore` line does (#424). [`Walker::match_hidden`]
+/// decides what a wildcard may *select*; it never narrows what an exclude
+/// removes. It also lets a subtree exclude cover every descendant, so
+/// `x/**` closes `x` whatever an include names below it.
+fn exclude_pattern_options() -> PatternOptions {
+    traversal_pattern_options(true)
+}
+
 #[derive(Debug, Clone)]
 struct TraversalPattern {
     /// The pattern as the caller wrote it, so a later
-    /// [`Walker::match_hidden`] can recompile it instead of forcing the caller
-    /// to order the builder calls.
+    /// [`Walker::match_hidden`] can recompile an include instead of forcing the
+    /// caller to order the builder calls.
     source: Vec<u8>,
     matcher: Pattern,
     directories_only: bool,
@@ -2542,8 +2575,9 @@ impl TraversalPattern {
     /// A cover also requires the pattern to match `path` itself. `X/**`
     /// accepts every directory `X` accepts, so a real cover keeps pruning.
     /// Where the two disagree, as for `a/**/**`, which refuses `a`, pruning
-    /// `a` would drop a hidden `a/.h` that no wildcard of the exclude reaches
-    /// without `match_hidden` (#422).
+    /// `a` would drop `a` itself, which the exclude does not match (#422).
+    /// Everything below a real cover is excluded, hidden entries included,
+    /// because excludes are compiled with `match_hidden` on (#424).
     fn covers_subtree(&self, path: &[u8], mode: WildcardMode) -> bool {
         if self.never_matches || self.directories_only {
             return false;
@@ -2564,17 +2598,6 @@ impl TraversalPattern {
         roots
             .iter()
             .any(|root| shares_a_line_of_descent(root, path))
-    }
-
-    /// Whether this include can reach below `path` and explicitly select a
-    /// component that wildcard-hidden policy leaves outside a covering
-    /// exclude. The matcher compiler owns the syntax analysis, including
-    /// brace and extglob alternatives; the walker adds only root reachability.
-    fn could_match_hidden_descendant(&self, path: &[u8]) -> bool {
-        self.could_match_descendant(path)
-            && self
-                .matcher
-                .can_match_hidden_component_without_match_hidden()
     }
 
     fn matches_extension(&self, path: &[u8]) -> bool {
@@ -4311,8 +4334,8 @@ mod tests {
     use super::{
         CancellationToken, DirectoryFrame, DirectoryScratch, ErrorPolicy, Pattern, PatternOptions,
         SerialTask, TraversalPattern, Verdict, WalkEntry, WalkEntryKind, WalkOptions, WalkStream,
-        Walker, WildcardMode, ends_with_extension, glob_path_bytes, literal_extension,
-        literal_pattern_root, push_entry_name, traversal_pattern_options,
+        Walker, WildcardMode, ends_with_extension, exclude_pattern_options, glob_path_bytes,
+        literal_extension, literal_pattern_root, push_entry_name, traversal_pattern_options,
     };
 
     #[test]
@@ -4392,11 +4415,17 @@ mod tests {
         }
     }
 
-    /// Compiles one walker pattern the way `include` and `exclude` do, in the
-    /// default dialect where a wildcard does not cover a leading period.
+    /// Compiles one walker pattern the way `include` does, in the default
+    /// dialect where a wildcard does not cover a leading period.
     fn traversal_pattern(pattern: &[u8]) -> TraversalPattern {
         TraversalPattern::compile(pattern, traversal_pattern_options(false))
             .expect("valid walker pattern")
+    }
+
+    /// Compiles one walker pattern the way `exclude` does, where a wildcard
+    /// covers a leading period (#424).
+    fn exclude_pattern(pattern: &[u8]) -> TraversalPattern {
+        TraversalPattern::compile(pattern, exclude_pattern_options()).expect("valid walker pattern")
     }
 
     struct Fixture {
@@ -5020,9 +5049,13 @@ mod tests {
         }
 
         let scoped = WildcardMode::ComponentScoped;
-        let exclude = traversal_pattern(b"**/node_modules/**");
+        let exclude = exclude_pattern(b"**/node_modules/**");
         assert!(exclude.covers_subtree(b"node_modules", scoped));
         assert!(exclude.covers_subtree(b"pkg/node_modules", scoped));
+        assert!(
+            exclude.covers_subtree(b".cache/node_modules", scoped),
+            "an exclude's `**` reaches below a hidden directory (#424)"
+        );
         assert!(!exclude.covers_subtree(b"my_node_modules", scoped));
         assert!(!exclude.covers_subtree(b"pkg/my_node_modules", scoped));
         assert!(
@@ -5040,8 +5073,8 @@ mod tests {
     /// A group in front of a trailing `/**` excludes the directory it names,
     /// as the inlined `a/**` does, so the walk prunes exactly what the
     /// exclude matches (#422). The subtree cover used to close `a` while the
-    /// matcher kept `a` and its hidden `a/.h`, which `**` does not reach
-    /// without `match_hidden`.
+    /// matcher kept `a`. Excludes reach hidden names since #424, so `a/.h` is
+    /// excluded either way; what the cover must not do is drop `a` itself.
     #[test]
     fn a_group_before_a_trailing_double_star_excludes_the_directory_it_covers() {
         let fixture = Fixture::new();
@@ -5078,10 +5111,10 @@ mod tests {
                     expected = vec!["c", "c/z"];
                 }
                 if exclude.ends_with("/**/**") || exclude == "@(a/**)/**" {
-                    // `a/**/**` refuses `a` itself, and without
-                    // `match_hidden` no `**` reaches `a/.h`, so neither is
-                    // pruned.
-                    expected = vec!["a", "a/.h", "a/.h/f", "ab", "ab/f", "b", "b/y", "c", "c/z"];
+                    // `a/**/**` refuses `a` itself, so `a` is kept and
+                    // opened; everything below it is excluded, hidden
+                    // entries included (#424).
+                    expected = vec!["a", "ab", "ab/f", "b", "b/y", "c", "c/z"];
                 }
                 assert_eq!(
                     relative_paths(result.entries(), &fixture.root),
@@ -5105,7 +5138,7 @@ mod tests {
             "@(a/**)/**",
             "x/@(**|a)/**",
         ] {
-            let pattern = traversal_pattern(source.as_bytes());
+            let pattern = exclude_pattern(source.as_bytes());
             for &candidate in candidates {
                 for mode in [
                     WildcardMode::ComponentScoped,
@@ -8457,6 +8490,191 @@ mod tests {
         );
     }
 
+    /// Excludes apply in every directory the walk enters, hidden ones
+    /// included, the way a `.gitignore` line does (#424): a wildcard in an
+    /// exclude covers a leading period whatever `match_hidden` says.
+    #[test]
+    fn excludes_apply_inside_hidden_directories() {
+        let fixture = Fixture::new();
+        for path in [
+            ".cache/node_modules/a.ts",
+            ".git/HEAD",
+            ".x.log",
+            "a.log",
+            "node_modules/b.ts",
+            "src/.y.log",
+            "src/main.ts",
+        ] {
+            fixture.write(path);
+        }
+        let paths = |list: &[&str]| list.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let every_file = paths(&[
+            ".cache/node_modules/a.ts",
+            ".git/HEAD",
+            ".x.log",
+            "a.log",
+            "node_modules/b.ts",
+            "src/.y.log",
+            "src/main.ts",
+        ]);
+        let without = |removed: &[&str]| -> Vec<PathBuf> {
+            every_file
+                .iter()
+                .filter(|path| !removed.iter().any(|removed| path == &Path::new(removed)))
+                .cloned()
+                .collect()
+        };
+
+        for match_hidden in [false, true] {
+            for mode in [
+                WildcardMode::ComponentScoped,
+                WildcardMode::SeparatorCrossing,
+            ] {
+                let walk = |exclude: &str, options: WalkOptions| -> Vec<PathBuf> {
+                    let build = || {
+                        Walker::new(&fixture.root)
+                            .match_hidden(match_hidden)
+                            .wildcard_mode(mode)
+                            .exclude(exclude)
+                            .expect("valid exclude")
+                            .options(options.sort(true).files_only(true))
+                    };
+                    assert_frontends_agree(exclude, &fixture.root, build);
+                    relative_paths(
+                        build()
+                            .threads(1)
+                            .collect()
+                            .expect("walk succeeds")
+                            .entries(),
+                        &fixture.root,
+                    )
+                };
+                let label = format!("match_hidden {match_hidden}, {mode:?}");
+                let default = WalkOptions::default();
+
+                let node_modules = without(&[".cache/node_modules/a.ts", "node_modules/b.ts"]);
+                assert_eq!(
+                    walk("**/node_modules/**", default),
+                    node_modules,
+                    "{label}: `**` reaches below a hidden directory"
+                );
+                assert_eq!(
+                    walk("**/node_modules/", default),
+                    node_modules,
+                    "{label}: a directory-only exclude matches below a hidden directory"
+                );
+                assert_eq!(
+                    walk(&fixture.absolute("/**/node_modules/**"), default),
+                    node_modules,
+                    "{label}: an absolute exclude is rewritten into the same rule"
+                );
+
+                // `*` covers a leading period, as it does in `.gitignore`. How
+                // far it reaches is still the wildcard mode's question.
+                let top_level_logs = without(&[".x.log", "a.log"]);
+                let every_log = without(&[".x.log", "a.log", "src/.y.log"]);
+                assert_eq!(
+                    walk("*.log", default),
+                    match mode {
+                        WildcardMode::ComponentScoped => top_level_logs,
+                        _ => every_log.clone(),
+                    },
+                    "{label}: `*.log` covers `.x.log`"
+                );
+                assert_eq!(walk("**/*.log", default), every_log, "{label}");
+
+                // Naming a hidden component was always enough.
+                assert_eq!(walk(".git/**", default), without(&[".git/HEAD"]), "{label}");
+
+                // `skip_hidden` still removes hidden entries before any
+                // pattern is consulted.
+                assert_eq!(
+                    walk("**/*.log", default.skip_hidden(true)),
+                    paths(&["node_modules/b.ts", "src/main.ts"]),
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    /// Only what an exclude removes grows under #424: what an include selects
+    /// still follows `match_hidden`, and a hidden entry an include names
+    /// literally is now removed by a wildcard exclude that covers it.
+    #[test]
+    fn hidden_aware_excludes_leave_include_selection_alone() {
+        let fixture = Fixture::new();
+        for path in [
+            ".cache/a.ts",
+            ".cache/node_modules/b.ts",
+            ".github/README.md",
+            ".github/workflows/ci.yml",
+            "src/.d.ts",
+            "src/c.ts",
+        ] {
+            fixture.write(path);
+        }
+        let walk = |match_hidden: bool, include: &str, exclude: Option<&str>| -> Vec<PathBuf> {
+            let build = || {
+                let mut walker = Walker::new(&fixture.root)
+                    .match_hidden(match_hidden)
+                    .include(include)
+                    .expect("valid include")
+                    .options(WalkOptions::default().sort(true).files_only(true));
+                if let Some(exclude) = exclude {
+                    walker = walker.exclude(exclude).expect("valid exclude");
+                }
+                walker
+            };
+            assert_frontends_agree(include, &fixture.root, build);
+            relative_paths(
+                build()
+                    .threads(1)
+                    .collect()
+                    .expect("walk succeeds")
+                    .entries(),
+                &fixture.root,
+            )
+        };
+        let paths = |list: &[&str]| list.iter().map(PathBuf::from).collect::<Vec<_>>();
+
+        assert_eq!(walk(false, "**/*.ts", None), paths(&["src/c.ts"]));
+        assert_eq!(
+            walk(false, "**/*.ts", Some("**/node_modules/**")),
+            paths(&["src/c.ts"]),
+            "the exclude does not make the include reach hidden entries"
+        );
+        assert_eq!(
+            walk(true, "**/*.ts", None),
+            paths(&[
+                ".cache/a.ts",
+                ".cache/node_modules/b.ts",
+                "src/.d.ts",
+                "src/c.ts"
+            ])
+        );
+        assert_eq!(
+            walk(true, "**/*.ts", Some("**/node_modules/**")),
+            paths(&[".cache/a.ts", "src/.d.ts", "src/c.ts"])
+        );
+        assert_eq!(
+            walk(false, "src/.d.ts", Some("**/*.js")),
+            paths(&["src/.d.ts"]),
+            "an exclude that does not match leaves a literal hidden include alone"
+        );
+
+        for match_hidden in [false, true] {
+            assert_eq!(
+                walk(match_hidden, ".github/**", None),
+                paths(&[".github/README.md", ".github/workflows/ci.yml"])
+            );
+            assert_eq!(
+                walk(match_hidden, ".github/**", Some("**/*.yml")),
+                paths(&[".github/README.md"]),
+                "a wildcard exclude removes a hidden entry the include names literally"
+            );
+        }
+    }
+
     /// An absolute pattern selects what the same pattern written relative to
     /// the root selects, which is the whole point of rewriting it.
     #[test]
@@ -9293,11 +9511,11 @@ mod tests {
         );
     }
 
-    /// A covering exclude has only one blind spot with the default glob
-    /// policy: hidden components. A broad include that cannot name one must
-    /// not turn a rejected build tree back into traversal work.
+    /// A covering exclude rejects every descendant, hidden ones included
+    /// (#424), so no include can turn a rejected build tree back into
+    /// traversal work - not even one that names a hidden descendant.
     #[test]
-    fn covering_excludes_prune_when_includes_cannot_reach_hidden_descendants() {
+    fn covering_excludes_prune_whatever_the_includes_name() {
         struct PruningBackend {
             root: PathBuf,
             reads: Mutex<Vec<PathBuf>>,
@@ -9373,24 +9591,107 @@ mod tests {
             );
         }
 
-        let (paths, reads) = walk("**/.hidden/keep.rs", false);
-        assert_eq!(paths, [PathBuf::from("target/.hidden/keep.rs")]);
-        assert!(
-            reads.contains(&PathBuf::from("target/.hidden")),
-            "an explicit hidden include still re-admits the excluded subtree's blind spot"
-        );
-
-        let (paths, reads) = walk("**/?(.visible).hidden/keep.rs", false);
-        assert_eq!(paths, [PathBuf::from("target/.hidden/keep.rs")]);
-        assert!(
-            reads.contains(&PathBuf::from("target/.hidden")),
-            "an extglob that explicitly permits a leading period can re-admit its zero-width branch"
-        );
+        // An include that names the hidden descendant explicitly, directly or
+        // through an extglob's zero-width branch, meets an exclude that covers
+        // it: the exclude wins, so there is nothing to open `target` for.
+        for (include, match_hidden) in [
+            ("**/.hidden/keep.rs", false),
+            ("**/.hidden/keep.rs", true),
+            ("**/?(.visible).hidden/keep.rs", false),
+            ("target/.hidden/keep.rs", false),
+        ] {
+            let (paths, reads) = walk(include, match_hidden);
+            assert!(paths.is_empty(), "{include}: {paths:?}");
+            assert!(
+                !reads.iter().any(|read| read.starts_with("target")),
+                "{include} with match_hidden={match_hidden} must not open target: {reads:?}"
+            );
+        }
     }
 
-    /// A wildcard cannot stop immediately before a leading literal period.
-    /// Therefore these includes cannot reach the hidden descendants and a
-    /// covering exclude may prune their parent subtree.
+    /// Without an include, an exclude that rejects a directory below a hidden
+    /// one closes it before it is opened, in each form that can reject a
+    /// directory (#424).
+    #[test]
+    fn excludes_prune_directories_below_hidden_ones() {
+        struct HiddenTreeBackend {
+            root: PathBuf,
+            reads: Mutex<Vec<PathBuf>>,
+        }
+
+        impl super::DirectoryBackend for HiddenTreeBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                listing.clear();
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .expect("walk only reads descendants of its root");
+                self.reads
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(relative.to_path_buf());
+                if relative.as_os_str().is_empty() {
+                    listing.push(".cache".as_ref(), true, false);
+                } else if relative == Path::new(".cache") {
+                    listing.push("node_modules".as_ref(), true, false);
+                    listing.push(".pnpm".as_ref(), true, false);
+                    listing.push("keep.ts".as_ref(), false, false);
+                } else {
+                    listing.push("must-not-be-read.ts".as_ref(), false, false);
+                }
+                Ok(())
+            }
+        }
+
+        for (exclude, closed) in [
+            ("**/node_modules/**", ".cache/node_modules"),
+            ("**/node_modules", ".cache/node_modules"),
+            ("**/node_modules/", ".cache/node_modules"),
+            (".cache/*/", ".cache/.pnpm"),
+            ("*/.*/**", ".cache/.pnpm"),
+        ] {
+            for match_hidden in [false, true] {
+                let fixture = Fixture::new();
+                let backend = HiddenTreeBackend {
+                    root: fixture.root.clone(),
+                    reads: Mutex::new(Vec::new()),
+                };
+                let result = Walker::new(&fixture.root)
+                    .threads(1)
+                    .match_hidden(match_hidden)
+                    .exclude(exclude)
+                    .expect("valid exclude")
+                    .options(WalkOptions::default().files_only(true))
+                    .collect_with(&backend)
+                    .expect("mock walk succeeds");
+                let paths = relative_paths(result.entries(), &fixture.root);
+                assert!(
+                    paths.contains(&PathBuf::from(".cache/keep.ts")),
+                    "{exclude}: {paths:?}"
+                );
+                assert!(
+                    !paths.iter().any(|path| path.starts_with(closed)),
+                    "{exclude}: {paths:?}"
+                );
+                let reads = backend
+                    .reads
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert!(
+                    !reads.contains(&PathBuf::from(closed)),
+                    "{exclude} with match_hidden={match_hidden} must close {closed}: {reads:?}"
+                );
+            }
+        }
+    }
+
+    /// A covering exclude removes hidden descendants whatever the include
+    /// that reaches them looks like (#424), so the subtree may be pruned.
     #[test]
     fn covering_excludes_prune_hidden_descendants_after_wildcards() {
         let fixture = Fixture::new();
@@ -9437,11 +9738,11 @@ mod tests {
     }
 
     /// An escaped separator is folded into a literal run, and the period
-    /// behind it starts a component for the matcher. The pruning summary has
-    /// to see that period too, or a covering exclude prunes a subtree the
-    /// include reaches through the exclude's hidden blind spot.
+    /// behind it starts a component for the matcher. The include names that
+    /// hidden component, but the covering exclude matches it too (#424), so
+    /// every frontend drops it.
     #[test]
-    fn covering_excludes_keep_hidden_descendants_behind_an_escaped_separator() {
+    fn covering_excludes_remove_hidden_descendants_behind_an_escaped_separator() {
         let fixture = Fixture::new();
         fixture.write("x/foo/.hidden/keep");
         fixture.write("x/foo/visible/keep");
@@ -9469,8 +9770,8 @@ mod tests {
                         .entries(),
                     &fixture.root,
                 ),
-                [PathBuf::from("x/foo/.hidden/keep")],
-                "{include}: the include reaches the excluded subtree's hidden blind spot"
+                Vec::<PathBuf>::new(),
+                "{include}: the covering exclude removes the hidden descendant"
             );
         }
     }
