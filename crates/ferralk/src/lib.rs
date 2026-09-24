@@ -15,6 +15,8 @@
 //! until asked for; recoverable errors are collected next to the entries.
 //!
 //! ```no_run
+//! use std::error::Error;
+//!
 //! use ferralk::{ErrorPolicy, WalkOptions, Walker};
 //!
 //! let result = Walker::new(".")
@@ -29,7 +31,11 @@
 //!     println!("{}", entry.path().display());
 //! }
 //! for error in result.errors() {
-//!     eprintln!("{error}");
+//!     // `Display` names the operation and path; `source()` says why it failed.
+//!     match error.source() {
+//!         Some(cause) => eprintln!("{error}: {cause}"),
+//!         None => eprintln!("{error}"),
+//!     }
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -686,6 +692,34 @@ impl fmt::Display for WalkOperation {
 }
 
 /// A recoverable I/O failure observed while walking.
+///
+/// `Display` describes this layer only: the failed [`WalkOperation`] and the
+/// path it was given, for example `read_dir src/locked`. The underlying
+/// [`std::io::Error`] — why the operation failed — is the error's
+/// [`source()`](Error::source), so reporters that walk the source chain, such
+/// as `anyhow`, `eyre`, or `std::error::Report`, print it exactly once. Code
+/// that formats a `WalkError` on its own should print the chain too:
+///
+/// ```no_run
+/// use std::error::Error;
+///
+/// let result = ferralk::Walker::new(".").collect()?;
+/// for error in result.errors() {
+///     // Prints, for example, `read_dir ./locked: Permission denied (os error 13)`.
+///     let mut message = error.to_string();
+///     let mut cause = error.source();
+///     while let Some(inner) = cause {
+///         message = format!("{message}: {inner}");
+///         cause = inner.source();
+///     }
+///     eprintln!("{message}");
+/// }
+/// # Ok::<(), ferralk::WalkError>(())
+/// ```
+///
+/// The wording is diagnostic text, not a programmatic interface; match on
+/// [`operation()`](Self::operation), [`path()`](Self::path), and the source's
+/// [`std::io::ErrorKind`] instead.
 #[derive(Debug)]
 pub struct WalkError {
     operation: WalkOperation,
@@ -717,13 +751,15 @@ impl WalkError {
 
 impl fmt::Display for WalkError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} {}: {}",
-            self.operation,
-            self.path.display(),
-            self.source
-        )
+        // The I/O error stays out of this message: it is `source()`, and a
+        // reporter that walks the chain would otherwise print it twice.
+        if self.path.as_os_str().is_empty() {
+            // `Walker::new("")` reaches here; without the quotes the message
+            // would name no path at all (`read_dir : No such file …`).
+            write!(formatter, "{} \"\"", self.operation)
+        } else {
+            write!(formatter, "{} {}", self.operation, self.path.display())
+        }
     }
 }
 
@@ -4739,6 +4775,15 @@ mod tests {
             ("{a,b}/../main.rs", 6),
             ("{a,..}/main.rs", 3),
             ("src/{x}/.", 8),
+            // An empty component is reported at the separator that closes it,
+            // the one to remove (#400); a trailing one at the separator that
+            // opens it.
+            ("src//*.ts", 4),
+            ("src//bar", 4),
+            ("a///b", 2),
+            ("src/{}/bar", 6),
+            ("src/?()/bar", 7),
+            ("a//", 1),
         ] {
             for mode in [
                 WildcardMode::ComponentScoped,
@@ -4922,6 +4967,56 @@ mod tests {
             relative_paths(result.entries(), &fixture.root),
             vec![PathBuf::from("src/b/y.rs")]
         );
+    }
+
+    /// Renders an error and its source chain the way anyhow, eyre and
+    /// `std::error::Report` do.
+    fn error_chain(error: &dyn std::error::Error) -> String {
+        let mut rendered = error.to_string();
+        let mut source = error.source();
+        while let Some(cause) = source {
+            rendered.push_str(": ");
+            rendered.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        rendered
+    }
+
+    /// `Display` describes the failed operation and its path; the I/O cause is
+    /// the error's `source()`, so a reporter walking the chain prints it once
+    /// (#400).
+    #[test]
+    fn walk_error_display_leaves_the_io_cause_to_its_source() {
+        let fixture = Fixture::new();
+        let missing = fixture.root.join("missing");
+        let result = Walker::new(&missing)
+            .collect()
+            .expect("Collect keeps the root error");
+        let [error] = result.errors() else {
+            panic!("one root error, got {:?}", result.errors());
+        };
+        let cause = std::error::Error::source(error).expect("the I/O error is the source");
+
+        assert_eq!(error.to_string(), format!("read_dir {}", missing.display()));
+        assert_eq!(
+            error_chain(error),
+            format!("read_dir {}: {cause}", missing.display())
+        );
+    }
+
+    /// An empty root is still reported, and the message makes the empty path
+    /// visible instead of leaving `read_dir ` with nothing after it (#400).
+    #[test]
+    fn walk_error_display_spells_an_empty_path() {
+        let result = Walker::new("")
+            .collect()
+            .expect("Collect keeps the root error");
+        let [error] = result.errors() else {
+            panic!("one root error, got {:?}", result.errors());
+        };
+
+        assert_eq!(error.path(), Path::new(""));
+        assert_eq!(error.to_string(), r#"read_dir """#);
     }
 
     #[test]

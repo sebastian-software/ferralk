@@ -52,6 +52,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     error::Error,
     fmt,
+    hash::{Hash, Hasher},
 };
 
 use memchr::{memchr, memchr2, memchr3, memmem};
@@ -408,7 +409,9 @@ impl Pattern {
                 b'/' => {
                     flush_literals(&mut tokens, &mut literals);
                     tokens.push(Token::Separator);
-                    walker_path.separator();
+                    walker_path.separator(
+                        walker_source_provenance.and_then(|provenance| provenance.offset_at(index)),
+                    );
                     index += 1;
                 }
                 b'*' if options.recursive_double_star && pattern.get(index + 1) == Some(&b'*') => {
@@ -416,7 +419,10 @@ impl Pattern {
                     if pattern.get(index + 2) == Some(&b'/') {
                         tokens.push(Token::RecursivePrefix);
                         walker_path.wildcard();
-                        walker_path.separator();
+                        walker_path.separator(
+                            walker_source_provenance
+                                .and_then(|provenance| provenance.offset_at(index + 2)),
+                        );
                         index += 3;
                     } else {
                         tokens.push(Token::RecursiveStar);
@@ -3073,15 +3079,67 @@ enum WalkerComponentKind {
     Other,
 }
 
+/// A source location kept for a diagnostic only.
+///
+/// It never distinguishes two walker states: the extglob analysis
+/// deduplicates states by what they can still match, and letting a location
+/// split them would multiply the state set, and the IR budget it is charged
+/// against, by the number of separators the arms of a group end in. Of states
+/// that differ only here, the first one reached keeps its location.
+#[derive(Debug, Clone, Copy, Default)]
+struct DiagnosticOffset(Option<usize>);
+
+impl PartialEq for DiagnosticOffset {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DiagnosticOffset {}
+
+impl Hash for DiagnosticOffset {
+    fn hash<H: Hasher>(&self, _: &mut H) {}
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 struct WalkerComponent {
     kind: WalkerComponentKind,
     /// The first literal dot in this component, when it still has a
     /// determinate location in the caller's unexpanded source bytes.
     offset: Option<usize>,
+    /// Where an empty component is. It has no byte of its own, so it is
+    /// located at a separator next to it: the one that closes it (the repeated
+    /// separator in `src//x`), or for a trailing one the separator that opens
+    /// it. Meaningful only while `kind` is `Empty`.
+    separator: DiagnosticOffset,
 }
 
 impl WalkerComponent {
+    /// The component that follows a separator at `offset`.
+    const fn opened_at(offset: Option<usize>) -> Self {
+        Self {
+            kind: WalkerComponentKind::Empty,
+            offset: None,
+            separator: DiagnosticOffset(offset),
+        }
+    }
+
+    /// Records the separator at `offset` that ends this component. Only an
+    /// empty component takes its location from it.
+    fn close_at(&mut self, offset: Option<usize>) {
+        if self.kind == WalkerComponentKind::Empty && offset.is_some() {
+            self.separator = DiagnosticOffset(offset);
+        }
+    }
+
+    /// Where this component is, if it is empty and that is known.
+    const fn empty_location(self) -> Option<usize> {
+        match self.kind {
+            WalkerComponentKind::Empty => self.separator.0,
+            _ => None,
+        }
+    }
+
     fn push_literal(&mut self, byte: u8, offset: Option<usize>) {
         match (self.kind, byte) {
             (WalkerComponentKind::Empty, b'.') => {
@@ -3107,7 +3165,11 @@ impl WalkerComponent {
 
     fn append(&mut self, other: Self) {
         match other.kind {
-            WalkerComponentKind::Empty => {}
+            WalkerComponentKind::Empty => {
+                if self.kind == WalkerComponentKind::Empty && other.separator.0.is_some() {
+                    self.separator = other.separator;
+                }
+            }
             WalkerComponentKind::Dot => self.push_literal(b'.', other.offset),
             WalkerComponentKind::Parent => {
                 self.push_literal(b'.', other.offset);
@@ -3150,8 +3212,11 @@ impl WalkerPathShapeBuilder {
         self.current.wildcard();
     }
 
-    fn separator(&mut self) {
-        self.components.push(std::mem::take(&mut self.current));
+    fn separator(&mut self, offset: Option<usize>) {
+        let mut component =
+            std::mem::replace(&mut self.current, WalkerComponent::opened_at(offset));
+        component.close_at(offset);
+        self.components.push(component);
     }
 
     fn finish(mut self) -> WalkerPathShape {
@@ -3173,10 +3238,10 @@ struct WalkerPathState {
     first_parent: Option<WalkerComponent>,
     first_dot: Option<WalkerComponent>,
     last_nonempty: Option<WalkerComponent>,
-    /// A separator closed an empty component. Such a leading or interior
-    /// component is not a spelling the walker can select, even when later
-    /// matcher text makes the final component nonempty.
-    has_empty_leading_or_interior_component: bool,
+    /// The first empty component a separator closed. Such a leading or
+    /// interior component is not a spelling the walker can select, even when
+    /// later matcher text makes the final component nonempty.
+    first_empty: Option<WalkerComponent>,
     current: WalkerComponent,
 }
 
@@ -3189,7 +3254,7 @@ impl WalkerPathState {
             first_parent: None,
             first_dot: None,
             last_nonempty: None,
-            has_empty_leading_or_interior_component: false,
+            first_empty: None,
             current: WalkerComponent::default(),
         }
     }
@@ -3208,10 +3273,13 @@ impl WalkerPathState {
         self.current.wildcard();
     }
 
-    fn separator(&mut self) {
-        let component = std::mem::take(&mut self.current);
-        self.has_empty_leading_or_interior_component |=
-            component.kind == WalkerComponentKind::Empty;
+    fn separator(&mut self, offset: Option<usize>) {
+        let mut component =
+            std::mem::replace(&mut self.current, WalkerComponent::opened_at(offset));
+        component.close_at(offset);
+        if component.kind == WalkerComponentKind::Empty && self.first_empty.is_none() {
+            self.first_empty = Some(component);
+        }
         self.record_component(component);
     }
 
@@ -3219,7 +3287,9 @@ impl WalkerPathState {
         for (index, component) in shape.components.iter().copied().enumerate() {
             self.current.append(component);
             if index + 1 != shape.components.len() {
-                self.separator();
+                // The shape's empty components already carry their separator
+                // locations, which `append` has just carried over.
+                self.separator(None);
             }
         }
     }
@@ -3249,11 +3319,13 @@ impl WalkerPathState {
 
     fn finish(mut self) -> WalkerPathEvaluation {
         let component = std::mem::take(&mut self.current);
-        let selects_candidate = component.kind != WalkerComponentKind::Empty
-            && !self.has_empty_leading_or_interior_component;
+        let empty_component = self
+            .first_empty
+            .or((component.kind == WalkerComponentKind::Empty).then_some(component));
         self.record_component(component);
         WalkerPathEvaluation {
-            selects_candidate,
+            selects_candidate: empty_component.is_none(),
+            empty_component_offset: empty_component.and_then(WalkerComponent::empty_location),
             problem: WalkerPathSummary {
                 all_empty_or_dot: self.all_empty_or_dot,
                 first_parent: self.first_parent,
@@ -3271,6 +3343,8 @@ struct WalkerPathEvaluation {
     /// leading or interior component. Nullable groups must not use an empty
     /// arm as a viable escape from their real invalid arms.
     selects_candidate: bool,
+    /// Where the empty component that makes this path unselectable is.
+    empty_component_offset: Option<usize>,
     problem: Option<WalkerPathProblem>,
 }
 
@@ -3279,7 +3353,7 @@ impl WalkerPathEvaluation {
         self.problem.or_else(|| {
             (!self.selects_candidate).then_some(WalkerPathProblem {
                 viability: WalkerPathViability::EmptyComponent,
-                offset: None,
+                offset: self.empty_component_offset,
             })
         })
     }
@@ -3410,8 +3484,12 @@ impl CompiledExtglob {
         while let Some(step) = self.steps.get(index) {
             match step {
                 ExtglobStep::Byte(b'/') => {
+                    let offset = self
+                        .walker_source_provenance
+                        .as_ref()
+                        .and_then(|provenance| provenance.offset_at(index));
                     for state in &mut states {
-                        state.separator();
+                        state.separator(offset);
                     }
                     index += 1;
                 }
@@ -3461,11 +3539,11 @@ impl CompiledExtglob {
             }
         }
         let mut first_problem = None;
-        let mut saw_unselectable = false;
+        let mut first_unselectable = None;
         for state in states {
             let evaluation = state.finish();
             if !evaluation.selects_candidate {
-                saw_unselectable = true;
+                first_unselectable.get_or_insert(evaluation.empty_component_offset);
                 continue;
             }
             let Some(problem) = evaluation.problem else {
@@ -3474,9 +3552,9 @@ impl CompiledExtglob {
             first_problem.get_or_insert(problem);
         }
         Ok(first_problem.or_else(|| {
-            saw_unselectable.then_some(WalkerPathProblem {
+            first_unselectable.map(|offset| WalkerPathProblem {
                 viability: WalkerPathViability::EmptyComponent,
-                offset: None,
+                offset,
             })
         }))
     }
@@ -6830,6 +6908,71 @@ mod tests {
         assert!(!compile("[[:upper:]]").is_match("a"));
         assert!(compile("[[:lower:]]").is_match("a"));
         assert!(!compile("[[:lower:]]").is_match("A"));
+    }
+
+    /// An empty component has no byte of its own; it is located at the
+    /// separator that closes it, or for a trailing one the separator that opens
+    /// it, through brace expansion and extglob arms alike (#400).
+    #[test]
+    fn walker_empty_component_is_located_at_its_separator() {
+        let options = PatternOptions::default()
+            .braces(true)
+            .recursive_double_star(true)
+            .extglob(true);
+        for (source, offset) in [
+            ("/bar", 0),
+            ("src//*.ts", 4),
+            ("a///b", 2),
+            ("**//x", 3),
+            ("src/", 3),
+            ("src/{}/bar", 6),
+            ("{a,b}//x", 6),
+            ("src/{,./a.rs}/bar", 13),
+            ("src/?()/bar", 7),
+            ("src/@(a/)/bar", 9),
+            ("src/@(a/|b/)", 7),
+        ] {
+            let compiled = Pattern::compile(source, options).expect("pattern compiles");
+            assert_eq!(
+                compiled.walker_path_viability(),
+                WalkerPathViability::EmptyComponent,
+                "{source}"
+            );
+            assert_eq!(
+                compiled.walker_path_problem_offset(),
+                Some(offset),
+                "{source}"
+            );
+            assert_eq!(
+                source.as_bytes()[offset],
+                b'/',
+                "{source} points at a separator"
+            );
+        }
+
+        // The location is diagnostic only. Arms that end in distinct
+        // separators still leave one walker state, so a wide group is charged
+        // as before instead of once per pair of arms and running out of IR.
+        let arms = (0..1000)
+            .map(|index| format!("a{index}/"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let empty_arms = (0..1000)
+            .map(|index| format!("a{index}//"))
+            .collect::<Vec<_>>()
+            .join("|");
+        for source in [
+            format!("*({arms})x"),
+            format!("@({arms})@({arms})x"),
+            format!("*({empty_arms})x"),
+        ] {
+            assert_eq!(
+                Pattern::compile(&source, options)
+                    .expect("a wide group stays within the IR budget")
+                    .walker_path_viability(),
+                WalkerPathViability::Viable
+            );
+        }
     }
 
     #[test]

@@ -151,6 +151,8 @@ assert!(!source_file.is_match_glob_path("src/generated/lib.rs.bak"));
 Walk a tree with the same component-aware pattern language:
 
 ```rust
+use std::error::Error;
+
 use ferralk::{ErrorPolicy, WalkOptions, Walker};
 
 let result = Walker::new(".")
@@ -167,7 +169,11 @@ for entry in result.entries() {
 }
 
 for error in result.errors() {
-    eprintln!("{error}");
+    // `Display` names the operation and path; `source()` says why it failed.
+    match error.source() {
+        Some(cause) => eprintln!("{error}: {cause}"),
+        None => eprintln!("{error}"),
+    }
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
