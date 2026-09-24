@@ -8,9 +8,11 @@
 //! through both and compares the selections. `Walker::exclude` is replayed the
 //! same way against the preset with `match_hidden(true)`, the dialect every
 //! exclude is compiled in whatever the walker's own `match_hidden` says
-//! (#424). The corpus verdicts themselves are not consulted: each case was
-//! recorded under its own flags, and the question here is whether the walker
-//! and the preset agree.
+//! (#424). Every comparison runs twice, once with `Walker::case_insensitive`
+//! against the preset with `case_insensitive(true)`, which is how the walker
+//! documents that switch. The corpus verdicts themselves are not consulted:
+//! each case was recorded under its own flags, and the question here is
+//! whether the walker and the preset agree.
 //!
 //! An integration test rather than a unit test because it needs the
 //! unpublished `corpus` package. Cargo strips that path-only dev-dependency
@@ -222,8 +224,10 @@ fn preset_rejections_are_walker_rejections() {
         .iter()
         .chain(pairs.iter().map(|(pattern, _)| pattern))
     {
-        for match_hidden in [false, true] {
-            let options = PatternOptions::walker().match_hidden(match_hidden);
+        for (match_hidden, case_insensitive) in dialects() {
+            let options = PatternOptions::walker()
+                .match_hidden(match_hidden)
+                .case_insensitive(case_insensitive);
             let Err(expected) = Pattern::compile(pattern, options) else {
                 continue;
             };
@@ -232,9 +236,7 @@ fn preset_rejections_are_walker_rejections() {
                 WildcardMode::SeparatorCrossing,
             ] {
                 let walker = || {
-                    Walker::new(".")
-                        .match_hidden(match_hidden)
-                        .wildcard_mode(mode)
+                    walker_in(Path::new("."), match_hidden, case_insensitive).wildcard_mode(mode)
                 };
                 for (operation, result) in [
                     ("include", walker().include(pattern)),
@@ -253,6 +255,20 @@ fn preset_rejections_are_walker_rejections() {
         }
     }
     assert!(checked > 0, "the corpus supplies rejected patterns");
+}
+
+/// Every `(match_hidden, case_insensitive)` pair the walker can be configured
+/// with.
+fn dialects() -> [(bool, bool); 4] {
+    [(false, false), (true, false), (false, true), (true, true)]
+}
+
+/// A walker of `root` with the two dialect switches set.
+fn walker_in(root: &Path, match_hidden: bool, case_insensitive: bool) -> Walker {
+    Walker::new(root)
+        .match_hidden(match_hidden)
+        .case_insensitive(case_insensitive)
+        .expect("a walker without patterns folds case without recompiling")
 }
 
 /// The preset's verdict on `path` under the walker's wildcard `mode`.
@@ -292,8 +308,10 @@ fn for_each_corpus_fixture(mut check: impl FnMut(&str, &Fixture, &[String]) -> u
 fn preset_matches_what_the_walker_selects() {
     let checked = for_each_corpus_fixture(|pattern, fixture, entries| {
         let mut checked = 0;
-        for match_hidden in [false, true] {
-            let options = PatternOptions::walker().match_hidden(match_hidden);
+        for (match_hidden, case_insensitive) in dialects() {
+            let options = PatternOptions::walker()
+                .match_hidden(match_hidden)
+                .case_insensitive(case_insensitive);
             let Ok(matcher) = Pattern::compile(pattern, options) else {
                 // Rejected patterns belong to the test above.
                 continue;
@@ -302,11 +320,8 @@ fn preset_matches_what_the_walker_selects() {
                 WildcardMode::ComponentScoped,
                 WildcardMode::SeparatorCrossing,
             ] {
-                let base = || {
-                    Walker::new(&fixture.root)
-                        .match_hidden(match_hidden)
-                        .wildcard_mode(mode)
-                };
+                let base =
+                    || walker_in(&fixture.root, match_hidden, case_insensitive).wildcard_mode(mode);
                 if base().include(pattern).is_err() {
                     // A walker-only refusal, such as a `..` component, which
                     // the preset documents as outside the dialect.
@@ -326,7 +341,7 @@ fn preset_matches_what_the_walker_selects() {
                     assert_eq!(
                         selected, expected,
                         "{frontend}: include {pattern:?} over {entries:?} under {mode:?}, \
-                         match_hidden {match_hidden}"
+                         match_hidden {match_hidden}, case_insensitive {case_insensitive}"
                     );
                 }
                 checked += 1;
@@ -346,23 +361,22 @@ fn preset_matches_what_the_walker_selects() {
 /// below a matching directory.
 #[test]
 fn preset_with_hidden_matching_is_what_the_walker_excludes() {
-    let options = PatternOptions::walker().match_hidden(true);
     let checked = for_each_corpus_fixture(|pattern, fixture, entries| {
-        let Ok(matcher) = Pattern::compile(pattern, options) else {
-            // Rejected patterns belong to the rejection test.
-            return 0;
-        };
         let mut checked = 0;
-        for match_hidden in [false, true] {
+        for (match_hidden, case_insensitive) in dialects() {
+            let options = PatternOptions::walker()
+                .match_hidden(true)
+                .case_insensitive(case_insensitive);
+            let Ok(matcher) = Pattern::compile(pattern, options) else {
+                // Rejected patterns belong to the rejection test.
+                continue;
+            };
             for mode in [
                 WildcardMode::ComponentScoped,
                 WildcardMode::SeparatorCrossing,
             ] {
-                let base = || {
-                    Walker::new(&fixture.root)
-                        .match_hidden(match_hidden)
-                        .wildcard_mode(mode)
-                };
+                let base =
+                    || walker_in(&fixture.root, match_hidden, case_insensitive).wildcard_mode(mode);
                 if base().exclude(pattern).is_err() {
                     // A walker-only refusal, as for includes.
                     continue;
@@ -383,7 +397,7 @@ fn preset_with_hidden_matching_is_what_the_walker_excludes() {
                     assert_eq!(
                         kept, expected,
                         "{frontend}: exclude {pattern:?} over {entries:?} under {mode:?}, \
-                         match_hidden {match_hidden}"
+                         match_hidden {match_hidden}, case_insensitive {case_insensitive}"
                     );
                 }
                 checked += 1;

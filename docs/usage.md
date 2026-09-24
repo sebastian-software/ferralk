@@ -109,7 +109,8 @@ walker builds its own options from it: recursive `**`, braces, and extglobs on,
 everything else at its default, as the table below shows. Chain
 `.match_hidden(true)` to mirror `Walker::match_hidden(true)` for an include,
 and always for an exclude, which covers a leading period under either
-setting. Match with
+setting, and `.case_insensitive(true)` to mirror
+`Walker::case_insensitive(true)` for both. Match with
 `is_match_glob_path`, or with `is_match` under
 `WildcardMode::SeparatorCrossing`, to answer as the walker does for a
 root-relative path. `PatternOptions::default()` is intentionally conservative:
@@ -122,7 +123,7 @@ under it `src/**/*.rs` does not match `src/lib.rs`, nor `*.{rs,toml}`
 | `recursive_double_star` | off | on | Makes a whole-component `**` (`**/x`, `x/**`, `x/**/y`) recursive. Any other star run, and every run while off, is ordinary stars. |
 | `extglob` | off | on | Enables Bash-style `@()`, `?()`, `*()`, `+()`, and `!()`. |
 | `match_hidden` | off | off | Allows wildcard tokens to match a leading period. |
-| `case_insensitive` | off | off | Uses ASCII-only case folding. |
+| `case_insensitive` | off | off | Uses ASCII-only case folding; `Walker::case_insensitive(true)` on a walk. |
 | `escape` | on | on | Interprets backslash as an escape. |
 
 Use `Pattern::validate` for syntax-only checks and `Pattern::has_wildcards` to
@@ -143,6 +144,17 @@ the example below does, to prune one at any depth. Includes read the same way:
 `src/**/*.rs` selects below the top-level `src` only, `**/src/**/*.rs` below
 every `src`. Rules read from ignore files under `respect_git_ignore(true)` keep
 Git's own anchoring.
+
+Matching is case-sensitive on every platform, whatever the filesystem does
+with names: `**/*.RS` selects nothing in a tree of `.rs` files, and `src/**`
+does not enter `SRC/`. `Walker::case_insensitive(true)` folds ASCII case in
+includes and excludes, and in the pruning derived from them, so `src/**` then
+walks into `SRC/` and nowhere else. Two things keep their own case rule: the
+walk root at the start of an absolute pattern, which is a path compared as
+spelled, and ignore files, which follow `git_ignore_case` and the
+repository's `core.ignoreCase`. The switch returns a `Result`, because
+patterns added before it are recompiled; the only error it can report is a
+pattern that exceeds the compiled-size limit under the new setting.
 
 ```rust,no_run
 use ferralk::{CancellationToken, ErrorPolicy, WalkOptions, Walker};
@@ -463,8 +475,15 @@ policy, panic propagation and sorting are unchanged, and only which entries
 survive differs.
 
 - `Verdict::Skip` drops the entry from the result. It does **not** prune: a
-  directory is still descended into, because pruning a subtree is what
-  `exclude()` expresses.
+  directory is still descended into.
+- `Verdict::Prune` drops the entry and does not walk below it: a pruned
+  directory is never opened, so nothing inside it is visited, returned, or
+  reported as an error. It is `exclude()` decided at run time, the way
+  `filter_entry` prunes in `walkdir` and `ignore`, and for a file it is the
+  same as `Skip`. The visitor is asked about a directory before anything
+  inside it, but only about entries the walk would return: a directory that
+  no include selects, or any directory under `files_only(true)`, is walked
+  without being offered for pruning.
 - `Verdict::Stop` ends the walk the way a cancellation request does, and
   `WalkResult::was_cancelled` reports it. A caller-owned `CancellationToken` is
   left alone.

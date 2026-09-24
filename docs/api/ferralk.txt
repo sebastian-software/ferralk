@@ -24,6 +24,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferralk::ErrorPolicy
 impl core::panic::unwind_safe::UnwindSafe for ferralk::ErrorPolicy
 #[non_exhaustive] pub enum ferralk::Verdict
 pub ferralk::Verdict::Keep
+pub ferralk::Verdict::Prune
 pub ferralk::Verdict::Skip
 pub ferralk::Verdict::Stop
 impl core::clone::Clone for ferralk::Verdict
@@ -283,6 +284,7 @@ impl ferralk::Walker
 pub fn ferralk::Walker::add_root(self, impl core::convert::Into<std::path::PathBuf>) -> core::result::Result<Self, ferralk_glob::PatternError>
 pub fn ferralk::Walker::add_roots<P: core::convert::Into<std::path::PathBuf>>(self, impl core::iter::traits::collect::IntoIterator<Item = P>) -> core::result::Result<Self, ferralk_glob::PatternError>
 pub fn ferralk::Walker::cancellation(self, ferralk::CancellationToken) -> Self
+pub fn ferralk::Walker::case_insensitive(self, bool) -> core::result::Result<Self, ferralk_glob::PatternError>
 pub const fn ferralk::Walker::clear_git_ignore_case(self) -> Self
 pub const fn ferralk::Walker::clear_git_precompose_unicode(self) -> Self
 pub fn ferralk::Walker::collect(self) -> core::result::Result<ferralk::WalkResult, ferralk::WalkError>

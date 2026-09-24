@@ -14,7 +14,7 @@ Pick the crate by what you hold. Files on disk: `ferralk::Walker`. A path or str
 
 Use `is_match_glob_path` for paths: it reads a pattern as a shell and the walker do. `is_match` is for text in which `/` is not special. `is_match_path` and `filter_paths*` keep zlob's list rule, in which a wildcard in the first component crosses `/`.
 
-**Two dialects.** `PatternOptions::default()` reads `**`, `{a,b}` and extglobs as plain text, so `src/**/*.rs` does not match `src/lib.rs` under it. `PatternOptions::walker()` turns all three on, exactly as `Walker` compiles its patterns. Add `.match_hidden(true)` for fast-glob's `dot: true` and `.case_insensitive(true)` for ASCII case folding.
+**Two dialects.** `PatternOptions::default()` reads `**`, `{a,b}` and extglobs as plain text, so `src/**/*.rs` does not match `src/lib.rs` under it. `PatternOptions::walker()` turns all three on, exactly as `Walker` compiles its patterns. Add `.match_hidden(true)` for fast-glob's `dot: true` and `.case_insensitive(true)` for ASCII case folding; `Walker::case_insensitive(true)?` is the same folding for a walk.
 
 **Walker defaults.** Each is off until asked for:
 
@@ -24,6 +24,7 @@ Use `is_match_glob_path` for paths: it reads a pattern as a shell and the walker
 | Files, directories and symlinks returned (never the root itself) | `WalkOptions::default().files_only(true)` |
 | Include wildcards, `**` included, do not cover a leading `.`; hidden entries are still walked, and excludes cover them as `.gitignore` lines do | `Walker::match_hidden(true)` for includes; `WalkOptions::skip_hidden(true)` drops hidden entries |
 | `*` stays inside one path component | `Walker::wildcard_mode(WildcardMode::SeparatorCrossing)` for the `globset` reading |
+| Patterns match case-sensitively on every platform, even on a case-insensitive filesystem | `Walker::case_insensitive(true)?` folds ASCII case in includes, excludes and their pruning; the root of an absolute pattern and ignore files keep their own rule |
 | Unsorted | `WalkOptions::sort(true)`, for `collect()` and `visit()` only; `Path` order, root included |
 | Recoverable errors collected in `WalkResult::errors()` | `Walker::error_policy(ErrorPolicy::Abort)` to fail fast |
 | Symlinks below the root not followed | `WalkOptions::follow_symlinks(true)` |
@@ -42,6 +43,7 @@ Use `is_match_glob_path` for paths: it reads a pattern as a shell and the walker
 10. Patterns and candidates are bytes. For a `Path`, pass `ferralk_glob::path_bytes(path)`; a `&str` works as it is.
 11. An include's `**` does not enter hidden directories: `include("**/*.ts")` misses `.cache/x.ts` until `match_hidden(true)`. Excludes are the opposite and cover hidden names as `.gitignore` lines do, even against an include that names one literally: `include(".github/**")` with `exclude("**/*.yml")` drops `.github/workflows/ci.yml`.
 12. There is no pattern-set type like `globset::GlobSet`: keep a `Vec<Pattern>` and ask `iter().any(…)` or `position(…)`.
+13. `Verdict::Skip` from `visit()` drops an entry but still walks a directory's subtree; `Verdict::Prune` drops it and does not walk below it.
 
 ## Recipes
 
