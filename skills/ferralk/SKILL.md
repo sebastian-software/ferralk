@@ -92,6 +92,9 @@ These compile and return a plausible, wrong result:
 - Walker patterns are anchored at the root: `exclude("target/**")` prunes only
   the top-level `target`; `**/target/**` prunes every one.
 - `**` is recursive only as a whole path component: `**/x` never matches `sx`.
+- Matching is case-sensitive on every platform, even where the filesystem is
+  not: `**/*.RS` misses `main.rs`. Use `Walker::case_insensitive(true)?`, or
+  `PatternOptions::case_insensitive(true)` for a `Pattern`.
 - Include wildcards, `**` included, skip a leading `.`: `**/*.ts` misses
   `.cache/x.ts`. Use `match_hidden(true)` or a literal `.cache/**`. Excludes
   cover hidden names either way, as `.gitignore` lines do:
@@ -105,6 +108,8 @@ These compile and return a plausible, wrong result:
   the entries. `ErrorPolicy::Skip` discards errors below the root. Branch on
   `error.io_kind()`, not on the message.
 - `options()` replaces all `WalkOptions`; pass one value once.
+- In `visit()`, `Verdict::Skip` drops an entry but still walks a directory's
+  subtree; return `Verdict::Prune` to leave the directory unopened.
 - `stream()` ignores `sort(true)`, and `take(n)` counts `Err` items.
 - Entry paths include the root (`./src/lib.rs` for `Walker::new(".")`), and so
   does `path_bytes()`. Use `entry.relative_path()` for matching or printing

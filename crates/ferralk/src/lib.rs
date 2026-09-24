@@ -1376,16 +1376,64 @@ impl Error for WalkError {
 ///
 /// The visitor runs on the thread that produced the entry, so a caller with a
 /// matcher of its own filters in parallel instead of over the returned list.
+///
+/// Every verdict other than `Keep` leaves the entry out of the result, and
+/// they differ only in how much of the rest of the walk they cut: nothing
+/// (`Skip`), the entry's own subtree (`Prune`), or everything (`Stop`). Each
+/// means the same for a file as for a directory; a file has no subtree, so
+/// `Prune` and `Skip` coincide for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Verdict {
     /// Keep the entry in the result.
     Keep,
     /// Leave the entry out of the result. Traversal is unaffected: a directory
-    /// is still descended into, because pruning a subtree is what
-    /// [`Walker::exclude`] expresses, and one verdict meaning different things
-    /// for files and directories would be a trap.
+    /// is still descended into. Return [`Verdict::Prune`] to cut it off.
     Skip,
+    /// Leave the entry out of the result and do not walk below it: a
+    /// directory is not opened, so nothing inside it is visited, returned, or
+    /// reported as an error.
+    ///
+    /// This is [`Walker::exclude`] decided at run time, for a cut that no
+    /// pattern expresses, the way `filter_entry` is used with `walkdir` or
+    /// `ignore`. The visitor is asked only about entries the walk would
+    /// return, so it can prune only a directory that passes the walk's
+    /// filters: one no include selects, or any directory under
+    /// [`WalkOptions::files_only`], is walked without being offered. A caller
+    /// that wants the pruned directory itself in the result records it in the
+    /// visitor, as for [`Verdict::Stop`].
+    ///
+    /// ```
+    /// use ferralk::{Verdict, Walker};
+    ///
+    /// let root = std::env::temp_dir()
+    ///     .join(format!("ferralk-doc-prune-{}", std::process::id()));
+    /// for file in ["app/src/main.rs", "app/vendor/dep/lib.rs", "app/vendor/PRUNE"] {
+    ///     let path = root.join(file);
+    ///     std::fs::create_dir_all(path.parent().expect("a file has a parent"))?;
+    ///     std::fs::write(path, b"")?;
+    /// }
+    ///
+    /// // Skip every directory that holds a `PRUNE` marker, whatever its name.
+    /// let result = Walker::new(&root).visit(|entry| {
+    ///     if entry.is_dir() && entry.path().join("PRUNE").exists() {
+    ///         Verdict::Prune
+    ///     } else {
+    ///         Verdict::Keep
+    ///     }
+    /// })?;
+    /// let mut kept = result
+    ///     .entries()
+    ///     .iter()
+    ///     .map(|entry| entry.path().strip_prefix(&root).expect("below the root"))
+    ///     .map(|path| path.to_string_lossy().replace('\\', "/"))
+    ///     .collect::<Vec<_>>();
+    /// kept.sort();
+    /// assert_eq!(kept, ["app", "app/src", "app/src/main.rs"]);
+    /// # std::fs::remove_dir_all(&root)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    Prune,
     /// Leave the entry out and end the walk, the way a cancellation request
     /// does. A caller that wants the entry which stopped the walk records it in
     /// the visitor, where the decision was made anyway.
@@ -1687,6 +1735,7 @@ pub struct Walker {
     /// Exclude patterns, on the same terms.
     exclude_sources: Vec<Vec<u8>>,
     match_hidden: bool,
+    case_insensitive: bool,
     options: WalkOptions,
     error_policy: ErrorPolicy,
     cancellation: Option<CancellationToken>,
@@ -1752,6 +1801,7 @@ impl Walker {
             include_sources: Vec::new(),
             exclude_sources: Vec::new(),
             match_hidden: false,
+            case_insensitive: false,
             options: WalkOptions::default(),
             error_policy: ErrorPolicy::default(),
             cancellation: None,
@@ -1770,7 +1820,8 @@ impl Walker {
     /// [`PatternOptions::walker`] names: recursive `**`, braces and extglobs.
     /// For an include, [`Walker::match_hidden`] decides whether a wildcard
     /// covers a leading period; an exclude always covers one, as
-    /// [`Walker::exclude`] describes. Compile a pattern with that preset, and
+    /// [`Walker::exclude`] describes. [`Walker::case_insensitive`] adds ASCII
+    /// case folding to both. Compile a pattern with that preset, and
     /// `.match_hidden(true)` for an exclude, to check or match it the way the
     /// walker will.
     ///
@@ -1853,8 +1904,7 @@ impl Walker {
         let pattern = pattern.as_ref();
         // Compiled for every root before any of them is changed, so a pattern
         // one root rejects leaves the walker as it was rather than half updated.
-        let compiled =
-            self.compile_for_every_root(pattern, traversal_pattern_options(self.match_hidden))?;
+        let compiled = self.compile_for_every_root(pattern, self.include_options())?;
         for (root, pattern) in self.roots.iter_mut().zip(compiled) {
             root.includes.push(pattern);
         }
@@ -2014,7 +2064,7 @@ impl Walker {
     /// root.
     pub fn try_exclude(&mut self, pattern: impl AsRef<[u8]>) -> Result<&mut Self, PatternError> {
         let pattern = pattern.as_ref();
-        let compiled = self.compile_for_every_root(pattern, exclude_pattern_options())?;
+        let compiled = self.compile_for_every_root(pattern, self.exclude_options())?;
         for (root, pattern) in self.roots.iter_mut().zip(compiled) {
             root.excludes.push(pattern);
         }
@@ -2110,23 +2160,7 @@ impl Walker {
     /// already configured cannot be rewritten for the new root.
     pub fn try_add_root(&mut self, root: impl Into<PathBuf>) -> Result<&mut Self, PatternError> {
         let mut plan = RootPlan::new(root.into());
-        let include_options = traversal_pattern_options(self.match_hidden);
-        let root_bytes = glob_path_bytes(&plan.path);
-        for source in &self.include_sources {
-            plan.includes.push(compile_for_root(
-                source,
-                root_bytes.as_ref(),
-                include_options,
-            )?);
-        }
-        for source in &self.exclude_sources {
-            plan.excludes.push(compile_for_root(
-                source,
-                root_bytes.as_ref(),
-                exclude_pattern_options(),
-            )?);
-        }
-        drop(root_bytes);
+        self.compile_sources_for(&mut plan, self.include_options(), self.exclude_options())?;
         self.roots.push(plan);
         Ok(self)
     }
@@ -2151,6 +2185,42 @@ impl Walker {
     #[must_use]
     pub fn roots(&self) -> impl ExactSizeIterator<Item = &Path> {
         self.roots.iter().map(|root| root.path.as_path())
+    }
+
+    /// Compiles every configured include and exclude for `plan`, which must
+    /// hold no patterns yet, or reports the first rejection.
+    fn compile_sources_for(
+        &self,
+        plan: &mut RootPlan,
+        include_options: PatternOptions,
+        exclude_options: PatternOptions,
+    ) -> Result<(), PatternError> {
+        let root_bytes = glob_path_bytes(&plan.path);
+        for source in &self.include_sources {
+            plan.includes.push(compile_for_root(
+                source,
+                root_bytes.as_ref(),
+                include_options,
+            )?);
+        }
+        for source in &self.exclude_sources {
+            plan.excludes.push(compile_for_root(
+                source,
+                root_bytes.as_ref(),
+                exclude_options,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// The dialect this walker compiles its includes in.
+    fn include_options(&self) -> PatternOptions {
+        traversal_pattern_options(self.match_hidden).case_insensitive(self.case_insensitive)
+    }
+
+    /// The dialect this walker compiles its excludes in.
+    fn exclude_options(&self) -> PatternOptions {
+        exclude_pattern_options().case_insensitive(self.case_insensitive)
     }
 
     /// Compiles one pattern once per root, or reports the first rejection.
@@ -2191,13 +2261,100 @@ impl Walker {
             return self;
         }
         self.match_hidden = enabled;
-        let options = traversal_pattern_options(enabled);
+        let options = self.include_options();
         for root in &mut self.roots {
             for pattern in &mut root.includes {
                 pattern.recompile(options);
             }
         }
         self
+    }
+
+    /// Matches includes and excludes with ASCII case folding, so `**/*.RS`
+    /// selects `src/main.rs` and `src/**` walks into `SRC/`. Off by default:
+    /// matching is case-sensitive on every platform, whatever the filesystem
+    /// does with names, so that one walker selects the same entries
+    /// everywhere.
+    ///
+    /// This is [`PatternOptions::case_insensitive`] for the walker: its
+    /// patterns are compiled in [`PatternOptions::walker`] with that switch
+    /// added, so a pattern compiled that way checks or matches like the
+    /// walker. Folding is ASCII-only, as there: `É` and `é` stay different
+    /// bytes.
+    ///
+    /// The switch applies to what the patterns select and to everything the
+    /// walker derives from them: a folded literal prefix still prunes, so
+    /// `include("src/**")` opens `SRC/` and `Src/` and nothing else, and an
+    /// exclude such as `**/NODE_MODULES/**` closes `node_modules` unopened.
+    /// Two things stay as they are:
+    ///
+    /// - The walk root of an absolute pattern is compared as spelled. The
+    ///   root is a real path, not a pattern, so `/Repo/src/**` names a
+    ///   different tree from a root of `/repo` and selects nothing under it;
+    ///   only the part below the root folds. See [`Walker::exclude`].
+    /// - Ignore files read under [`Walker::respect_git_ignore`] keep Git's
+    ///   rule, which [`Walker::git_ignore_case`] and the repository's
+    ///   `core.ignoreCase` decide.
+    ///
+    /// Builder order does not matter: includes and excludes added before this
+    /// call are recompiled under the new setting.
+    ///
+    /// ```
+    /// use ferralk::{WalkOptions, Walker};
+    ///
+    /// let root = std::env::temp_dir()
+    ///     .join(format!("ferralk-doc-case-{}", std::process::id()));
+    /// for file in ["SRC/Main.RS", "SRC/notes.txt", "docs/guide.rs"] {
+    ///     let path = root.join(file);
+    ///     std::fs::create_dir_all(path.parent().expect("a file has a parent"))?;
+    ///     std::fs::write(path, b"")?;
+    /// }
+    ///
+    /// let result = Walker::new(&root)
+    ///     .include("src/**/*.rs")?
+    ///     .case_insensitive(true)?
+    ///     .options(WalkOptions::default().files_only(true))
+    ///     .collect()?;
+    /// let selected = result
+    ///     .entries()
+    ///     .iter()
+    ///     .map(|entry| entry.path().strip_prefix(&root).expect("below the root"))
+    ///     .map(|path| path.to_string_lossy().replace('\\', "/"))
+    ///     .collect::<Vec<_>>();
+    /// assert_eq!(selected, ["SRC/Main.RS"]);
+    /// # std::fs::remove_dir_all(&root)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`PatternError`] of a pattern already configured that
+    /// cannot be compiled under the new setting, and leaves the walker
+    /// unchanged. Folding changes no syntax, so the only such error is the
+    /// compiled-size limit, which a pattern can reach under one setting and
+    /// not the other. Setting the switch before adding patterns reports the
+    /// same error from [`Walker::include`] or [`Walker::exclude`] instead.
+    pub fn case_insensitive(mut self, enabled: bool) -> Result<Self, PatternError> {
+        if self.case_insensitive == enabled {
+            return Ok(self);
+        }
+        let include_options =
+            traversal_pattern_options(self.match_hidden).case_insensitive(enabled);
+        let exclude_options = exclude_pattern_options().case_insensitive(enabled);
+        // Every root is compiled before any of them is replaced, so a pattern
+        // that fails leaves the walker as it was rather than half folded.
+        let roots = self
+            .roots
+            .iter()
+            .map(|root| {
+                let mut plan = RootPlan::new(root.path.clone());
+                self.compile_sources_for(&mut plan, include_options, exclude_options)?;
+                Ok(plan)
+            })
+            .collect::<Result<Vec<_>, PatternError>>()?;
+        self.roots = roots;
+        self.case_insensitive = enabled;
+        Ok(self)
     }
 
     /// Chooses how far an ordinary wildcard reaches.
@@ -2416,8 +2573,12 @@ impl Walker {
     ///
     /// Cancellation, the error policy, panic propagation and sorting behave
     /// exactly as they do for [`Walker::collect`]; only which entries survive
-    /// differs. A [`Verdict::Stop`] ends the walk and is reported by
-    /// [`WalkResult::was_cancelled`].
+    /// differs, and what is walked once the visitor cuts it short: a
+    /// [`Verdict::Prune`] leaves a directory unopened, and a
+    /// [`Verdict::Stop`] ends the walk and is reported by
+    /// [`WalkResult::was_cancelled`]. The visitor is asked about a directory
+    /// before anything inside it, which is what lets it prune; beyond that,
+    /// the order in which it sees entries is not specified.
     ///
     /// ```no_run
     /// use ferralk::{Verdict, Walker};
@@ -2849,6 +3010,10 @@ struct TraversalPattern {
     literal_roots: Option<Vec<Vec<u8>>>,
     /// Literal final extension of every brace alternative, on the same terms.
     extensions: Option<Vec<Vec<u8>>>,
+    /// Whether the pattern was compiled with ASCII case folding, which the
+    /// two literal prefilters above must then apply too: a literal root of
+    /// `src` that refused `SRC` would prune what the matcher selects.
+    case_insensitive: bool,
     /// Set for an absolute pattern that named paths outside this walk root.
     /// Such a pattern selects nothing and prunes nothing, and saying so once
     /// here keeps the decision out of every caller of the four predicates.
@@ -2899,6 +3064,9 @@ impl TraversalPattern {
             // hidden literal root stays its own root.
             literal_roots: prefilter_of_every_alternative(&alternatives, literal_pattern_root),
             extensions: prefilter_of_every_alternative(&alternatives, literal_extension),
+            // `PatternOptions` has setters only, and a setter that changes
+            // nothing is how to read one back.
+            case_insensitive: options.case_insensitive(true) == options,
             never_matches: false,
         })
     }
@@ -2967,7 +3135,7 @@ impl TraversalPattern {
         };
         roots
             .iter()
-            .any(|root| shares_a_line_of_descent(root, path))
+            .any(|root| shares_a_line_of_descent(root, path, self.case_insensitive))
     }
 
     fn matches_extension(&self, path: &[u8]) -> bool {
@@ -2984,37 +3152,48 @@ impl TraversalPattern {
         // separator and period scans that dominated on short names.
         extensions
             .iter()
-            .any(|extension| ends_with_extension(path, extension))
+            .any(|extension| ends_with_extension(path, extension, self.case_insensitive))
     }
 }
 
-/// Whether `path` ends in `.` followed by `extension`.
+/// Whether `path` ends in `.` followed by `extension`, with ASCII case
+/// folding when the pattern was compiled with it.
 ///
 /// The period is checked first and the extension compared byte by byte: this
 /// runs for every entry against every literal extension, and a two- or
 /// three-byte comparison through `memcmp` cost more than the comparison.
-fn ends_with_extension(path: &[u8], extension: &[u8]) -> bool {
+fn ends_with_extension(path: &[u8], extension: &[u8], case_insensitive: bool) -> bool {
     let Some(start) = path.len().checked_sub(extension.len()) else {
         return false;
     };
     start > 0
         && path[start - 1] == b'.'
-        && path[start..]
-            .iter()
-            .zip(extension)
-            .all(|(actual, expected)| actual == expected)
+        && if case_insensitive {
+            path[start..].eq_ignore_ascii_case(extension)
+        } else {
+            path[start..]
+                .iter()
+                .zip(extension)
+                .all(|(actual, expected)| actual == expected)
+        }
 }
 
 /// Whether `path` is the literal root, or one of the two contains the other:
-/// only then can something under `path` still match.
-fn shares_a_line_of_descent(root: &[u8], path: &[u8]) -> bool {
-    root == path
-        || root
-            .strip_prefix(path)
-            .is_some_and(|suffix| suffix.starts_with(b"/"))
-        || path
-            .strip_prefix(root)
-            .is_some_and(|suffix| suffix.starts_with(b"/"))
+/// only then can something under `path` still match. The comparison folds
+/// ASCII case when the pattern does; the separator it checks has no case.
+fn shares_a_line_of_descent(root: &[u8], path: &[u8], case_insensitive: bool) -> bool {
+    let (shorter, longer) = if root.len() <= path.len() {
+        (root, path)
+    } else {
+        (path, root)
+    };
+    let head = &longer[..shorter.len()];
+    let same_head = if case_insensitive {
+        head.eq_ignore_ascii_case(shorter)
+    } else {
+        head == shorter
+    };
+    same_head && longer.get(shorter.len()).is_none_or(|&byte| byte == b'/')
 }
 
 /// Collects one prefilter value per brace alternative, or `None` as soon as an
@@ -4252,7 +4431,7 @@ impl Iterator for WalkStream {
             let result = match task {
                 SerialTask::Directory(task) => self.prepare_directory(task),
                 SerialTask::Resume(frame) => self.resume_directory(frame),
-                SerialTask::Emit(entry) => Some(Ok(entry)),
+                SerialTask::Record(entry) => Some(Ok(entry)),
             };
             if result.is_some() {
                 return result;
@@ -4316,7 +4495,9 @@ impl DirectoryFrame {
 enum SerialTask {
     Directory(DirectoryTask),
     Resume(DirectoryFrame),
-    Emit(WalkEntry),
+    /// A directory entry the visitor has already kept, recorded once its
+    /// subtree has been walked.
+    Record(WalkEntry),
 }
 
 /// Entries between two cancellation checks inside one directory.
@@ -4405,12 +4586,32 @@ impl<'walker> WalkState<'walker> {
     }
 
     fn emit_owned(&mut self, entry: WalkEntry) {
+        // Nothing lies below an entry emitted without a subtree to walk, so
+        // `Prune` is `Skip` for it.
+        if let (Some(entry), _) = self.decide(entry) {
+            self.entries.push(entry);
+        }
+    }
+
+    /// Asks the visitor about one entry, before anything below it is walked.
+    ///
+    /// Returns the entry if the visitor kept it, and whether its subtree may
+    /// still be walked: a pruned directory is not, and after a stop nothing is.
+    fn decide(&mut self, entry: WalkEntry) -> (Option<WalkEntry>, bool) {
         match (self.visitor)(&entry) {
-            Verdict::Keep => self.entries.push(entry),
-            Verdict::Skip => self.spare = entry.path,
+            Verdict::Keep => (Some(entry), true),
+            Verdict::Skip => {
+                self.spare = entry.path;
+                (None, true)
+            }
+            Verdict::Prune => {
+                self.spare = entry.path;
+                (None, false)
+            }
             Verdict::Stop => {
                 self.spare = entry.path;
                 self.cancelled = true;
+                (None, false)
             }
         }
     }
@@ -4425,7 +4626,7 @@ impl<'walker> WalkState<'walker> {
             match task {
                 SerialTask::Directory(task) => self.start_directory(backend, task, &mut pending)?,
                 SerialTask::Resume(frame) => self.resume_directory(backend, frame, &mut pending)?,
-                SerialTask::Emit(entry) => self.emit_owned(entry),
+                SerialTask::Record(entry) => self.entries.push(entry),
             }
         }
         Ok(())
@@ -4581,15 +4782,25 @@ impl<'walker> WalkState<'walker> {
                     pending.push(SerialTask::Directory(task));
                     return Ok(());
                 }
-                // The subtree is walked before the directory itself is
-                // recorded, the depth-first order this frontend has always
-                // exposed. Its path must now outlive the paused frame.
+                // The visitor is asked before the subtree is walked, because
+                // its verdict may prune it. A kept directory is still recorded
+                // after its subtree, the depth-first result order this
+                // frontend has always exposed, so its path must now outlive
+                // the paused frame.
                 EntryAction::DescendAndEmit(entry, task) => {
                     let entry = entry.with_path(own_path(&mut self.spare, &frame.scratch.path));
                     reset_to_directory(&mut frame.scratch.path, path);
+                    let (kept, descend) = self.decide(entry);
+                    if !descend {
+                        // Pruned or stopped: the task is dropped unopened. A
+                        // stop ends this listing at the next entry.
+                        continue;
+                    }
                     frame.suspend(backend);
                     pending.push(SerialTask::Resume(frame));
-                    pending.push(SerialTask::Emit(entry));
+                    if let Some(entry) = kept {
+                        pending.push(SerialTask::Record(entry));
+                    }
                     pending.push(SerialTask::Directory(task));
                     return Ok(());
                 }
@@ -4705,7 +4916,8 @@ mod tests {
         CancellationToken, DirectoryFrame, DirectoryScratch, ErrorPolicy, Pattern, PatternOptions,
         SerialTask, TraversalPattern, Verdict, WalkEntry, WalkEntryKind, WalkOptions, WalkStream,
         Walker, WildcardMode, ends_with_extension, exclude_pattern_options, glob_path_bytes,
-        literal_extension, literal_pattern_root, push_entry_name, traversal_pattern_options,
+        literal_extension, literal_pattern_root, push_entry_name, shares_a_line_of_descent,
+        traversal_pattern_options,
     };
 
     #[test]
@@ -4945,16 +5157,47 @@ mod tests {
 
     #[test]
     fn extension_check_requires_a_period_before_the_literal_extension() {
-        assert!(ends_with_extension(b"src/lib.rs", b"rs"));
-        assert!(ends_with_extension(b"lib.rs", b"rs"));
-        assert!(ends_with_extension(b".rs", b"rs"));
-        assert!(ends_with_extension(b"types.d.ts", b"ts"));
-        assert!(!ends_with_extension(b"rs", b"rs"));
-        assert!(!ends_with_extension(b"lib.rsx", b"rs"));
-        assert!(!ends_with_extension(b"lib.ts", b"tsx"));
-        assert!(!ends_with_extension(b"librs", b"rs"));
-        assert!(!ends_with_extension(b"dir.rs/main", b"rs"));
-        assert!(!ends_with_extension(b"", b"rs"));
+        for case_insensitive in [false, true] {
+            let ends_with = |path: &[u8], extension: &[u8]| {
+                ends_with_extension(path, extension, case_insensitive)
+            };
+            assert!(ends_with(b"src/lib.rs", b"rs"));
+            assert!(ends_with(b"lib.rs", b"rs"));
+            assert!(ends_with(b".rs", b"rs"));
+            assert!(ends_with(b"types.d.ts", b"ts"));
+            assert!(!ends_with(b"rs", b"rs"));
+            assert!(!ends_with(b"lib.rsx", b"rs"));
+            assert!(!ends_with(b"lib.ts", b"tsx"));
+            assert!(!ends_with(b"librs", b"rs"));
+            assert!(!ends_with(b"dir.rs/main", b"rs"));
+            assert!(!ends_with(b"", b"rs"));
+            assert_eq!(ends_with(b"src/LIB.RS", b"rs"), case_insensitive);
+            assert_eq!(ends_with(b"lib.Rs", b"rS"), case_insensitive);
+        }
+        // Folding is ASCII-only, as the matcher's is.
+        assert!(!ends_with_extension(
+            "a.\u{c9}".as_bytes(),
+            "\u{e9}".as_bytes(),
+            true
+        ));
+    }
+
+    #[test]
+    fn literal_root_prefilter_folds_only_under_case_insensitive() {
+        for case_insensitive in [false, true] {
+            let shares =
+                |root: &[u8], path: &[u8]| shares_a_line_of_descent(root, path, case_insensitive);
+            assert!(shares(b"src", b"src"));
+            assert!(shares(b"src/app", b"src"));
+            assert!(shares(b"src", b"src/app/main.rs"));
+            assert!(!shares(b"src", b"srcfoo"));
+            assert!(!shares(b"srcfoo", b"src"));
+            assert!(!shares(b"src/app", b"lib"));
+            assert_eq!(shares(b"src", b"SRC"), case_insensitive);
+            assert_eq!(shares(b"src/app", b"Src"), case_insensitive);
+            assert_eq!(shares(b"SRC", b"src/APP/main.rs"), case_insensitive);
+            assert!(!shares(b"src", b"SRCfoo"));
+        }
     }
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -5368,6 +5611,86 @@ mod tests {
                 PathBuf::from("b"),
                 PathBuf::from("a/f1.txt"),
                 PathBuf::from("a"),
+            ]
+        );
+    }
+
+    /// The serial frontend asks the visitor about a directory before it walks
+    /// the subtree, which is what lets `Verdict::Prune` keep it unread, and
+    /// still records a kept directory after its subtree, so the result order
+    /// above is unchanged.
+    #[test]
+    fn serial_visit_asks_before_the_subtree_and_never_reads_a_pruned_one() {
+        struct PruningBackend {
+            root: PathBuf,
+        }
+
+        impl super::DirectoryBackend for PruningBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                listing.clear();
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .expect("walk only reads descendants of its root");
+                match relative.to_str().expect("fixture paths are UTF-8") {
+                    "" => {
+                        listing.push("b".as_ref(), true, false);
+                        listing.push("a".as_ref(), true, false);
+                        listing.push("c".as_ref(), true, false);
+                    }
+                    "a" => listing.push("f1.txt".as_ref(), false, false),
+                    "c" => listing.push("f3.txt".as_ref(), false, false),
+                    "b" => panic!("a pruned directory was read"),
+                    other => panic!("unexpected directory read: {other}"),
+                }
+                Ok(())
+            }
+        }
+
+        let backend = PruningBackend {
+            root: PathBuf::from("/serial-prune-order"),
+        };
+        let asked = std::sync::Mutex::new(Vec::new());
+        let visitor = |entry: &WalkEntry| {
+            let relative = entry
+                .path()
+                .strip_prefix(&backend.root)
+                .expect("entry below the root")
+                .to_path_buf();
+            let verdict = match relative.to_str() {
+                Some("b") => Verdict::Prune,
+                Some("c") => Verdict::Skip,
+                _ => Verdict::Keep,
+            };
+            asked.lock().expect("visitor lock").push(relative);
+            verdict
+        };
+        let result = Walker::new(&backend.root)
+            .threads(1)
+            .walk(&backend, &visitor)
+            .expect("mock walk succeeds");
+
+        assert_eq!(
+            asked.into_inner().expect("visitor lock"),
+            [
+                PathBuf::from("b"),
+                PathBuf::from("a"),
+                PathBuf::from("a/f1.txt"),
+                PathBuf::from("c"),
+                PathBuf::from("c/f3.txt"),
+            ]
+        );
+        assert_eq!(
+            relative_paths(result.entries(), &backend.root),
+            [
+                PathBuf::from("a/f1.txt"),
+                PathBuf::from("a"),
+                PathBuf::from("c/f3.txt"),
             ]
         );
     }

@@ -399,7 +399,12 @@ impl<'backend> Shared<'backend> {
     /// The entry's path is copied out of the worker's scratch here, into the
     /// buffer the last dropped entry gave back — so a worker whose visitor
     /// keeps nothing runs without allocating.
-    fn emit(&self, worker: &mut WorkerScratch, emitted: EmittedEntry) {
+    ///
+    /// Returns whether the entry's subtree may still be walked: not after a
+    /// [`Verdict::Prune`], and not after a stop. The caller asks before it
+    /// schedules the directory, so pruning is a decision about one task and
+    /// never reaches the scheduler's accounting.
+    fn emit(&self, worker: &mut WorkerScratch, emitted: EmittedEntry) -> bool {
         let WorkerScratch {
             entries,
             path,
@@ -408,11 +413,22 @@ impl<'backend> Shared<'backend> {
         } = worker;
         let entry = emitted.with_path(own_path(spare, path));
         match (self.visitor)(&entry) {
-            Verdict::Keep => entries.push(entry),
-            Verdict::Skip => *spare = entry.path,
+            Verdict::Keep => {
+                entries.push(entry);
+                true
+            }
+            Verdict::Skip => {
+                *spare = entry.path;
+                true
+            }
+            Verdict::Prune => {
+                *spare = entry.path;
+                false
+            }
             Verdict::Stop => {
                 *spare = entry.path;
                 self.stop();
+                false
             }
         }
     }
@@ -822,11 +838,17 @@ fn act(shared: &Shared, worker: &mut WorkerScratch, action: EntryAction) {
     match action {
         EntryAction::Skip => {}
         EntryAction::Descend(task) => shared.schedule(&worker.queue, ParallelTask::Directory(task)),
+        // The visitor is asked first, because its verdict may prune the
+        // directory. A pruned task is dropped before it is ever counted.
         EntryAction::DescendAndEmit(entry, task) => {
-            shared.schedule(&worker.queue, ParallelTask::Directory(task));
+            if shared.emit(worker, entry) {
+                shared.schedule(&worker.queue, ParallelTask::Directory(task));
+            }
+        }
+        // Nothing to walk below this entry, so `Prune` is `Skip` for it.
+        EntryAction::Emit(entry) => {
             shared.emit(worker, entry);
         }
-        EntryAction::Emit(entry) => shared.emit(worker, entry),
         EntryAction::Failed { failure, descend } => {
             if let Some(task) = descend {
                 shared.schedule(&worker.queue, ParallelTask::Directory(task));
@@ -1398,6 +1420,51 @@ mod tests {
             "the visitor ran on {visitor_threads} thread(s) across {workers} workers"
         );
         assert!(!result.entries().is_empty());
+    }
+
+    /// Pruning is decided before a directory is scheduled, so a widened walk
+    /// that drops tasks on several workers still accounts for every task it
+    /// did schedule and terminates, and no pruned directory is ever read.
+    #[test]
+    fn a_widened_walk_prunes_on_every_worker_and_terminates() {
+        let _rendezvous = lock(&WORKER_RENDEZVOUS_GUARD);
+        let root = unique_root("visitor-prune");
+        create_wide_fixture(&root);
+
+        expect_worker_threads(root.clone(), 4);
+        let asked = Mutex::new(Vec::new());
+        let result = Walker::new(&root)
+            .threads(4)
+            .visit(|entry| {
+                let relative = entry
+                    .path()
+                    .strip_prefix(&root)
+                    .expect("entry below the root")
+                    .to_path_buf();
+                let pruned = entry.basename() == Some("nested-1".as_ref());
+                lock(&asked).push(relative);
+                if pruned {
+                    crate::Verdict::Prune
+                } else {
+                    crate::Verdict::Keep
+                }
+            })
+            .expect("visited walk succeeds");
+        let workers = observed_worker_threads();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(workers, 4, "the walk did not reach its thread budget");
+        assert!(!result.was_cancelled());
+        let asked = asked.into_inner().expect("visitor lock");
+        assert!(
+            asked.iter().all(|path| !path
+                .parent()
+                .is_some_and(|parent| parent.ends_with("nested-1"))),
+            "a pruned directory was read"
+        );
+        // Ten branches, each with itself, three kept nested directories and
+        // their four files.
+        assert_eq!(result.entries().len(), 10 * (1 + 3 * (1 + 4)));
     }
 
     /// A tree below the floor never builds the scoped machinery, so a panic
