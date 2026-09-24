@@ -928,3 +928,69 @@ fn a_broken_link_errors_when_followed_and_is_merely_dropped_when_resolved() {
         "resolving a broken link is an answer, not a failure"
     );
 }
+
+/// The fixture path in the spelling an absolute pattern is written in: `/`
+/// separators on every platform, per ADR-0005.
+fn pattern_spelling(path: &Path) -> String {
+    path.to_str()
+        .expect("the temporary directory is UTF-8 on a test host")
+        .replace('\\', "/")
+}
+
+/// A walk root with a `..` component is rejected for every absolute pattern,
+/// through every builder entry point, wherever the pattern stops agreeing with
+/// the root's spelling (#396). Before, `$B/a/**` got the error while `$B/b/**`
+/// and `$B/zzz/**` returned an empty walk.
+#[test]
+fn a_walk_root_with_dot_dot_rejects_every_absolute_pattern() {
+    const ROOT_DOT_DOT: &str = "an absolute pattern needs a walk root without a `..` component";
+    let fixture = Fixture::new();
+    fixture.directory("a");
+    fixture.write("b/y.txt");
+    let dotted_root = fixture.root.join("a").join("..").join("b");
+    let base = pattern_spelling(&fixture.root);
+    let patterns = [
+        format!("{base}/a/**"),
+        format!("{base}/b/**"),
+        format!("{base}/zzz/**"),
+    ];
+
+    for pattern in &patterns {
+        for add in [Walker::include, Walker::exclude] {
+            let error = add(Walker::new(&dotted_root), pattern.as_str())
+                .err()
+                .unwrap_or_else(|| panic!("{pattern} was accepted under a root with `..`"));
+            assert_eq!(error.message(), ROOT_DOT_DOT, "{pattern}");
+        }
+
+        // Adding the root after the pattern reports the same rejection, and
+        // the borrowed form leaves the walker's one root in place.
+        let later = Walker::new(fixture.root.join("b"))
+            .include(pattern.as_str())
+            .expect("an absolute pattern under a plain root is accepted")
+            .add_root(&dotted_root)
+            .err()
+            .unwrap_or_else(|| panic!("{pattern} was accepted for an added root with `..`"));
+        assert_eq!(later.message(), ROOT_DOT_DOT, "{pattern}");
+
+        let mut walker = Walker::new(fixture.root.join("b"))
+            .exclude(pattern.as_str())
+            .expect("an absolute pattern under a plain root is accepted");
+        let error = walker
+            .try_add_root(&dotted_root)
+            .err()
+            .unwrap_or_else(|| panic!("{pattern} was accepted for an added root with `..`"));
+        assert_eq!(error.message(), ROOT_DOT_DOT, "{pattern}");
+        assert_eq!(walker.roots().len(), 1, "the rejected root is not added");
+    }
+
+    // A relative pattern needs no arithmetic against the root, so the same
+    // root still walks.
+    assert_eq!(
+        paths_from_every_frontend(
+            |walker| walker.include("**/*.txt").expect("valid include"),
+            &dotted_root,
+        ),
+        vec![PathBuf::from("y.txt")]
+    );
+}
