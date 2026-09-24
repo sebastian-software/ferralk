@@ -190,8 +190,11 @@ Important defaults:
   are rejected. A walk root with a `..` component rejects every absolute
   pattern, including one about a different tree, because the root cannot be
   related to any absolute path without resolving it; relative patterns work
-  under such a root as usual. Relative patterns receive the same guardrails: `.` and `./`
-  name the root, and a `.` component after the conventional leading `./`
+  under such a root as usual. The conventional leading `./` is ignored once on
+  every brace alternative, as the path matchers ignore it, so
+  `{./src,lib}/*.ts` selects from both directories. Relative patterns receive
+  the same guardrails: `.` and `./` name the root, and a `.` component after
+  that prefix
   (such as `src/./main.rs`), a real `..` component, or an empty component
   left by a repeated separator (`src//*.ts`) is rejected with guidance
   instead of silently selecting nothing. See the
