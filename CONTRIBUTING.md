@@ -59,8 +59,8 @@ the pull request as well, so the generated summary has the context consumers
 need.
 
 The marker convention does not change at 1.0; what the marker *costs* does.
-Release Please's `bump-minor-pre-major` setting is what turns a `!` into a minor
-bump today. From 1.0 on, the same `!` proposes a major release, so the decision
+During `0.x`, Release Please's `bump-minor-pre-major` setting turned a `!` into
+a minor bump. From 1.0 on, the same `!` proposes a major release, so the decision
 of whether a change is consumer-visible stops being a changelog-formatting
 question and becomes the decision of whether to spend a major version. Use the
 [1.x stability contract](docs/stability.md) to answer it: a change confined to
@@ -181,6 +181,39 @@ Update `FERRAMENTA_PIN` in the generator script to adopt a new family revision.
 For the root README, update `mdtheme.yaml` and regenerate separately. Commit
 pins and outputs together. Never edit generated family text by hand.
 
+## Releases
+
+Release Please cuts every release from `main` following the org product
+template (`reference/release-please/rust-product-release-config.json` in
+`sebastian-software/standards`): one component, `ferralk`, at the repository
+root, versioned by the `rust` strategy. That strategy needs a real package at
+the root, so the root `Cargo.toml` is the `ferralk` package. Its sources stay
+in `crates/ferralk/`, and its `include` list keeps the published file set to
+those sources plus the repository's license texts and `NOTICE`. One release
+pull request then bumps, without any Cargo entry in `extra-files`:
+
+- the root package's `version`;
+- the `version` of every workspace member, `ferralk-glob` and the unpublished
+  tools alike. Members therefore carry a concrete `version` instead of
+  `version.workspace = true`, and `[workspace] members` lists them by path,
+  never by glob, because Release Please reads each listed path directly;
+- the `ferralk` → `ferralk-glob` requirement, which names both `path` and
+  `version` for that reason;
+- `Cargo.lock`.
+
+The remaining `extra-files` are the consumer documents whose current-version
+lines carry an `x-release-please-version` marker, and three version fields in
+`fuzz/Cargo.lock`. The fuzz crate is a separate workspace whose lockfile the
+`rust` strategy does not see, and CI builds it with `--locked`.
+`cargo test -p doc-tests` holds the configuration, the member versions, the
+fuzz lockfile, and the annotated lines to this shape.
+
+Tags stay `v<version>` (`include-component-in-tag: false`) so the existing
+release history continues. A `Release-As: <version>` footer on `main` still
+overrides the proposed version. Publishing the GitHub release runs
+`.github/workflows/publish.yml`, which publishes `ferralk-glob` and then
+`ferralk`.
+
 ## 1.0 release checklist
 
 This is the checklist the 1.0 release train was planned with; the
@@ -214,8 +247,9 @@ cadence below asks for, by maintainer decision on 2026-09-24;
   release pull request. The candidate is then the artifact the rounds run
   against rather than their result, and `1.0.0` still waits for a clean one.
 - [ ] Tell Release Please the version explicitly. Its `bump-minor-pre-major`
-  setting turns every breaking change on `0.x` into a minor bump, so it never
-  proposes a major version on its own. Land a commit on `main` whose footer
+  setting, in force until 1.0, turned every breaking change on `0.x` into a
+  minor bump, so it never proposed a major version on its own. Land a commit on
+  `main` whose footer
   reads `Release-As: 1.0.0-rc.1` for the candidate, and later one with
   `Release-As: 1.0.0`; the release pull request then carries that version and
   the ordinary bump rules resume from it.

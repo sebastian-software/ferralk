@@ -2,7 +2,7 @@
 name = "ferralk-glob"
 description = "Compiled, byte-first glob matching with explicit wildcard, brace, and extglob semantics."
 readme = "README.md"
-version.workspace = true
+version = "1.0.0"
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
