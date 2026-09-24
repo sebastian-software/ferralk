@@ -68,71 +68,108 @@ use sweep::{SweepEngine, SweepState};
 pub struct Pattern {
     alternatives: Vec<CompiledAlternative>,
     alternative_fast_path: Option<Box<AlternativeFastPath>>,
-    /// One list-filter route per entry of `alternatives`, in the same order,
-    /// or `None` when every alternative is a [`PathFilterArm::Whole`].
-    path_filter_alternatives: Option<Vec<PathFilterArm>>,
+    /// The list-filter routes of [`Pattern::is_match_path`], or `None` when
+    /// every alternative answers it exactly like [`Pattern::is_match`].
+    path_filter: Option<Box<PathFilter>>,
     can_match_hidden_component_without_match_hidden: bool,
     walker_path_viability: WalkerPathViability,
     walker_path_problem_offset: Option<usize>,
     options: PatternOptions,
 }
 
-/// How one alternative answers the list-filter entry point
+/// How the alternatives answer the list-filter entry point
 /// [`Pattern::is_match_path`].
 ///
-/// Each alternative is routed on its own, so a brace arm's verdict never
-/// depends on the syntax of its siblings.
+/// Every alternative has exactly one route, chosen from its own syntax and
+/// never from a sibling's, so a brace arm's verdict does not depend on the
+/// arms beside it.
 #[derive(Debug, Clone)]
-enum PathFilterArm {
-    /// No wildcard of the alternative stands in a component-local position,
-    /// so the whole-sequence reading of [`Pattern::is_match`] is already the
-    /// list-filter verdict.
-    Whole,
-    /// An extglob program, which reads the component policy at match time: a
-    /// group directly behind a separator is component-local exactly like a
-    /// plain wildcard there. The one compiled program serves both readings.
-    Program,
-    /// A second compile for the component policy, with one leading `./`
-    /// removed and a fast path chosen for component-local wildcards.
-    Compiled(Box<CompiledAlternative>),
+struct PathFilter {
+    /// Second compiles for the component policy, with one leading `./`
+    /// removed and a fast path chosen for component-local wildcards. Once
+    /// one plain alternative needs such a copy every plain alternative gets
+    /// one, so they are all matched in one contiguous pass; the copy of an
+    /// alternative without a component-local position answers exactly as
+    /// the original does. An extglob alternative gets a copy only for its
+    /// leading `./`.
+    compiled: Vec<CompiledAlternative>,
+    /// Indices of extglob alternatives answered from their shared compile. A
+    /// program reads the component policy at match time, so a group directly
+    /// behind a separator is component-local exactly like a plain wildcard
+    /// there.
+    programs: Vec<usize>,
+    /// Indices of plain alternatives answered like [`Pattern::is_match`],
+    /// used only while no plain alternative needs a component copy.
+    whole: Vec<usize>,
 }
 
-impl PathFilterArm {
-    /// Chooses the route for `alternative`, compiling a component copy only
-    /// when the plain matcher needs one.
+impl PathFilter {
     fn compile(
-        alternative: &CompiledAlternative,
+        alternatives: &[CompiledAlternative],
         options: PatternOptions,
         budget: &mut IrBudget,
-    ) -> Result<Self, PatternError> {
-        if alternative.raw.starts_with(b"./") {
-            // A second compiled copy of the alternative, so it costs the
-            // budget a second time.
-            return Pattern::compile_path_filter_alternative(alternative, options, budget)
-                .map(|compiled| Self::Compiled(Box::new(compiled)));
+    ) -> Result<Option<Self>, PatternError> {
+        let is_program = |alternative: &CompiledAlternative| {
+            options.extglob && alternative.extglob.is_some() && !alternative.raw.starts_with(b"./")
+        };
+        let needs_copy = |alternative: &CompiledAlternative| {
+            alternative.raw.starts_with(b"./")
+                || alternative.tokens.windows(2).any(|tokens| {
+                    matches!(
+                        tokens,
+                        [Token::Separator, Token::Any | Token::Star | Token::Class(_)]
+                    )
+                })
+        };
+        let plain_needs_copy = alternatives
+            .iter()
+            .any(|alternative| !is_program(alternative) && needs_copy(alternative));
+        let mut filter = Self {
+            compiled: Vec::new(),
+            programs: Vec::new(),
+            whole: Vec::new(),
+        };
+        for (index, alternative) in alternatives.iter().enumerate() {
+            if is_program(alternative) {
+                filter.programs.push(index);
+            } else if plain_needs_copy {
+                // A second compiled copy of the alternative, so it costs the
+                // budget a second time.
+                filter
+                    .compiled
+                    .push(Pattern::compile_path_filter_alternative(
+                        alternative,
+                        options,
+                        budget,
+                    )?);
+            } else {
+                filter.whole.push(index);
+            }
         }
-        if options.extglob && alternative.extglob.is_some() {
-            return Ok(Self::Program);
-        }
-        if alternative.tokens.windows(2).any(|tokens| {
-            matches!(
-                tokens,
-                [Token::Separator, Token::Any | Token::Star | Token::Class(_)]
-            )
-        }) {
-            return Pattern::compile_path_filter_alternative(alternative, options, budget)
-                .map(|compiled| Self::Compiled(Box::new(compiled)));
-        }
-        Ok(Self::Whole)
+        Ok((!filter.compiled.is_empty() || !filter.programs.is_empty()).then_some(filter))
     }
 
-    /// The compiled alternative this route matches with: its own component
-    /// copy, or the shared one.
-    fn alternative<'a>(&'a self, shared: &'a CompiledAlternative) -> &'a CompiledAlternative {
-        match self {
-            Self::Compiled(compiled) => compiled.as_ref(),
-            Self::Whole | Self::Program => shared,
-        }
+    /// Answers `path` with `options` on the component routes and
+    /// `whole_options` on the alternatives read like `is_match`.
+    fn is_match(
+        &self,
+        alternatives: &[CompiledAlternative],
+        options: PatternOptions,
+        whole_options: PatternOptions,
+        path: &[u8],
+    ) -> bool {
+        let shared = |indices: &[usize], options: PatternOptions| {
+            indices.iter().any(|&index| {
+                Pattern::match_alternatives(
+                    std::slice::from_ref(&alternatives[index]),
+                    options,
+                    path,
+                )
+            })
+        };
+        Pattern::match_alternatives(&self.compiled, options, path)
+            || shared(&self.programs, options)
+            || shared(&self.whole, whole_options)
     }
 }
 
@@ -651,13 +688,9 @@ impl Pattern {
     #[cfg(any(test, feature = "unstable-test-hooks"))]
     fn compiled_alternatives_mut(&mut self) -> impl Iterator<Item = &mut CompiledAlternative> {
         self.alternatives.iter_mut().chain(
-            self.path_filter_alternatives
+            self.path_filter
                 .iter_mut()
-                .flatten()
-                .filter_map(|arm| match arm {
-                    PathFilterArm::Compiled(compiled) => Some(compiled.as_mut()),
-                    PathFilterArm::Whole | PathFilterArm::Program => None,
-                }),
+                .flat_map(|filter| filter.compiled.iter_mut()),
         )
     }
 
@@ -801,21 +834,11 @@ impl Pattern {
             .alternatives
             .iter()
             .any(|alternative| alternative.raw.starts_with(b"./"))
-            && let Some(arms) = &self.path_filter_alternatives
+            && let Some(filter) = &self.path_filter
         {
-            // Only the `./` arms need their stripped copy; every other arm
-            // answers from the shared compile exactly as below.
-            return self
-                .alternatives
-                .iter()
-                .zip(arms)
-                .any(|(alternative, arm)| {
-                    Self::match_alternatives(
-                        std::slice::from_ref(arm.alternative(alternative)),
-                        options,
-                        path,
-                    )
-                });
+            // The `./` alternatives need their stripped copies; every other
+            // route answers under this policy exactly as below.
+            return filter.is_match(&self.alternatives, options, options, path);
         }
         if let [alternative] = self.alternatives.as_slice()
             && (!options.extglob || alternative.extglob.is_none())
@@ -844,7 +867,7 @@ impl Pattern {
         let path = without_leading_dot_slash(path.as_ref());
         // The copies exist whenever an alternative has the prefix, so asking
         // for them first spares most patterns the scan over alternatives.
-        if let Some(alternatives) = &self.path_filter_alternatives
+        if let Some(filter) = &self.path_filter
             && self
                 .alternatives
                 .iter()
@@ -854,7 +877,9 @@ impl Pattern {
             // removed prefix. Their fast paths are the literal and
             // fixed-width shapes, which read the same under either wildcard
             // reach, and every other engine takes the reach from `options`.
-            return Self::match_alternatives(alternatives, self.options, path);
+            // Every `./` alternative has a copy; the others answer from the
+            // shared compile.
+            return filter.is_match(&self.alternatives, self.options, self.options, path);
         }
         self.is_match(path)
     }
@@ -920,27 +945,14 @@ impl Pattern {
 
     fn matches_path_filter(&self, path: &[u8]) -> bool {
         let path = without_leading_dot_slash(path);
-        let Some(arms) = &self.path_filter_alternatives else {
+        let Some(filter) = &self.path_filter else {
             return self.is_match(path);
         };
         let component = PatternOptions {
             component_wildcards: true,
             ..self.options
         };
-        self.alternatives
-            .iter()
-            .zip(arms)
-            .any(|(alternative, arm)| {
-                let options = match arm {
-                    PathFilterArm::Whole => self.options,
-                    PathFilterArm::Program | PathFilterArm::Compiled(_) => component,
-                };
-                Self::match_alternatives(
-                    std::slice::from_ref(arm.alternative(alternative)),
-                    options,
-                    path,
-                )
-            })
+        filter.is_match(&self.alternatives, component, self.options, path)
     }
 
     fn from_alternatives(
@@ -953,18 +965,11 @@ impl Pattern {
             .any(CompiledAlternative::can_match_hidden_path_component_without_match_hidden);
         let alternative_fast_path =
             AlternativeFastPath::compile(&alternatives, options, budget)?.map(Box::new);
-        let path_filter_alternatives = alternatives
-            .iter()
-            .map(|alternative| PathFilterArm::compile(alternative, options, budget))
-            .collect::<Result<Vec<_>, _>>()?;
-        let path_filter_alternatives = path_filter_alternatives
-            .iter()
-            .any(|arm| !matches!(arm, PathFilterArm::Whole))
-            .then_some(path_filter_alternatives);
+        let path_filter = PathFilter::compile(&alternatives, options, budget)?.map(Box::new);
         Ok(Self {
             alternatives,
             alternative_fast_path,
-            path_filter_alternatives,
+            path_filter,
             can_match_hidden_component_without_match_hidden,
             walker_path_viability: WalkerPathViability::Viable,
             walker_path_problem_offset: None,
@@ -4626,6 +4631,10 @@ enum ExtglobKind {
 /// of a group being classifiable on its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CompiledExtglob {
+    /// The ordinary bytes the program starts with. Every engine consumes
+    /// them one for one, so a candidate that does not start with them is
+    /// rejected before either engine runs, as the plain prefilter does.
+    literal_prefix: Vec<u8>,
     steps: Vec<ExtglobStep>,
     groups: Vec<ExtglobGroup>,
     /// Linear-space Thompson machine for eligible positive extglobs.
@@ -4798,12 +4807,23 @@ struct ExtglobGroup {
     /// Whether the group operator follows an explicit separator in the outer
     /// program. Its alternatives inherit that position at their root.
     component_local: bool,
-    /// Whether some alternative spells a separator itself, so a match can
-    /// span components even where every wildcard is component-local.
-    spells_separator: bool,
+    /// Whether some alternative spells a separator or a recursive star, so a
+    /// match can span components even where every ordinary wildcard is
+    /// component-local.
+    spans_components: bool,
+    /// Whether some alternative starts with an ordinary wildcard, the one
+    /// token whose locality follows the group's position.
+    root_wildcard: bool,
 }
 
 impl ExtglobGroup {
+    /// Whether the first iteration of a repetition reads its root wildcard
+    /// differently from a later one, which follows the previous iteration's
+    /// text rather than the separator in front of the group.
+    fn first_iteration_differs(&self) -> bool {
+        self.component_local && self.root_wildcard
+    }
+
     /// The last candidate offset a match of one alternative can end at.
     ///
     /// A negated group consumes the text its alternatives reject, a
@@ -4812,8 +4832,8 @@ impl ExtglobGroup {
     /// rule itself: its root wildcard is component-local exactly when the
     /// group is, and a wildcard behind it crosses again under the list-filter
     /// rule, as in `a/b*`. Bounding it by the component end is only a
-    /// shortcut, taken when every wildcard is component-local and no
-    /// alternative spells a separator.
+    /// shortcut, taken when every ordinary wildcard is component-local and no
+    /// alternative spells a separator or a recursive star.
     fn alternative_end_limit(
         &self,
         path: &[u8],
@@ -4823,7 +4843,7 @@ impl ExtglobGroup {
         if self.kind == ExtglobKind::Negated {
             return extglob_component_end(path, path_index, options, self.component_local);
         }
-        if options.component_wildcards && options.root_component_wildcards && !self.spells_separator
+        if options.component_wildcards && options.root_component_wildcards && !self.spans_components
         {
             return extglob_component_end(path, path_index, options, true);
         }
@@ -5175,11 +5195,11 @@ impl PositiveExtglobBuilder<'_> {
         let blocks_leading_period = !extglob_group_allows_literal_leading_period(group);
         match group.kind {
             ExtglobKind::ExactlyOne => {
-                let alternatives = self.alternatives(group, rest)?;
+                let alternatives = self.alternatives(group, rest, group.component_local)?;
                 self.epsilon(alternatives, blocks_leading_period)
             }
             ExtglobKind::Optional => {
-                let mut alternatives = self.alternatives(group, rest)?;
+                let mut alternatives = self.alternatives(group, rest, group.component_local)?;
                 alternatives.push(rest);
                 self.epsilon(alternatives, blocks_leading_period)
             }
@@ -5191,8 +5211,16 @@ impl PositiveExtglobBuilder<'_> {
                     },
                     0,
                 )?;
-                let alternatives = self.alternatives(group, hub)?;
-                let mut loop_targets = alternatives.clone();
+                // Only the first iteration stands where the group does; a
+                // later one follows the previous iteration's text, so its
+                // root wildcard gets a copy that is not component-local.
+                let later = self.alternatives(group, hub, false)?;
+                let first = if group.first_iteration_differs() {
+                    self.alternatives(group, hub, true)?
+                } else {
+                    later.clone()
+                };
+                let mut loop_targets = later;
                 loop_targets.push(rest);
                 let edge_count = loop_targets.len();
                 self.budget.charge(edge_count, 0)?;
@@ -5201,9 +5229,11 @@ impl PositiveExtglobBuilder<'_> {
                     blocks_leading_period: false,
                 };
                 if group.kind == ExtglobKind::ZeroOrMore {
-                    self.epsilon(vec![hub], blocks_leading_period)
+                    let mut entry = first;
+                    entry.push(rest);
+                    self.epsilon(entry, blocks_leading_period)
                 } else {
-                    self.epsilon(alternatives, blocks_leading_period)
+                    self.epsilon(first, blocks_leading_period)
                 }
             }
             ExtglobKind::Negated => unreachable!("negated groups do not compile to this NFA"),
@@ -5214,13 +5244,12 @@ impl PositiveExtglobBuilder<'_> {
         &mut self,
         group: &ExtglobGroup,
         next: usize,
+        root_component_local: bool,
     ) -> Result<Vec<usize>, PatternError> {
         let mut starts = Vec::new();
         for alternative in &group.alternatives {
             for alternative in &alternative.compiled {
-                if let Some(start) =
-                    self.tokens(&alternative.tokens, next, group.component_local)?
-                {
+                if let Some(start) = self.tokens(&alternative.tokens, next, root_component_local)? {
                     starts.push(start);
                 }
             }
@@ -5370,7 +5399,15 @@ fn compile_extglob(
         }
     }
     let positive_nfa = PositiveExtglobNfa::compile(&steps, &groups, budget)?;
+    let literal_prefix = steps
+        .iter()
+        .map_while(|step| match step {
+            ExtglobStep::Byte(byte) => Some(*byte),
+            _ => None,
+        })
+        .collect();
     Ok(Some(CompiledExtglob {
+        literal_prefix,
         steps,
         groups,
         positive_nfa,
@@ -5416,13 +5453,21 @@ fn compile_extglob_step(
                 false,
             )?);
         }
-        let spells_separator = alternatives.iter().any(|alternative| {
+        let spans_components = alternatives.iter().any(|alternative| {
             alternative.compiled.iter().any(|compiled| {
                 compiled.tokens.iter().any(|token| match token {
-                    Token::Separator => true,
+                    Token::Separator | Token::RecursiveStar | Token::RecursivePrefix => true,
                     Token::Literal(literal) => literal.iter().any(|byte| is_separator(*byte)),
-                    _ => false,
+                    Token::Any | Token::Star | Token::Class(_) => false,
                 })
+            })
+        });
+        let root_wildcard = alternatives.iter().any(|alternative| {
+            alternative.compiled.iter().any(|compiled| {
+                matches!(
+                    compiled.tokens.first(),
+                    Some(Token::Any | Token::Class(_) | Token::Star)
+                )
             })
         });
         groups.push(ExtglobGroup {
@@ -5431,7 +5476,8 @@ fn compile_extglob_step(
             start: index,
             rest: close + 1,
             component_local: index > 0 && is_separator(pattern[index - 1]),
-            spells_separator,
+            spans_components,
+            root_wildcard,
         });
         return Ok(ExtglobStep::Group(groups.len() - 1));
     }
@@ -5671,6 +5717,15 @@ thread_local! {
 /// the general scratch, so holding both at once would push every sub-match
 /// onto the re-entrancy fallback and allocate there.
 fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: PatternOptions) -> bool {
+    let prefix = &program.literal_prefix;
+    if path.len() < prefix.len()
+        || !prefix
+            .iter()
+            .zip(path)
+            .all(|(&expected, &actual)| bytes_equal(expected, actual, options.case_insensitive))
+    {
+        return false;
+    }
     if let Some(nfa) = &program.positive_nfa {
         return nfa.is_match(path, options);
     }
@@ -6019,29 +6074,9 @@ fn match_extglob_task(
                         options,
                         state,
                     );
-                    if has_star && star_path_index < path.len() {
-                        if !extglob_star_can_consume(
-                            path,
-                            star_path_index,
-                            options,
-                            star_component_local,
-                        ) {
-                            let Some((resume, consumed)) = crossing_star.take() else {
-                                return false;
-                            };
-                            star_pattern_index = resume;
-                            star_path_index = consumed;
-                            star_component_local = false;
-                            if !extglob_star_can_consume(path, star_path_index, options, false) {
-                                return false;
-                            }
-                        }
-                        pattern_index = star_pattern_index;
-                        star_path_index += 1;
-                        path_index = star_path_index;
-                        continue;
-                    }
-                    return false;
+                    // The group's continuations are queued; this branch
+                    // then backtracks through the preceding star like any
+                    // failed step, below.
                 }
                 ExtglobStep::Star {
                     next,
@@ -6065,8 +6100,7 @@ fn match_extglob_task(
                             );
                         }
                         let component_local =
-                            !extglob_step_is_recursive_star(steps, pattern_index, options)
-                                && extglob_wildcard_component_local(steps, pattern_index, options);
+                            extglob_star_component_local(steps, pattern_index, options);
                         remember_crossing_star(
                             &mut crossing_star,
                             has_star.then_some((
@@ -6216,16 +6250,27 @@ fn extglob_wildcard_component_local(
         && (options.root_component_wildcards || extglob_step_component_local(steps, step_index))
 }
 
-fn extglob_step_is_recursive_star(
+/// Whether the outer star run at `step_index` stays inside one component,
+/// answered exactly as the token engine reads the same run.
+///
+/// A single star follows the position rule. A longer run starts with a
+/// recursive star under `recursive_double_star`, which crosses under every
+/// policy, and is otherwise a sequence of ordinary stars: the second one
+/// stands behind the first rather than behind a separator, so the run crosses
+/// unless every ordinary wildcard is component-local.
+fn extglob_star_component_local(
     steps: &[ExtglobStep],
     step_index: usize,
     options: PatternOptions,
 ) -> bool {
-    options.recursive_double_star
-        && matches!(
-            steps.get(step_index),
-            Some(ExtglobStep::Star { next, .. }) if *next - step_index == 2
-        )
+    match steps.get(step_index) {
+        Some(ExtglobStep::Star { next, .. }) if *next - step_index >= 2 => {
+            !options.recursive_double_star
+                && options.component_wildcards
+                && options.root_component_wildcards
+        }
+        _ => extglob_wildcard_component_local(steps, step_index, options),
+    }
 }
 
 fn extglob_star_can_consume(
@@ -6374,16 +6419,14 @@ fn matching_extglob_group_ends(
     output: &mut Vec<usize>,
 ) {
     output.clear();
+    let span = AlternativeSpan {
+        path,
+        start: path_index,
+        end_limit: group.alternative_end_limit(path, path_index, options),
+        root_component_local: group.component_local,
+    };
     for alternative in &group.alternatives {
-        matching_extglob_alternative_ends(
-            group,
-            alternative,
-            path,
-            path_index,
-            options,
-            prefix_sweep_state,
-            output,
-        );
+        matching_extglob_alternative_ends(alternative, span, options, prefix_sweep_state, output);
     }
     output.sort_unstable();
     output.dedup();
@@ -6404,6 +6447,16 @@ fn matching_extglob_repetition_ends(
 ) {
     let component_end = group.alternative_end_limit(path, path_index, options);
     let position_count = component_end - path_index + 1;
+    // Only the first iteration stands where the group does. A later one
+    // follows the previous iteration's text, not the separator, so its first
+    // wildcard is not component-local: `src/+(*.ts)` reads like
+    // `src/*.ts*.ts`. The difference is only observable under the list-filter
+    // policy; there the first iteration is matched on its own, because the
+    // streaming sweeps share one policy across every live iteration.
+    let first_iteration_apart = group.first_iteration_differs()
+        && options.component_wildcards
+        && !options.root_component_wildcards;
+    let later_root_local = group.component_local && !first_iteration_apart;
     state.visited.clear();
     let reachable_base = push_visited(state.visited, position_count);
     let matched_base = push_visited(state.visited, position_count);
@@ -6411,6 +6464,11 @@ fn matching_extglob_repetition_ends(
     prepare_extglob_sweeps(group, state.sweep_states);
     for offset in 0..position_count {
         let absolute = path_index + offset;
+        let root_component_local = if offset == 0 {
+            group.component_local
+        } else {
+            later_root_local
+        };
         if visited(state.visited, reachable_base, offset) {
             let mut sweep_index = 0;
             for alternative in &group.alternatives {
@@ -6424,7 +6482,7 @@ fn matching_extglob_repetition_ends(
                             &path[absolute..end],
                             at_component_start(path, absolute, options),
                             options,
-                            group.component_local,
+                            root_component_local,
                         )
                     {
                         let reached = end - path_index;
@@ -6433,11 +6491,15 @@ fn matching_extglob_repetition_ends(
                     }
                     continue;
                 }
-                let mut has_fallback = false;
+                let enumerate_apart = offset == 0 && first_iteration_apart;
+                let mut has_fallback = enumerate_apart;
                 for compiled in &alternative.compiled {
                     if let Some(sweep) = &compiled.sweep {
                         let sweep_state = &mut state.sweep_states[sweep_index];
                         sweep_index += 1;
+                        if enumerate_apart {
+                            continue;
+                        }
                         sweep.inject_start(sweep_state);
                         if sweep.accepts(sweep_state) {
                             visit(state.visited, matched_base, offset);
@@ -6449,10 +6511,13 @@ fn matching_extglob_repetition_ends(
                 if has_fallback {
                     state.candidate_ends.clear();
                     matching_extglob_alternative_ends(
-                        group,
                         alternative,
-                        path,
-                        absolute,
+                        AlternativeSpan {
+                            path,
+                            start: absolute,
+                            end_limit: component_end,
+                            root_component_local,
+                        },
                         options,
                         state.prefix_sweep_state,
                         state.candidate_ends,
@@ -6485,7 +6550,7 @@ fn matching_extglob_repetition_ends(
                 let sweep_state = &mut state.sweep_states[sweep_index];
                 sweep_index += 1;
                 let alternative_options =
-                    extglob_alternative_options(path, absolute, options, group.component_local);
+                    extglob_alternative_options(path, absolute, options, later_root_local);
                 if sweep.advance(sweep_state, byte, starts_component, alternative_options)
                     && sweep.accepts(sweep_state)
                 {
@@ -6526,17 +6591,31 @@ fn prepare_extglob_sweeps(group: &ExtglobGroup, states: &mut Vec<SweepState>) {
     states.truncate(count);
 }
 
+/// Where one match of a group alternative starts and how far it may reach.
+#[derive(Clone, Copy)]
+struct AlternativeSpan<'a> {
+    path: &'a [u8],
+    start: usize,
+    /// See [`ExtglobGroup::alternative_end_limit`].
+    end_limit: usize,
+    /// Whether the alternative's first wildcard is in a component-local
+    /// position: the group's own position for its first iteration.
+    root_component_local: bool,
+}
+
 fn matching_extglob_alternative_ends(
-    group: &ExtglobGroup,
     alternative: &ExtglobAlternative,
-    path: &[u8],
-    path_index: usize,
+    span: AlternativeSpan<'_>,
     options: PatternOptions,
     prefix_sweep_state: &mut Option<SweepState>,
     output: &mut Vec<usize>,
 ) {
-    let root_component_local = group.component_local;
-    let component_end = group.alternative_end_limit(path, path_index, options);
+    let AlternativeSpan {
+        path,
+        start: path_index,
+        end_limit: component_end,
+        root_component_local,
+    } = span;
     if let Some(width) = alternative.width {
         let Some(end) = path_index.checked_add(width) else {
             return;
@@ -6672,10 +6751,10 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     use super::LiteralSuffix;
     use super::{
-        AlternativeFastPath, ExtglobStep, FailedStates, FastPath, PathFilterArm, Pattern,
-        PatternOptions, Prefilter, Token, WalkerPathViability, extglob_failed_len,
-        extglob_failed_stats, extglob_pending_peak, extglob_scratch_capacities,
-        positive_extglob_scratch_capacities, scratch_capacities,
+        AlternativeFastPath, ExtglobStep, FailedStates, FastPath, Pattern, PatternOptions,
+        Prefilter, Token, WalkerPathViability, extglob_failed_len, extglob_failed_stats,
+        extglob_pending_peak, extglob_scratch_capacities, positive_extglob_scratch_capacities,
+        scratch_capacities,
     };
 
     fn compile(pattern: &str) -> Pattern {
@@ -9149,35 +9228,45 @@ mod tests {
             .expect("component pattern compiles");
         assert!(
             component_pattern
-                .path_filter_alternatives
+                .path_filter
                 .as_ref()
-                .is_some_and(|arms| arms.iter().all(|arm| matches!(
-                    arm,
-                    PathFilterArm::Compiled(alternative) if alternative.fast_path.is_none()
-                )))
+                .is_some_and(|filter| {
+                    filter.compiled.len() == 1
+                        && filter.compiled[0].fast_path.is_none()
+                        && filter.programs.is_empty()
+                        && filter.whole.is_empty()
+                })
         );
 
         let root_pattern =
             Pattern::compile("*.rs", PatternOptions::default()).expect("root pattern compiles");
-        assert!(root_pattern.path_filter_alternatives.is_none());
+        assert!(root_pattern.path_filter.is_none());
     }
 
     #[test]
     fn filter_paths_routes_each_brace_arm_on_its_own() {
         let options = PatternOptions::default().braces(true).extglob(true);
+        // The extglob arm is answered from its shared program; the plain
+        // arms share one pass over their component copies.
         let mixed = Pattern::compile("{zz,lib/*,src/@(*.ts)}", options).expect("pattern compiles");
-        let arms = mixed
-            .path_filter_alternatives
+        let filter = mixed
+            .path_filter
             .as_ref()
             .expect("component arms need the list-filter routes");
-        assert!(matches!(
-            arms.as_slice(),
-            [
-                PathFilterArm::Whole,
-                PathFilterArm::Compiled(_),
-                PathFilterArm::Program
-            ]
-        ));
+        assert_eq!(filter.compiled.len(), 2);
+        assert_eq!(filter.programs, [2]);
+        assert!(filter.whole.is_empty());
+
+        // Without a plain arm that needs a copy, plain arms keep the
+        // whole-sequence route and nothing is compiled twice.
+        let lean = Pattern::compile("{zz,src/@(*.ts)}", options).expect("pattern compiles");
+        let filter = lean
+            .path_filter
+            .as_ref()
+            .expect("the extglob arm is routed");
+        assert!(filter.compiled.is_empty());
+        assert_eq!(filter.programs, [1]);
+        assert_eq!(filter.whole, [0]);
 
         // Issue #393: an extglob group directly behind a separator is
         // component-local, and a sibling arm cannot change that verdict.
@@ -9198,6 +9287,35 @@ mod tests {
             assert!(!pattern.is_match_path("src/a/b.ts"));
             assert!(pattern.is_match("src/a/b.ts") || pattern.is_match("./src/a/b.ts"));
             assert!(!pattern.is_match_glob_path("src/a/b.ts"));
+        }
+
+        // Only a repetition's first iteration stands behind the separator; a
+        // later one follows the previous iteration's text, so `src/+(*.ts)`
+        // reads like `src/*.ts*.ts` there. Both engines agree on it.
+        let repeated_like = Pattern::compile("src/*.ts*.ts", options).expect("pattern compiles");
+        for pattern in ["src/+(*.ts)", "src/*(*.ts)"] {
+            let pattern = Pattern::compile(pattern, options).expect("pattern compiles");
+            for candidate in ["src/a.tsb/c.ts", "src/a.ts/c.ts", "src/a/b.ts"] {
+                assert_eq!(
+                    pattern.is_match_path(candidate),
+                    repeated_like.is_match_path(candidate),
+                    "{candidate}"
+                );
+                assert!(pattern.engines_agree(candidate), "{candidate}");
+            }
+            let mut interpreted = pattern.clone();
+            for alternative in interpreted.compiled_alternatives_mut() {
+                if let Some(program) = alternative.extglob.as_mut() {
+                    program.positive_nfa = None;
+                }
+            }
+            for candidate in ["src/a.tsb/c.ts", "src/a/b.ts", "src/a.ts"] {
+                assert_eq!(
+                    pattern.is_match_path(candidate),
+                    interpreted.is_match_path(candidate),
+                    "{candidate}"
+                );
+            }
         }
     }
 
@@ -9228,8 +9346,18 @@ mod tests {
             ("**/lua/@(*.lua)", "**/lua/*.lua"),
             // A spelled separator inside the group is ordinary syntax.
             ("*/@(a/b)", "*/a/b"),
+            // A star run of two or more reads as the token engine reads it:
+            // recursive under `recursive_double_star`, otherwise ordinary
+            // stars of which only the first stands behind the separator.
+            ("x@(y)/***/z", "xy/***/z"),
+            ("src/@(*.ts)/***", "src/*.ts/***"),
+            ("src/**/*.@(ts)", "src/**/*.ts"),
         ];
         let candidates = [
+            "xy/b/c/z",
+            "src/a.ts/b/c",
+            "src/a/b/c.ts",
+            "a/b/c/d.ts",
             "b.ts",
             "a/b.ts",
             "src/b.ts",
@@ -9276,17 +9404,28 @@ mod tests {
                 }
             }
         }
+
+        // A recursive star inside a group crosses separators under both path
+        // entry points; the group is not cut at the component end.
+        let options = PatternOptions::default()
+            .extglob(true)
+            .recursive_double_star(true);
+        for (pattern, candidate) in [("a/@(x|**)/*.ts", "a/b/c/d.ts"), ("*/@(**)/z", "a/b/c/z")] {
+            let pattern = Pattern::compile(pattern, options).expect("pattern compiles");
+            assert!(pattern.is_match_path(candidate), "{candidate}");
+            assert!(pattern.is_match_glob_path(candidate), "{candidate}");
+            assert!(pattern.engines_agree(candidate), "{candidate}");
+        }
     }
 
     #[test]
     fn component_deterministic_fast_path_matches_the_general_matcher() {
         let options = PatternOptions::default().case_insensitive(true);
         let fast = Pattern::compile("src/[ab]?.[Rr][Ss]", options).expect("pattern compiles");
-        assert!(fast.path_filter_alternatives.as_ref().is_some_and(|arms| {
+        assert!(fast.path_filter.as_ref().is_some_and(|filter| {
             matches!(
-                &arms[0],
-                PathFilterArm::Compiled(alternative)
-                    if matches!(alternative.fast_path, Some(FastPath::DeterministicTokens(_)))
+                filter.compiled[0].fast_path,
+                Some(FastPath::DeterministicTokens(_))
             )
         }));
         let mut general = fast.clone();

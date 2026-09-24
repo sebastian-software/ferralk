@@ -61,7 +61,10 @@ their alternatives use the same root and component rule selected by the entry
 point. Through `is_match_path` a group directly behind a separator stands where
 a wildcard would, so `src/@(*.ts)` keeps `src/a/b.ts` out exactly like
 `src/*.ts`, `src/!(x)` matches within one component, and a later wildcard
-inside an alternative crosses again as in `a/b*`. Brace alternatives are
+inside an alternative crosses again as in `a/b*`. Only the first iteration of
+`+(…)` or `*(…)` stands behind the separator, so `src/+(*.ts)` reads like
+`src/*.ts*.ts`, and an outer star run of two or more reads as in plain syntax.
+Brace alternatives are
 judged one by one, so `{src/@(*.ts),lib/*}` and `{src/@(*.ts),zz}` answer
 alike for `src/a/b.ts`. A recursive `**/` prefix may consume zero directories
 before a group, so `**/@(x)` matches both `x` and `a/x` when both options are
