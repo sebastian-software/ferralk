@@ -30,7 +30,7 @@ switch that changes it; the sections below explain the semantics.
 | Symlink kind for `files_only` and `directories_only` | The listing's kind: a symlink is a symlink | `WalkOptions::resolve_symlink_kind(true)` classifies by target |
 | Entry kinds | Files, directories, and symlinks | `WalkOptions::files_only(true)` or `directories_only(true)` |
 | Depth | Unlimited | `WalkOptions::max_depth(n)` |
-| Ordering | Unsorted | `WalkOptions::sort(true)` |
+| Ordering | Unsorted | `WalkOptions::sort(true)`, for `collect()` and `visit()`; `stream()` ignores it |
 | Metadata | Not fetched | `WalkOptions::metadata(true)` |
 | Recoverable errors | Collected next to the entries | `Walker::error_policy(ErrorPolicy::Skip)` or `ErrorPolicy::Abort` |
 | Threads | Available parallelism, clamped to `1..=256` | `Walker::threads(n)`; `stream()` is always single-threaded |
@@ -128,6 +128,15 @@ policy twice.
 include accepts every non-excluded entry. Excluded directories are pruned only
 when the walker can prove that no include can re-admit a descendant.
 
+Patterns are anchored at the root. They are not matched at any depth the way a
+slash-free `.gitignore` line is: `exclude("target/**")`, like a bare
+`exclude("target")`, prunes only the `target` directly below the root, and a
+`target` further down is walked as usual. Write `exclude("**/target/**")`, as
+the example below does, to prune one at any depth. Includes read the same way:
+`src/**/*.rs` selects below the top-level `src` only, `**/src/**/*.rs` below
+every `src`. Rules read from ignore files under `respect_git_ignore(true)` keep
+Git's own anchoring.
+
 ```rust,no_run
 use ferralk::{CancellationToken, ErrorPolicy, WalkOptions, Walker};
 
@@ -153,6 +162,12 @@ if result.was_cancelled() {
 # let _ = result;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+`options()` replaces every `WalkOptions` switch at once. It does not merge with
+an earlier call, because a `WalkOptions` value cannot tell a switch left at its
+default from one set to `false`. Build one value, as above, and pass it once:
+`.options(WalkOptions::default().files_only(true)).options(WalkOptions::default().sort(true))`
+is sorted but no longer files-only.
 
 ### Keep a configured walker when input patterns are invalid
 
@@ -325,19 +340,37 @@ Important defaults:
   `Symlink` either way: the switch answers what the link points at, not what
   the entry is.
 - `ErrorPolicy::Collect` is the default. It returns accepted entries and
-  recoverable filesystem errors in one `WalkResult`. `Skip` still drops
-  recoverable failures discovered below a root, but it always reports a root
-  open/read failure: a missing, unreadable, or non-directory caller-supplied
-  root must not look like an empty tree. Other roots continue, so a multi-root
-  walk can return their entries alongside the failed root's error. `stream()`
-  yields that root error as an item under both `Collect` and `Skip`; `Abort`
-  returns it immediately. Ignore-rule read and safety-limit failures use the
-  `read_ignore` operation; under `Skip` they are omitted like other
-  descendant-level recoverable failures.
-- Results are unsorted unless `WalkOptions::sort(true)` is set.
+  recoverable filesystem errors in one `WalkResult`. What each policy does with
+  a recoverable error:
+
+  | Policy | Error below a root | Root that cannot be opened | `collect()` returns |
+  |---|---|---|---|
+  | `Collect` (default) | collected in `errors()` | collected in `errors()` | `Ok`, with entries and errors |
+  | `Skip` | discarded, reported nowhere | collected in `errors()` | `Ok`, with entries and root errors |
+  | `Abort` | returned as `Err`, ending the walk | returned as `Err`, ending the walk | `Err` with the first error; entries are discarded |
+
+  Neither `Collect` nor `Skip` turns an error into `Err`, so `collect()?`
+  succeeds for a root that does not exist, with the failure only in
+  `WalkResult::errors()`. Check it; `WalkResult` is `#[must_use]` for this
+  reason. A missing, unreadable, or non-directory caller-supplied root is kept
+  even under `Skip`, because it must not look like an empty tree, and other
+  roots continue, so a multi-root walk can return their entries alongside the
+  failed root's error. `Skip` is not "skip but tell me": use `Collect` for
+  that. `visit()` follows the same table. `stream()` yields each kept error as
+  an item in place; under `Abort` the first error is its last item.
+  Ignore-rule read and safety-limit failures use the `read_ignore` operation;
+  under `Skip` they are discarded like other descendant-level recoverable
+  failures.
+- Results are unsorted unless `WalkOptions::sort(true)` is set. `stream()`
+  ignores that switch without a diagnostic; use `collect()` when the order
+  matters.
 - Metadata is not fetched unless `WalkOptions::metadata(true)` is set.
 - `stream()` yields entries and recoverable errors incrementally. It is
-  single-threaded and cannot provide global sorting.
+  single-threaded and cannot provide global sorting. Because errors are items,
+  iterator adapters count them: `stream().take(10)` can yield fewer than ten
+  entries. Decide what an error means before counting, with
+  `.filter_map(Result::ok).take(10)` to drop errors or
+  `.take(10).collect::<Result<Vec<_>, _>>()` to stop at the first one.
 
 Recoverable failures expose a typed `WalkOperation`; match it with a fallback
 arm because the enum is non-exhaustive. `as_str()` provides the stable

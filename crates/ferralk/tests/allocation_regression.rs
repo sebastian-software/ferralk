@@ -120,7 +120,7 @@ fn count_skipping_walk_with(
     });
     let outcome = outcome.expect("measurement produced a walk result");
     assert!(outcome.entries().is_empty());
-    black_box(outcome);
+    let _ = black_box(outcome);
     let visited = visited.load(Ordering::Relaxed);
     if gitignore {
         assert!(

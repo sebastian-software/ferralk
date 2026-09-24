@@ -27,6 +27,9 @@
 //!     .options(WalkOptions::default().files_only(true).sort(true))
 //!     .collect()?;
 //!
+//! // `collect()?` succeeded, but that does not mean the walk did: under the
+//! // default `ErrorPolicy::Collect` even a root that does not exist is reported
+//! // in `errors()` below rather than as `Err`.
 //! for entry in result.entries() {
 //!     println!("{}", entry.path().display());
 //! }
@@ -39,6 +42,10 @@
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
+//!
+//! `options` sets every [`WalkOptions`] switch in one call; see
+//! [`Walker::options`]. The table on [`ErrorPolicy`] shows which errors each
+//! policy collects, discards, or returns as `Err`.
 //!
 //! Three ways to consume a walk:
 //!
@@ -303,18 +310,69 @@ use gitignore::{IgnoreReadError, IgnoreScope};
 
 /// Controls what a walk does after a recoverable filesystem error.
 ///
+/// A recoverable error is one that ends a directory rather than the walk: a
+/// directory that cannot be listed, an unreadable ignore file, a symlink whose
+/// target cannot be examined. The policy decides whether the walk keeps it,
+/// discards it, or stops on it. A caller-supplied root that cannot be opened
+/// is treated more strictly than an error below a root, so that a missing root
+/// never passes for an empty tree:
+///
+/// | Policy | Error below a root | Root that cannot be opened | [`Walker::collect`] returns |
+/// |---|---|---|---|
+/// | [`Collect`](ErrorPolicy::Collect) (default) | **collected** in [`WalkResult::errors`] | **collected** in [`WalkResult::errors`] | `Ok`, with entries and errors |
+/// | [`Skip`](ErrorPolicy::Skip) | **discarded**, reported nowhere | **collected** in [`WalkResult::errors`] | `Ok`, with entries and root errors |
+/// | [`Abort`](ErrorPolicy::Abort) | **returned** as `Err`, ending the walk | **returned** as `Err`, ending the walk | `Err` with the first error; entries are discarded |
+///
+/// Neither `Collect` nor `Skip` turns an error into `Err`: `collect()?`
+/// succeeds for a root that does not exist, and the failure is only visible in
+/// [`WalkResult::errors`]. That is deliberate, because one failing root of a
+/// multi-root walk must not discard the entries of the others, and it is why
+/// [`WalkResult`] is `#[must_use]`. Check `errors()`, or choose `Abort`:
+///
+/// ```
+/// use ferralk::{ErrorPolicy, Walker};
+///
+/// let missing = std::env::temp_dir().join("ferralk-doc-no-such-root");
+///
+/// // Collect and Skip: `Ok`, with the root failure in `errors()`.
+/// for policy in [ErrorPolicy::Collect, ErrorPolicy::Skip] {
+///     let result = Walker::new(&missing).error_policy(policy).collect()?;
+///     assert!(result.entries().is_empty());
+///     assert_eq!(result.errors().len(), 1);
+/// }
+///
+/// // Abort: the first error is the `Err`.
+/// let aborted = Walker::new(&missing)
+///     .error_policy(ErrorPolicy::Abort)
+///     .collect();
+/// assert!(aborted.is_err());
+/// # Ok::<(), ferralk::WalkError>(())
+/// ```
+///
+/// [`Walker::visit`] follows the same table. [`Walker::stream`] yields a kept
+/// error as an `Err` item in place and goes on, and under `Abort` yields the
+/// first error as its last item.
+///
 /// This enum is intentionally exhaustive: these are the complete policy
 /// outcomes, and callers may match all of them without a fallback arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ErrorPolicy {
-    /// Stop immediately and return the first error.
+    /// Stop at the first recoverable error and return it as `Err`. Entries
+    /// found before it are discarded by [`Walker::collect`] and
+    /// [`Walker::visit`]; [`Walker::stream`] has already yielded them and ends
+    /// after yielding the error.
     Abort,
-    /// Continue walking and do not retain recoverable errors discovered below
-    /// a root. A caller-supplied root that cannot be opened is still retained
-    /// (or yielded by [`Walker::stream`]), so it cannot look like an empty
-    /// tree.
+    /// Continue walking and **discard** recoverable errors discovered below a
+    /// root: they are not reported anywhere. A caller-supplied root that
+    /// cannot be opened is still kept in [`WalkResult::errors`] (or yielded by
+    /// [`Walker::stream`]), so it cannot look like an empty tree.
+    ///
+    /// "Skip" means skip the failed directory *and* its error. To keep walking
+    /// while still being told what failed, use [`ErrorPolicy::Collect`].
     Skip,
-    /// Continue walking and return accumulated recoverable errors.
+    /// Continue walking and **collect** every recoverable error, a failed root
+    /// included, in [`WalkResult::errors`] next to the entries. The walk
+    /// itself returns `Ok`.
     #[default]
     Collect,
 }
@@ -410,6 +468,12 @@ impl WalkOptions {
     }
 
     /// Sorts final entries by their native path representation.
+    ///
+    /// Applies to [`Walker::collect`] and [`Walker::visit`] only.
+    /// [`Walker::stream`] ignores it, silently: a stream yields each entry as
+    /// soon as it is found, so it cannot order the whole result. Use
+    /// `collect()` when the order matters, or collect the stream and sort it
+    /// yourself.
     #[must_use]
     pub const fn sort(mut self, enabled: bool) -> Self {
         self.sort = enabled;
@@ -791,6 +855,22 @@ pub enum Verdict {
 }
 
 /// Completed entries and recoverable errors.
+///
+/// A walk that returned `Ok` has not necessarily succeeded. Under the default
+/// [`ErrorPolicy::Collect`], every recoverable error is here in
+/// [`errors`](WalkResult::errors) - even a root that does not exist, which
+/// otherwise looks exactly like an empty tree. Check it:
+///
+/// ```no_run
+/// use ferralk::Walker;
+///
+/// let result = Walker::new("workspace").include("**/*.rs")?.collect()?;
+/// if let Some(error) = result.errors().first() {
+///     return Err(format!("walk incomplete: {error}").into());
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "a walk reports recoverable errors, even a root that cannot be read, only through `errors()`"]
 #[derive(Debug)]
 pub struct WalkResult {
     entries: Vec<WalkEntry>,
@@ -978,6 +1058,11 @@ impl Walker {
     /// # Ok::<(), ferralk::ferralk_glob::PatternError>(())
     /// ```
     ///
+    /// A relative pattern is anchored at the walk root: `src/**/*.rs` selects
+    /// below the `src` directly inside the root, and `**/src/**/*.rs` below
+    /// every `src`. Excludes read the same way; [`Walker::exclude`] shows the
+    /// difference on a real tree.
+    ///
     /// For a caller-supplied list that may contain invalid patterns, use
     /// [`Walker::try_include`] instead. It borrows the builder, so rejecting a
     /// pattern leaves the caller's configured walker available for the next
@@ -1029,6 +1114,47 @@ impl Walker {
     /// Like an include, an exclude that starts with `!` is rejected: there is
     /// no negation to re-admit what another exclude matched. See
     /// [`Walker::include`].
+    ///
+    /// # Patterns are relative to the root
+    ///
+    /// A relative pattern is anchored at the walk root. It is not matched at
+    /// any depth, the way a slash-free `.gitignore` line is: `target/**`
+    /// prunes only the `target` directly below the root, and so does a bare
+    /// `target`, while a `target` further down is walked as usual. Write
+    /// `**/target/**` to prune one at any depth. (Rules that
+    /// [`Walker::respect_git_ignore`] reads from ignore files keep Git's own
+    /// anchoring; this is about the patterns passed here.)
+    ///
+    /// ```
+    /// use ferralk::{WalkEntry, WalkOptions, Walker};
+    ///
+    /// let root = std::env::temp_dir()
+    ///     .join(format!("ferralk-doc-exclude-{}", std::process::id()));
+    /// for dir in ["target", "crates/app/target"] {
+    ///     std::fs::create_dir_all(root.join(dir))?;
+    ///     std::fs::write(root.join(dir).join("out.bin"), b"")?;
+    /// }
+    /// let relative = |entry: &WalkEntry| {
+    ///     let path = entry.path().strip_prefix(&root).expect("entry below the root");
+    ///     path.to_string_lossy().replace('\\', "/")
+    /// };
+    /// let files_left_by = |exclude: &str| -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    ///     let result = Walker::new(&root)
+    ///         .exclude(exclude)?
+    ///         .options(WalkOptions::default().files_only(true))
+    ///         .collect()?;
+    ///     assert!(result.errors().is_empty());
+    ///     Ok(result.entries().iter().map(relative).collect())
+    /// };
+    ///
+    /// // Root-relative: only the top-level `target` is pruned.
+    /// assert_eq!(files_left_by("target/**")?, ["crates/app/target/out.bin"]);
+    /// assert_eq!(files_left_by("target")?, ["crates/app/target/out.bin"]);
+    /// // Every `target`, at any depth.
+    /// assert!(files_left_by("**/target/**")?.is_empty());
+    /// # std::fs::remove_dir_all(&root)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     ///
     /// # Absolute patterns
     ///
@@ -1308,7 +1434,25 @@ impl Walker {
         self
     }
 
-    /// Replaces all traversal options.
+    /// Replaces **all** traversal options with `options`; it does not merge.
+    ///
+    /// A [`WalkOptions`] value cannot tell a switch left at its default from
+    /// one set to `false`, so every call overwrites the whole set, and a second
+    /// call discards everything the first one chose. Build one value and pass
+    /// it once:
+    ///
+    /// ```
+    /// use ferralk::{WalkOptions, Walker};
+    ///
+    /// let walker = Walker::new(".")
+    ///     .options(WalkOptions::default().files_only(true).sort(true));
+    ///
+    /// // Not this: the second call resets `files_only` to `false`.
+    /// let wrong = Walker::new(".")
+    ///     .options(WalkOptions::default().files_only(true))
+    ///     .options(WalkOptions::default().sort(true));
+    /// # let _ = (walker, wrong);
+    /// ```
     #[must_use]
     pub const fn options(mut self, options: WalkOptions) -> Self {
         self.options = options;
@@ -1525,7 +1669,14 @@ impl Walker {
     /// Starts an incremental unsorted traversal. Unlike collect, recoverable
     /// errors are yielded as individual iterator items under Collect; sorting
     /// is intentionally a collect-only global operation.
-    #[must_use]
+    ///
+    /// [`WalkOptions::sort`] is ignored here without a diagnostic: entries
+    /// arrive in traversal order whatever it says. Use [`Walker::collect`]
+    /// when the result must be ordered.
+    ///
+    /// Every item is a `Result`, so iterator adapters count errors as items:
+    /// `take(10)` stops after ten *items*, which may be fewer than ten
+    /// entries. See [`WalkStream`] for the idioms.
     pub fn stream(self) -> WalkStream {
         SystemBackend.begin_walk();
         // Reversed, because the stream pops from the back and the roots are
@@ -2939,6 +3090,46 @@ impl DirectoryBackend for SystemBackend {
 }
 
 /// Incremental portable traversal produced by Walker stream.
+///
+/// Each item is a `Result<WalkEntry, WalkError>`: recoverable errors that the
+/// [`ErrorPolicy`] keeps arrive in place, between the entries. Adapters that
+/// count items therefore count errors too, and `stream().take(10)` can yield
+/// fewer than ten entries. Decide what an error means *before* counting:
+///
+/// ```no_run
+/// use ferralk::Walker;
+///
+/// // Ten entries, ignoring errors. Dropping them is a choice made here, in
+/// // the open, rather than by the adapter.
+/// let first_ten: Vec<_> = Walker::new("workspace")
+///     .stream()
+///     .filter_map(Result::ok)
+///     .take(10)
+///     .collect();
+///
+/// // Ten entries, reporting errors as they pass.
+/// let first_ten: Vec<_> = Walker::new("workspace")
+///     .stream()
+///     .filter_map(|item| item.inspect_err(|error| eprintln!("{error}")).ok())
+///     .take(10)
+///     .collect();
+///
+/// // Ten entries, or the first error.
+/// let first_ten = Walker::new("workspace")
+///     .stream()
+///     .take(10)
+///     .collect::<Result<Vec<_>, _>>()?;
+/// # let _ = first_ten;
+/// # Ok::<(), ferralk::WalkError>(())
+/// ```
+///
+/// The last form still counts an error toward the ten, but it cannot come back
+/// short without saying why: an error among the first ten items is the `Err`.
+/// Every form returns fewer than ten entries when the tree has fewer.
+///
+/// A stream is single-threaded and never sorted; [`WalkOptions::sort`] does
+/// not apply to it.
+#[must_use = "a walk stream does nothing unless iterated"]
 #[derive(Debug)]
 pub struct WalkStream {
     walker: Walker,
@@ -7225,7 +7416,7 @@ mod tests {
 
         for threads in [1, 4] {
             let backend = CountingBackend::default();
-            Walker::new(&fixture.root)
+            let _ = Walker::new(&fixture.root)
                 .threads(threads)
                 .respect_git_ignore(true)
                 .collect_with(&backend)
