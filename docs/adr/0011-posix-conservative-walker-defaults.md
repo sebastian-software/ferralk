@@ -1,6 +1,6 @@
 # ADR-0011: POSIX-conservative walker defaults
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-09-24)
 - **Date:** 2026-08-18
 
 ## Context
@@ -40,3 +40,14 @@ zlob controls that show the knee is the platform's rather than ferralk's.
   matching cost dwarfs its filesystem cost — measured, that means a serial walk
   roughly four times its metadata-only time — is faster with more workers and
   should call `Walker::threads`.
+
+## Amendment, 2026-09-24: excludes cover a leading period
+
+The `*` row governs what a walk *selects*: include patterns. Walker excludes
+cover a leading period whatever `match_hidden` says, so they apply inside
+every directory the walk enters, hidden ones included, the way a `.gitignore`
+line does (#424). An exclude that stopped at a hidden directory left entries
+in the result that every ignore-style tool removes, which is the kind of
+surprise this ADR exists to avoid. What a walk can select is unchanged.
+
+Amendment only; the decision above is unchanged.

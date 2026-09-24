@@ -186,7 +186,6 @@ pub struct Pattern {
     /// The list-filter routes of [`Pattern::is_match_path`], or `None` when
     /// every alternative answers it exactly like [`Pattern::is_match`].
     path_filter: Option<Box<PathFilter>>,
-    can_match_hidden_component_without_match_hidden: bool,
     walker_path_viability: WalkerPathViability,
     walker_path_problem_offset: Option<usize>,
     options: PatternOptions,
@@ -373,10 +372,11 @@ impl PatternOptions {
     /// drift apart.
     ///
     /// Every other switch keeps its default. In particular a wildcard does not
-    /// cover a leading period, which matches the walker's default; chain
-    /// [`match_hidden(true)`](Self::match_hidden) to mirror
-    /// `Walker::match_hidden(true)`. Case folding and escaping are not walker
-    /// settings and stay at their defaults there too.
+    /// cover a leading period, which matches the walker's default for
+    /// includes; chain [`match_hidden(true)`](Self::match_hidden) to mirror
+    /// `Walker::match_hidden(true)`, or to match an exclude, which the walker
+    /// always lets cover a leading period. Case folding and escaping are not
+    /// walker settings and stay at their defaults there too.
     ///
     /// Options select syntax, and the entry point selects how far a wildcard
     /// reaches. For a root-relative path, [`Pattern::is_match_glob_path`]
@@ -686,18 +686,6 @@ impl Pattern {
     #[must_use]
     pub const fn walker_path_problem_offset(&self) -> Option<usize> {
         self.walker_path_problem_offset
-    }
-
-    /// Whether an explicit literal in some compiled branch can opt a hidden
-    /// path component into matching while `match_hidden` is disabled.
-    ///
-    /// This semantic summary includes brace-expanded and nested extglob
-    /// alternatives. Walk planners use it to distinguish a wildcard's hidden
-    /// blind spot from includes that can deliberately select through it.
-    #[doc(hidden)]
-    #[must_use]
-    pub const fn can_match_hidden_component_without_match_hidden(&self) -> bool {
-        self.can_match_hidden_component_without_match_hidden
     }
 
     /// The compile every alternative shares, carrying the budget that bounds
@@ -1381,9 +1369,6 @@ impl Pattern {
         options: PatternOptions,
         budget: &mut IrBudget,
     ) -> Result<Self, PatternError> {
-        let can_match_hidden_component_without_match_hidden = alternatives
-            .iter()
-            .any(CompiledAlternative::can_match_hidden_path_component_without_match_hidden);
         let alternative_fast_path =
             AlternativeFastPath::compile(&alternatives, options, budget)?.map(Box::new);
         let path_filter = PathFilter::compile(&alternatives, options, budget)?.map(Box::new);
@@ -1391,7 +1376,6 @@ impl Pattern {
             alternatives,
             alternative_fast_path,
             path_filter,
-            can_match_hidden_component_without_match_hidden,
             walker_path_viability: WalkerPathViability::Viable,
             walker_path_problem_offset: None,
             options,
@@ -2251,36 +2235,6 @@ struct CompiledAlternative {
 }
 
 impl CompiledAlternative {
-    fn can_match_hidden_component_without_match_hidden(&self) -> bool {
-        self.can_match_hidden_component_after(0)
-    }
-
-    /// The same summary for a top-level alternative, read the way the path
-    /// entry points read it: its one conventional leading `./` is ignored
-    /// rather than matched, so its `.` opts no hidden component in (#395).
-    /// Extglob branches keep reading a leading `./` as a real `.` component.
-    fn can_match_hidden_path_component_without_match_hidden(&self) -> bool {
-        let prefix = if self.raw.starts_with(b"./")
-            && matches!(
-                self.tokens.as_slice(),
-                [Token::Literal(dot), Token::Separator, ..] if dot == b"."
-            ) {
-            2
-        } else {
-            0
-        };
-        self.can_match_hidden_component_after(prefix)
-    }
-
-    /// `prefix` counts both the leading tokens and the source bytes skipped,
-    /// which coincide for the `./` prefix, the only one skipped.
-    fn can_match_hidden_component_after(&self, prefix: usize) -> bool {
-        tokens_can_match_hidden_component_without_match_hidden(&self.tokens[prefix..])
-            || self.extglob.as_ref().is_some_and(|program| {
-                program.can_match_hidden_component_without_match_hidden_from(prefix)
-            })
-    }
-
     /// Removes accelerated engines, descending into extglob alternatives so a
     /// differential run pins one engine for the sub-matches too.
     #[cfg(any(test, feature = "unstable-test-hooks"))]
@@ -2307,103 +2261,6 @@ impl CompiledAlternative {
                 }
             }
         }
-    }
-}
-
-/// Whether a plain compiled alternative can place a literal period at the
-/// start of any candidate component.
-///
-/// Single-byte wildcards can cross a separator under separator-crossing
-/// semantics and leave the following token at a component boundary. Stars do
-/// not: their zero-width branch is forbidden immediately before a leading
-/// period, so a following period literal is not an implicit hidden opt-in.
-/// The syntactic `**/` prefix is different because it explicitly advances to
-/// a component boundary without consuming candidate bytes. An escaped
-/// separator is folded into its literal run, and the byte behind it starts a
-/// component for the matcher just as one behind a separator token does.
-fn tokens_can_match_hidden_component_without_match_hidden(tokens: &[Token]) -> bool {
-    let mut at_component_start = true;
-    for token in tokens {
-        match token {
-            Token::Separator | Token::RecursivePrefix => at_component_start = true,
-            Token::Literal(literal) => {
-                for &byte in literal {
-                    if at_component_start && byte == b'.' {
-                        return true;
-                    }
-                    at_component_start = is_separator(byte);
-                }
-            }
-            Token::Any | Token::Class(_) => at_component_start = true,
-            Token::Star | Token::RecursiveStar => at_component_start = false,
-        }
-    }
-    false
-}
-
-impl CompiledExtglob {
-    /// Whether the program can opt a hidden component in, reading its outer
-    /// steps from byte offset `start`, where a component begins.
-    fn can_match_hidden_component_without_match_hidden_from(&self, start: usize) -> bool {
-        // Positive group alternatives are complete compiled branches. Inspect
-        // them recursively so nested groups and hidden components after an
-        // alternative's separator are represented by compiler semantics too.
-        if self.groups.iter().any(|group| {
-            group.kind != ExtglobKind::Negated
-                && group.alternatives.iter().any(|alternative| {
-                    alternative
-                        .compiled
-                        .iter()
-                        .any(CompiledAlternative::can_match_hidden_component_without_match_hidden)
-                })
-        }) {
-            return true;
-        }
-
-        let mut at_component_start = true;
-        let mut index = start;
-        while let Some(step) = self.steps.get(index) {
-            match step {
-                ExtglobStep::Byte(b'/') => {
-                    at_component_start = true;
-                    index += 1;
-                }
-                ExtglobStep::Byte(byte) => {
-                    if at_component_start && *byte == b'.' {
-                        return true;
-                    }
-                    at_component_start = false;
-                    index += 1;
-                }
-                ExtglobStep::Escape { escaped } => {
-                    if at_component_start && *escaped == b'.' {
-                        return true;
-                    }
-                    // An escaped separator still ends a component.
-                    at_component_start = is_separator(*escaped);
-                    index += 2;
-                }
-                ExtglobStep::Group(group) => {
-                    // Even a zero-width branch observes the group's leading-
-                    // period guard before it reaches the continuation. If the
-                    // group opts into a leading period through an alternative,
-                    // the recursive alternative scan above has already made
-                    // this summary true; otherwise the group consumes the
-                    // component-start privilege just like a wildcard.
-                    at_component_start = false;
-                    index = self.groups[*group].rest;
-                }
-                ExtglobStep::Star { next, .. } | ExtglobStep::Class { next, .. } => {
-                    at_component_start = false;
-                    index = *next;
-                }
-                ExtglobStep::Any | ExtglobStep::UnclosedGroup { .. } | ExtglobStep::NoMatch => {
-                    at_component_start = false;
-                    index += 1;
-                }
-            }
-        }
-        false
     }
 }
 
@@ -7925,41 +7782,14 @@ mod tests {
         }
     }
 
+    /// A zero-width extglob branch still observes the leading-period rule;
+    /// only a branch that spells the period opts a hidden component in.
     #[test]
-    fn compiled_patterns_summarize_explicit_hidden_components() {
+    fn zero_width_extglob_branches_keep_the_leading_period_rule() {
         let walker_options = PatternOptions::default()
             .braces(true)
             .recursive_double_star(true)
             .extglob(true);
-        let can_match_hidden = |pattern: &str| {
-            Pattern::compile(pattern, walker_options)
-                .expect("pattern compiles")
-                .can_match_hidden_component_without_match_hidden()
-        };
-
-        assert!(!can_match_hidden("**/*.txt"));
-        assert!(!can_match_hidden("**/*.{rs,toml}"));
-        assert!(!can_match_hidden("x/f*.hidden/keep.rs"));
-        assert!(!can_match_hidden("visible/**"));
-        assert!(!can_match_hidden("**/@(*|visible)/*.txt"));
-        assert!(!can_match_hidden("**/!(.gitignore)/*.txt"));
-        assert!(can_match_hidden(".hidden/keep.txt"));
-        assert!(can_match_hidden("**/.hidden/keep.txt"));
-        assert!(can_match_hidden("**/{visible,.hidden}/keep.txt"));
-        assert!(can_match_hidden("**/@(visible|.hidden)/keep.txt"));
-        assert!(can_match_hidden("visible/@(nested/.hidden|other)/keep.txt"));
-        assert!(!can_match_hidden("**/?(visible).hidden/keep.txt"));
-        assert!(!can_match_hidden("**/*(visible).hidden/keep.txt"));
-        assert!(can_match_hidden("**/?(.visible).hidden/keep.txt"));
-        // An escaped separator is folded into the literal run, and the
-        // period behind it starts a component for the matcher.
-        assert!(can_match_hidden("x/f*\\/.hidden/keep"));
-        assert!(can_match_hidden("x/*\\/.hidden/keep"));
-        assert!(can_match_hidden("**/f*\\/.hidden/keep"));
-        assert!(can_match_hidden("x/@(f*)\\/.hidden/keep"));
-        assert!(!can_match_hidden("x/f*\\.hidden/keep"));
-        assert!(!can_match_hidden("x/@(f*)\\.hidden/keep"));
-
         let zero_width = Pattern::compile("**/?(visible).hidden/keep.txt", walker_options)
             .expect("pattern compiles");
         assert!(!zero_width.is_match("target/.hidden/keep.txt"));
@@ -8413,22 +8243,6 @@ mod tests {
         let extglob = compile("@(./a.rs)");
         assert!(!extglob.is_match_glob_path("a.rs"));
         assert!(!extglob.is_match_crossing_path("a.rs"));
-        // Nor does the ignored prefix count as a hidden component a walker
-        // must keep descending for; a hidden component after it still does.
-        for (source, expected) in [
-            ("./src/**", false),
-            ("{./src,lib}/**", false),
-            ("{x,}./src/**", false),
-            ("./.git/**", true),
-            ("{./.git,lib}/**", true),
-            ("@(./a)", true),
-        ] {
-            assert_eq!(
-                compile(source).can_match_hidden_component_without_match_hidden(),
-                expected,
-                "{source}"
-            );
-        }
         // Without a `./` alternative the crossing reading is `is_match`.
         let plain = compile("src/*.rs");
         assert!(plain.is_match_crossing_path("src/a/m.rs"));

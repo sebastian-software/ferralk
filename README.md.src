@@ -202,10 +202,12 @@ excludes), `early_stop`, and `keep_going` (errors that do not end the walk).
    descendants. The walker enables `**`, braces, and extglobs for you, while
    `ferralk-glob` leaves each one opt-in through `PatternOptions`;
    `PatternOptions::walker()` selects the walker's dialect in one call.
-2. **Wildcards do not cover a leading period.** `**/*.ts` skips
+2. **Include wildcards do not cover a leading period.** `**/*.ts` skips
    `.cache/routes.ts` and the whole `.cache` subtree. Opt in with
    `Walker::match_hidden(true)`, or drop hidden entries before any pattern is
-   consulted with `WalkOptions::skip_hidden(true)`.
+   consulted with `WalkOptions::skip_hidden(true)`. Excludes cover hidden
+   names either way, as `.gitignore` lines do: `**/node_modules/**` also
+   removes `.cache/node_modules`.
 3. **Patterns use `/` on every platform, and `\` escapes.** Keep the root in
    `Walker::new(root)` and write the pattern relative to it. Joining a
    `PathBuf` into a pattern on Windows produces `\*`, which asks for a literal
