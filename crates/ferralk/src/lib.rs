@@ -296,6 +296,7 @@ pub use ignore_rules::fuzz_rule as fuzz_ignore_rule;
 pub use ignore_rules::fuzz_rule_bytes as fuzz_ignore_rule_bytes;
 mod parallel;
 mod scheduler;
+mod sort_order;
 
 use classify::{DirectoryTask, EmittedEntry, EntryAction, TraversalContext, classify_entry};
 use gitignore::{IgnoreReadError, IgnoreScope};
@@ -1512,9 +1513,7 @@ impl Walker {
             state.walk_directory(backend, task)?;
         }
         if self.options.sort {
-            state
-                .entries
-                .sort_by(|left, right| left.path.cmp(&right.path));
+            sort_order::sort_entries(&self, &mut state.entries);
         }
         Ok(WalkResult {
             entries: state.entries,
