@@ -796,6 +796,81 @@ mod tests {
         }
     }
 
+    /// The user-space CPU gate is declared once, as `CPU_GATE_PERCENT` in the
+    /// walker benchmark workflow, and the acceptance marker once, in the tool
+    /// that applies the gate. The benchmark evidence and CONTRIBUTING restate
+    /// both, so this contract holds them to their sources. Line by line, like
+    /// the coverage contract above.
+    #[test]
+    fn the_cpu_gate_is_declared_once_and_restated_consistently() {
+        let repository_root = repository_root();
+        let read = |path: &str| {
+            fs::read_to_string(repository_root.join(path))
+                .unwrap_or_else(|error| panic!("{path} is readable: {error}"))
+        };
+        let workflow = read(".github/workflows/walker-bench.yml");
+        let declarations = workflow
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("CPU_GATE_PERCENT:"))
+            .map(|value| value.trim().trim_matches('"'))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declarations.len(),
+            1,
+            "the CPU gate must be declared exactly once, as CPU_GATE_PERCENT"
+        );
+        let percent = declarations[0];
+        assert!(
+            workflow
+                .lines()
+                .any(|line| line.contains("--gate-percent \"$CPU_GATE_PERCENT\"")),
+            "the CPU job must gate on CPU_GATE_PERCENT, not on a literal threshold"
+        );
+
+        let tool = read("tools/bench/src/bin/compare_callgrind.rs");
+        let marker = tool
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("const ACCEPTANCE_MARKER: &str = \"")?
+                    .strip_suffix("\";")
+            })
+            .expect("compare_callgrind declares ACCEPTANCE_MARKER");
+
+        let evidence = read("docs/benchmark-evidence.md");
+        let lane_row = evidence
+            .lines()
+            .find(|line| line.starts_with("| User-space CPU |"))
+            .expect("the lanes table lists the user-space CPU lane");
+        let restated = format!("more than {percent}% over its merge base");
+        assert!(
+            lane_row.contains(&restated),
+            "the lanes table must state the {percent}% CPU gate: {lane_row}"
+        );
+        assert!(
+            evidence
+                .lines()
+                .any(|line| line.contains(&format!("by more than **{percent}%**"))),
+            "the CPU gate section must state the {percent}% threshold"
+        );
+
+        let contributing = read("CONTRIBUTING.md");
+        assert!(
+            contributing.lines().any(|line| line.contains(&restated)),
+            "CONTRIBUTING must state the {percent}% CPU gate"
+        );
+        for (path, text) in [
+            ("CONTRIBUTING.md", &contributing),
+            ("docs/benchmark-evidence.md", &evidence),
+        ] {
+            assert!(
+                text.lines()
+                    .any(|line| line.contains(&format!("`{marker}`"))),
+                "{path} must name the acceptance marker {marker:?}"
+            );
+        }
+    }
+
     /// The coverage floor is declared once, as `COVERAGE_MIN_LINES` in the
     /// `coverage` job. Two documents restate it for readers, so this contract
     /// holds them to the workflow instead of trusting them to be updated.
