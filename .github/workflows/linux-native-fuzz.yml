@@ -23,13 +23,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The nightly is pinned once, in .github/nightly-toolchain.
+      - name: Read the pinned nightly
+        run: |
+          toolchain=$(cat .github/nightly-toolchain)
+          echo "NIGHTLY_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master branch
         with:
-          toolchain: nightly-2026-08-04
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
       # The seeded `rust-toolchain.toml` selects stable and outranks the
       # rustup default this action sets; a directory override outranks the
       # file. Without this line the job would silently run on stable.
-      - run: rustup override set nightly-2026-08-04
+      - run: rustup override set "$NIGHTLY_TOOLCHAIN"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
         with:
@@ -53,13 +58,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The nightly is pinned once, in .github/nightly-toolchain.
+      - name: Read the pinned nightly
+        run: |
+          toolchain=$(cat .github/nightly-toolchain)
+          echo "NIGHTLY_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master branch
         with:
-          toolchain: nightly-2026-08-04
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
       # The seeded `rust-toolchain.toml` selects stable and outranks the
       # rustup default this action sets; a directory override outranks the
       # file. Without this line the job would silently run on stable.
-      - run: rustup override set nightly-2026-08-04
+      - run: rustup override set "$NIGHTLY_TOOLCHAIN"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run AddressSanitizer tests
         env:
@@ -72,12 +82,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The nightly is pinned once, in .github/nightly-toolchain.
+      - name: Read the pinned nightly
+        run: |
+          toolchain=$(cat .github/nightly-toolchain)
+          echo "NIGHTLY_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master branch
         with:
-          toolchain: nightly-2026-08-04
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
           components: miri
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo +nightly-2026-08-04 miri setup
+      - run: cargo "+$NIGHTLY_TOOLCHAIN" miri setup
       # The raw-syscall reader requires a real Linux kernel. This focused test
       # exercises the bounds-checked parser without crossing that FFI boundary.
-      - run: cargo +nightly-2026-08-04 miri test -p ferralk --features native-linux linux_native::tests::parser_skips_dot_entries_and_rejects_truncated_records
+      - run: cargo "+$NIGHTLY_TOOLCHAIN" miri test -p ferralk --features native-linux linux_native::tests::parser_skips_dot_entries_and_rejects_truncated_records

@@ -16,7 +16,7 @@ Decisions from the end-to-end design review of 2026-08-18 (see
 | [0009](0009-own-work-stealing-scheduler.md) | Own work-stealing scheduler (no WalkParallel, no rayon) |
 | [0010](0010-portable-1.0-native-backends-macos-then-linux.md) | Portable-only 1.0; native backends macOS → Linux; Windows tier 2 |
 | [0011](0011-posix-conservative-walker-defaults.md) | POSIX-conservative walker defaults |
-| [0012](0012-ferroni-repository-blueprint.md) | Ferroni repository blueprint for tooling |
+| [0012](0012-ferroni-repository-blueprint.md) | Ferroni repository blueprint for tooling (reference point amended to the `@sebastian-software/standards` family baseline) |
 | [0013](0013-no-glob-to-regex-translation.md) | Dedicated glob matcher — no glob-to-regex translation |
 | [0014](0014-own-gitignore-rule-matching.md) | Own gitignore rule matching over ferralk-glob (engine half of 0006) |
 | [0015](0015-posix-escapes-in-bracket-classes.md) | POSIX escape processing inside bracket classes |

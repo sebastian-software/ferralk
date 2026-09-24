@@ -729,6 +729,74 @@ mod tests {
         );
     }
 
+    /// The nightly toolchain is pinned once, in `.github/nightly-toolchain`.
+    /// Every lane that needs a nightly reads that file into
+    /// `NIGHTLY_TOOLCHAIN`, so a workflow restating a dated nightly is the
+    /// second copy this contract exists to prevent.
+    #[test]
+    fn the_nightly_toolchain_is_pinned_once() {
+        let repository_root = repository_root();
+        let pin = fs::read_to_string(repository_root.join(".github/nightly-toolchain"))
+            .expect("the nightly pin is readable");
+        let pins = pin
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pins.len(),
+            1,
+            ".github/nightly-toolchain must hold exactly one toolchain"
+        );
+        let date = pins[0]
+            .strip_prefix("nightly-")
+            .expect("the pin names a nightly toolchain");
+        assert!(
+            date.len() == 10
+                && date.bytes().enumerate().all(|(index, byte)| match index {
+                    4 | 7 => byte == b'-',
+                    _ => byte.is_ascii_digit(),
+                }),
+            "the pin must be a dated nightly (nightly-YYYY-MM-DD), not a floating one: {}",
+            pins[0]
+        );
+
+        let readers = [
+            "ci.yml",
+            "glob-fuzz.yml",
+            "linux-native-fuzz.yml",
+            "macos-native-fuzz.yml",
+        ];
+        let workflows = repository_root.join(".github/workflows");
+        for entry in fs::read_dir(&workflows).expect("the workflow directory is readable") {
+            let path = entry.expect("workflow entry is readable").path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("workflow file names are UTF-8")
+                .to_owned();
+            let workflow = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{name} is readable: {error}"));
+            if let Some(line) = workflow.lines().find(|line| line.contains("nightly-20")) {
+                panic!("{name} restates a dated nightly instead of reading the pin: {line}");
+            }
+            let reads_pin = workflow
+                .lines()
+                .any(|line| line.contains("$(cat .github/nightly-toolchain)"));
+            let uses_nightly = workflow
+                .lines()
+                .any(|line| line.contains("NIGHTLY_TOOLCHAIN"));
+            assert_eq!(
+                reads_pin, uses_nightly,
+                "{name} must read NIGHTLY_TOOLCHAIN from .github/nightly-toolchain"
+            );
+            assert!(
+                !readers.contains(&name.as_str()) || reads_pin,
+                "{name} runs a nightly lane and must read .github/nightly-toolchain"
+            );
+        }
+    }
+
     #[test]
     fn semver_values_keep_prerelease_and_build_metadata() {
         assert_eq!(semver_values("ferralk = \"1.0.0\""), vec!["1.0.0"]);
