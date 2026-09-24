@@ -1390,6 +1390,12 @@ pub enum Verdict {
     /// Leave the entry out of the result. Traversal is unaffected: a directory
     /// is still descended into. Return [`Verdict::Prune`] to cut it off.
     Skip,
+    /// Leave the entry out and end the walk, the way a cancellation request
+    /// does. A caller that wants the entry which stopped the walk records it in
+    /// the visitor, where the decision was made anyway.
+    Stop,
+    // Declared after `Stop`, so adding it left the implicit discriminants of
+    // the existing variants unchanged.
     /// Leave the entry out of the result and do not walk below it: a
     /// directory is not opened, so nothing inside it is visited, returned, or
     /// reported as an error.
@@ -1434,10 +1440,6 @@ pub enum Verdict {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     Prune,
-    /// Leave the entry out and end the walk, the way a cancellation request
-    /// does. A caller that wants the entry which stopped the walk records it in
-    /// the visitor, where the decision was made anyway.
-    Stop,
 }
 
 /// Completed entries and recoverable errors.
