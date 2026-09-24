@@ -25,8 +25,8 @@ excluded by the input shape, so a fuzz failure is always a new finding.
 |---|---|---|---|---|
 | One leading `./` is normalized by path APIs | `./` vs `` | `true` | `false` | Any brace-expanded pattern or candidate starting with `./` |
 | Leading `!` reads as negation | `!a` vs `b` | `false` | `true` | Patterns starting with `!` |
-| `**` is a whole path component, not a recursive wildcard | `**/a` vs `aa`, `a/**/b` vs `a/ab` | `true` | `false` | Any syntactic `**` except bare `**`, or a complete `**/` component followed by an ordinary component-leading `*` |
-| A trailing `**` component elides to nothing | `a/**` vs `a` | `true` | `false` | Same rule |
+| A trailing `**` component elides to nothing | `a/**` vs `a` | `true` | `false` | A whole-component `**` at the end of a pattern that has anything before it |
+| A whole-component run of three or more stars stays recursive | `***/a` vs `b/c/a` | `true` | `false` | A star run longer than two that is a whole component |
 | A backslash before an ordinary byte unescapes it | `\b` vs `b` | `true` | `false` | `\` only before `* ? [ ] { } \` |
 | A class may accept a separator | `[/]` vs `/`, `[.-r]` vs `/` | `false` | `true` | `/` inside a class, a range spanning `/`, and every negated class |
 | POSIX class names | `[[:alpha:]]` vs `a` | `true` | `false` | `[:` at the start of a class |
@@ -52,22 +52,23 @@ fuzz harness used to apply to both engines; reported upstream:
 that bounds brace expansion at all: zlob 1.6.3 and glibc `GLOB_BRACE` run until
 they exhaust the machine, and Ferralk reports `too many brace alternatives`.
 
-The recursive-wildcard exclusion has one deliberately narrow shared case.
-Patterns such as `**/*.rs` and `src/**/*.rs` accept the same language after the
-leading-`./` candidate exclusion: the ordinary component-leading `*` can absorb
-every partial-component match that Ferralk's recursive wildcard could add.
-That reasoning does not extend to a literal, `?`, or class after `**/` —
-`a/**/b` versus `a/ab` is already a counterexample — nor to a trailing `**`.
-The classifier reads escapes and classes before recognizing a star pair, so an
-escaped or class-member `**` is not rejected as recursive syntax.
+Until issue #419 the recursive-wildcard exclusion covered almost every `**`:
+Ferralk let a `**` anywhere cross separators and let `**/` hand over inside a
+component, so `**/a` accepted `aa` (`fastglob-034`). Since
+[ADR-0020](adr/0020-double-star-only-as-a-whole-component.md) both engines read
+`**` as recursive only when it is a whole path component and as ordinary stars
+anywhere else, so every `**`, whole or attached, is shared except the two rows
+above. The classifier judges a star run once, at its first star, and reads
+escapes and classes before recognizing one, so an escaped or class-member `**`
+is not rejected as recursive syntax.
 
 Brace expansion happens before matching, so an alternative can concatenate
-with the surrounding text into a `**` that only Ferralk reads recursively
+with the surrounding text into a `**` that only Ferralk reads as one run
 (`{*}*` vs `/`). A star next to brace punctuation is therefore excluded too.
 For the same reason, the `./` exclusion checks the expanded alternatives: an
 empty brace arm can expose a later prefix (`{x,}./`), while a dot arm can join
 the following separator (`{.}/`).
 
-The negation, recursive wildcard, escaping, and POSIX rows hold for `is_match`
-as well and are corpus candidates. Leading `./` normalization and the
+The negation, trailing-`**`, star-run, escaping, and POSIX rows hold for
+`is_match` as well and are corpus candidates. Leading `./` normalization and the
 class-versus-separator row exist only under the component-local policy.

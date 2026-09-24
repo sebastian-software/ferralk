@@ -10,8 +10,8 @@ Pick the entry point by what you hold and how far a wildcard may reach:
 
 | You want to | Use | Wildcard scope |
 | --- | --- | --- |
-| Find files on disk | `Walker` with `include` and `exclude` patterns | Ordinary wildcards stay inside one component; `**` is recursive. Braces and extglobs are enabled for you. |
-| Match a path you already hold, as a shell glob would | `Pattern::is_match_glob_path` | Every ordinary wildcard stays inside one component; `**` crosses when `recursive_double_star` is enabled. |
+| Find files on disk | `Walker` with `include` and `exclude` patterns | Ordinary wildcards stay inside one component; a whole-component `**` is recursive. Braces and extglobs are enabled for you. |
+| Match a path you already hold, as a shell glob would | `Pattern::is_match_glob_path` | Every ordinary wildcard stays inside one component; a whole-component `**` crosses when `recursive_double_star` is enabled. |
 | Match a whole byte sequence in which `/` is not special | `Pattern::is_match` | Every wildcard may cross a separator. |
 | Filter a list the way zlob's `matchPaths` does | `Pattern::is_match_path` and the `filter_paths` family | zlob's list-filter rule, described below. |
 
@@ -45,6 +45,22 @@ paths, prefer `is_match_glob_path`: ordinary `*`, `?`, classes, and Extglob
 operators stay within one component, while an explicitly enabled `**` crosses
 components.
 
+`**` is recursive only as a whole path component, as in gitignore, Bash
+`globstar`, `globset`, and `fast-glob`: `**`, `**/x`, `x/**`, and `x/**/y`.
+Whole means an unescaped `/` or an end of the pattern on both sides of the
+star run; an escaped `\/` is a literal byte and bounds nothing. A `**/` hands
+over only at a component start, so `**/x` matches `x` and `a/x` but not `sx`,
+`a/**/b` matches `a/b` and `a/x/b` but not `a/xb`, and `**/node_modules/**`
+does not reach `my_node_modules`. Anywhere else — `a**`, `**b`, `a**/b`,
+`**.ts` — the run is ordinary, read exactly as it is with
+`recursive_double_star` disabled: component-local under `is_match_glob_path`,
+the position rule below under `is_match_path`, and separator-crossing like any
+`*` under `is_match`. Braces expand first, so each alternative is judged as the
+pattern it expands to: `{**,x}/y` holds a recursive `**/y`, `a{**,x}/y` an
+ordinary `a**/y`. An extglob alternative stands where its group stands:
+`@(**)/y` is recursive, `x@(**)/y` is not. A whole-component run of three or
+more stars stays recursive.
+
 `is_match_path` preserves the zlob list-filter convention instead: a wildcard
 in the root component may cross separators, and a wildcard standing directly
 behind an explicit separator is component-local. That is zlob's exact rule and
@@ -67,8 +83,8 @@ inside an alternative crosses again as in `a/b*`. Only the first iteration of
 Brace alternatives are
 judged one by one, so `{src/@(*.ts),lib/*}` and `{src/@(*.ts),zz}` answer
 alike for `src/a/b.ts`. A recursive `**/` prefix may consume zero directories
-before a group, so `**/@(x)` matches both `x` and `a/x` when both options are
-enabled.
+before a group, so `**/@(x)` matches both `x` and `a/x`, and not `sx`, when
+both options are enabled.
 
 ```rust
 use ferralk_glob::{Pattern, PatternOptions};
@@ -96,7 +112,7 @@ under it `src/**/*.rs` does not match `src/lib.rs`, nor `*.{rs,toml}`
 | Option | `default()` | `walker()` | Effect when enabled |
 | --- | --- | --- | --- |
 | `braces` | off | on | Enables nested `{a,b}` alternatives. |
-| `recursive_double_star` | off | on | Gives consecutive `**` recursive semantics; while off, a star run is equivalent to `*`. |
+| `recursive_double_star` | off | on | Makes a whole-component `**` (`**/x`, `x/**`, `x/**/y`) recursive. Any other star run, and every run while off, is ordinary stars. |
 | `extglob` | off | on | Enables Bash-style `@()`, `?()`, `*()`, `+()`, and `!()`. |
 | `match_hidden` | off | off | Allows wildcard tokens to match a leading period. |
 | `case_insensitive` | off | off | Uses ASCII-only case folding. |
@@ -172,8 +188,9 @@ let result = walker.collect()?;
 Important defaults:
 
 - Ordinary wildcards (`*`, `?`, classes) stay inside one path component, so
-  `*.ts` selects a file in the walk root and not `src/main.ts`. `**` is
-  recursive under either setting, and
+  `*.ts` selects a file in the walk root and not `src/main.ts`. A `**` that is
+  a whole path component is recursive under either setting — `**/x` selects
+  `x` and `a/x`, never `sx` — and
   `Walker::wildcard_mode(WildcardMode::SeparatorCrossing)` switches to the
   reading `globset` and `fast-glob` use; see the
   [compatibility guide](compatibility-guide.md).

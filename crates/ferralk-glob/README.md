@@ -19,8 +19,10 @@ every ordinary wildcard in one component, as a shell glob does, and is the
 entry point for filesystem paths. `is_match` is separator-agnostic.
 `is_match_path` keeps zlob's list-filter rule, where a root wildcard may cross
 separators but wildcards after an explicit separator are component-local. With
-`recursive_double_star` disabled, `**` is equivalent to `*`; enable it for
-recursive separator crossing. Braces, extglobs, hidden-name matching, ASCII
+`recursive_double_star` disabled, `**` is equivalent to `*`; enable it to
+make a `**` that forms a whole path component (`**/x`, `x/**`, `x/**/y`)
+recursive. Any other star run stays ordinary, so `**/x` never matches `sx`.
+Braces, extglobs, hidden-name matching, ASCII
 case folding, and changed escaping remain explicit opt-ins.
 `PatternOptions::default()` enables none of them; `PatternOptions::walker()`
 enables recursive `**`, braces, and extglobs, the dialect the `ferralk` walker

@@ -25,9 +25,10 @@ than a known difference. The divergences and their exclusions are tabulated in
 is reported as a ready-to-paste `corpus/fast-glob.jsonl` line.
 Filtered or unparseable inputs return libFuzzer's rejected-corpus verdict, so
 they cannot displace comparable inputs in the evolving corpus. The shared
-globstar subset includes bare `**` and complete `**/` components followed by
-an ordinary component-leading `*`, such as `src/**/*.rs`; other positions keep
-the documented structural exclusion.
+globstar subset includes every `**`, whole-component or attached, since both
+engines read it as recursive only as a whole path component (ADR-0020); a
+trailing `/**` and a whole-component run of three or more stars keep the
+documented structural exclusion.
 
 `cargo test --manifest-path fuzz/Cargo.toml --lib --locked` checks the subset
 boundary and replays every checked-in differential seed through both matchers.

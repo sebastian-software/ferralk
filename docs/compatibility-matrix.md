@@ -11,7 +11,7 @@ read the [compatibility guide](compatibility-guide.md).
 | zlob capability / flag | ferralk API | Status | Notes |
 |---|---|---|---|
 | `*`, `?`, separators | `Pattern::compile` / `Pattern::is_match` | Implemented | In-memory `*`/`?` are separator-agnostic; leading periods remain opt-in. |
-| `**` | `PatternOptions::recursive_double_star` | Implemented (M1) | Explicit option; while disabled, consecutive stars have ordinary `*` semantics through every entry point. |
+| `**` | `PatternOptions::recursive_double_star` | Implemented (M1) | Explicit option; recursive only as a whole path component (ADR-0020), so `**/x` does not match `sx`. While disabled, and for any other star run, consecutive stars have ordinary `*` semantics through every entry point. |
 | bracket classes, ranges, `[!...]`, `[^...]` | `Pattern::compile` | Implemented (M1) | Byte-first, including ASCII POSIX classes. |
 | `ZLOB_BRACE` | `PatternOptions::braces` | Implemented (M1) | Nested and empty alternatives; source-backed corpus import continues. |
 | `ZLOB_EXTGLOB` | `PatternOptions::extglob` | Implemented (M1) | `@()`, `?()`, `*()`, `+()`, `!()` with zlob's non-nested scope. Deliberate shell-compatible divergence: before `*(`, the final star in a run opens the group instead of being greedily collapsed (`extsuite-*star-run-before-zero-or-more`, issue #305). |
@@ -19,7 +19,7 @@ read the [compatibility guide](compatibility-guide.md).
 | `ZLOB_NOESCAPE` | `PatternOptions::escape` | Implemented (M1) | Higher-level boolean, not a bitflag. |
 | case folding | `PatternOptions::case_insensitive` | Implemented (M1) | Explicit opt-in on every platform. |
 | `has_wildcards` | `Pattern::has_wildcards` | Implemented (M1) | Byte-first, flag-sensitive preflight matching zlob's active syntax markers. |
-| `zlob_match_paths` / `_at` and index variants | `Pattern::{filter_paths,filter_paths_at,filter_path_indices,filter_path_indices_at}` | Implemented (M1) | Path APIs preserve caller order rather than zlob's default sort; index APIs return input positions. `_at` matches after stripping a component-boundary base path while returning original full paths or indices. One leading `./` is normalized on both pattern and candidate. Wildcards after an explicit separator stay in that component; `**` is recursive only when enabled. |
+| `zlob_match_paths` / `_at` and index variants | `Pattern::{filter_paths,filter_paths_at,filter_path_indices,filter_path_indices_at}` | Implemented (M1) | Path APIs preserve caller order rather than zlob's default sort; index APIs return input positions. `_at` matches after stripping a component-boundary base path while returning original full paths or indices. One leading `./` is normalized on both pattern and candidate. Wildcards after an explicit separator stay in that component; `**` is recursive only when enabled and only as a whole path component. |
 | `ZLOB_NOCHECK`, `ZLOB_NOMAGIC` | Walker no-match policy | Deferred (M4 review) | These are C/glob result-shaping semantics, not matcher semantics. |
 | `ZLOB_TILDE`, `ZLOB_TILDE_CHECK` | — | Deliberate divergence | Out of scope per RFC non-goals. |
 
@@ -35,7 +35,7 @@ read the [compatibility guide](compatibility-guide.md).
 | `ZLOB_ONLYDIR` | `WalkOptions::directories_only` | Implemented (M2) | Filters returned files without pruning traversal. Filters on the kind the listing reports, so an unfollowed symlink to a directory is not a directory here. |
 | `ZLOB_WALK_NO_REPORT_DIRS` | `WalkOptions::files_only` | Implemented (M2) | Filters returned directories without pruning traversal. Matches zlob on symlinks: the oracle (`tools/oracle/tests/zlob_walk_symlinks.rs`) shows zlob 1.6.3 returning links to files, links to directories and broken links alike under this flag, suppressing only real directories. |
 | — | `WalkOptions::resolve_symlink_kind` | Implemented (M5) | Extension with no zlob equivalent, default off so the default stays zlob-compatible. Classifies symlink entries by their target for the two kind filters, at one `stat` per symlink entry; a broken link is neither kind and is dropped without an error. See the [compatibility guide](compatibility-guide.md#deliberate-differences). |
-| root-relative glob filter | `Pattern::is_match_glob_path` / `Walker::include` | Implemented (M2) | Ordinary wildcard and Extglob tokens stay within every component; `**` is the recursive form. |
+| root-relative glob filter | `Pattern::is_match_glob_path` / `Walker::include` | Implemented (M2) | Ordinary wildcard and Extglob tokens stay within every component; a whole-component `**` is the recursive form. |
 | walker `max_depth` | `WalkOptions::max_depth` | Implemented (M2) | Returns entries through the depth boundary while pruning any deeper descent in serial, parallel, and streaming modes. |
 | `ZLOB_MARK` | — | Deliberate divergence | Ferralk preserves native paths instead of appending display-only separators. |
 | `ZLOB_ERR` | `ErrorPolicy::{Abort,Skip,Collect}` | Implemented (M2) | `Collect` default. |

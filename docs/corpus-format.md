@@ -42,7 +42,7 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 The topic files are `basic.jsonl`, `braces.jsonl`, `bytes.jsonl`,
 `case-folding.jsonl`, `classes.jsonl`, `dotfiles.jsonl`, `edge-cases.jsonl`, `errors.jsonl`,
 `extglob-suite.jsonl`, `fast-glob.jsonl`, `fnmatch.jsonl`,
-`glibc-recursive.jsonl`, `ignore.jsonl`, `match-paths.jsonl`,
+`glibc-recursive.jsonl`, `globstar.jsonl`, `ignore.jsonl`, `match-paths.jsonl`,
 `path-matcher.jsonl`, `platform.jsonl`, `preflight.jsonl`, and
 `wildcards.jsonl`. Files are added when a topic gains a case. Case IDs do
 not change once published; a changed expected value is a new case plus an
@@ -167,7 +167,7 @@ empty branch of a leading repeating extglob in
 defects rather than Ferralk policy decisions.
 
 `fast-glob` 1.1 is a secondary differential oracle, not Ferralk's semantic
-authority. Its nine recorded disagreements cover recursive-`**` shape,
+authority. Its eight recorded disagreements cover the trailing-`**` elision,
 backslash and POSIX-class syntax, separator handling in classes, leading `./`
 normalization, and its brace-group limit. They carry `oracle_defect: true` to
 state that no Ferralk contract decision is pending on their result.

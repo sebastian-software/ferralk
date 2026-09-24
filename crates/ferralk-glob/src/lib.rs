@@ -290,8 +290,38 @@ impl PatternOptions {
         self
     }
 
-    /// Gives a consecutive `**` recursive, separator-crossing semantics.
-    /// When disabled, a run of stars has the same semantics as one `*`.
+    /// Gives a `**` that forms a whole path component recursive,
+    /// separator-crossing semantics, as gitignore, Bash `globstar`, `globset`,
+    /// and `fast-glob` do.
+    ///
+    /// A star run is a whole component when an unescaped `/` or an end of the
+    /// pattern bounds it on each side: `**`, `**/x`, `x/**`, `x/**/y`. Braces
+    /// are expanded first, so every alternative is judged as the pattern it
+    /// expands to, and an extglob alternative takes its group's position. A
+    /// `**/` matches zero or more whole components and hands over only at a
+    /// component start, so `**/x` matches `x` and `a/x` but not `sx`, and
+    /// `a/**/b` matches `a/b` but not `a/xb`. A trailing `/**` also accepts the
+    /// path without it: `x/**` matches `x`.
+    ///
+    /// Any other run, such as `a**`, `**b`, or `**.ts`, stays ordinary stars:
+    /// component-local under [`Pattern::is_match_glob_path`], the position
+    /// rule under [`Pattern::is_match_path`], and separator-crossing under
+    /// [`Pattern::is_match`]. When disabled, every run reads that way.
+    ///
+    /// ```
+    /// use ferralk_glob::{Pattern, PatternOptions};
+    ///
+    /// let options = PatternOptions::default().recursive_double_star(true);
+    /// let whole = Pattern::compile("**/x", options)?;
+    /// assert!(whole.is_match_glob_path("x"));
+    /// assert!(whole.is_match_glob_path("a/b/x"));
+    /// assert!(!whole.is_match_glob_path("a/sx"));
+    ///
+    /// let attached = Pattern::compile("a**/x", options)?;
+    /// assert!(attached.is_match_glob_path("abc/x"));
+    /// assert!(!attached.is_match_glob_path("a/b/x"));
+    /// # Ok::<(), ferralk_glob::PatternError>(())
+    /// ```
     #[must_use]
     pub const fn recursive_double_star(mut self, enabled: bool) -> Self {
         self.recursive_double_star = enabled;
@@ -456,6 +486,7 @@ impl Pattern {
             &mut provenance_budget,
             Some(&source_provenance),
             pattern.starts_with(b"./"),
+            ComponentBounds::WHOLE,
         )?;
         let (viability, offset) = walker_path_analysis(&compiled.alternatives, &mut budget)?;
         compiled.walker_path_viability = viability;
@@ -513,6 +544,7 @@ impl Pattern {
         provenance_budget: &mut ProvenanceBudget,
         walker_source_provenance: Option<&SourceProvenance>,
         leading_dot_is_normalized: bool,
+        bounds: ComponentBounds,
     ) -> Result<Self, PatternError> {
         if options.braces {
             let parse_options = PatternOptions {
@@ -547,6 +579,7 @@ impl Pattern {
                     provenance_budget,
                     alternative.source_provenance.as_ref(),
                     leading_dot_is_normalized,
+                    bounds,
                 )?;
                 alternatives.extend(compiled.alternatives);
             }
@@ -564,10 +597,29 @@ impl Pattern {
         // one token however long it is, so billing bytes would reject patterns
         // that compile to almost nothing.
         let mut charged = 0;
+        // The star run `index` is in, classified once at its first star: only
+        // a whole-component run may emit the recursive tokens (#419).
+        let mut star_run_end = 0;
+        let mut star_run_is_recursive = false;
 
         while index < pattern.len() {
             budget.charge(tokens.len() - charged, 0)?;
             charged = tokens.len();
+            if pattern[index] == b'*' && index >= star_run_end {
+                star_run_end = index
+                    + pattern[index..]
+                        .iter()
+                        .take_while(|&&byte| byte == b'*')
+                        .count();
+                star_run_is_recursive = options.recursive_double_star
+                    && star_run_is_whole_component(
+                        pattern,
+                        index,
+                        star_run_end,
+                        options.escape,
+                        bounds,
+                    );
+            }
             match pattern[index] {
                 b'/' => {
                     flush_literals(&mut tokens, &mut literals);
@@ -577,7 +629,7 @@ impl Pattern {
                     );
                     index += 1;
                 }
-                b'*' if options.recursive_double_star && pattern.get(index + 1) == Some(&b'*') => {
+                b'*' if star_run_is_recursive && pattern.get(index + 1) == Some(&b'*') => {
                     flush_literals(&mut tokens, &mut literals);
                     if pattern.get(index + 2) == Some(&b'/') {
                         tokens.push(Token::RecursivePrefix);
@@ -1233,7 +1285,8 @@ impl Pattern {
     /// not stop immediately before a component-leading period: doing so would
     /// let a following literal opt into a hidden name implicitly. The
     /// syntactic `**/` prefix is exempt because it explicitly advances to the
-    /// next component without consuming one.
+    /// next component without consuming one; in exchange it may stop only at
+    /// a component start.
     fn advance_star<const SKIP: bool>(
         token_index: usize,
         path_index: usize,
@@ -1253,11 +1306,13 @@ impl Pattern {
         ) {
             deferred.push((token_index, next));
         }
-        (!semantics.blocks_hidden_stop
+        let hidden_stop_allowed = !semantics.blocks_hidden_stop
             || options.match_hidden
             || path.get(path_index) != Some(&b'.')
-            || !at_component_start(path, path_index, options))
-        .then_some((token_index + 1, path_index))
+            || !at_component_start(path, path_index, options);
+        let component_stop_allowed =
+            !semantics.stops_at_component_start || at_component_start(path, path_index, options);
+        (hidden_stop_allowed && component_stop_allowed).then_some((token_index + 1, path_index))
     }
 
     /// Where the star should resume consuming, or `None` when it cannot.
@@ -1430,18 +1485,24 @@ struct StarWork<'scratch> {
 struct StarSemantics {
     recursive: bool,
     blocks_hidden_stop: bool,
+    /// The star may stop only where a path component starts. A `**/` prefix
+    /// consumes whole components with their separators, so handing over in
+    /// the middle of one would let `**/x` match `sx` (#419).
+    stops_at_component_start: bool,
 }
 
 impl StarSemantics {
     const RECURSIVE_PREFIX: Self = Self {
         recursive: true,
         blocks_hidden_stop: false,
+        stops_at_component_start: true,
     };
 
     const fn ordinary(recursive: bool) -> Self {
         Self {
             recursive,
             blocks_hidden_stop: true,
+            stops_at_component_start: false,
         }
     }
 }
@@ -1780,9 +1841,81 @@ enum Token {
     Separator,
     Any,
     Star,
+    /// A whole-component `**` at the end of its pattern (see
+    /// [`star_run_is_whole_component`]); a star that also crosses separators.
     RecursiveStar,
+    /// A whole-component `**/`: zero or more whole components, each with its
+    /// separator. It may only hand over at a component start.
     RecursivePrefix,
     Class(Class),
+}
+
+/// Whether the two ends of a compiled pattern sit on path-component
+/// boundaries of the pattern it came from.
+///
+/// A top-level pattern — and each brace alternative, which is a whole pattern
+/// once expanded — is bounded on both sides. An extglob alternative inherits
+/// its group's position: its start is a component start only when the group
+/// operator is, and its end a component end only when the group's closing
+/// parenthesis is. That is what makes `@(**)/y` recursive and `x@(**)/y` an
+/// ordinary star run, exactly as `**/y` and `x**/y` are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComponentBounds {
+    starts: bool,
+    ends: bool,
+}
+
+impl ComponentBounds {
+    const WHOLE: Self = Self {
+        starts: true,
+        ends: true,
+    };
+}
+
+/// Whether the star run `pattern[start..end]` forms a whole path component
+/// (#419, ADR-0020).
+///
+/// Only such a run may be recursive: on each side it must meet an unescaped
+/// `/` or an end of the pattern that `bounds` marks as a component boundary.
+/// An escaped `/` is a literal byte, not a pattern separator, so it bounds
+/// nothing. Every other run is an ordinary star run, read exactly as it is
+/// with `recursive_double_star` disabled.
+fn star_run_is_whole_component(
+    pattern: &[u8],
+    start: usize,
+    end: usize,
+    escapes: bool,
+    bounds: ComponentBounds,
+) -> bool {
+    starts_component_at(pattern, start, escapes, bounds) && ends_component_at(pattern, end, bounds)
+}
+
+/// Whether offset `start` of `pattern` begins a path component: it follows an
+/// unescaped `/`, or it is the pattern's start and `bounds` says that is one.
+fn starts_component_at(
+    pattern: &[u8],
+    start: usize,
+    escapes: bool,
+    bounds: ComponentBounds,
+) -> bool {
+    let Some(before) = start.checked_sub(1) else {
+        return bounds.starts;
+    };
+    let escaped = escapes
+        && pattern[..before]
+            .iter()
+            .rev()
+            .take_while(|&&byte| byte == b'\\')
+            .count()
+            % 2
+            == 1;
+    pattern[before] == b'/' && !escaped
+}
+
+/// Whether offset `end` of `pattern` ends a path component: a `/` follows, or
+/// it is the pattern's end and `bounds` says that is one.
+fn ends_component_at(pattern: &[u8], end: usize, bounds: ComponentBounds) -> bool {
+    pattern.get(end).map_or(bounds.ends, |&byte| byte == b'/')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4770,6 +4903,8 @@ enum PositiveExtglobState {
         matcher: PositiveExtglobMatcher,
         next: usize,
         blocks_leading_period: bool,
+        /// A `**/` prefix hands over only at a component start (#419).
+        stops_at_component_start: bool,
     },
     Match,
 }
@@ -5107,6 +5242,7 @@ impl PositiveExtglobNfa {
                 PositiveExtglobState::Star {
                     next,
                     blocks_leading_period,
+                    stops_at_component_start,
                     ..
                 } => {
                     active.push(state);
@@ -5114,6 +5250,7 @@ impl PositiveExtglobNfa {
                         && !options.match_hidden
                         && at_component_start
                         && byte == Some(b'.'))
+                        && (!*stops_at_component_start || at_component_start)
                     {
                         scratch.pending.push(*next);
                     }
@@ -5210,14 +5347,15 @@ impl PositiveExtglobBuilder<'_> {
         &mut self,
         matcher: PositiveExtglobMatcher,
         next: Option<usize>,
-        blocks_leading_period: bool,
+        semantics: StarSemantics,
     ) -> Result<Option<usize>, PatternError> {
         next.map(|next| {
             self.push(
                 PositiveExtglobState::Star {
                     matcher,
                     next,
-                    blocks_leading_period,
+                    blocks_leading_period: semantics.blocks_hidden_stop,
+                    stops_at_component_start: semantics.stops_at_component_start,
                 },
                 1,
             )
@@ -5362,17 +5500,17 @@ impl PositiveExtglobBuilder<'_> {
                         token_position_component_local(tokens, token_index, root_component_local),
                     )),
                     start,
-                    true,
+                    StarSemantics::ordinary(false),
                 )?,
                 Token::RecursiveStar => self.star(
                     PositiveExtglobMatcher::Wildcard(WildcardScope::Recursive),
                     start,
-                    true,
+                    StarSemantics::ordinary(true),
                 )?,
                 Token::RecursivePrefix => self.star(
                     PositiveExtglobMatcher::Wildcard(WildcardScope::Recursive),
                     start,
-                    false,
+                    StarSemantics::RECURSIVE_PREFIX,
                 )?,
             };
             if token_index + 2 == tokens.len()
@@ -5500,6 +5638,12 @@ fn compile_extglob_step(
                 byte: pattern[index],
             });
         };
+        // An alternative stands where its group stands, so a `**` at its edge
+        // is a whole component only when the group is (#419).
+        let bounds = ComponentBounds {
+            starts: starts_component_at(pattern, index, options.escape, ComponentBounds::WHOLE),
+            ends: ends_component_at(pattern, close + 1, ComponentBounds::WHOLE),
+        };
         let mut alternatives = Vec::new();
         for range in split_extglob_alternatives(&pattern[open + 1..close], options.escape) {
             let start = open + 1 + range.start;
@@ -5516,6 +5660,7 @@ fn compile_extglob_step(
                 provenance_budget,
                 alternative_provenance.as_ref(),
                 false,
+                bounds,
             )?);
         }
         let spans_components = alternatives.iter().any(|alternative| {
@@ -5567,7 +5712,8 @@ fn compile_extglob_step(
                 next,
                 blocks_leading_period: !(options.recursive_double_star
                     && next - index == 2
-                    && pattern.get(next) == Some(&b'/')),
+                    && pattern.get(next) == Some(&b'/')
+                    && starts_component_at(pattern, index, options.escape, ComponentBounds::WHOLE)),
             }
         }
         b'?' => ExtglobStep::Any,
@@ -5597,6 +5743,7 @@ fn compile_extglob_alternative(
     provenance_budget: &mut ProvenanceBudget,
     walker_source_provenance: Option<&SourceProvenance>,
     leading_dot_is_normalized: bool,
+    bounds: ComponentBounds,
 ) -> Result<ExtglobAlternative, PatternError> {
     let options = PatternOptions {
         braces: false,
@@ -5612,6 +5759,7 @@ fn compile_extglob_alternative(
         provenance_budget,
         walker_source_provenance,
         leading_dot_is_normalized,
+        bounds,
     )?
     .alternatives;
     let width = fixed_token_width(&compiled);
@@ -6318,11 +6466,12 @@ fn extglob_wildcard_component_local(
 /// Whether the outer star run at `step_index` stays inside one component,
 /// answered exactly as the token engine reads the same run.
 ///
-/// A single star follows the position rule. A longer run starts with a
-/// recursive star under `recursive_double_star`, which crosses under every
-/// policy, and is otherwise a sequence of ordinary stars: the second one
-/// stands behind the first rather than behind a separator, so the run crosses
-/// unless every ordinary wildcard is component-local.
+/// A single star follows the position rule. A longer run that is a whole path
+/// component starts with a recursive star under `recursive_double_star`,
+/// which crosses under every policy (#419, ADR-0020). Any other longer run is
+/// a sequence of ordinary stars: the second one stands behind the first
+/// rather than behind a separator, so the run crosses unless every ordinary
+/// wildcard is component-local.
 fn extglob_star_component_local(
     steps: &[ExtglobStep],
     step_index: usize,
@@ -6330,12 +6479,24 @@ fn extglob_star_component_local(
 ) -> bool {
     match steps.get(step_index) {
         Some(ExtglobStep::Star { next, .. }) if *next - step_index >= 2 => {
-            !options.recursive_double_star
+            !(options.recursive_double_star
+                && extglob_star_run_is_whole_component(steps, step_index, *next))
                 && options.component_wildcards
                 && options.root_component_wildcards
         }
         _ => extglob_wildcard_component_local(steps, step_index, options),
     }
+}
+
+/// Whether the outer star run `start..end` is a whole path component, the
+/// step-table reading of [`star_run_is_whole_component`]: it follows the
+/// program start or a separator and ends at the program end or before one. An
+/// escaped separator compiles to an escape, never to a separator byte, so it
+/// bounds nothing, exactly as in the token engine.
+fn extglob_star_run_is_whole_component(steps: &[ExtglobStep], start: usize, end: usize) -> bool {
+    let is_separator_step =
+        |index: usize| matches!(steps.get(index), Some(ExtglobStep::Byte(b'/')));
+    (start == 0 || is_separator_step(start - 1)) && (end == steps.len() || is_separator_step(end))
 }
 
 fn extglob_star_can_consume(
@@ -6565,7 +6726,8 @@ fn matching_extglob_repetition_ends(
                         if enumerate_apart {
                             continue;
                         }
-                        sweep.inject_start(sweep_state);
+                        sweep
+                            .inject_start(sweep_state, at_component_start(path, absolute, options));
                         if sweep.accepts(sweep_state) {
                             visit(state.visited, matched_base, offset);
                         }
@@ -8505,6 +8667,9 @@ mod tests {
             "+(|a)b",
             "a@(b|[a-c])/?(.x|y)",
             r"x\@(a|b)@(c)",
+            // A group's alternatives inherit its component position (#419); an
+            // attached group keeps its stars ordinary.
+            "x@(**)a",
         ] {
             for match_hidden in [false, true] {
                 for case_insensitive in [false, true] {
@@ -8540,6 +8705,59 @@ mod tests {
                             "is_match_glob_path diverges for {source:?} against {candidate:?} under {options:?}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// The two extglob engines agree on recursive stars inside a group,
+    /// including the component-start rule of a `**/` alternative and the
+    /// ordinary reading of an attached group's `**` (#419).
+    #[test]
+    fn positive_extglob_nfa_agrees_on_recursive_group_alternatives() {
+        let candidates = byte_words(b"ab./", 5);
+        for source in [
+            "@(**/a|b)",
+            "a/@(**|b)/a",
+            "@(**)/a",
+            "+(**/a)",
+            "@(a/**)",
+            "x@(**/a)",
+            "@(**)x",
+        ] {
+            for match_hidden in [false, true] {
+                let options = PatternOptions::default()
+                    .extglob(true)
+                    .recursive_double_star(true)
+                    .match_hidden(match_hidden);
+                let compiled = Pattern::compile(source, options).expect("pattern compiles");
+                assert!(
+                    compiled.alternatives[0]
+                        .extglob
+                        .as_ref()
+                        .is_some_and(|program| program.positive_nfa.is_some()),
+                    "{source} compiles to the positive NFA"
+                );
+                let mut interpreted = compiled.clone();
+                for alternative in interpreted.compiled_alternatives_mut() {
+                    if let Some(program) = alternative.extglob.as_mut() {
+                        program.positive_nfa = None;
+                    }
+                }
+                for candidate in &candidates {
+                    let answers = |pattern: &Pattern| {
+                        (
+                            pattern.is_match(candidate),
+                            pattern.is_match_path(candidate),
+                            pattern.is_match_glob_path(candidate),
+                        )
+                    };
+                    assert_eq!(
+                        answers(&compiled),
+                        answers(&interpreted),
+                        "the engines diverge for {source:?} against {:?} under {options:?}",
+                        String::from_utf8_lossy(candidate)
+                    );
                 }
             }
         }
@@ -10131,5 +10349,369 @@ mod tests {
             current = next;
         }
         words
+    }
+
+    /// Which reach an ordinary wildcard has in [`reference_glob_match`].
+    #[derive(Clone, Copy, Debug)]
+    enum ReferenceReach {
+        /// `is_match`: every ordinary wildcard crosses separators.
+        Crossing,
+        /// `is_match_path`: only a wildcard directly behind a `/` stays local.
+        PathFilter,
+        /// `is_match_glob_path`: every ordinary wildcard stays local.
+        GlobPath,
+    }
+
+    /// A deliberately naive specification of `**` as a whole path component
+    /// (#419), written against the pattern bytes rather than the token IR.
+    ///
+    /// The generated alphabet has no braces, classes, escapes or extglobs. A
+    /// run of exactly two stars bounded by `/` or a pattern end on both sides
+    /// is a globstar: before a `/` it consumes zero or more whole components,
+    /// each with its separator; at the end it consumes the rest of the path,
+    /// and a `/**` suffix also accepts the path that stops before its `/`.
+    /// Every other star is an ordinary one-byte-at-a-time wildcard. Without
+    /// `match_hidden` nothing but a literal consumes the period that starts a
+    /// component, and an ordinary star does not stop right before one.
+    fn reference_glob_match(
+        pattern: &[u8],
+        path: &[u8],
+        recursive: bool,
+        reach: ReferenceReach,
+        match_hidden: bool,
+    ) -> bool {
+        fn component_start(path: &[u8], index: usize) -> bool {
+            index == 0 || path[index - 1] == b'/'
+        }
+        fn hidden_at(path: &[u8], index: usize, match_hidden: bool) -> bool {
+            !match_hidden && path.get(index) == Some(&b'.') && component_start(path, index)
+        }
+        fn globstar_at(pattern: &[u8], index: usize) -> bool {
+            pattern.get(index..index + 2) == Some(b"**")
+                && pattern.get(index + 2) != Some(&b'*')
+                && (index == 0 || pattern[index - 1] == b'/')
+                && pattern.get(index + 2).is_none_or(|&byte| byte == b'/')
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn go(
+            pattern: &[u8],
+            path: &[u8],
+            p: usize,
+            s: usize,
+            recursive: bool,
+            reach: ReferenceReach,
+            match_hidden: bool,
+            memo: &mut std::collections::HashMap<(usize, usize), bool>,
+        ) -> bool {
+            if let Some(&known) = memo.get(&(p, s)) {
+                return known;
+            }
+            let local = match reach {
+                ReferenceReach::Crossing => false,
+                ReferenceReach::GlobPath => true,
+                // The `/` that ends a globstar prefix belongs to the prefix,
+                // so the wildcard behind it is not behind an explicit
+                // separator.
+                ReferenceReach::PathFilter => {
+                    p > 0
+                        && pattern[p - 1] == b'/'
+                        && !(recursive && p >= 3 && globstar_at(pattern, p - 3))
+                }
+            };
+            let mut recurse = |p, s| go(pattern, path, p, s, recursive, reach, match_hidden, memo);
+            let result = if p == pattern.len() {
+                s == path.len()
+            } else if recursive && globstar_at(pattern, p) {
+                if p + 2 == pattern.len() {
+                    // The rest of the path, through no hidden component start.
+                    (s..path.len()).all(|index| !hidden_at(path, index, match_hidden))
+                } else {
+                    // Zero directories, or one whole visible component more.
+                    recurse(p + 3, s) || {
+                        let end = path[s..]
+                            .iter()
+                            .position(|&byte| byte == b'/')
+                            .map(|offset| s + offset);
+                        end.is_some_and(|end| {
+                            !hidden_at(path, s, match_hidden) && recurse(p, end + 1)
+                        })
+                    }
+                }
+            } else {
+                match pattern[p] {
+                    b'*' => {
+                        let stop = !hidden_at(path, s, match_hidden) && recurse(p + 1, s);
+                        stop || (s < path.len()
+                            && !(local && path[s] == b'/')
+                            && !hidden_at(path, s, match_hidden)
+                            && recurse(p, s + 1))
+                    }
+                    b'?' => {
+                        s < path.len()
+                            && !(local && path[s] == b'/')
+                            && !hidden_at(path, s, match_hidden)
+                            && recurse(p + 1, s + 1)
+                    }
+                    b'/' if recursive
+                        && s == path.len()
+                        && p + 3 == pattern.len()
+                        && globstar_at(pattern, p + 1) =>
+                    {
+                        true
+                    }
+                    byte => path.get(s) == Some(&byte) && recurse(p + 1, s + 1),
+                }
+            };
+            memo.insert((p, s), result);
+            result
+        }
+        go(
+            pattern,
+            path,
+            0,
+            0,
+            recursive,
+            reach,
+            match_hidden,
+            &mut std::collections::HashMap::new(),
+        )
+    }
+
+    /// Every engine against the whole-component specification above, over
+    /// every short pattern the alphabet spells (#419).
+    #[test]
+    fn every_engine_reads_double_star_as_a_whole_component_over_exhaustive_patterns() {
+        // Four path bytes reach two nested components (`a/a/a`); the pattern
+        // alphabet spells every globstar position up to five bytes, with `?`
+        // up to four to keep the debug-build run short.
+        let paths = byte_words(b"a./", 4);
+        let mut patterns = byte_words(b"a*/.", 5);
+        patterns.extend(byte_words(b"a*?/.", 4));
+        patterns.sort_unstable();
+        patterns.dedup();
+        let mut compared = 0_usize;
+        for pattern in patterns {
+            // Longer runs keep their inherited token shape; the specification
+            // above does not model them, and dedicated cases pin them.
+            if pattern.windows(3).any(|window| window == b"***") {
+                continue;
+            }
+            for recursive in [false, true] {
+                for match_hidden in [false, true] {
+                    let options = PatternOptions::default()
+                        .recursive_double_star(recursive)
+                        .match_hidden(match_hidden);
+                    let compiled = Pattern::compile(&pattern, options).expect("pattern compiles");
+                    let mut sweep_only = compiled.clone();
+                    sweep_only.strip_engines(true, false, false);
+                    let mut memoized = compiled.clone();
+                    memoized.strip_engines(true, true, true);
+                    for path in &paths {
+                        let expected = [
+                            ReferenceReach::Crossing,
+                            ReferenceReach::PathFilter,
+                            ReferenceReach::GlobPath,
+                        ]
+                        .map(|reach| {
+                            reference_glob_match(&pattern, path, recursive, reach, match_hidden)
+                        });
+                        for (engine, matcher) in [
+                            ("compiled", &compiled),
+                            ("sweep", &sweep_only),
+                            ("memoized", &memoized),
+                        ] {
+                            let actual = [
+                                matcher.is_match(path),
+                                // The path entry points ignore a leading `./`,
+                                // which the specification does not model.
+                                if path.starts_with(b"./") || pattern.starts_with(b"./") {
+                                    expected[1]
+                                } else {
+                                    matcher.is_match_path(path)
+                                },
+                                if path.starts_with(b"./") || pattern.starts_with(b"./") {
+                                    expected[2]
+                                } else {
+                                    matcher.is_match_glob_path(path)
+                                },
+                            ];
+                            assert_eq!(
+                                actual,
+                                expected,
+                                "{engine} engine: {:?} against {:?} (is_match, is_match_path, \
+                                 is_match_glob_path) under {options:?}",
+                                String::from_utf8_lossy(&pattern),
+                                String::from_utf8_lossy(path),
+                            );
+                        }
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            compared > 500_000,
+            "the sweep compared only {compared} pairs"
+        );
+    }
+
+    #[test]
+    fn only_a_whole_component_star_run_compiles_to_recursive_tokens() {
+        let options = PatternOptions::default()
+            .recursive_double_star(true)
+            .braces(true);
+        let tokens = |source: &str| {
+            Pattern::compile(source, options)
+                .expect("pattern compiles")
+                .alternatives
+                .into_iter()
+                .map(|alternative| alternative.tokens)
+                .collect::<Vec<_>>()
+        };
+        let literal = |bytes: &[u8]| Token::Literal(bytes.to_vec());
+        assert_eq!(
+            tokens("**/x"),
+            [vec![Token::RecursivePrefix, literal(b"x")]]
+        );
+        assert_eq!(
+            tokens("a/**"),
+            [vec![literal(b"a"), Token::Separator, Token::RecursiveStar]]
+        );
+        assert_eq!(
+            tokens("a**/x"),
+            [vec![
+                literal(b"a"),
+                Token::Star,
+                Token::Star,
+                Token::Separator,
+                literal(b"x"),
+            ]]
+        );
+        assert_eq!(
+            tokens("**x"),
+            [vec![Token::Star, Token::Star, literal(b"x")]]
+        );
+        assert_eq!(
+            tokens("x/**y"),
+            [vec![
+                literal(b"x"),
+                Token::Separator,
+                Token::Star,
+                Token::Star,
+                literal(b"y")
+            ]]
+        );
+        // An escaped separator is a literal byte and bounds nothing.
+        assert_eq!(
+            tokens(r"a\/**"),
+            [vec![literal(b"a/"), Token::Star, Token::Star]]
+        );
+        // Runs longer than two keep their inherited whole-component shape.
+        assert_eq!(
+            tokens("***/x"),
+            [vec![
+                Token::RecursiveStar,
+                Token::Star,
+                Token::Separator,
+                literal(b"x"),
+            ]]
+        );
+        // Each brace alternative is judged as the whole pattern it expands to.
+        assert_eq!(
+            tokens("{**,a**}/x"),
+            [
+                vec![Token::RecursivePrefix, literal(b"x")],
+                vec![
+                    literal(b"a"),
+                    Token::Star,
+                    Token::Star,
+                    Token::Separator,
+                    literal(b"x"),
+                ],
+            ]
+        );
+        // With the option off every run is ordinary, whatever its position.
+        let ordinary = Pattern::compile("**/x", PatternOptions::default()).unwrap();
+        assert_eq!(
+            ordinary.alternatives[0].tokens,
+            [Token::Star, Token::Star, Token::Separator, literal(b"x")]
+        );
+    }
+
+    #[test]
+    fn extglob_alternatives_inherit_the_component_position_of_their_group() {
+        let options = PatternOptions::default()
+            .recursive_double_star(true)
+            .extglob(true);
+        let alternative_tokens = |source: &str| {
+            let compiled = Pattern::compile(source, options).expect("pattern compiles");
+            let program = compiled.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("an extglob program")
+                .clone();
+            program.groups[0]
+                .alternatives
+                .iter()
+                .map(|alternative| alternative.compiled[0].tokens.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(alternative_tokens("@(**)/y")[0], [Token::RecursiveStar]);
+        assert_eq!(alternative_tokens("a/@(**)")[0], [Token::RecursiveStar]);
+        assert_eq!(
+            alternative_tokens("x@(**)/y")[0],
+            [Token::Star, Token::Star]
+        );
+        assert_eq!(alternative_tokens("@(**)y")[0], [Token::Star, Token::Star]);
+        assert_eq!(
+            alternative_tokens("x@(**/y|z)")[0],
+            [
+                Token::Star,
+                Token::Star,
+                Token::Separator,
+                Token::Literal(b"y".to_vec())
+            ]
+        );
+        assert_eq!(
+            alternative_tokens("@(y/**|z)x")[0],
+            [
+                Token::Literal(b"y".to_vec()),
+                Token::Separator,
+                Token::Star,
+                Token::Star
+            ]
+        );
+
+        // The separator-crossing reading for groups whose alternatives cross,
+        // and the filesystem-glob reading where an attached run must not.
+        for (source, candidate, crossing, expected) in [
+            ("@(**)/y", "a/b/y", true, true),
+            ("@(**)/y", "a/b/y", false, true),
+            ("@(**/x|z)", "a/b/x", false, true),
+            ("x@(**)/y", "xa/b/y", false, false),
+            ("x@(**)/y", "xa/y", false, true),
+            ("@(**/x|z)", "sx", true, false),
+            ("@(**/x|z)", "sx", false, false),
+            ("@(**/x|z)", "a/b/x", true, true),
+            ("+(**/x)", "a/x/b/x", true, true),
+            ("+(**/x)", "a/sx", true, false),
+            ("**/@(x)", "sx", true, false),
+            ("**/@(x)", "a/x", false, true),
+            ("a**/@(y)", "ay", true, false),
+            ("a**/@(y)", "ab/y", false, true),
+            ("a**/@(y)", "a/b/y", false, false),
+        ] {
+            let compiled = Pattern::compile(source, options).expect("pattern compiles");
+            let actual = if crossing {
+                compiled.is_match(candidate)
+            } else {
+                compiled.is_match_glob_path(candidate)
+            };
+            assert_eq!(actual, expected, "{source} against {candidate}");
+            assert!(
+                compiled.engines_agree(candidate),
+                "{source} against {candidate}: engines disagree"
+            );
+        }
     }
 }

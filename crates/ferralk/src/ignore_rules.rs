@@ -7,12 +7,12 @@
 //! down, lives in [`super::gitignore`] and is untouched.
 //!
 //! A rule compiles per path component rather than into one pattern, because the
-//! two dialects read `**` differently. ferralk's `**` is an ordinary recursive
-//! wildcard that need not stop on a component boundary - deliberately, as
-//! `fastglob-034` in the corpus records - while Git's is only ever a whole
-//! component. Translating `foo` into `**/foo` would therefore also ignore
-//! `xfoo`. The component walk is ours; each component is a ferralk-glob
-//! pattern, which is where stars, classes and escapes are actually matched.
+//! two dialects still read `**` differently at the edges. Both make only a
+//! whole-component `**` recursive (ADR-0020), but Git also reads a run of three
+//! or more stars as one, lets `**` before an escaped slash span one or more
+//! components, and requires something below a trailing `/**`. The component
+//! walk is ours; each component is a ferralk-glob pattern, which is where
+//! stars, classes and escapes are actually matched.
 //!
 //! What that leaves for the translation:
 //!

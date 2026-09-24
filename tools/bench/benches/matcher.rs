@@ -228,6 +228,26 @@ fn matcher(c: &mut Criterion) {
         },
     );
 
+    // An inner `**/` before a literal component has no fast path, so the
+    // sweep engine answers it; its `**/` may hand over only at a component
+    // start (#419). The near miss ends in a name that only ends in the
+    // literal directory.
+    let inner_globstar = Pattern::compile(
+        "**/node_modules/**/*.js",
+        PatternOptions::default().recursive_double_star(true),
+    )
+    .expect("inner globstar benchmark pattern is valid");
+    let inner_match = "packages/app/node_modules/react/cjs/react.production.js";
+    let inner_near_miss = "packages/app/my_node_modules/react/cjs/react.production.js";
+    assert!(inner_globstar.is_match_glob_path(inner_match));
+    assert!(!inner_globstar.is_match_glob_path(inner_near_miss));
+    c.bench_function("inner_globstar/glob_path/matching", |benchmark| {
+        benchmark.iter(|| black_box(inner_globstar.is_match_glob_path(black_box(inner_match))))
+    });
+    c.bench_function("inner_globstar/glob_path/non_matching", |benchmark| {
+        benchmark.iter(|| black_box(inner_globstar.is_match_glob_path(black_box(inner_near_miss))))
+    });
+
     let general_literal_skip = Pattern::compile("*a*b.ts", PatternOptions::default())
         .expect("general literal-skip benchmark pattern is valid");
     c.bench_function("general_literal_skip/matching", |benchmark| {
