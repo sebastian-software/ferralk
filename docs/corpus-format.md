@@ -94,8 +94,10 @@ An `absolute_pattern` case describes `Walker::include` and `Walker::exclude`
 rewriting an absolute pattern for a walk root, and has three outcomes: it
 produces `rewritten`, it names paths outside the root and so can select nothing
 (neither `rewritten` nor `error_message`), or it is rejected with
-`error_message`. The zlob oracle skips these, having no walker to compare
-against.
+`error_message`. A relative pattern passes through the same step unchanged,
+so the walker-only rules for relative patterns, such as refusing a leading `!`
+that is not an extglob, are recorded as this kind too. The zlob oracle skips
+these, having no walker to compare against.
 
 The zlob oracle skips `match_glob_path` cases: zlob has no component-local
 mode to compare against.

@@ -3812,6 +3812,48 @@ pub fn expand_braces(
     .collect())
 }
 
+/// One brace alternative and the source offset of its first byte.
+type AlternativeWithFirstOffset = (Vec<u8>, Option<usize>);
+
+/// [`expand_braces`], with each alternative paired with the source offset of
+/// its first byte, or `None` for an empty alternative.
+///
+/// This is provenance for path-consuming embeddings: a rule about how an
+/// alternative begins can then be reported at the byte the caller wrote
+/// instead of at an offset into an expansion the caller never saw.
+#[doc(hidden)]
+pub fn expand_braces_with_first_offsets(
+    pattern: impl AsRef<[u8]>,
+    options: PatternOptions,
+) -> Result<Vec<AlternativeWithFirstOffset>, PatternError> {
+    let pattern = pattern.as_ref();
+    let first = (!pattern.is_empty()).then_some(0);
+    if !options.braces {
+        return Ok(vec![(pattern.to_vec(), first)]);
+    }
+    let source = SourceProvenance::Contiguous { source_start: 0 };
+    let mut provenance_budget = ProvenanceBudget::new();
+    Ok(expand_brace_alternatives_with_provenance(
+        pattern,
+        Some(&source),
+        options.escape,
+        &mut provenance_budget,
+    )?
+    .into_iter()
+    .map(|alternative| {
+        let first = if alternative.bytes.is_empty() {
+            None
+        } else {
+            alternative
+                .source_provenance
+                .as_ref()
+                .and_then(|provenance| provenance.offset_at(0))
+        };
+        (alternative.bytes, first)
+    })
+    .collect())
+}
+
 /// A contiguous output range that came from a contiguous source range.
 ///
 /// Brace expansion removes delimiters and alternatives but never manufactures
@@ -6788,6 +6830,61 @@ mod tests {
         assert!(!compile("[[:upper:]]").is_match("a"));
         assert!(compile("[[:lower:]]").is_match("a"));
         assert!(!compile("[[:lower:]]").is_match("A"));
+    }
+
+    #[test]
+    fn brace_alternatives_carry_the_source_offset_of_their_first_byte() {
+        let braces = PatternOptions::default().braces(true);
+        let expand = |source: &str, options| {
+            super::expand_braces_with_first_offsets(source, options)
+                .expect("review pattern expands")
+                .into_iter()
+                .map(|(bytes, first)| (String::from_utf8(bytes).unwrap(), first))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(expand("!src/**", braces), [("!src/**".into(), Some(0))]);
+        assert_eq!(
+            expand("{!a,b}/**", braces),
+            [("!a/**".into(), Some(1)), ("b/**".into(), Some(4))]
+        );
+        assert_eq!(
+            expand("{a,}!b", braces),
+            [("a!b".into(), Some(1)), ("!b".into(), Some(4))]
+        );
+        assert_eq!(
+            expand("x{{!a,b},c}", braces),
+            [
+                ("x!a".into(), Some(0)),
+                ("xb".into(), Some(0)),
+                ("xc".into(), Some(0))
+            ]
+        );
+        assert_eq!(
+            expand("{{!a,b},c}", braces),
+            [
+                ("!a".into(), Some(2)),
+                ("b".into(), Some(5)),
+                ("c".into(), Some(8))
+            ]
+        );
+        assert_eq!(
+            expand("{,}", braces),
+            [(String::new(), None), (String::new(), None)]
+        );
+        assert_eq!(
+            expand("{!a,b}", PatternOptions::default()),
+            [("{!a,b}".into(), Some(0))]
+        );
+        assert_eq!(
+            super::expand_braces_with_first_offsets("{!a,b}/**", braces)
+                .unwrap()
+                .into_iter()
+                .map(|(bytes, _)| bytes)
+                .collect::<Vec<_>>(),
+            super::expand_braces("{!a,b}/**", braces).unwrap(),
+            "the alternatives are the public expansion's"
+        );
     }
 
     #[test]

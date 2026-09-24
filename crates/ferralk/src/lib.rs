@@ -913,6 +913,13 @@ impl Walker {
     /// The pattern may be absolute. See [`Walker::exclude`] for what that
     /// means and when it is rejected.
     ///
+    /// A leading `!` is not negation, as it is in fast-glob, globby or
+    /// `.gitignore`: a pattern, or a brace alternative, that starts with `!`
+    /// is rejected with a [`PatternError`] rather than compiled into a
+    /// pattern that asks for a literal `!` and selects nothing. Pass what
+    /// should be left out to [`Walker::exclude`] without the `!`. `!(x)` is
+    /// the negated extglob and `\!` a literal `!`, both unchanged.
+    ///
     /// ```
     /// use ferralk::Walker;
     ///
@@ -975,6 +982,10 @@ impl Walker {
 
     /// Adds an OR-ed exclude pattern. A matching directory is not emitted and
     /// is pruned only when no include can select a descendant.
+    ///
+    /// Like an include, an exclude that starts with `!` is rejected: there is
+    /// no negation to re-admit what another exclude matched. See
+    /// [`Walker::include`].
     ///
     /// # Absolute patterns
     ///
@@ -1675,6 +1686,7 @@ fn rewrite_pattern_for_root_with_source(
 ) -> Result<Option<RewrittenPattern>, PatternError> {
     match absolute::rewrite_in(pattern, root, syntax)? {
         absolute::Rewrite::Relative => {
+            reject_list_negation(pattern)?;
             absolute::reject_path_shaped(pattern, syntax)?;
             Ok(Some(RewrittenPattern {
                 bytes: pattern.to_vec(),
@@ -1694,6 +1706,44 @@ fn rewrite_pattern_for_root_with_source(
         }
         absolute::Rewrite::Outside => Ok(None),
     }
+}
+
+const LEADING_NEGATION: &str = "a leading `!` does not negate a walker pattern; pass the pattern without it to `exclude()` instead, or write `\\!` for a literal `!`";
+const BRACE_ALTERNATIVE_NEGATION: &str = "a brace alternative starting with `!` does not negate a walker pattern; pass that alternative without it to `exclude()` instead, or write `\\!` for a literal `!`";
+
+/// Rejects a relative pattern that list-oriented globbers read as a negation.
+///
+/// fast-glob, globby and `.gitignore` treat a leading `!` as "not this", and
+/// fast-glob expands braces first, so `{!a,b}` negates `a` there as well. A
+/// walker include or exclude has no negation: the `!` would ask for a
+/// component literally named that way and silently select nothing, so the
+/// shape is refused at the `!` that starts the alternative. `!(` stays the
+/// negated extglob it is everywhere, `\!` keeps spelling a literal `!`, and
+/// an absolute pattern never reaches this check, because a `!` below its root
+/// is not at the start of anything a caller wrote.
+fn reject_list_negation(pattern: &[u8]) -> Result<(), PatternError> {
+    if !pattern.contains(&b'!') {
+        return Ok(());
+    }
+    // An expansion the brace limits refuse is reported by the compiler, with
+    // its own message, when the pattern is compiled.
+    let Ok(alternatives) =
+        ferralk_glob::expand_braces_with_first_offsets(pattern, traversal_pattern_options(false))
+    else {
+        return Ok(());
+    };
+    for (alternative, first) in alternatives {
+        if alternative.first() == Some(&b'!') && alternative.get(1) != Some(&b'(') {
+            let offset = first.unwrap_or(0);
+            let message = if offset == 0 {
+                LEADING_NEGATION
+            } else {
+                BRACE_ALTERNATIVE_NEGATION
+            };
+            return Err(PatternError::new(offset, message));
+        }
+    }
+    Ok(())
 }
 
 /// The one trailing slash [`TraversalPattern`] treats as a directory-only
