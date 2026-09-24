@@ -58,7 +58,10 @@ the position rule below under `is_match_path`, and separator-crossing like any
 `*` under `is_match`. Braces expand first, so each alternative is judged as the
 pattern it expands to: `{**,x}/y` holds a recursive `**/y`, `a{**,x}/y` an
 ordinary `a**/y`. An extglob alternative stands where its group stands:
-`@(**)/y` is recursive, `x@(**)/y` is not. A whole-component run of three or
+`@(**)/y` is recursive, `x@(**)/y` is not. A group then reads like its
+alternatives written in its place, so the two `**` rules above hold around
+groups too: `@(**)/y` matches `y` as `**/y` does, and `@(x)/**`, `!(y)/**`,
+and `x/@(**)` all accept `x` as `x/**` does. A whole-component run of three or
 more stars stays recursive.
 
 `is_match_path` preserves the zlob list-filter convention instead: a wildcard

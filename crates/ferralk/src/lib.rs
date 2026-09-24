@@ -2109,6 +2109,12 @@ impl TraversalPattern {
     /// component prunes subtrees the exclude does not cover: `*.tmp/**` would
     /// close `a/b.tmp` even though a component-scoped `*.tmp` cannot match the
     /// component `a`.
+    ///
+    /// A cover also requires the pattern to match `path` itself. `X/**`
+    /// accepts every directory `X` accepts, so a real cover keeps pruning.
+    /// Where the two disagree, as for `a/**/**`, which refuses `a`, pruning
+    /// `a` would drop a hidden `a/.h` that no wildcard of the exclude reaches
+    /// without `match_hidden` (#422).
     fn covers_subtree(&self, path: &[u8], mode: WildcardMode) -> bool {
         if self.never_matches || self.directories_only {
             return false;
@@ -2116,7 +2122,7 @@ impl TraversalPattern {
         self.subtree_root.as_ref().is_some_and(|root| match mode {
             WildcardMode::ComponentScoped => root.is_match_glob_path(path),
             WildcardMode::SeparatorCrossing => root.is_match_crossing_path(path),
-        })
+        }) && self.matches(path, true, mode)
     }
 
     fn could_match_descendant(&self, path: &[u8]) -> bool {
@@ -4600,6 +4606,92 @@ mod tests {
         assert!(!escaped.covers_subtree(br"a\", scoped));
         assert!(!escaped.covers_subtree(b"a", scoped));
         assert!(traversal_pattern(br"a\\/**").covers_subtree(br"a\", scoped));
+    }
+
+    /// A group in front of a trailing `/**` excludes the directory it names,
+    /// as the inlined `a/**` does, so the walk prunes exactly what the
+    /// exclude matches (#422). The subtree cover used to close `a` while the
+    /// matcher kept `a` and its hidden `a/.h`, which `**` does not reach
+    /// without `match_hidden`.
+    #[test]
+    fn a_group_before_a_trailing_double_star_excludes_the_directory_it_covers() {
+        let fixture = Fixture::new();
+        for path in ["a/.h/f", "a/x/f", "b/y", "c/z", "ab/f"] {
+            fixture.write(path);
+        }
+        for (threads, mode) in [
+            (1, WildcardMode::ComponentScoped),
+            (4, WildcardMode::ComponentScoped),
+            (1, WildcardMode::SeparatorCrossing),
+        ] {
+            for exclude in [
+                "@(a|b)/**",
+                "a/@(**)",
+                "?(a|b)/**",
+                "+(a|b)/**",
+                "a/**/**",
+                "@(a/**)/**",
+            ] {
+                let result = Walker::new(&fixture.root)
+                    .threads(threads)
+                    .wildcard_mode(mode)
+                    .exclude(exclude)
+                    .expect("valid exclude")
+                    .options(WalkOptions::default().sort(true))
+                    .collect()
+                    .expect("walk succeeds");
+                let mut expected = vec!["ab", "ab/f", "c", "c/z"];
+                if exclude == "a/@(**)" {
+                    expected = vec!["ab", "ab/f", "b", "b/y", "c", "c/z"];
+                }
+                if exclude == "+(a|b)/**" {
+                    // `ab` is two repetitions of the group.
+                    expected = vec!["c", "c/z"];
+                }
+                if exclude.ends_with("/**/**") || exclude == "@(a/**)/**" {
+                    // `a/**/**` refuses `a` itself, and without
+                    // `match_hidden` no `**` reaches `a/.h`, so neither is
+                    // pruned.
+                    expected = vec!["a", "a/.h", "a/.h/f", "ab", "ab/f", "b", "b/y", "c", "c/z"];
+                }
+                assert_eq!(
+                    relative_paths(result.entries(), &fixture.root),
+                    expected.iter().map(PathBuf::from).collect::<Vec<_>>(),
+                    "{exclude}, threads = {threads}, {mode:?}"
+                );
+            }
+        }
+
+        // Wherever a subtree cover holds, the exclude matches the directory
+        // itself, so pruning below it never drops an entry the exclude does
+        // not reach.
+        let candidates: &[&[u8]] = &[b"a", b"b", b"ab", b"a/x", b"x/a", b".h", b"a/.h"];
+        for source in [
+            "@(a|b)/**",
+            "!(b)/**",
+            "*(a)/**",
+            "?(a)/**",
+            "**/@(a|x)/**",
+            "@(**)/a/**",
+            "@(a/**)/**",
+            "x/@(**|a)/**",
+        ] {
+            let pattern = traversal_pattern(source.as_bytes());
+            for &candidate in candidates {
+                for mode in [
+                    WildcardMode::ComponentScoped,
+                    WildcardMode::SeparatorCrossing,
+                ] {
+                    if pattern.covers_subtree(candidate, mode) {
+                        assert!(
+                            pattern.matches(candidate, true, mode),
+                            "{source} covers {} without matching it ({mode:?})",
+                            String::from_utf8_lossy(candidate)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
