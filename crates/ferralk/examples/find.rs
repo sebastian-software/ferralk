@@ -36,7 +36,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("{}", entry.path().display());
     }
     for error in result.errors() {
-        eprintln!("{error}");
+        // `Display` names the operation and path; `source()` says why it
+        // failed.
+        match error.source() {
+            Some(cause) => eprintln!("{error}: {cause}"),
+            None => eprintln!("{error}"),
+        }
     }
 
     if result.errors().is_empty() {

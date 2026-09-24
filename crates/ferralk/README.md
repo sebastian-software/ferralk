@@ -7,6 +7,8 @@ opens only the directories the pattern can reach. It re-exports
 component-aware language.
 
 ```rust,no_run
+use std::error::Error;
+
 use ferralk::{ErrorPolicy, WalkOptions, Walker};
 
 let result = Walker::new(".")
@@ -23,7 +25,11 @@ for entry in result.entries() {
 }
 
 for error in result.errors() {
-    eprintln!("{error}");
+    // `Display` names the operation and path; `source()` says why it failed.
+    match error.source() {
+        Some(cause) => eprintln!("{error}: {cause}"),
+        None => eprintln!("{error}"),
+    }
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```

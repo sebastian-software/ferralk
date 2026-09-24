@@ -312,6 +312,11 @@ Recoverable failures expose a typed `WalkOperation`; match it with a fallback
 arm because the enum is non-exhaustive. `as_str()` provides the stable
 machine-readable operation name. Human-readable `WalkError` and underlying
 I/O error messages are diagnostic text, not a programmatic interface.
+`WalkError`'s `Display` names only the operation and the path, such as
+`read_dir src/locked`; the `io::Error` that says why is its `source()`. Error
+reporters that print the source chain, such as `anyhow`, therefore show the
+cause once, and code that prints a `WalkError` by itself should print its
+source as well.
 
 `CancellationToken::cancel` requests a cooperative stop. It is safe to clone the
 token and keep it outside the walker; walkers only observe it, so their own
