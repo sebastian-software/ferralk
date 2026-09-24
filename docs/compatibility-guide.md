@@ -60,7 +60,9 @@ directories but hands over only at a component start, so `**/x` rejects `sx`
 and `a/**/b` rejects `a/xb`. Any other run (`a**`, `**b`, `a**/b`, `**.ts`) is
 ordinary stars, exactly as with the option disabled. Brace alternatives are
 judged after expansion, and an extglob alternative takes its group's position:
-`@(**)/y` is recursive, `x@(**)/y` is not. This is the reading of gitignore,
+`@(**)/y` is recursive, `x@(**)/y` is not. A group reads like its
+alternatives written in its place, so `@(**)/y` also matches `y`, and
+`@(x)/**` and `x/@(**)` accept `x` as `x/**` does. This is the reading of gitignore,
 Bash `globstar`, `globset`, and `fast-glob`; the zlob differences it implies
 are listed under [deliberate differences](#deliberate-differences).
 
@@ -473,7 +475,7 @@ and covered by the cross-platform corpus. See the
   `a**/y` rejects `a/x/y` and `**.ts` rejects `src/a.ts`, where Ferralk's
   `is_match` reads the run as ordinary separator-crossing stars. Its segment
   split also ignores extglob groups, so `@(**)/y` and `@(**/x|z)` are not
-  recursive there. A trailing `**/` accepts `a/b` against `a/**/` there, while
+  recursive there, `@(**)/y` rejects `y`, and `x/@(**)` rejects `x`. A trailing `**/` accepts `a/b` against `a/**/` there, while
   Ferralk demands the final separator. zlob's filesystem glob treats any `**`
   substring as recursive and can drop the text beside it. The corpus records
   these verdicts in `globstar-*` with `adr: "0020"`.
@@ -552,6 +554,7 @@ It is an audit of the current contract, not a second changelog.
 | 1.0.0: leading `!` in walker patterns | `include`, `exclude`, and their `try_` forms reject a pattern or brace alternative that starts with `!` not followed by `(`, instead of compiling it as a literal `!` that selects nothing; `\!` and `!(…)` are unchanged. See [migrating from fast-glob](#migrating-patterns-from-globset-or-fast-glob). |
 | 1.0.0: extglob position rule in path filters | Under `is_match_path` a group directly after `/` is component-local like a wildcard there (for a repeated group only its first iteration), and brace alternatives are judged independently; under both path entry points a separator-crossing star before a component-local one keeps its backtrack point (`**/*.@(ts\|js)` reaches every depth), a separator or recursive `**` inside a group can cross components, and a star run such as `***` reads as it does outside a group. See the [matcher table](#matcher) and [usage guide](usage.md#match-paths-deliberately). |
 | 1.0.0: `**` only as a whole path component | With `recursive_double_star`, `**` is recursive only when bounded by `/` or a pattern end on both sides; `**/x` no longer matches `sx`, `a/**/b` no longer matches `a/xb`, and a walker exclude `**/node_modules/**` no longer prunes `my_node_modules`. Any other `**` run is ordinary stars. See the [matcher section](#matcher), [deliberate differences](#deliberate-differences), [ADR-0020](adr/0020-double-star-only-as-a-whole-component.md), and the [usage guide](usage.md#match-paths-deliberately). |
+| 1.0.0: extglob groups beside a whole-component `**` | A group reads like its alternatives written in its place: before a trailing `/**` it accepts the path without that suffix (`@(x)/**`, `!(y)/**`, and `*(a)/**` accept `x`, `x`, and `a`), a trailing group holding `**` does the same (`x/@(**)` accepts `x`), and a `**` ending an alternative in front of `/` may stand for no directory (`@(**)/y` accepts `y`, `a/@(**)/b` accepts `a/b`). A walker exclude such as `@(a\|b)/**` therefore excludes `a` itself, and a subtree cover prunes only a directory the exclude matches, so `a/**/**` without `match_hidden` no longer drops `a/.h`. See the [usage guide](usage.md#match-paths-deliberately). |
 
 ## Defaults to review
 

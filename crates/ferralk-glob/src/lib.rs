@@ -301,7 +301,9 @@ impl PatternOptions {
     /// `**/` matches zero or more whole components and hands over only at a
     /// component start, so `**/x` matches `x` and `a/x` but not `sx`, and
     /// `a/**/b` matches `a/b` but not `a/xb`. A trailing `/**` also accepts the
-    /// path without it: `x/**` matches `x`.
+    /// path without it: `x/**` matches `x`. An extglob group reads like its
+    /// alternatives written in its place, so both rules hold around groups
+    /// too: `@(**)/y` matches `y`, and `@(x)/**` and `x/@(**)` match `x`.
     ///
     /// Any other run, such as `a**`, `**b`, or `**.ts`, stays ordinary stars:
     /// component-local under [`Pattern::is_match_glob_path`], the position
@@ -1992,7 +1994,11 @@ impl CompiledAlternative {
         }
         if let Some(program) = &mut self.extglob {
             for group in &mut program.groups {
-                for alternative in &mut group.alternatives {
+                for alternative in group
+                    .alternatives
+                    .iter_mut()
+                    .chain(group.through_separator.iter_mut())
+                {
                     for nested in &mut alternative.compiled {
                         nested.strip_engines(fast_paths, sweeps, prefilters);
                     }
@@ -4945,6 +4951,10 @@ struct CompiledExtglob {
     /// The byte-indexed step table remains the interpreter's address space.
     memo_state_indices: Vec<usize>,
     memo_state_count: usize,
+    /// The step offset of a separator that a candidate ending right in front
+    /// of it may leave out, because only a trailing whole-component `**`
+    /// follows it; see [`trailing_globstar_separator`].
+    trailing_globstar_separator: Option<usize>,
     /// Original-source byte offsets for `steps`, retained after brace
     /// expansion so walker diagnostics preserve `PatternError` provenance.
     walker_source_provenance: Option<SourceProvenance>,
@@ -5092,6 +5102,11 @@ struct ExtglobAlternative {
     /// Byte width when every token consumes a fixed count, which lets the scan
     /// over candidate end offsets visit one offset instead of the component.
     width: Option<usize>,
+    /// Whether [`ExtglobGroup::through_separator`] holds this alternative
+    /// with the separator behind the group, which the matchers use instead.
+    /// The alternative itself stays for the compile-time analyses, which
+    /// read the separator from the outer program.
+    absorbed_by_separator: bool,
 }
 
 /// One `?(…)`, `*(…)`, `+(…)`, `@(…)` or `!(…)`.
@@ -5113,6 +5128,16 @@ struct ExtglobGroup {
     /// Whether some alternative starts with an ordinary wildcard, the one
     /// token whose locality follows the group's position.
     root_wildcard: bool,
+    /// Every alternative that ends in a whole-component `**` right before a
+    /// separator of the outer program, compiled together with that separator
+    /// and resuming behind it (#422). Written inline, the `**` and the
+    /// separator are one `**/`, which may stand for no directory at all, so
+    /// `@(**)/y` matches `y` as `**/y` does, and which leaves no trailing
+    /// `/**` for the path to stop in front of, so `@(a/**)/**` refuses `a` as
+    /// `a/**/**` does. Such an alternative can only be the last iteration of
+    /// a repetition. Empty for a negated group, which consumes what its
+    /// alternatives reject rather than their text.
+    through_separator: Vec<ExtglobAlternative>,
 }
 
 impl ExtglobGroup {
@@ -5121,6 +5146,28 @@ impl ExtglobGroup {
     /// text rather than the separator in front of the group.
     fn first_iteration_differs(&self) -> bool {
         self.component_local && self.root_wildcard
+    }
+
+    /// The alternatives the matchers run with the continuation behind the
+    /// group; the rest are matched through [`Self::through_separator`].
+    fn matched_alternatives(&self) -> impl Iterator<Item = &ExtglobAlternative> {
+        self.alternatives
+            .iter()
+            .filter(|alternative| !alternative.absorbed_by_separator)
+    }
+
+    /// Whether the interpreter matches the first iteration on its own, which
+    /// it does where that difference is observable: under the list-filter
+    /// policy.
+    fn first_iteration_apart(&self, options: PatternOptions) -> bool {
+        self.first_iteration_differs()
+            && options.component_wildcards
+            && !options.root_component_wildcards
+    }
+
+    /// The root position the interpreter gives an iteration after the first.
+    fn later_iteration_root_local(&self, options: PatternOptions) -> bool {
+        self.component_local && !self.first_iteration_apart(options)
     }
 
     /// The last candidate offset a match of one alternative can end at.
@@ -5154,6 +5201,7 @@ impl PositiveExtglobNfa {
     fn compile(
         steps: &[ExtglobStep],
         groups: &[ExtglobGroup],
+        trailing_globstar_separator: Option<usize>,
         budget: &mut IrBudget,
     ) -> Result<Option<Self>, PatternError> {
         if groups
@@ -5204,7 +5252,12 @@ impl PositiveExtglobNfa {
                     )?,
                     ExtglobStep::Group(group) => {
                         let group = &groups[*group];
-                        builder.group(group, suffixes[group.rest])?
+                        let behind_separator = if group.through_separator.is_empty() {
+                            None
+                        } else {
+                            suffixes[group.rest + 1]
+                        };
+                        builder.group(group, suffixes[group.rest], behind_separator)?
                     }
                     ExtglobStep::UnclosedGroup { byte: b'*' } => {
                         unreachable!("unclosed outer stars keep the compatible interpreter")
@@ -5218,6 +5271,13 @@ impl PositiveExtglobNfa {
                     ExtglobStep::UnclosedGroup { byte } => builder
                         .consume(PositiveExtglobMatcher::Literal(*byte), suffixes[index + 1])?,
                 };
+            // A candidate may end in front of the separator of a trailing
+            // `/**`, as `x/**` accepts `x` (#422).
+            let start = if trailing_globstar_separator == Some(index) {
+                builder.epsilon(start.into_iter().chain([accept]).collect(), false)?
+            } else {
+                start
+            };
             suffixes[index] = start;
         }
         Ok(suffixes[0].map(|start| Self {
@@ -5486,23 +5546,43 @@ impl PositiveExtglobBuilder<'_> {
         .map(Some)
     }
 
+    /// Compiles `group` in front of `rest`. `behind_separator` is the state
+    /// behind the separator that follows the group, where the alternatives
+    /// that take that separator along resume (#422).
     fn group(
         &mut self,
         group: &ExtglobGroup,
         rest: Option<usize>,
+        behind_separator: Option<usize>,
     ) -> Result<Option<usize>, PatternError> {
+        // The separator in front of `behind_separator` consumes one byte into
+        // it, so it has no state exactly when `behind_separator` has none.
         let Some(rest) = rest else {
             return Ok(None);
         };
         let blocks_leading_period = !extglob_group_allows_literal_leading_period(group);
         match group.kind {
             ExtglobKind::ExactlyOne => {
-                let alternatives = self.alternatives(group, rest, group.component_local)?;
+                let mut alternatives = self.alternatives(group, rest, group.component_local)?;
+                if let Some(behind_separator) = behind_separator {
+                    alternatives.extend(self.through_separator(
+                        group,
+                        behind_separator,
+                        group.component_local,
+                    )?);
+                }
                 self.epsilon(alternatives, blocks_leading_period)
             }
             ExtglobKind::Optional => {
                 let mut alternatives = self.alternatives(group, rest, group.component_local)?;
                 alternatives.push(rest);
+                if let Some(behind_separator) = behind_separator {
+                    alternatives.extend(self.through_separator(
+                        group,
+                        behind_separator,
+                        group.component_local,
+                    )?);
+                }
                 self.epsilon(alternatives, blocks_leading_period)
             }
             ExtglobKind::ZeroOrMore | ExtglobKind::OneOrMore => {
@@ -5517,13 +5597,23 @@ impl PositiveExtglobBuilder<'_> {
                 // later one follows the previous iteration's text, so its
                 // root wildcard gets a copy that is not component-local.
                 let later = self.alternatives(group, hub, false)?;
-                let first = if group.first_iteration_differs() {
+                let mut first = if group.first_iteration_differs() {
                     self.alternatives(group, hub, true)?
                 } else {
                     later.clone()
                 };
                 let mut loop_targets = later;
                 loop_targets.push(rest);
+                // An alternative that takes the separator along can only be the
+                // last iteration, so it leaves the loop behind the separator (#422).
+                if let Some(behind_separator) = behind_separator {
+                    first.extend(self.through_separator(
+                        group,
+                        behind_separator,
+                        group.first_iteration_differs(),
+                    )?);
+                    loop_targets.extend(self.through_separator(group, behind_separator, false)?);
+                }
                 let edge_count = loop_targets.len();
                 self.budget.charge(edge_count, 0)?;
                 self.states[hub] = PositiveExtglobState::Epsilon {
@@ -5548,8 +5638,32 @@ impl PositiveExtglobBuilder<'_> {
         next: usize,
         root_component_local: bool,
     ) -> Result<Vec<usize>, PatternError> {
+        self.alternative_list(group.matched_alternatives(), next, root_component_local)
+    }
+
+    /// The alternatives that take the separator behind the group along,
+    /// resuming at `behind_separator`.
+    fn through_separator(
+        &mut self,
+        group: &ExtglobGroup,
+        behind_separator: usize,
+        root_component_local: bool,
+    ) -> Result<Vec<usize>, PatternError> {
+        self.alternative_list(
+            &group.through_separator,
+            behind_separator,
+            root_component_local,
+        )
+    }
+
+    fn alternative_list<'a>(
+        &mut self,
+        alternatives: impl IntoIterator<Item = &'a ExtglobAlternative>,
+        next: usize,
+        root_component_local: bool,
+    ) -> Result<Vec<usize>, PatternError> {
         let mut starts = Vec::new();
-        for alternative in &group.alternatives {
+        for alternative in alternatives {
             for alternative in &alternative.compiled {
                 if let Some(start) = self.tokens(&alternative.tokens, next, root_component_local)? {
                     starts.push(start);
@@ -5687,6 +5801,10 @@ fn compile_extglob(
     for group in &groups {
         add_memo_state(group.start);
         add_memo_state(group.rest);
+        if !group.through_separator.is_empty() {
+            // Alternatives that take the separator along resume behind it.
+            add_memo_state(group.rest + 1);
+        }
     }
     for step in &steps {
         if let ExtglobStep::Star {
@@ -5700,8 +5818,13 @@ fn compile_extglob(
             add_memo_state(*next + 1);
         }
     }
-    let positive_nfa = PositiveExtglobNfa::compile(&steps, &groups, budget)?;
-    let literal_prefix = steps
+    let trailing_globstar_separator =
+        trailing_globstar_separator(pattern, &steps, &groups, options);
+    let positive_nfa =
+        PositiveExtglobNfa::compile(&steps, &groups, trailing_globstar_separator, budget)?;
+    // A candidate may stop in front of a trailing `/**`, so that separator
+    // is not a byte every candidate starts with.
+    let literal_prefix = steps[..trailing_globstar_separator.unwrap_or(steps.len())]
         .iter()
         .map_while(|step| match step {
             ExtglobStep::Byte(byte) => Some(*byte),
@@ -5715,6 +5838,7 @@ fn compile_extglob(
         positive_nfa,
         memo_state_indices,
         memo_state_count,
+        trailing_globstar_separator,
         walker_source_provenance: walker_source_provenance.cloned(),
         leading_dot_is_normalized,
     }))
@@ -5743,24 +5867,57 @@ fn compile_extglob_step(
             starts: starts_component_at(pattern, index, options.escape, ComponentBounds::WHOLE),
             ends: ends_component_at(pattern, close + 1, ComponentBounds::WHOLE),
         };
+        // A separator right behind the group is where an alternative's
+        // trailing `**` would read as `**/`, zero directories included (#422).
+        let separator_follows = pattern.get(close + 1) == Some(&b'/');
         let mut alternatives = Vec::new();
+        let mut through_separator = Vec::new();
         for range in split_extglob_alternatives(&pattern[open + 1..close], options.escape) {
             let start = open + 1 + range.start;
+            let end = open + 1 + range.end;
             let alternative_provenance = match walker_source_provenance {
-                Some(provenance) => {
-                    Some(provenance.slice(start, open + 1 + range.end, provenance_budget, index)?)
-                }
+                Some(provenance) => Some(provenance.slice(start, end, provenance_budget, index)?),
                 None => None,
             };
-            alternatives.push(compile_extglob_alternative(
-                &pattern[start..open + 1 + range.end],
+            let mut alternative = compile_extglob_alternative(
+                &pattern[start..end],
                 options,
                 budget,
                 provenance_budget,
                 alternative_provenance.as_ref(),
                 false,
                 bounds,
-            )?);
+            )?;
+            if kind != ExtglobKind::Negated
+                && separator_follows
+                && alternative_ends_in_recursive_star(&alternative)
+            {
+                // Written inline, the trailing `**` and the separator are one
+                // `**/`, so the alternative is compiled once more with that
+                // separator, exactly as the inlined text tokenizes, and the
+                // copy replaces it for matching.
+                let mut with_separator = pattern[start..end].to_vec();
+                with_separator.push(b'/');
+                let absorbing = compile_extglob_alternative(
+                    &with_separator,
+                    options,
+                    budget,
+                    provenance_budget,
+                    None,
+                    false,
+                    bounds,
+                )?;
+                debug_assert!(
+                    absorbing.compiled.iter().all(|compiled| matches!(
+                        compiled.tokens.last(),
+                        Some(Token::RecursivePrefix)
+                    )),
+                    "the separator turns the trailing `**` into a `**/`"
+                );
+                through_separator.push(absorbing);
+                alternative.absorbed_by_separator = true;
+            }
+            alternatives.push(alternative);
         }
         let spans_components = alternatives.iter().any(|alternative| {
             alternative.compiled.iter().any(|compiled| {
@@ -5787,6 +5944,7 @@ fn compile_extglob_step(
             component_local: index > 0 && is_separator(pattern[index - 1]),
             spans_components,
             root_wildcard,
+            through_separator,
         });
         return Ok(ExtglobStep::Group(groups.len() - 1));
     }
@@ -5862,7 +6020,78 @@ fn compile_extglob_alternative(
     )?
     .alternatives;
     let width = fixed_token_width(&compiled);
-    Ok(ExtglobAlternative { compiled, width })
+    Ok(ExtglobAlternative {
+        compiled,
+        width,
+        absorbed_by_separator: false,
+    })
+}
+
+/// Whether the alternative ends in a whole-component `**` that is not the
+/// start of a `**/` (see [`Token::RecursiveStar`]).
+fn alternative_ends_in_recursive_star(alternative: &ExtglobAlternative) -> bool {
+    alternative
+        .compiled
+        .iter()
+        .any(|compiled| matches!(compiled.tokens.last(), Some(Token::RecursiveStar)))
+}
+
+/// Whether the alternative is exactly one whole-component `**`, which at the
+/// end of a pattern also accepts the path without the separator in front of
+/// it, as `x/**` accepts `x`.
+fn alternative_is_globstar(alternative: &ExtglobAlternative) -> bool {
+    alternative
+        .compiled
+        .iter()
+        .any(|compiled| matches!(compiled.tokens.as_slice(), [Token::RecursiveStar]))
+}
+
+/// The step offset of the separator in front of a trailing whole-component
+/// `**`, which a candidate that ends right before it does not need (#422).
+///
+/// The token engine lets a trailing `/**` accept the path without it, so
+/// `x/**` matches `x`. The program keeps that rule where the `**` is an outer
+/// star run behind a group, as in `@(x)/**`, and where it is the only
+/// alternative of a trailing positive group, as in `x/@(**)`.
+fn trailing_globstar_separator(
+    pattern: &[u8],
+    steps: &[ExtglobStep],
+    groups: &[ExtglobGroup],
+    options: PatternOptions,
+) -> Option<usize> {
+    if !options.recursive_double_star {
+        return None;
+    }
+    // An outer run of exactly two stars that ends the program.
+    let outer_star = steps.len().checked_sub(2).filter(
+        |&star| matches!(steps[star], ExtglobStep::Star { next, .. } if next == steps.len()),
+    );
+    // Otherwise a trailing positive group with a `**` alternative. Its
+    // interior is `NoMatch` filler, so it is found by where it ends.
+    let globstar = match outer_star {
+        Some(star) => star,
+        None => {
+            groups
+                .iter()
+                .find(|group| {
+                    group.rest == steps.len()
+                        && group.kind != ExtglobKind::Negated
+                        && matches!(steps.get(group.start), Some(ExtglobStep::Group(_)))
+                        && group.alternatives.iter().any(alternative_is_globstar)
+                })?
+                .start
+        }
+    };
+    // Either one is a whole component only behind an unescaped separator.
+    let separator = globstar.checked_sub(1)?;
+    (matches!(steps[separator], ExtglobStep::Byte(b'/'))
+        && starts_component_at(
+            pattern,
+            separator + 1,
+            options.escape,
+            ComponentBounds::WHOLE,
+        ))
+    .then_some(separator)
 }
 
 /// Total bytes the alternative consumes, when that is the same for every
@@ -6504,6 +6733,13 @@ fn match_extglob_task(
                         path_index += 1;
                         continue;
                     }
+                    // A candidate may end in front of the separator of a
+                    // trailing `/**`, as `x/**` accepts `x` (#422).
+                    if path_index == path.len()
+                        && program.trailing_globstar_separator == Some(pattern_index)
+                    {
+                        return true;
+                    }
                 }
                 ExtglobStep::NoMatch => {}
             }
@@ -6626,6 +6862,15 @@ fn extglob_group_allows_literal_leading_period(group: &ExtglobGroup) -> bool {
                 Some(Token::Literal(literal)) if literal.first() == Some(&b'.')
             )
         })
+    }) || group.through_separator.iter().any(|alternative| {
+        // An alternative that begins with a `**/` may leave a leading period
+        // to what follows, as `**/.h` matches `.h` (#422). The `**/` itself
+        // consumes no hidden component, and every token after it keeps its
+        // own rule.
+        alternative
+            .compiled
+            .iter()
+            .any(|alternative| matches!(alternative.tokens.first(), Some(Token::RecursivePrefix)))
     })
 }
 
@@ -6648,6 +6893,9 @@ fn queue_extglob_group(
                 state.ends,
             );
             queue_extglob_continuations(program, state, group.rest);
+            queue_extglob_through_separator(
+                program, group, path, path_index, false, options, state,
+            );
         }
         ExtglobKind::Optional => {
             queue_extglob_continuation(program, state, group.rest, path_index);
@@ -6660,15 +6908,20 @@ fn queue_extglob_group(
                 state.ends,
             );
             queue_extglob_continuations(program, state, group.rest);
+            queue_extglob_through_separator(
+                program, group, path, path_index, false, options, state,
+            );
         }
         ExtglobKind::ZeroOrMore => {
             queue_extglob_continuation(program, state, group.rest, path_index);
             matching_extglob_repetition_ends(group, path, path_index, options, state);
             queue_extglob_continuations(program, state, group.rest);
+            queue_extglob_through_separator(program, group, path, path_index, true, options, state);
         }
         ExtglobKind::OneOrMore => {
             matching_extglob_repetition_ends(group, path, path_index, options, state);
             queue_extglob_continuations(program, state, group.rest);
+            queue_extglob_through_separator(program, group, path, path_index, true, options, state);
         }
         ExtglobKind::Negated => {
             let stop_limit = negated_extglob_stop_limit(
@@ -6714,6 +6967,58 @@ fn queue_extglob_continuations(
     }
 }
 
+/// Queues the continuations of the alternatives in
+/// [`ExtglobGroup::through_separator`], which resume behind the separator
+/// after the group (#422).
+///
+/// For a repetition such an alternative can only be the last iteration. It
+/// starts where the group starts or where an earlier iteration ended, which
+/// `state.ends` holds once [`matching_extglob_repetition_ends`] ran. A later
+/// iteration follows that iteration's text, so its root wildcard is read as
+/// the repetition reads it.
+fn queue_extglob_through_separator(
+    program: &CompiledExtglob,
+    group: &ExtglobGroup,
+    path: &[u8],
+    path_index: usize,
+    repeated: bool,
+    options: PatternOptions,
+    state: &mut ExtglobMatchState<'_>,
+) {
+    if group.through_separator.is_empty() {
+        return;
+    }
+    let resume = group.rest + 1;
+    let later_root_local = group.later_iteration_root_local(options);
+    let starts = if repeated { 1 + state.ends.len() } else { 1 };
+    for start_index in 0..starts {
+        let (start, root_component_local) = match start_index.checked_sub(1) {
+            None => (path_index, group.component_local),
+            Some(end_index) => (state.ends[end_index], later_root_local),
+        };
+        let span = AlternativeSpan {
+            path,
+            start,
+            end_limit: group.alternative_end_limit(path, start, options),
+            root_component_local,
+        };
+        state.candidate_ends.clear();
+        for alternative in &group.through_separator {
+            matching_extglob_alternative_ends(
+                alternative,
+                span,
+                options,
+                state.prefix_sweep_state,
+                state.candidate_ends,
+            );
+        }
+        for index in 0..state.candidate_ends.len() {
+            let end = state.candidate_ends[index];
+            queue_extglob_continuation(program, state, resume, end);
+        }
+    }
+}
+
 /// Queues a continuation once. Marking at enqueue time bounds the live
 /// worklist by the memo-state × candidate space instead of all duplicate
 /// paths that happen to discover that state before it is popped.
@@ -6750,7 +7055,7 @@ fn matching_extglob_group_ends(
         end_limit: group.alternative_end_limit(path, path_index, options),
         root_component_local: group.component_local,
     };
-    for alternative in &group.alternatives {
+    for alternative in group.matched_alternatives() {
         matching_extglob_alternative_ends(alternative, span, options, prefix_sweep_state, output);
     }
     output.sort_unstable();
@@ -6778,10 +7083,8 @@ fn matching_extglob_repetition_ends(
     // `src/*.ts*.ts`. The difference is only observable under the list-filter
     // policy; there the first iteration is matched on its own, because the
     // streaming sweeps share one policy across every live iteration.
-    let first_iteration_apart = group.first_iteration_differs()
-        && options.component_wildcards
-        && !options.root_component_wildcards;
-    let later_root_local = group.component_local && !first_iteration_apart;
+    let first_iteration_apart = group.first_iteration_apart(options);
+    let later_root_local = group.later_iteration_root_local(options);
     state.visited.clear();
     let reachable_base = push_visited(state.visited, position_count);
     let matched_base = push_visited(state.visited, position_count);
@@ -6796,7 +7099,7 @@ fn matching_extglob_repetition_ends(
         };
         if visited(state.visited, reachable_base, offset) {
             let mut sweep_index = 0;
-            for alternative in &group.alternatives {
+            for alternative in group.matched_alternatives() {
                 if let Some(width) = alternative.width {
                     let Some(end) = absolute.checked_add(width) else {
                         continue;
@@ -6868,7 +7171,7 @@ fn matching_extglob_repetition_ends(
         let byte = path[absolute];
         let starts_component = at_component_start(path, absolute, options);
         let mut sweep_index = 0;
-        for alternative in &group.alternatives {
+        for alternative in group.matched_alternatives() {
             for compiled in &alternative.compiled {
                 let Some(sweep) = &compiled.sweep else {
                     continue;
@@ -6901,7 +7204,7 @@ fn matching_extglob_repetition_ends(
 
 fn prepare_extglob_sweeps(group: &ExtglobGroup, states: &mut Vec<SweepState>) {
     let mut count = 0;
-    for alternative in &group.alternatives {
+    for alternative in group.matched_alternatives() {
         for compiled in &alternative.compiled {
             let Some(sweep) = &compiled.sweep else {
                 continue;
@@ -9748,6 +10051,16 @@ mod tests {
             ("x@(y)/***/z", "xy/***/z"),
             ("src/@(*.ts)/***", "src/*.ts/***"),
             ("src/**/*.@(ts)", "src/**/*.ts"),
+            // A trailing `/**` also accepts the path without it, and a
+            // whole-component `**` in a group may stand for no directory at
+            // all, exactly as written inline (#422).
+            ("@(x)/**", "x/**"),
+            ("x/@(**)", "x/**"),
+            ("@(**)/z", "**/z"),
+            ("a/@(**)/z", "a/**/z"),
+            ("@(x/**)/z", "x/**/z"),
+            ("@(**/**)/z", "**/**/z"),
+            ("@(**)/*", "**/*"),
         ];
         let candidates = [
             "xy/b/c/z",
@@ -9776,6 +10089,12 @@ mod tests {
             "x/lua/a.lua",
             "x/lua/a/b.lua",
             "x/y/lua/a.lua",
+            "x",
+            "z",
+            "a/z",
+            ".z",
+            "x/.z",
+            "sz",
         ];
         for recursive in [false, true] {
             let options = PatternOptions::default()
@@ -9787,10 +10106,12 @@ mod tests {
                 for candidate in candidates {
                     assert_eq!(
                         (
+                            extglob.is_match(candidate),
                             extglob.is_match_path(candidate),
                             extglob.is_match_glob_path(candidate)
                         ),
                         (
+                            plain.is_match(candidate),
                             plain.is_match_path(candidate),
                             plain.is_match_glob_path(candidate)
                         ),
@@ -9811,6 +10132,151 @@ mod tests {
             assert!(pattern.is_match_path(candidate), "{candidate}");
             assert!(pattern.is_match_glob_path(candidate), "{candidate}");
             assert!(pattern.engines_agree(candidate), "{candidate}");
+        }
+    }
+
+    /// A group next to a whole-component `**` answers every entry point like
+    /// the union of its alternatives written inline (#422): before a trailing
+    /// `/**` the path without that suffix matches, and a `**` that ends an
+    /// alternative in front of a separator may stand for no directory. Both
+    /// extglob engines agree on it.
+    #[test]
+    fn extglob_groups_around_a_globstar_read_like_their_inlined_alternatives() {
+        let inlined: &[(&str, &[&str])] = &[
+            ("@(a|b)/**", &["a/**", "b/**"]),
+            ("?(a)/**", &["a/**", "/**"]),
+            ("a/@(**)", &["a/**"]),
+            ("a/?(**|b)", &["a/**", "a/b", "a/"]),
+            ("@(**)/a", &["**/a"]),
+            ("@(**|b)/a", &["**/a", "b/a"]),
+            ("?(**)/a", &["**/a", "/a"]),
+            ("@(**)/.a", &["**/.a"]),
+            ("@(**)/*", &["**/*"]),
+            ("@(**)/?", &["**/?"]),
+            ("a/@(**)/b", &["a/**/b"]),
+            ("@(a/**)/b", &["a/**/b"]),
+            ("@(**/**)/a", &["**/**/a"]),
+            ("@(a/**/**)/b", &["a/**/**/b"]),
+            ("@(**/a|**)/b", &["**/a/b", "**/b"]),
+            ("@(**)//a", &["**//a"]),
+            ("/@(**)/", &["/**/"]),
+            ("@(****)/a", &["****/a"]),
+            ("@(***)/a", &["***/a"]),
+        ];
+        let candidates = byte_words(b"ab./", 4);
+        for match_hidden in [false, true] {
+            let options = PatternOptions::default()
+                .extglob(true)
+                .recursive_double_star(true)
+                .match_hidden(match_hidden);
+            for &(source, alternatives) in inlined {
+                let group = Pattern::compile(source, options).expect("pattern compiles");
+                let mut interpreted = group.clone();
+                for alternative in interpreted.compiled_alternatives_mut() {
+                    if let Some(program) = alternative.extglob.as_mut() {
+                        program.positive_nfa = None;
+                    }
+                }
+                let alternatives = alternatives
+                    .iter()
+                    .map(|alternative| Pattern::compile(alternative, options).unwrap())
+                    .collect::<Vec<_>>();
+                let answers = |pattern: &Pattern, candidate: &[u8]| {
+                    [
+                        pattern.is_match(candidate),
+                        pattern.is_match_path(candidate),
+                        pattern.is_match_glob_path(candidate),
+                    ]
+                };
+                for candidate in &candidates {
+                    // The path entry points drop one leading `./`, which an
+                    // inlined alternative that starts with a separator would
+                    // read differently.
+                    if candidate.starts_with(b"./") {
+                        continue;
+                    }
+                    let mut expected = alternatives.iter().fold([false; 3], |any, alternative| {
+                        let answers = answers(alternative, candidate);
+                        [0, 1, 2].map(|entry| any[entry] || answers[entry])
+                    });
+                    let mut actual = answers(&group, candidate);
+                    let mut actual_interpreted = answers(&interpreted, candidate);
+                    // Under the list filter the outer program reads a
+                    // wildcard behind the separator of `**/` as behind a
+                    // separator, where the token engine does not. That only
+                    // shows where the wildcard would have to match the
+                    // separator of an empty component, as `**/?@(x)` and
+                    // `**/?x` already differ on `a//x`, so those candidates
+                    // are left out of that entry point here.
+                    if candidate.first() == Some(&b'/')
+                        || candidate.windows(2).any(|pair| pair == b"//")
+                    {
+                        expected[1] = false;
+                        actual[1] = false;
+                        actual_interpreted[1] = false;
+                    }
+                    let lossy = String::from_utf8_lossy(candidate);
+                    assert_eq!(
+                        actual, expected,
+                        "{source:?} against {lossy:?} (is_match, is_match_path, \
+                         is_match_glob_path), match_hidden {match_hidden}"
+                    );
+                    assert_eq!(
+                        actual_interpreted, expected,
+                        "interpreter: {source:?} against {lossy:?}, match_hidden {match_hidden}"
+                    );
+                    assert!(
+                        group.engines_agree(candidate),
+                        "{source:?} against {lossy:?}"
+                    );
+                }
+            }
+        }
+
+        // Shapes without an inline spelling: the outer trailing `/**` still
+        // accepts the path in front of it, and a repeated `**` alternative has
+        // the same zero-directory reading as a single one.
+        let options = PatternOptions::default()
+            .extglob(true)
+            .recursive_double_star(true);
+        for (source, candidate, expected) in [
+            ("!(y)/**", "x", true),
+            ("!(y)/**", "y", false),
+            ("!(y)/**", "x/a", true),
+            ("*(a)/**", "a", true),
+            ("*(a)/**", "aa", true),
+            ("*(a)/**", "b", false),
+            ("+(a)/**", "a", true),
+            ("+(**)/a", "a", true),
+            ("*(**)/a", "a", true),
+            ("*(**)/a", "b/a", true),
+            ("+(b|**)/a", "b/a", true),
+            ("x/*(**)", "x", true),
+            ("x/!(**)", "x", false),
+            ("!(**)/a", "a", false),
+        ] {
+            let pattern = Pattern::compile(source, options).expect("pattern compiles");
+            let mut interpreted = pattern.clone();
+            for alternative in interpreted.compiled_alternatives_mut() {
+                if let Some(program) = alternative.extglob.as_mut() {
+                    program.positive_nfa = None;
+                }
+            }
+            for matcher in [&pattern, &interpreted] {
+                assert_eq!(
+                    [
+                        matcher.is_match(candidate),
+                        matcher.is_match_path(candidate),
+                        matcher.is_match_glob_path(candidate),
+                    ],
+                    [expected; 3],
+                    "{source} against {candidate}"
+                );
+            }
+            assert!(
+                pattern.engines_agree(candidate),
+                "{source} against {candidate}"
+            );
         }
     }
 
