@@ -36,7 +36,7 @@ for error in result.errors() {
 for entry in result.entries() {
     println!("{}", entry.path().strip_prefix(entry.root())?.display());
 }
-# Ok::<(), Box<dyn std::error::Error>>(())
+# Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
 ```
 
 Walk with a fast-glob or globby list, whose `!` entries are excludes:
@@ -54,7 +54,7 @@ for glob in globs {
 }
 let result = walker.collect()?;
 # let _ = result;
-# Ok::<(), Box<dyn std::error::Error>>(())
+# Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
 ```
 
 Match paths you hold against several globs:
@@ -92,6 +92,11 @@ These compile and return a plausible, wrong result:
 - Walker patterns are anchored at the root: `exclude("target/**")` prunes only
   the top-level `target`; `**/target/**` prunes every one.
 - `**` is recursive only as a whole path component: `**/x` never matches `sx`.
+- Wildcards, `**` included, skip a leading `.`: `**/*.ts` misses `.cache/x.ts`,
+  and `exclude("**/node_modules/**")` misses `.cache/node_modules`. Use
+  `match_hidden(true)` or a literal `.cache/**`.
+- `respect_git_ignore(true)` applies the ignore files in the walk root and
+  below even outside a Git repository, unlike the `ignore` crate.
 - A leading `!` is not negation: the walker rejects it and the matcher reads
   a literal `!`. Split lists as shown above; `!(…)` stays an extglob.
 - `collect()?` is `Ok` even for a missing root; the failure is in

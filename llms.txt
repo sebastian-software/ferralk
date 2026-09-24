@@ -20,11 +20,11 @@ Use `is_match_glob_path` for paths: it reads a pattern as a shell and the walker
 
 | Default | Change it with |
 | --- | --- |
-| `.gitignore`, `.ignore`, `.git/info/exclude` not read | `Walker::respect_git_ignore(true)` |
+| `.gitignore`, `.ignore`, `.git/info/exclude` not read | `Walker::respect_git_ignore(true)`. The files in the walk root and below apply even outside a repository; inside one, `.git/info/exclude` and the files from the repository root down apply too. The global excludes file never does. |
 | Files, directories and symlinks returned (never the root itself) | `WalkOptions::default().files_only(true)` |
-| Wildcards do not cover a leading `.`; hidden entries are still walked | `Walker::match_hidden(true)`; `WalkOptions::skip_hidden(true)` drops them |
+| Wildcards, `**` included, do not cover a leading `.`; hidden entries are still walked | `Walker::match_hidden(true)`; `WalkOptions::skip_hidden(true)` drops them |
 | `*` stays inside one path component | `Walker::wildcard_mode(WildcardMode::SeparatorCrossing)` for the `globset` reading |
-| Unsorted | `WalkOptions::sort(true)`, for `collect()` and `visit()` only |
+| Unsorted | `WalkOptions::sort(true)`, for `collect()` and `visit()` only; `Path` order, root included |
 | Recoverable errors collected in `WalkResult::errors()` | `Walker::error_policy(ErrorPolicy::Abort)` to fail fast |
 | Symlinks below the root not followed | `WalkOptions::follow_symlinks(true)` |
 
@@ -40,7 +40,8 @@ Use `is_match_glob_path` for paths: it reads a pattern as a shell and the walker
 8. Returned paths include the root: `Walker::new(".")` yields `./src/lib.rs`. Use `entry.path().strip_prefix(entry.root())` for the relative path; `WalkEntry::path_bytes()` also includes the root.
 9. Patterns use `/` and `\` escapes on every platform, Windows included. Never build a pattern with `PathBuf::join`; keep the root in `Walker::new(root)`.
 10. Patterns and candidates are bytes. For a `Path`, pass `path.as_os_str().as_encoded_bytes()`; a `&str` works as it is.
-11. There is no pattern-set type like `globset::GlobSet`: keep a `Vec<Pattern>` and ask `iter().any(…)` or `position(…)`.
+11. `**` does not enter hidden directories either. Without an include, `exclude("**/node_modules/**")` still returns `.cache/node_modules/a.ts`; turn on `match_hidden(true)` or exclude `.cache/**` literally.
+12. There is no pattern-set type like `globset::GlobSet`: keep a `Vec<Pattern>` and ask `iter().any(…)` or `position(…)`.
 
 ## Recipes
 
