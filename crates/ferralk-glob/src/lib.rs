@@ -10387,6 +10387,14 @@ mod tests {
                     "is_match_glob_path: {}",
                     shown()
                 );
+                // The walker's separator-crossing reading asks the `./`-free
+                // copies under the pattern's own options.
+                assert_eq!(
+                    filtered.is_match_crossing_path(&path),
+                    unfiltered.is_match_crossing_path(&path),
+                    "is_match_crossing_path: {}",
+                    shown()
+                );
             }
         }
         assert!(
