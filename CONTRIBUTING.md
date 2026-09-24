@@ -170,10 +170,12 @@ protects is defined in [`docs/stability.md`](docs/stability.md).
   consumer-visible breaking change.
 - [ ] Run the canonical preflight above on the release candidate commit and
   verify all platform, oracle, semver, and policy CI jobs.
-- [ ] Using `cargo-public-api` 0.52.0, regenerate `docs/api/ferralk.txt` and
-  `docs/api/ferralk-glob.txt` with `cargo public-api -p <crate> --simplified
-  --color never`; review every changed line as API rather than accepting
-  generated output mechanically.
+- [ ] Using `cargo-public-api` 0.52.0 and the nightly pinned as
+  `PUBLIC_API_NIGHTLY` in the `lint` job of `.github/workflows/ci.yml`,
+  regenerate `docs/api/ferralk.txt` and `docs/api/ferralk-glob.txt` with
+  `cargo +<that nightly> public-api -p <crate> --simplified --color never`;
+  review every changed line as API rather than accepting generated output
+  mechanically.
 - [ ] Confirm the README still links the stability contract and that the
   contract covers the public API, corpus semantics, matcher entry points,
   Windows tier, MSRV policy, and explicit exclusions.
