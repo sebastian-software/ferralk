@@ -264,6 +264,7 @@ separator.
 | `/repo` | `/repo` | rejected: names the root; add `/**` |
 | `/**/*.ts` | `/repo` | rejected: wildcard at or above the root |
 | `/repo/../repo/x.ts` | `/repo` | rejected: `..` is not resolved |
+| `/b/**` or `/other/**` | `/a/../b` | rejected: the root has a `..` |
 
 The three rejections are the shapes where guessing would silently select the
 wrong entries. A wildcard standing where the root's own components are may or
@@ -271,8 +272,12 @@ may not cover the root, and deciding that needs matching rather than
 arithmetic; write the part below the root instead, where `**/*.ts` says what
 `/**/*.ts` was reaching for. A `..` is not folded away because folding it
 lexically is wrong across a symlink, and resolving it properly would mean
-touching the filesystem to compile a pattern. Naming the root itself selects
-nothing, because the walk emits what is inside the root.
+touching the filesystem to compile a pattern. The same reason rejects a walk
+root with a `..` component for every absolute pattern, whichever tree the
+pattern names: such a root cannot be related to any absolute path without
+resolving it. Relative patterns need no such relation and work under it as
+usual. Naming the root itself selects nothing, because the walk emits what is
+inside the root.
 
 The same candidate guard applies to relative patterns. Brace alternatives are
 expanded, so `{.,..}` is rejected as an attempt to name the unwalkable dot and
@@ -474,6 +479,7 @@ It is an audit of the current contract, not a second changelog.
 | Final 0.x: extglob escape reading | An extglob escape has only its escaped-byte reading, matching Bash and zlob; see the [matcher entry-point contract](#matcher). |
 | Final 0.x: Git bracket classes at slash endpoints | Slash endpoints preserve Git's range state and verdict; see [Git filesystem adaptations](#git-filesystem-adaptations). |
 | Final 0.x: settle the 1.0 contract | `WalkError::operation()` is typed; the extensible enums require fallback match arms; compiled `Pattern` values have no representation equality; and extglobs obey the same entry-point rules as plain patterns, including depth-zero `**/@(x)`. See the [stability contract](stability.md#public-enum-policy), [usage guide](usage.md#match-paths-deliberately), and [matcher table](#matcher). |
+| Final 0.x: absolute patterns under a root with `..` | A walk root with a `..` component rejects every absolute include or exclude, from `include`, `exclude`, `add_root`, and their `try_` forms, instead of selecting nothing when the pattern diverged from the root's spelling before the `..`; relative patterns are unaffected. See [absolute patterns](#absolute-patterns-and-the-caller-side-rewrite-they-replace). |
 
 ## Defaults to review
 

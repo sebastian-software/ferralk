@@ -187,7 +187,10 @@ Important defaults:
   caller holding absolute patterns does not have to strip the root itself. A
   pattern about a different tree selects nothing rather than erroring; a
   wildcard at or above the root, a `..`, and a pattern naming the root itself
-  are rejected. Relative patterns receive the same guardrails: `.` and `./`
+  are rejected. A walk root with a `..` component rejects every absolute
+  pattern, including one about a different tree, because the root cannot be
+  related to any absolute path without resolving it; relative patterns work
+  under such a root as usual. Relative patterns receive the same guardrails: `.` and `./`
   name the root, and a `.` component after the conventional leading `./`
   (such as `src/./main.rs`), a real `..` component, or an empty component
   left by a repeated separator (`src//*.ts`) is rejected with guidance

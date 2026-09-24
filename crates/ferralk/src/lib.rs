@@ -1002,7 +1002,10 @@ impl Walker {
     ///   root instead: `**/*.ts` selects everything under it.
     /// - a `..` component, which is not resolved here. Folding it away
     ///   lexically is wrong across a symlink, and resolving it properly would
-    ///   mean touching the filesystem to compile a pattern.
+    ///   mean touching the filesystem to compile a pattern. The same holds
+    ///   for a walk root with a `..` component: it rejects every absolute
+    ///   pattern, including one about a different tree, while relative
+    ///   patterns work under it as usual.
     /// - a pattern naming the walk root itself, which selects nothing because
     ///   the walk emits what is inside the root. Add `/**`.
     ///

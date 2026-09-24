@@ -217,6 +217,18 @@ pub(crate) fn rewrite_in(
             "an absolute pattern needs an absolute walk root",
         ));
     };
+    // A property of the root alone, so it is decided before anything the
+    // pattern says. Checked while walking the root's components instead, it
+    // was only reached if the pattern agreed with every component above the
+    // `..`: `/b/**` against a root of `/a/../b` diverged at `a`, was read as
+    // naming another tree and silently selected nothing (#396), while `/a/**`
+    // got this error. Whether a root is usable cannot depend on the pattern.
+    if components(&root[root_prefix..]).any(|component| component == b"..") {
+        return Err(PatternError::new(
+            0,
+            "an absolute pattern needs a walk root without a `..` component",
+        ));
+    }
     if !roots_agree(&pattern[..pattern_prefix], &root[..root_prefix]) {
         // A different drive or share. Nothing under this root can match.
         return Ok(Rewrite::Outside);
@@ -239,12 +251,6 @@ pub(crate) fn rewrite_in(
     let mut offset = pattern_prefix;
     let root_is_unc = syntax == Syntax::Windows && root[..root_prefix] == *b"//";
     for (root_component_index, root_component) in components(&root[root_prefix..]).enumerate() {
-        if root_component == b".." {
-            return Err(PatternError::new(
-                0,
-                "an absolute pattern needs a walk root without a `..` component",
-            ));
-        }
         loop {
             let Some((component, next)) = next_component(pattern, offset) else {
                 // The pattern named an ancestor of the root and stopped there,
@@ -650,6 +656,56 @@ mod tests {
         // `b/../c/*.ts`, which matches no walk candidate, so the pattern would
         // quietly select nothing instead of what it names.
         assert!(message("/a/b/../c/*.ts", "/a", Syntax::Posix).starts_with("`..`"));
+    }
+
+    /// A root with `..` is rejected for every absolute pattern, wherever the
+    /// pattern stops agreeing with the root's spelling (#396). Before, only a
+    /// pattern that followed the root up to its `..` reached the error; one
+    /// that diverged earlier, or ended earlier, silently selected nothing.
+    #[test]
+    fn a_root_with_dot_dot_is_rejected_whatever_the_pattern_says() {
+        const ROOT_DOT_DOT: &str = "an absolute pattern needs a walk root without a `..` component";
+        for (pattern, root, syntax) in [
+            ("/a/**", "/a/../b", Syntax::Posix),
+            ("/b/**", "/a/../b", Syntax::Posix),
+            ("/zzz/**", "/a/../b", Syntax::Posix),
+            ("/a", "/a/../b", Syntax::Posix),
+            ("/a/../b/**", "/a/../b", Syntax::Posix),
+            ("/*/x.ts", "/a/../b", Syntax::Posix),
+            ("/x/**", "/..", Syntax::Posix),
+            ("/a/b/**", "/a/b/..", Syntax::Posix),
+            ("C:/b/**", "C:/a/../b", Syntax::Windows),
+            ("D:/b/**", "C:/a/../b", Syntax::Windows),
+            ("//host/other/**", "//host/share/a/../b", Syntax::Windows),
+            ("C:/b/**", "//?/C:/a/../b", Syntax::Windows),
+            ("//host/b/**", "//?/UNC/host/share/../b", Syntax::Windows),
+        ] {
+            let error = rewrite_in(pattern.as_bytes(), root.as_bytes(), syntax)
+                .expect_err("a root with `..` is rejected for an absolute pattern");
+            assert_eq!(error.message(), ROOT_DOT_DOT, "{pattern} under {root}");
+            assert_eq!(error.offset(), 0, "{pattern} under {root}");
+        }
+
+        // A relative pattern needs no arithmetic against the root, so the
+        // root's spelling does not concern it.
+        assert_eq!(
+            verdict("src/**", "/a/../b", Syntax::Posix),
+            Rewrite::Relative
+        );
+        assert_eq!(
+            verdict("src/**", "C:/a/../b", Syntax::Windows),
+            Rewrite::Relative
+        );
+        // A name that merely contains dots is an ordinary component.
+        assert_eq!(rooted("/a/..b/x/**", "/a/..b", Syntax::Posix), "x/**");
+        assert_eq!(rooted("/a/.../x/**", "/a/...", Syntax::Posix), "x/**");
+        // A `.` component names nothing, so it is skipped rather than refused.
+        assert_eq!(rooted("/a/b/**", "/a/./b", Syntax::Posix), "**");
+        assert_eq!(rooted("/a/b/**", "/./a/b/.", Syntax::Posix), "**");
+        assert_eq!(
+            verdict("/other/**", "/a/./b", Syntax::Posix),
+            Rewrite::Outside
+        );
     }
 
     #[test]
