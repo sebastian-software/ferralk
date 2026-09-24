@@ -1,8 +1,9 @@
 # Contributing
 
 Start with the [documentation index](docs/README.md). The
-[usage guide](docs/usage.md) carries the commands a change has to pass, the
-[corpus format](docs/corpus-format.md) governs behavioral cases, and the
+[preflight below](#before-opening-a-pull-request) carries the commands a change
+has to pass, the [corpus format](docs/corpus-format.md) governs behavioral
+cases, and the
 [ADRs](docs/adr/README.md) record decisions that are not up for re-litigation
 in a pull request.
 
@@ -90,7 +91,16 @@ mise run readme:check
 ```
 
 This is the canonical portable preflight for a pull request and needs no Zig
-installation. Its Git-backed ignore test requires Git 2.52.0 or newer. On an
+installation. It does need:
+
+- the Rust toolchain pinned in `rust-toolchain.toml`;
+- [mise](https://mise.jdx.dev) with the tools in `mise.toml` installed
+  (`mise install`), for `mise run readme:check`;
+- Node.js 22.13 or newer, pnpm, and network access, because
+  `scripts/readme-family-block.sh` fetches its generator from Git;
+- Git 2.52.0 or newer, for the Git-backed ignore test described next.
+
+Its Git-backed ignore test requires Git 2.52.0 or newer. On an
 older Git release that test skips and still passes; its companion
 `git_ignore_oracle_version_is_reported` prints the detected version and whether
 the corpus was replayed or skipped, visible with
@@ -201,5 +211,3 @@ protects is defined in [`docs/stability.md`](docs/stability.md).
   dialog silently drops it, Release Please proposes the ordinary bump instead,
   and the release pull request is the first place anyone notices. A one-line
   follow-up commit carrying only the footer fixes it.
-
-#

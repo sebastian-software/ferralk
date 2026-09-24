@@ -1,7 +1,5 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
-#![doc = "Portable, byte-first glob matching."]
-
 //! Compiled, byte-first glob patterns with explicit behavior-changing options.
 //!
 //! A [`Pattern`] is compiled once from any `AsRef<[u8]>` and matched many
@@ -633,6 +631,13 @@ impl Pattern {
     /// assert!(!source_file.is_match_glob_path("src/generated/lib.rs.bak"));
     /// # Ok::<(), ferralk_glob::PatternError>(())
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PatternError`] when the pattern is not valid under
+    /// `options`: an unclosed class or extglob group, an invalid range, or a
+    /// pattern beyond the compile budget. [`PatternError::offset`] locates the
+    /// problem in the caller's pattern bytes.
     pub fn compile(
         pattern: impl AsRef<[u8]>,
         options: PatternOptions,
@@ -893,6 +898,10 @@ impl Pattern {
     }
 
     /// Reports whether a pattern is syntactically valid without retaining it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same [`PatternError`] that [`Pattern::compile`] would.
     pub fn validate(
         pattern: impl AsRef<[u8]>,
         options: PatternOptions,

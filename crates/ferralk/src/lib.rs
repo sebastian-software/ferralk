@@ -3,8 +3,6 @@
 // docs.rs passes `--cfg docsrs` (see `[package.metadata.docs.rs]`), which is
 // what lets a feature-gated item render with the flags that gate it.
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![doc = "Portable filesystem walking."]
-
 //! Parallel filesystem walking with byte-first glob selection.
 //!
 //! A [`Walker`] takes one or more roots, root-relative include and exclude
@@ -1437,6 +1435,12 @@ impl Walker {
     /// [`Walker::try_include`] instead. It borrows the builder, so rejecting a
     /// pattern leaves the caller's configured walker available for the next
     /// pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PatternError`] when the pattern is invalid, or has one of
+    /// the shapes [`Walker::exclude`] lists as rejected, for any configured
+    /// root.
     pub fn include(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
         self.try_include(pattern)?;
         Ok(self)
@@ -1466,6 +1470,12 @@ impl Walker {
     /// # let _ = result;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PatternError`] when the pattern is invalid, or has one of
+    /// the shapes [`Walker::exclude`] lists as rejected, for any configured
+    /// root.
     pub fn try_include(&mut self, pattern: impl AsRef<[u8]>) -> Result<&mut Self, PatternError> {
         let pattern = pattern.as_ref();
         // Compiled for every root before any of them is changed, so a pattern
@@ -1594,6 +1604,12 @@ impl Walker {
     /// For a caller-supplied list that may contain invalid patterns, use
     /// [`Walker::try_exclude`] instead. It preserves the configured builder
     /// when a pattern is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PatternError`] when the pattern is invalid, or has one of
+    /// the shapes [`Walker::exclude`] lists as rejected, for any configured
+    /// root.
     pub fn exclude(mut self, pattern: impl AsRef<[u8]>) -> Result<Self, PatternError> {
         self.try_exclude(pattern)?;
         Ok(self)
@@ -1605,6 +1621,12 @@ impl Walker {
     /// same all-or-nothing compilation rule as [`Walker::try_include`]: a
     /// rejected pattern leaves every root and previously configured filter
     /// unchanged, while a valid one composes with them.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PatternError`] when the pattern is invalid, or has one of
+    /// the shapes [`Walker::exclude`] lists as rejected, for any configured
+    /// root.
     pub fn try_exclude(&mut self, pattern: impl AsRef<[u8]>) -> Result<&mut Self, PatternError> {
         let pattern = pattern.as_ref();
         let compiled = self.compile_for_every_root(pattern)?;
@@ -1696,6 +1718,11 @@ impl Walker {
     /// # let _ = result;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PatternError`] when an absolute include or exclude pattern
+    /// already configured cannot be rewritten for the new root.
     pub fn try_add_root(&mut self, root: impl Into<PathBuf>) -> Result<&mut Self, PatternError> {
         let mut plan = RootPlan::new(root.into());
         let options = traversal_pattern_options(self.match_hidden);
@@ -1970,6 +1997,15 @@ impl Walker {
     /// `spawn_worker` error on the first root. It is returned in
     /// [`WalkResult::errors`] under [`ErrorPolicy::Collect`], dropped under
     /// [`ErrorPolicy::Skip`], and ends the walk under [`ErrorPolicy::Abort`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`WalkError`] only under [`ErrorPolicy::Abort`], for the first
+    /// recoverable error the walk meets. Under the default
+    /// [`ErrorPolicy::Collect`] every such error, including a root that does
+    /// not exist or cannot be read, is returned in [`WalkResult::errors`]
+    /// next to the entries, and `collect` itself returns `Ok`. Check
+    /// `errors()` when a missing root must not pass for an empty tree.
     pub fn collect(self) -> Result<WalkResult, WalkError> {
         self.collect_with(&SystemBackend)
     }
