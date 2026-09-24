@@ -1996,7 +1996,10 @@ impl Walker {
     /// - a wildcard at or above the walk root (`/*/x.ts`, `/**/*.ts`, or
     ///   `/repo*/x.ts` for a root of `/repo`), which may or may not cover the
     ///   root and cannot be decided without matching. Write the part below the
-    ///   root instead: `**/*.ts` selects everything under it.
+    ///   root instead: `**/*.ts` selects everything under it. A root whose own
+    ///   name contains pattern syntax is spelled with that syntax escaped, so
+    ///   `/work/a\[1\]/**` rewrites to `**` for a root of `/work/a[1]`; any
+    ///   other escape at or above the root is rejected like a wildcard.
     /// - a `..` component, which is not resolved here. Folding it away
     ///   lexically is wrong across a symlink, and resolving it properly would
     ///   mean touching the filesystem to compile a pattern. The same holds
@@ -3224,14 +3227,21 @@ fn prefilter_of_every_alternative(
 /// an unpaired one is an ordinary byte. Shared with the absolute-pattern rewrite
 /// so that "how far is this pattern a plain path" has one answer.
 pub(crate) fn first_metacharacter(pattern: &[u8]) -> Option<usize> {
-    pattern.iter().enumerate().position(|(index, byte)| {
-        matches!(byte, b'*' | b'?' | b'[')
-            || (*byte == b'\\')
-            || (*byte == b'{' && has_closing_brace(pattern, index))
-            || (matches!(byte, b'@' | b'+' | b'!')
-                && pattern.get(index + 1) == Some(&b'(')
-                && has_closing_parenthesis(pattern, index + 1))
-    })
+    (0..pattern.len()).find(|&index| is_metacharacter_at(pattern, index))
+}
+
+/// Whether the byte at `index` stops `pattern` from being a literal path there,
+/// by the rule [`first_metacharacter`] applies. A backslash counts: it is
+/// where an escape starts, and the caller decides what an escape may spell.
+pub(crate) fn is_metacharacter_at(pattern: &[u8], index: usize) -> bool {
+    match pattern[index] {
+        b'*' | b'?' | b'[' | b'\\' => true,
+        b'{' => has_closing_brace(pattern, index),
+        b'@' | b'+' | b'!' => {
+            pattern.get(index + 1) == Some(&b'(') && has_closing_parenthesis(pattern, index + 1)
+        }
+        _ => false,
+    }
 }
 
 fn literal_pattern_root(pattern: &[u8]) -> Option<Vec<u8>> {
@@ -9627,6 +9637,50 @@ mod tests {
         assert_eq!(
             walk(&fixture.absolute("/src/*.ts")),
             vec![PathBuf::from("src/a.ts")]
+        );
+    }
+
+    /// A caller holding an absolute pattern for a root whose name contains
+    /// pattern syntax escapes that syntax, and the walk selects what the
+    /// relative spelling selects. Every name here is legal on Windows too.
+    #[test]
+    fn an_absolute_pattern_may_spell_its_root_with_escapes() {
+        let fixture = Fixture::new();
+        let name = "brace{a,b} [1] @(x)!+";
+        fixture.write(format!("{name}/src/a.ts"));
+        fixture.write(format!("{name}/src/deep/b.ts"));
+        let root = fixture.root.join(name);
+        let escaped: String = name
+            .chars()
+            .flat_map(|character| {
+                let syntax = "\\*?[]{}(),|!@+".contains(character);
+                syntax.then_some('\\').into_iter().chain([character])
+            })
+            .collect();
+
+        let walk = |pattern: &str| -> Vec<PathBuf> {
+            let result = Walker::new(&root)
+                .include(pattern)
+                .expect("valid include")
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("walk succeeds");
+            relative_paths(result.entries(), &root)
+        };
+
+        assert_eq!(
+            walk(&fixture.absolute(&format!("/{escaped}/src/*.ts"))),
+            vec![PathBuf::from("src/a.ts")]
+        );
+        assert_eq!(
+            walk(&fixture.absolute(&format!("/{escaped}/**/*.ts"))),
+            walk("**/*.ts")
+        );
+        // Unescaped, the same bytes are syntax at the root, and refused.
+        assert!(
+            Walker::new(&root)
+                .include(fixture.absolute(&format!("/{name}/src/*.ts")))
+                .is_err()
         );
     }
 

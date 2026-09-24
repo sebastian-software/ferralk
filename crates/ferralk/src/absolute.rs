@@ -14,11 +14,12 @@
 //! [`rewrite`] takes the root as an argument rather than reading it from a
 //! walker, so a future multi-root walk can rewrite one pattern once per root.
 //!
-//! One limitation follows from the pattern dialect rather than from this code:
-//! a walk root whose own name contains `*`, `?`, `[`, `{` or `\` cannot be
-//! spelled literally in front of a pattern, because those bytes are syntax
-//! there. Such a root is reported as unrewritable rather than guessed at, and
-//! the pattern has to be written relative to it.
+//! A walk root whose own name contains pattern syntax - `*`, `?`, `[`, `{`,
+//! `\` and the rest - is spelled in front of a pattern with each of those
+//! bytes escaped by a `\`. The part of the pattern that names the root may
+//! contain those escapes and nothing else: an unescaped wildcard there, or an
+//! escape of an ordinary byte, is reported as unrewritable rather than guessed
+//! at.
 
 use std::borrow::Cow;
 
@@ -261,16 +262,24 @@ pub(crate) fn rewrite_in(
                 offset = next;
                 continue;
             }
-            if magic.is_some_and(|at| at < offset + component.len()) {
-                return Err(PatternError::new(
-                    source_offset_after_deverbatimize(source_pattern, syntax, offset),
-                    "a wildcard at or above the walk root cannot be made relative to it",
-                ));
-            }
+            let component = if magic.is_some_and(|at| at < offset + component.len()) {
+                // Only escaped syntax may stand here, spelling the root's own
+                // name; anything else could cover names besides the root's.
+                let Some(literal) = escaped_literal(pattern, offset, component.len(), syntax)
+                else {
+                    return Err(PatternError::new(
+                        source_offset_after_deverbatimize(source_pattern, syntax, offset),
+                        "a wildcard at or above the walk root cannot be made relative to it",
+                    ));
+                };
+                Cow::Owned(literal)
+            } else {
+                Cow::Borrowed(component)
+            };
             let component_agrees = if root_is_unc && root_component_index < 2 {
                 component.eq_ignore_ascii_case(root_component)
             } else {
-                component == root_component
+                *component == *root_component
             };
             if !component_agrees {
                 return Ok(Rewrite::Outside);
@@ -400,6 +409,47 @@ fn next_component(pattern: &[u8], offset: usize) -> Option<(&[u8], usize)> {
         Some(separator) => Some((&rest[..separator], offset + separator + 1)),
         None => Some((rest, pattern.len())),
     }
+}
+
+/// Bytes that are pattern syntax somewhere in the walker's dialect, and so the
+/// ones a caller escapes to spell a root whose name contains them.
+const PATTERN_SYNTAX: &[u8] = b"\\*?[]{}(),|!@+";
+
+/// The name a component at or above the walk root spells, when its only syntax
+/// is escaped pattern syntax.
+///
+/// `pattern[start..start + len]` is one `/`-separated component. `None` means
+/// it holds syntax a root name cannot be read from: an unescaped wildcard, an
+/// escape that is not of [`PATTERN_SYNTAX`], or an escape of the separator
+/// that ends the component. Escaping an ordinary byte is legal pattern text,
+/// but here it is far more often a path spelled with `\` than a name, so it
+/// stays refused rather than compared.
+///
+/// On Windows an escape of a byte Windows forbids in a name is refused too. No
+/// root can contain one, so comparing would only turn `C:/repo\*`, a path
+/// joined with the wrong separator, from an error into a silent miss.
+fn escaped_literal(pattern: &[u8], start: usize, len: usize, syntax: Syntax) -> Option<Vec<u8>> {
+    let end = start + len;
+    let mut literal = Vec::with_capacity(len);
+    let mut index = start;
+    while index < end {
+        if pattern[index] == b'\\' {
+            let escaped = *pattern[..end].get(index + 1)?;
+            let forbidden =
+                syntax == Syntax::Windows && FORBIDDEN_IN_A_WINDOWS_NAME.contains(&escaped);
+            if !PATTERN_SYNTAX.contains(&escaped) || forbidden {
+                return None;
+            }
+            literal.push(escaped);
+            index += 2;
+        } else if crate::is_metacharacter_at(pattern, index) {
+            return None;
+        } else {
+            literal.push(pattern[index]);
+            index += 1;
+        }
+    }
+    Some(literal)
 }
 
 /// Offset of the first `..` path component, if the pattern has one.
@@ -643,6 +693,84 @@ mod tests {
         // A wildcard below the root is fine; only the part being removed has
         // to be literal.
         assert_eq!(rooted("/a/b/*/x.ts", "/a/b", Syntax::Posix), "*/x.ts");
+    }
+
+    /// A root whose name contains pattern syntax is spelled with that syntax
+    /// escaped, and the escaped spelling is compared as the name it spells.
+    /// Before, any `\` at or above the root was refused, so such a root could
+    /// only be walked with relative patterns.
+    #[test]
+    fn escaped_syntax_spells_a_root_name() {
+        for (pattern, root) in [
+            (r"/work/bracket\[project\]/src/**", "/work/bracket[project]"),
+            (r"/work/brace\{project\}/src/**", "/work/brace{project}"),
+            (r"/work/back\\slash/src/**", r"/work/back\slash"),
+            (r"/work/star\*\?/src/**", "/work/star*?"),
+            (r"/work/ext\@\(glob\)\!\+/src/**", "/work/ext@(glob)!+"),
+            (r"/work/list\,pipe\|/src/**", "/work/list,pipe|"),
+            // An unpaired opener was never syntax, escaped or not.
+            (r"/work/half\{open/src/**", "/work/half{open"),
+            ("/work/half{open/src/**", "/work/half{open"),
+        ] {
+            assert_eq!(rooted(pattern, root, Syntax::Posix), "src/**", "{pattern}");
+        }
+        // The part below the root keeps its escapes: it is still a pattern.
+        assert_eq!(
+            rooted(r"/work/a\[b\]/c\[d\]/*.ts", "/work/a[b]", Syntax::Posix),
+            r"c\[d\]/*.ts"
+        );
+        // Windows allows brackets, braces and parentheses in a name.
+        assert_eq!(
+            rooted(
+                r"C:/work/brace\{project\}/src/**",
+                "C:/work/brace{project}",
+                Syntax::Windows
+            ),
+            "src/**"
+        );
+        // An escaped spelling of another name is another tree.
+        assert_eq!(
+            verdict(
+                r"/work/other\[x\]/**",
+                "/work/bracket[project]",
+                Syntax::Posix
+            ),
+            Rewrite::Outside
+        );
+        // The unescaped spelling is syntax, which could cover other names.
+        assert_eq!(
+            message(
+                "/work/bracket[project]/**",
+                "/work/bracket[project]",
+                Syntax::Posix
+            ),
+            "a wildcard at or above the walk root cannot be made relative to it"
+        );
+    }
+
+    /// What stays refused at or above the root: anything that is not an escape
+    /// of pattern syntax.
+    #[test]
+    fn only_escaped_syntax_spells_a_root_name() {
+        const WILDCARD: &str = "a wildcard at or above the walk root cannot be made relative to it";
+        for (pattern, root, syntax) in [
+            // An unescaped wildcard beside the escapes.
+            (r"/work/a\[b\]*/**", "/work/a[b]", Syntax::Posix),
+            // An escaped ordinary byte: more likely a path joined with `\`
+            // than a name, so it is not read as one.
+            (r"/re\po/**", "/repo", Syntax::Posix),
+            (r"/work\src/**", "/work", Syntax::Posix),
+            // A trailing escape, and one of the separator after it.
+            ("/work/a\\", "/work/a", Syntax::Posix),
+            (r"/work/a\/b/**", "/work/a/b", Syntax::Posix),
+            // On Windows, an escape of a byte no Windows name can contain is
+            // a path joined with `\`, not a name.
+            (r"C:/repo\*/**", "C:/repo", Syntax::Windows),
+            (r"C:/repo\\x/**", "C:/repo", Syntax::Windows),
+            (r"C:/a\b\src\*.ts", "C:/a/b", Syntax::Windows),
+        ] {
+            assert_eq!(message(pattern, root, syntax), WILDCARD, "{pattern}");
+        }
     }
 
     #[test]

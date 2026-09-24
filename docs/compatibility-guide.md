@@ -212,7 +212,9 @@ there a file may genuinely be named `src*.ts`.
 
 **Converting a path you already hold.** Replace the separators, and remember
 that a path is not automatically a valid pattern: if any component contains
-`*`, `?`, `[` or `{`, those bytes are syntax and need escaping with `\`.
+pattern syntax such as `*`, `?`, `[` or `{`, those bytes need escaping with
+`\`. [Absolute patterns](#absolute-patterns-and-the-caller-side-rewrite-they-replace)
+lists every byte that does.
 
 ```rust,no_run
 # use ferralk::Walker;
@@ -288,6 +290,7 @@ separator.
 | `/other/**` | `/repo` | selects nothing, and prunes nothing |
 | `/repo` | `/repo` | rejected: names the root; add `/**` |
 | `/**/*.ts` | `/repo` | rejected: wildcard at or above the root |
+| `/work/a\[1\]/**` | `/work/a[1]` | `**`: escaped syntax spells the root's name |
 | `/repo/../repo/x.ts` | `/repo` | rejected: `..` is not resolved |
 | `/b/**` or `/other/**` | `/a/../b` | rejected: the root has a `..` |
 
@@ -295,7 +298,13 @@ The three rejections are the shapes where guessing would silently select the
 wrong entries. A wildcard standing where the root's own components are may or
 may not cover the root, and deciding that needs matching rather than
 arithmetic; write the part below the root instead, where `**/*.ts` says what
-`/**/*.ts` was reaching for. A `..` is not folded away because folding it
+`/**/*.ts` was reaching for. A root whose name contains pattern syntax is
+spelled with each such byte escaped (`\*`, `\?`, `\[`, `\]`, `\{`, `\}`,
+`\(`, `\)`, `\,`, `\|`, `\!`, `\@`, `\+`, `\\`), and the escaped spelling is
+compared as the name it spells. Any other escape at or above the root is
+rejected like a wildcard, because there it is far more often a path joined with
+`\` than a name; on Windows that includes an escape of a byte no Windows name
+can contain. A `..` is not folded away because folding it
 lexically is wrong across a symlink, and resolving it properly would mean
 touching the filesystem to compile a pattern. The same reason rejects a walk
 root with a `..` component for every absolute pattern, whichever tree the
