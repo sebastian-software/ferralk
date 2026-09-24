@@ -40,10 +40,12 @@ switch that changes it; the sections below explain the semantics.
 ## Match paths deliberately
 
 `Pattern` accepts `AsRef<[u8]>`, so callers can match filenames without lossy
-Unicode conversion. `Pattern::is_match` compares an entire byte sequence. For
-paths, prefer `is_match_glob_path`: ordinary `*`, `?`, classes, and Extglob
-operators stay within one component, while an explicitly enabled `**` crosses
-components.
+Unicode conversion. A `&str` is already such a value; for a `Path` or an
+`OsStr`, `ferralk_glob::path_bytes(path)` borrows its native encoded bytes,
+raw on Unix and lossless WTF-8 on Windows (ADR-0005). `Pattern::is_match`
+compares an entire byte sequence. For paths, prefer `is_match_glob_path`:
+ordinary `*`, `?`, classes, and Extglob operators stay within one component,
+while an explicitly enabled `**` crosses components.
 
 `**` is recursive only as a whole path component, as in gitignore, Bash
 `globstar`, `globset`, and `fast-glob`: `**`, `**/x`, `x/**`, and `x/**/y`.
@@ -173,6 +175,14 @@ an earlier call, because a `WalkOptions` value cannot tell a switch left at its
 default from one set to `false`. Build one value, as above, and pass it once:
 `.options(WalkOptions::default().files_only(true)).options(WalkOptions::default().sort(true))`
 is sorted but no longer files-only.
+
+An entry's `path()` is the root exactly as it was given, a separator unless
+the root is empty or already ends in one, and the path below the root:
+`Walker::new(".")` yields `./src/lib.rs`. `WalkEntry::relative_path()` is that
+last part, `src/lib.rs`, and it is exactly the spelling the include and
+exclude patterns were matched against, whether the root was written `.`,
+`./`, `x//y/` or `a/..`. It borrows from the entry, and
+`WalkEntry::into_path()` takes the whole path without copying it.
 
 ### Keep a configured walker when input patterns are invalid
 
@@ -377,14 +387,20 @@ Important defaults:
   entries. Decide what an error means before counting, with
   `.filter_map(Result::ok).take(10)` to drop errors or
   `.take(10).collect::<Result<Vec<_>, _>>()` to stop at the first one.
+- A `WalkResult` iterates with the same item type, owned or borrowed:
+  `for item in walker.collect()?` yields every entry as `Ok`, in the order of
+  `entries()`, and then every error as `Err`, so a loop cannot pass over the
+  errors unseen. `entries()` and `into_parts()` take the entries alone when
+  the errors are handled separately.
 
 Recoverable failures expose a typed `WalkOperation`; match it with a fallback
 arm because the enum is non-exhaustive. `as_str()` provides the stable
 machine-readable operation name. Human-readable `WalkError` and underlying
 I/O error messages are diagnostic text, not a programmatic interface.
 `WalkError`'s `Display` names only the operation and the path, such as
-`read_dir src/locked`; the `io::Error` that says why is its `source()`. Error
-reporters that print the source chain, such as `anyhow`, therefore show the
+`read_dir src/locked`; the `io::Error` that says why is its `source()`, and
+`WalkError::io_kind()` is that error's `io::ErrorKind`, for branching without a
+downcast. Error reporters that print the source chain, such as `anyhow`, therefore show the
 cause once, and code that prints a `WalkError` by itself should print its
 source as well.
 
@@ -417,7 +433,9 @@ that pass is big enough to cancel out the threads the walk just used.
 `WalkEntry` keeps its native `Path`, while `Pattern` is byte-first; pass
 `WalkEntry::path_bytes()` to bridge them without allocating or converting
 through UTF-8. The bytes are the native `OsStr::as_encoded_bytes()` form: raw
-filesystem bytes on Unix and lossless WTF-8 on Windows (ADR-0005).
+filesystem bytes on Unix and lossless WTF-8 on Windows (ADR-0005). They include
+the root; for a pattern written relative to the root, as the walker's own are,
+pass `ferralk_glob::path_bytes(entry.relative_path())` instead.
 
 ```rust,no_run
 use ferralk::{Verdict, Walker, ferralk_glob::{Pattern, PatternOptions}};

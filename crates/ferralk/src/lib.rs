@@ -56,8 +56,9 @@
 //! Paths stay [`PathBuf`] throughout the public API. Patterns are matched
 //! against root-relative encoded path bytes; no filesystem result is converted
 //! through UTF-8. An entry's [`path`](WalkEntry::path) is its root joined with
-//! that relative path, so `Walker::new(".")` yields `./src/lib.rs`;
-//! [`WalkEntry::path_bytes`] hands the whole path, root included, to a
+//! that relative path, so `Walker::new(".")` yields `./src/lib.rs`, and
+//! [`relative_path`](WalkEntry::relative_path) is the `src/lib.rs` the
+//! patterns saw. [`ferralk_glob::path_bytes`] hands either to a
 //! [`ferralk_glob::Pattern`] of your own without allocating.
 //!
 //! The [usage guide](https://github.com/sebastian-software/ferralk/blob/main/docs/usage.md)
@@ -107,13 +108,10 @@
 //!         eprintln!("not walked: {error}");
 //!     }
 //!
-//!     // `path()` is the root joined with the relative path; strip the root
-//!     // to get the part the patterns matched.
-//!     let mut files = Vec::new();
-//!     for entry in result.entries() {
-//!         files.push(entry.path().strip_prefix(entry.root())?.to_path_buf());
-//!     }
-//!     Ok(files)
+//!     // `relative_path()` is `path()` without the root: the part the
+//!     // patterns matched.
+//!     let files = result.entries().iter().map(|entry| entry.relative_path().to_path_buf());
+//!     Ok(files.collect())
 //! }
 //! # let root = std::env::temp_dir().join(format!("ferralk-recipe-ignore-{}", std::process::id()));
 //! # let _ = std::fs::remove_dir_all(&root);
@@ -173,11 +171,7 @@
 //!     for error in result.errors() {
 //!         eprintln!("not walked: {error}");
 //!     }
-//!     let mut files = Vec::new();
-//!     for entry in result.entries() {
-//!         files.push(entry.path().strip_prefix(entry.root())?.to_path_buf());
-//!     }
-//!     Ok(files)
+//!     Ok(result.entries().iter().map(|entry| entry.relative_path().to_path_buf()).collect())
 //! }
 //! # let root = std::env::temp_dir().join(format!("ferralk-recipe-lists-{}", std::process::id()));
 //! # let _ = std::fs::remove_dir_all(&root);
@@ -270,7 +264,7 @@
 //! included, while `collect()` itself returns `Ok`. [`ErrorPolicy`] lists
 //! what `Skip` and `Abort` do instead. A [`WalkError`]'s `Display` names the
 //! operation and the path; the [`std::io::Error`] that says why is its
-//! `source()`.
+//! `source()`, and [`WalkError::io_kind`] is that error's kind.
 //!
 //! ```
 //! use std::{error::Error, io, path::Path};
@@ -284,13 +278,9 @@
 //!     for error in result.errors() {
 //!         // Decide from the operation and the `io::ErrorKind`, never from the
 //!         // message text.
-//!         let kind = error
-//!             .source()
-//!             .and_then(|cause| cause.downcast_ref::<io::Error>())
-//!             .map(io::Error::kind);
 //!         let cause = error.source().map(ToString::to_string).unwrap_or_default();
-//!         match (error.operation(), kind) {
-//!             (WalkOperation::ReadDir, Some(io::ErrorKind::NotFound)) => {
+//!         match (error.operation(), error.io_kind()) {
+//!             (WalkOperation::ReadDir, io::ErrorKind::NotFound) => {
 //!                 eprintln!("missing: {}", error.path().display());
 //!             }
 //!             _ => eprintln!("warning: {error}: {cause}"),
@@ -948,6 +938,34 @@ pub enum WalkEntryKind {
     Symlink,
 }
 
+/// A walk root as every entry found under it refers to it.
+///
+/// One allocation per root, shared by its entries: the spelling the caller
+/// gave, for [`WalkEntry::root`], and where the root-relative part of every
+/// path under it begins, for [`WalkEntry::relative_path`].
+pub(crate) struct SharedRoot {
+    path: PathBuf,
+    /// [`RootPlan::relative_start`] of this root.
+    relative_start: usize,
+}
+
+impl SharedRoot {
+    pub(crate) const fn new(path: PathBuf, relative_start: usize) -> Self {
+        Self {
+            path,
+            relative_start,
+        }
+    }
+}
+
+impl fmt::Debug for SharedRoot {
+    /// Only the path, so a [`WalkEntry`] debug-prints its root as it did when
+    /// the root was a bare path.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.path.fmt(formatter)
+    }
+}
+
 /// One matching filesystem entry.
 ///
 /// Entries are [`Clone`], so callers can retain an entry in more than one
@@ -958,7 +976,7 @@ pub struct WalkEntry {
     path: PathBuf,
     /// The walk root this entry was found under. Shared per root rather than
     /// copied per entry.
-    root: Arc<Path>,
+    root: Arc<SharedRoot>,
     is_dir: bool,
     is_symlink: bool,
     depth: usize,
@@ -1016,14 +1034,95 @@ impl WalkEntry {
     /// # use ferralk::Walker;
     /// let result = Walker::new("crates").add_root("tools")?.collect()?;
     /// for entry in result.entries() {
-    ///     let inside = entry.path().strip_prefix(entry.root()).expect("under its root");
+    ///     let inside = entry.relative_path();
     ///     println!("{} in {}", inside.display(), entry.root().display());
     /// }
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[must_use]
     pub fn root(&self) -> &Path {
-        &self.root
+        &self.root.path
+    }
+
+    /// The part of [`path`](Self::path) below [`root`](Self::root): the
+    /// spelling the walk matched its include and exclude patterns against.
+    ///
+    /// `path()` is the root exactly as it was given, then a separator unless
+    /// the root is empty or already ends in one, then this relative path. So
+    /// however the root is spelled, none of it shows up here:
+    ///
+    /// | Root | `path()` | `relative_path()` |
+    /// | --- | --- | --- |
+    /// | `.` or `./` | `./src/lib.rs` | `src/lib.rs` |
+    /// | `src` or `src/` | `src/lib.rs` | `lib.rs` |
+    /// | `x//y/` | `x//y/src/lib.rs` | `src/lib.rs` |
+    /// | `a/..` | `a/../src/lib.rs` | `src/lib.rs` |
+    /// | `/work/project` | `/work/project/src/lib.rs` | `src/lib.rs` |
+    ///
+    /// It is never empty, because a walk never returns its root. On Windows
+    /// its separators are `\`, which the walker's patterns and
+    /// [`ferralk_glob::Pattern`] read as `/`. It borrows from the entry: the
+    /// walk fixes once per root where the relative part begins, so this is a
+    /// slice of `path()` rather than a `path().strip_prefix(root())`, which
+    /// compares component by component on every call.
+    ///
+    /// To match an entry again with a [`ferralk_glob::Pattern`] of
+    /// your own, compiled in the walker's dialect, pass
+    /// [`ferralk_glob::path_bytes`]`(entry.relative_path())`:
+    ///
+    /// ```
+    /// use std::{error::Error, path::Path};
+    ///
+    /// use ferralk::{
+    ///     WalkOptions, Walker,
+    ///     ferralk_glob::{Pattern, PatternOptions, path_bytes},
+    /// };
+    ///
+    /// # let root = std::env::temp_dir().join(format!("ferralk-doc-relative-path-{}", std::process::id()));
+    /// # std::fs::create_dir_all(root.join("src"))?;
+    /// # std::fs::write(root.join("src/lib.rs"), "")?;
+    /// let result = Walker::new(&root)
+    ///     .include("src/*.rs")?
+    ///     .options(WalkOptions::default().files_only(true))
+    ///     .collect()?;
+    /// let entry = &result.entries()[0];
+    /// assert_eq!(entry.path(), root.join("src").join("lib.rs"));
+    /// assert_eq!(entry.relative_path(), Path::new("src/lib.rs"));
+    ///
+    /// let pattern = Pattern::compile("src/*.rs", PatternOptions::walker())?;
+    /// assert!(pattern.is_match_glob_path(path_bytes(entry.relative_path())));
+    /// # std::fs::remove_dir_all(&root)?;
+    /// # Ok::<(), Box<dyn Error>>(())
+    /// ```
+    #[must_use]
+    pub fn relative_path(&self) -> &Path {
+        path_from(&self.path, self.root.relative_start)
+    }
+
+    /// Consumes the entry and returns its [`path`](Self::path) without
+    /// copying it.
+    ///
+    /// ```
+    /// use std::{error::Error, path::PathBuf};
+    ///
+    /// use ferralk::{WalkEntry, WalkOptions, Walker};
+    ///
+    /// # let root = std::env::temp_dir().join(format!("ferralk-doc-into-path-{}", std::process::id()));
+    /// # std::fs::create_dir_all(root.join("src"))?;
+    /// # std::fs::write(root.join("src/lib.rs"), "")?;
+    /// let result = Walker::new(&root)
+    ///     .options(WalkOptions::default().files_only(true))
+    ///     .collect()?;
+    /// let (entries, errors) = result.into_parts();
+    /// assert!(errors.is_empty());
+    /// let paths: Vec<PathBuf> = entries.into_iter().map(WalkEntry::into_path).collect();
+    /// assert_eq!(paths, [root.join("src").join("lib.rs")]);
+    /// # std::fs::remove_dir_all(&root)?;
+    /// # Ok::<(), Box<dyn Error>>(())
+    /// ```
+    #[must_use]
+    pub fn into_path(self) -> PathBuf {
+        self.path
     }
 
     /// Whether this entry is a directory according to the selected backend.
@@ -1066,6 +1165,45 @@ impl WalkEntry {
     #[must_use]
     pub fn metadata(&self) -> Option<&fs::Metadata> {
         self.metadata.as_deref()
+    }
+}
+
+/// `path` from byte `start` on, where `start` is a component boundary.
+///
+/// On Unix the bytes are the path, so this is a slice.
+#[cfg(unix)]
+fn path_from(path: &Path, start: usize) -> &Path {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    Path::new(OsStr::from_bytes(bytes.get(start..).unwrap_or_default()))
+}
+
+/// `path` from byte `start` on, where `start` is a component boundary.
+///
+/// Elsewhere an `OsStr` cannot be sliced without `unsafe`, so this drops
+/// leading components until what remains is no longer than the suffix. The
+/// remainder `Components::as_path` reports starts at a component, never with a
+/// separator or a lone `.`, and a walked path below its root continues with a
+/// listed name, so it lands on the suffix exactly.
+#[cfg(not(unix))]
+fn path_from(path: &Path, start: usize) -> &Path {
+    path_suffix_by_components(path, start)
+}
+
+#[cfg(any(not(unix), test))]
+fn path_suffix_by_components(path: &Path, start: usize) -> &Path {
+    let suffix_len = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .len()
+        .saturating_sub(start);
+    let mut components = path.components();
+    loop {
+        let rest = components.as_path();
+        if rest.as_os_str().as_encoded_bytes().len() <= suffix_len || components.next().is_none() {
+            return rest;
+        }
     }
 }
 
@@ -1143,17 +1281,13 @@ impl fmt::Display for WalkOperation {
 /// // Branch on the typed parts, not on the text.
 /// assert_eq!(error.operation(), WalkOperation::ReadDir);
 /// assert_eq!(error.path(), missing);
-/// let kind = error
-///     .source()
-///     .and_then(|cause| cause.downcast_ref::<io::Error>())
-///     .map(io::Error::kind);
-/// assert_eq!(kind, Some(io::ErrorKind::NotFound));
+/// assert_eq!(error.io_kind(), io::ErrorKind::NotFound);
 /// # Ok::<(), ferralk::WalkError>(())
 /// ```
 ///
 /// The wording is diagnostic text, not a programmatic interface; match on
-/// [`operation()`](Self::operation), [`path()`](Self::path), and the source's
-/// [`std::io::ErrorKind`] instead.
+/// [`operation()`](Self::operation), [`path()`](Self::path), and
+/// [`io_kind()`](Self::io_kind) instead.
 #[derive(Debug)]
 pub struct WalkError {
     operation: WalkOperation,
@@ -1180,6 +1314,41 @@ impl WalkError {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The [`std::io::ErrorKind`] of the underlying I/O error: why the
+    /// operation failed, in the form a program branches on.
+    ///
+    /// Every `WalkError` is an I/O failure, and its [`source()`](Error::source)
+    /// is always that [`std::io::Error`]. This is its
+    /// [`kind()`](std::io::Error::kind) without downcasting the source first;
+    /// the source remains the way to its message or
+    /// [`raw_os_error()`](std::io::Error::raw_os_error).
+    ///
+    /// ```
+    /// use std::io;
+    ///
+    /// use ferralk::{WalkOperation, Walker};
+    ///
+    /// let missing = std::env::temp_dir().join("ferralk-doc-io-kind-missing-root");
+    /// let result = Walker::new(&missing).collect()?;
+    /// for error in result.errors() {
+    ///     match (error.operation(), error.io_kind()) {
+    ///         (WalkOperation::ReadDir, io::ErrorKind::NotFound) => {
+    ///             eprintln!("missing: {}", error.path().display());
+    ///         }
+    ///         (_, io::ErrorKind::PermissionDenied) => {
+    ///             eprintln!("not allowed: {}", error.path().display());
+    ///         }
+    ///         _ => eprintln!("warning: {error}"),
+    ///     }
+    /// }
+    /// assert_eq!(result.errors()[0].io_kind(), io::ErrorKind::NotFound);
+    /// # Ok::<(), ferralk::WalkError>(())
+    /// ```
+    #[must_use]
+    pub fn io_kind(&self) -> std::io::ErrorKind {
+        self.source.kind()
     }
 }
 
@@ -1239,6 +1408,12 @@ pub enum Verdict {
 /// }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
+///
+/// Iterating a `WalkResult`, owned or borrowed, yields every entry as `Ok`
+/// and then every error as `Err`, the item type a [`WalkStream`] has, so a
+/// `for` loop cannot pass over the errors unseen. [`entries`](Self::entries)
+/// and [`into_parts`](Self::into_parts) take the entries alone, where the
+/// errors are handled separately.
 #[must_use = "a walk reports recoverable errors, even a root that cannot be read, only through `errors()`"]
 #[derive(Debug)]
 pub struct WalkResult {
@@ -1274,6 +1449,199 @@ impl WalkResult {
     }
 }
 
+/// Every entry as `Ok`, then every error as `Err`.
+///
+/// The items are those of a [`WalkStream`], so code written for one reads a
+/// collected walk too, and a loop has to say what an error means. The
+/// entries come first, in the order [`WalkResult::entries`] holds them, sorted
+/// if [`WalkOptions::sort`] asked for it; the errors follow in the order
+/// [`WalkResult::errors`] holds them. [`WalkResult::was_cancelled`] is not an
+/// item: read it before consuming the result.
+///
+/// ```
+/// use std::{error::Error, path::PathBuf};
+///
+/// use ferralk::{WalkEntry, WalkError, WalkOptions, Walker};
+///
+/// # let root = std::env::temp_dir().join(format!("ferralk-doc-into-iter-{}", std::process::id()));
+/// # std::fs::create_dir_all(root.join("src"))?;
+/// # std::fs::write(root.join("src/lib.rs"), "")?;
+/// let walker = Walker::new(&root).options(WalkOptions::default().files_only(true));
+///
+/// // Every path, or the first error.
+/// let paths = walker
+///     .clone()
+///     .collect()?
+///     .into_iter()
+///     .map(|item| item.map(WalkEntry::into_path))
+///     .collect::<Result<Vec<PathBuf>, WalkError>>()?;
+/// assert_eq!(paths, [root.join("src").join("lib.rs")]);
+///
+/// // Every path, reporting each error and going on.
+/// for item in walker.add_root(root.join("missing"))?.collect()? {
+///     match item {
+///         Ok(entry) => println!("{}", entry.relative_path().display()),
+///         Err(error) => eprintln!("not walked: {error}"),
+///     }
+/// }
+/// # std::fs::remove_dir_all(&root)?;
+/// # Ok::<(), Box<dyn Error>>(())
+/// ```
+impl IntoIterator for WalkResult {
+    type Item = Result<WalkEntry, WalkError>;
+    type IntoIter = WalkResultIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        WalkResultIntoIter {
+            entries: self.entries.into_iter(),
+            errors: self.errors.into_iter(),
+        }
+    }
+}
+
+/// Every entry as `Ok`, then every error as `Err`, borrowed.
+///
+/// The same order as the owned iteration: [`WalkResult::entries`], then
+/// [`WalkResult::errors`].
+///
+/// ```
+/// use std::error::Error;
+///
+/// use ferralk::{WalkOptions, Walker};
+///
+/// # let root = std::env::temp_dir().join(format!("ferralk-doc-iter-{}", std::process::id()));
+/// # std::fs::create_dir_all(root.join("src"))?;
+/// # std::fs::write(root.join("src/lib.rs"), "")?;
+/// let result = Walker::new(&root)
+///     .add_root(root.join("missing"))?
+///     .options(WalkOptions::default().files_only(true))
+///     .collect()?;
+///
+/// let (mut found, mut failed) = (0, 0);
+/// for item in &result {
+///     match item {
+///         Ok(entry) => {
+///             println!("{}", entry.relative_path().display());
+///             found += 1;
+///         }
+///         Err(error) => {
+///             eprintln!("not walked: {error}");
+///             failed += 1;
+///         }
+///     }
+/// }
+/// assert_eq!((found, failed), (1, 1));
+/// # std::fs::remove_dir_all(&root)?;
+/// # Ok::<(), Box<dyn Error>>(())
+/// ```
+impl<'a> IntoIterator for &'a WalkResult {
+    type Item = Result<&'a WalkEntry, &'a WalkError>;
+    type IntoIter = WalkResultIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        WalkResultIter {
+            entries: self.entries.iter(),
+            errors: self.errors.iter(),
+        }
+    }
+}
+
+/// Owning iterator over a [`WalkResult`]: every entry as `Ok`, then every
+/// error as `Err`.
+///
+/// Returned by `WalkResult::into_iter`, which a `for` loop over a
+/// [`WalkResult`] calls. It knows how many items are left.
+///
+/// ```
+/// use ferralk::Walker;
+///
+/// let missing = std::env::temp_dir().join("ferralk-doc-into-iter-missing-root");
+/// let mut items = Walker::new(&missing).collect()?.into_iter();
+/// assert_eq!(items.len(), 1);
+/// let error = items.next().expect("one item").expect_err("the root is missing");
+/// assert_eq!(error.path(), missing);
+/// assert!(items.next().is_none());
+/// # Ok::<(), ferralk::WalkError>(())
+/// ```
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+#[derive(Debug)]
+pub struct WalkResultIntoIter {
+    entries: std::vec::IntoIter<WalkEntry>,
+    errors: std::vec::IntoIter<WalkError>,
+}
+
+impl Iterator for WalkResultIntoIter {
+    type Item = Result<WalkEntry, WalkError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.entries.next() {
+            Some(entry) => Some(Ok(entry)),
+            None => self.errors.next().map(Err),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for WalkResultIntoIter {
+    fn len(&self) -> usize {
+        self.entries.len() + self.errors.len()
+    }
+}
+
+impl std::iter::FusedIterator for WalkResultIntoIter {}
+
+/// Borrowing iterator over a [`WalkResult`]: every entry as `Ok`, then every
+/// error as `Err`.
+///
+/// Returned by `(&result).into_iter()`, which a `for` loop over `&result`
+/// calls. It knows how many items are left, and iterator adapters work on it
+/// as on any other:
+///
+/// ```
+/// use ferralk::Walker;
+///
+/// let missing = std::env::temp_dir().join("ferralk-doc-iter-missing-root");
+/// let result = Walker::new(&missing).collect()?;
+/// assert_eq!((&result).into_iter().len(), 1);
+/// let failed = (&result).into_iter().filter(Result::is_err).count();
+/// assert_eq!(failed, result.errors().len());
+/// # Ok::<(), ferralk::WalkError>(())
+/// ```
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+#[derive(Debug, Clone)]
+pub struct WalkResultIter<'a> {
+    entries: std::slice::Iter<'a, WalkEntry>,
+    errors: std::slice::Iter<'a, WalkError>,
+}
+
+impl<'a> Iterator for WalkResultIter<'a> {
+    type Item = Result<&'a WalkEntry, &'a WalkError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.entries.next() {
+            Some(entry) => Some(Ok(entry)),
+            None => self.errors.next().map(Err),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for WalkResultIter<'_> {
+    fn len(&self) -> usize {
+        self.entries.len() + self.errors.len()
+    }
+}
+
+impl std::iter::FusedIterator for WalkResultIter<'_> {}
+
 /// A borrowed per-entry visitor, shared by every worker of one walk.
 ///
 /// Behind a reference rather than a generic parameter: the walk already reaches
@@ -1297,8 +1665,9 @@ pub(crate) fn keep_every_entry(_: &WalkEntry) -> Verdict {
 struct RootPlan {
     path: PathBuf,
     /// Shared with every entry produced under this root, so an entry can name
-    /// its root without each one owning a copy of the path.
-    shared_path: Arc<Path>,
+    /// its root and find its root-relative part without each one owning a
+    /// copy of the path.
+    shared: Arc<SharedRoot>,
     /// Byte index at which the root-relative part of any path built under this
     /// root begins. See [`RootPlan::relative_start`].
     relative_start: usize,
@@ -1352,9 +1721,10 @@ impl RootPlan {
 
     /// A root with no patterns compiled for it yet.
     fn new(path: PathBuf) -> Self {
+        let relative_start = Self::relative_start(&path);
         Self {
-            relative_start: Self::relative_start(&path),
-            shared_path: Arc::from(path.as_path()),
+            relative_start,
+            shared: Arc::new(SharedRoot::new(path.clone(), relative_start)),
             path,
             includes: Vec::new(),
             excludes: Vec::new(),
@@ -4349,6 +4719,230 @@ mod tests {
         }
     }
 
+    /// The component walk that stands in for byte slicing where an `OsStr`
+    /// cannot be sliced safely lands on the same suffix as the slice.
+    #[test]
+    fn component_suffix_agrees_with_the_byte_offset() {
+        for root in [
+            "", "/", ".", "./", ".//", "dir", "dir/", "dir//", "/a/b", "a//b/", "a/.", "a/./",
+            "./a/../b", "..", "../..",
+        ] {
+            let root = Path::new(root);
+            let start = super::RootPlan::relative_start(root);
+            for relative in ["x", ".x", "x/y", "x/.y/z", "..x"] {
+                let mut path = root.to_path_buf();
+                let mut native_relative = PathBuf::new();
+                for name in relative.split('/') {
+                    push_entry_name(&mut path, std::ffi::OsStr::new(name));
+                    push_entry_name(&mut native_relative, std::ffi::OsStr::new(name));
+                }
+                let bytes = path.as_os_str().as_encoded_bytes();
+                assert_eq!(
+                    super::path_suffix_by_components(&path, start)
+                        .as_os_str()
+                        .as_encoded_bytes(),
+                    &bytes[start..],
+                    "root {root:?}, relative {relative:?}"
+                );
+                assert_eq!(
+                    super::path_from(&path, start).as_os_str(),
+                    native_relative.as_os_str(),
+                    "root {root:?}, relative {relative:?}"
+                );
+            }
+        }
+    }
+
+    /// `relative_path` is the spelling the walker's patterns saw, whatever the
+    /// root's spelling, and a pattern compiled in the walker's dialect agrees
+    /// with the walk about it.
+    #[test]
+    fn relative_path_is_what_the_walker_patterns_matched() {
+        let fixture = Fixture::new();
+        for file in ["a/b/lib.rs", "a/b/.hidden.rs", "a/notes.md", "top.rs"] {
+            fixture.write(file);
+        }
+        let base = fixture.root.as_os_str().to_owned();
+        let spell = |suffix: &str| {
+            let mut root = base.clone();
+            root.push(suffix);
+            PathBuf::from(root)
+        };
+        let separator = std::path::MAIN_SEPARATOR_STR;
+        let spellings = [
+            spell(""),
+            spell(separator),
+            spell(&format!("{separator}{separator}")),
+            spell(&format!("{separator}.")),
+            spell(&format!("{separator}.{separator}")),
+            spell(&format!("{separator}a{separator}..")),
+            spell(&format!(
+                "{separator}a{separator}{separator}b{separator}..{separator}.."
+            )),
+        ];
+        let expected_all = [
+            "a",
+            "a/b",
+            "a/b/.hidden.rs",
+            "a/b/lib.rs",
+            "a/notes.md",
+            "top.rs",
+        ]
+        .map(PathBuf::from);
+        for root in &spellings {
+            let all = Walker::new(root)
+                .options(WalkOptions::default().sort(true))
+                .collect()
+                .expect("unfiltered walk succeeds");
+            assert!(all.errors().is_empty(), "root {root:?}: {:?}", all.errors());
+            let relative = all
+                .entries()
+                .iter()
+                .map(|entry| {
+                    assert_eq!(entry.root(), root.as_path());
+                    assert_eq!(entry.root().join(entry.relative_path()), entry.path());
+                    let path = entry.path().as_os_str().as_encoded_bytes();
+                    let tail = entry.relative_path().as_os_str().as_encoded_bytes();
+                    assert!(path.ends_with(tail) && !tail.is_empty());
+                    entry.relative_path().to_path_buf()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(relative, expected_all, "root {root:?}");
+
+            for glob in [
+                "**/*.rs",
+                "a/*",
+                "*.rs",
+                "a/**",
+                "**/b/*.rs",
+                "{top,a/b/lib}.rs",
+            ] {
+                let matcher = Pattern::compile(glob, PatternOptions::walker())
+                    .expect("the test pattern compiles");
+                let selected = Walker::new(root)
+                    .include(glob)
+                    .expect("the walker accepts the test pattern")
+                    .options(WalkOptions::default().sort(true))
+                    .collect()
+                    .expect("filtered walk succeeds");
+                let walked = selected
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.relative_path().to_path_buf())
+                    .collect::<Vec<_>>();
+                let matched = all
+                    .entries()
+                    .iter()
+                    .filter(|entry| {
+                        matcher.is_match_glob_path(ferralk_glob::path_bytes(entry.relative_path()))
+                    })
+                    .map(|entry| entry.relative_path().to_path_buf())
+                    .collect::<Vec<_>>();
+                assert_eq!(walked, matched, "root {root:?}, include {glob:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn walk_entry_debug_prints_its_root_as_a_path() {
+        let fixture = Fixture::new();
+        fixture.write("lib.rs");
+        let result = Walker::new(&fixture.root).collect().expect("walk succeeds");
+        let entry = &result.entries()[0];
+        let debug = format!("{entry:?}");
+        assert!(
+            debug.contains(&format!("root: {:?}", fixture.root)),
+            "{debug}"
+        );
+        assert_eq!(entry.clone().into_path(), entry.path());
+    }
+
+    #[test]
+    fn io_kind_is_the_kind_of_the_source() {
+        let fixture = Fixture::new();
+        let missing = fixture.root.join("missing");
+        let result = Walker::new(&missing)
+            .collect()
+            .expect("collect keeps the error");
+        let error = &result.errors()[0];
+        let source = std::error::Error::source(error)
+            .and_then(|cause| cause.downcast_ref::<std::io::Error>())
+            .expect("the source is an io::Error");
+        assert_eq!(error.io_kind(), source.kind());
+        assert_eq!(error.io_kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Iterating a result yields its entries as `Ok` in order, then its errors
+    /// as `Err` in order, owned and borrowed alike, and says how many are left.
+    #[test]
+    fn walk_result_iterates_entries_then_errors() {
+        let fixture = Fixture::new();
+        for file in ["a.rs", "b.rs", "c/d.rs"] {
+            fixture.write(file);
+        }
+        let missing = [
+            fixture.root.join("missing-1"),
+            fixture.root.join("missing-2"),
+        ];
+        let walk = || {
+            Walker::new(&fixture.root)
+                .add_roots(missing.clone())
+                .expect("roots are accepted")
+                .options(WalkOptions::default().sort(true))
+                .collect()
+                .expect("collect keeps the errors")
+        };
+        let result = walk();
+        let entries = result
+            .entries()
+            .iter()
+            .map(|entry| entry.path().to_path_buf())
+            .collect::<Vec<_>>();
+        let errors = result
+            .errors()
+            .iter()
+            .map(|error| error.path().to_path_buf())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(errors.len(), 2);
+
+        let mut borrowed = (&result).into_iter();
+        assert_eq!(borrowed.len(), 6);
+        assert_eq!(borrowed.size_hint(), (6, Some(6)));
+        let borrowed_items = borrowed
+            .by_ref()
+            .map(|item| match item {
+                Ok(entry) => Ok(entry.path().to_path_buf()),
+                Err(error) => Err(error.path().to_path_buf()),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(borrowed.len(), 0);
+        assert!(borrowed.next().is_none(), "the iterator is fused");
+
+        let mut owned = walk().into_iter();
+        assert_eq!(owned.len(), 6);
+        let first = owned.next();
+        assert!(matches!(first, Some(Ok(_))));
+        assert_eq!(owned.len(), 5);
+        let owned_items = first
+            .into_iter()
+            .chain(owned.by_ref())
+            .map(|item| {
+                item.map(WalkEntry::into_path)
+                    .map_err(|error| error.path().to_path_buf())
+            })
+            .collect::<Vec<_>>();
+        assert!(owned.next().is_none(), "the iterator is fused");
+
+        let expected = entries
+            .into_iter()
+            .map(Ok)
+            .chain(errors.into_iter().map(Err))
+            .collect::<Vec<_>>();
+        assert_eq!(borrowed_items, expected);
+        assert_eq!(owned_items, expected);
+    }
+
     #[test]
     fn extension_check_requires_a_period_before_the_literal_extension() {
         assert!(ends_with_extension(b"src/lib.rs", b"rs"));
@@ -4649,7 +5243,7 @@ mod tests {
     fn keeps_relative(relative: &Path, root: &Path, keeps: impl Fn(&WalkEntry) -> bool) -> bool {
         let entry = WalkEntry {
             path: root.join(relative),
-            root: std::sync::Arc::from(root),
+            root: super::RootPlan::new(root.to_path_buf()).shared,
             is_dir: false,
             is_symlink: false,
             depth: 0,
@@ -4899,48 +5493,41 @@ mod tests {
         }
     }
 
+    /// `entry.path().strip_prefix(root)`. Whenever `root` is the entry's own
+    /// root this also holds [`WalkEntry::relative_path`] to the same bytes, so
+    /// every walk these helpers read checks the accessor as well.
+    fn stripped(entry: &WalkEntry, root: &Path) -> PathBuf {
+        let stripped = entry
+            .path()
+            .strip_prefix(root)
+            .expect("entry is rooted in fixture");
+        if entry.root() == root {
+            assert_eq!(
+                entry.relative_path().as_os_str(),
+                stripped.as_os_str(),
+                "relative_path of {:?} under root {:?}",
+                entry.path(),
+                entry.root(),
+            );
+        }
+        stripped.to_path_buf()
+    }
+
     fn relative_paths(entries: &[WalkEntry], root: &Path) -> Vec<PathBuf> {
-        entries
-            .iter()
-            .map(|entry| {
-                entry
-                    .path()
-                    .strip_prefix(root)
-                    .expect("entry is rooted in fixture")
-                    .to_path_buf()
-            })
-            .collect()
+        entries.iter().map(|entry| stripped(entry, root)).collect()
     }
 
     fn relative_paths_and_depths(entries: &[WalkEntry], root: &Path) -> Vec<(PathBuf, usize)> {
         entries
             .iter()
-            .map(|entry| {
-                (
-                    entry
-                        .path()
-                        .strip_prefix(root)
-                        .expect("entry is rooted in fixture")
-                        .to_path_buf(),
-                    entry.depth(),
-                )
-            })
+            .map(|entry| (stripped(entry, root), entry.depth()))
             .collect()
     }
 
     fn rooted_relative_paths(entries: &[WalkEntry]) -> Vec<(PathBuf, PathBuf)> {
         let mut paths = entries
             .iter()
-            .map(|entry| {
-                (
-                    entry.root().to_path_buf(),
-                    entry
-                        .path()
-                        .strip_prefix(entry.root())
-                        .expect("entry is rooted in its declared root")
-                        .to_path_buf(),
-                )
-            })
+            .map(|entry| (entry.root().to_path_buf(), stripped(entry, entry.root())))
             .collect::<Vec<_>>();
         paths.sort_unstable();
         paths

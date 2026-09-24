@@ -137,12 +137,14 @@ pub struct ferralk::WalkEntry
 impl ferralk::WalkEntry
 pub fn ferralk::WalkEntry::basename(&self) -> core::option::Option<&std::ffi::os_str::OsStr>
 pub const fn ferralk::WalkEntry::depth(&self) -> usize
+pub fn ferralk::WalkEntry::into_path(self) -> std::path::PathBuf
 pub const fn ferralk::WalkEntry::is_dir(&self) -> bool
 pub const fn ferralk::WalkEntry::is_symlink(&self) -> bool
 pub const fn ferralk::WalkEntry::kind(&self) -> ferralk::WalkEntryKind
 pub fn ferralk::WalkEntry::metadata(&self) -> core::option::Option<&std::fs::Metadata>
 pub fn ferralk::WalkEntry::path(&self) -> &std::path::Path
 pub fn ferralk::WalkEntry::path_bytes(&self) -> &[u8]
+pub fn ferralk::WalkEntry::relative_path(&self) -> &std::path::Path
 pub fn ferralk::WalkEntry::root(&self) -> &std::path::Path
 impl core::clone::Clone for ferralk::WalkEntry
 pub fn ferralk::WalkEntry::clone(&self) -> ferralk::WalkEntry
@@ -157,6 +159,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferralk::WalkEntry
 impl core::panic::unwind_safe::UnwindSafe for ferralk::WalkEntry
 pub struct ferralk::WalkError
 impl ferralk::WalkError
+pub fn ferralk::WalkError::io_kind(&self) -> core::io::error::ErrorKind
 pub const fn ferralk::WalkError::operation(&self) -> ferralk::WalkOperation
 pub fn ferralk::WalkError::path(&self) -> &std::path::Path
 impl core::error::Error for ferralk::WalkError
@@ -209,6 +212,14 @@ pub fn ferralk::WalkResult::into_parts(self) -> (alloc::vec::Vec<ferralk::WalkEn
 pub const fn ferralk::WalkResult::was_cancelled(&self) -> bool
 impl core::fmt::Debug for ferralk::WalkResult
 pub fn ferralk::WalkResult::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::iter::traits::collect::IntoIterator for ferralk::WalkResult
+pub type ferralk::WalkResult::IntoIter = ferralk::WalkResultIntoIter
+pub type ferralk::WalkResult::Item = core::result::Result<ferralk::WalkEntry, ferralk::WalkError>
+pub fn ferralk::WalkResult::into_iter(self) -> Self::IntoIter
+impl<'a> core::iter::traits::collect::IntoIterator for &'a ferralk::WalkResult
+pub type &'a ferralk::WalkResult::IntoIter = ferralk::WalkResultIter<'a>
+pub type &'a ferralk::WalkResult::Item = core::result::Result<&'a ferralk::WalkEntry, &'a ferralk::WalkError>
+pub fn &'a ferralk::WalkResult::into_iter(self) -> Self::IntoIter
 impl core::marker::Freeze for ferralk::WalkResult
 impl core::marker::Send for ferralk::WalkResult
 impl core::marker::Sync for ferralk::WalkResult
@@ -216,6 +227,42 @@ impl core::marker::Unpin for ferralk::WalkResult
 impl core::marker::UnsafeUnpin for ferralk::WalkResult
 impl !core::panic::unwind_safe::RefUnwindSafe for ferralk::WalkResult
 impl !core::panic::unwind_safe::UnwindSafe for ferralk::WalkResult
+pub struct ferralk::WalkResultIntoIter
+impl core::fmt::Debug for ferralk::WalkResultIntoIter
+pub fn ferralk::WalkResultIntoIter::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::iter::traits::exact_size::ExactSizeIterator for ferralk::WalkResultIntoIter
+pub fn ferralk::WalkResultIntoIter::len(&self) -> usize
+impl core::iter::traits::iterator::Iterator for ferralk::WalkResultIntoIter
+pub type ferralk::WalkResultIntoIter::Item = core::result::Result<ferralk::WalkEntry, ferralk::WalkError>
+pub fn ferralk::WalkResultIntoIter::next(&mut self) -> core::option::Option<Self::Item>
+pub fn ferralk::WalkResultIntoIter::size_hint(&self) -> (usize, core::option::Option<usize>)
+impl core::iter::traits::marker::FusedIterator for ferralk::WalkResultIntoIter
+impl core::marker::Freeze for ferralk::WalkResultIntoIter
+impl core::marker::Send for ferralk::WalkResultIntoIter
+impl core::marker::Sync for ferralk::WalkResultIntoIter
+impl core::marker::Unpin for ferralk::WalkResultIntoIter
+impl core::marker::UnsafeUnpin for ferralk::WalkResultIntoIter
+impl !core::panic::unwind_safe::RefUnwindSafe for ferralk::WalkResultIntoIter
+impl !core::panic::unwind_safe::UnwindSafe for ferralk::WalkResultIntoIter
+pub struct ferralk::WalkResultIter<'a>
+impl core::iter::traits::exact_size::ExactSizeIterator for ferralk::WalkResultIter<'_>
+pub fn ferralk::WalkResultIter<'_>::len(&self) -> usize
+impl core::iter::traits::marker::FusedIterator for ferralk::WalkResultIter<'_>
+impl<'a> core::clone::Clone for ferralk::WalkResultIter<'a>
+pub fn ferralk::WalkResultIter<'a>::clone(&self) -> ferralk::WalkResultIter<'a>
+impl<'a> core::fmt::Debug for ferralk::WalkResultIter<'a>
+pub fn ferralk::WalkResultIter<'a>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a> core::iter::traits::iterator::Iterator for ferralk::WalkResultIter<'a>
+pub type ferralk::WalkResultIter<'a>::Item = core::result::Result<&'a ferralk::WalkEntry, &'a ferralk::WalkError>
+pub fn ferralk::WalkResultIter<'a>::next(&mut self) -> core::option::Option<Self::Item>
+pub fn ferralk::WalkResultIter<'a>::size_hint(&self) -> (usize, core::option::Option<usize>)
+impl<'a> core::marker::Freeze for ferralk::WalkResultIter<'a>
+impl<'a> core::marker::Send for ferralk::WalkResultIter<'a>
+impl<'a> core::marker::Sync for ferralk::WalkResultIter<'a>
+impl<'a> core::marker::Unpin for ferralk::WalkResultIter<'a>
+impl<'a> core::marker::UnsafeUnpin for ferralk::WalkResultIter<'a>
+impl<'a> !core::panic::unwind_safe::RefUnwindSafe for ferralk::WalkResultIter<'a>
+impl<'a> !core::panic::unwind_safe::UnwindSafe for ferralk::WalkResultIter<'a>
 pub struct ferralk::WalkStream
 impl ferralk::WalkStream
 pub const fn ferralk::WalkStream::was_cancelled(&self) -> bool

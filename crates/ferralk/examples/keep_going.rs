@@ -24,14 +24,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("{} entries", result.entries().len());
 
     for error in result.errors() {
-        let kind = error
-            .source()
-            .and_then(|cause| cause.downcast_ref::<io::Error>())
-            .map(io::Error::kind);
         // Decide from the typed parts; the message text is for people.
-        let advice = match (error.operation(), kind) {
-            (WalkOperation::ReadDir, Some(io::ErrorKind::NotFound)) => "does not exist",
-            (WalkOperation::ReadDir, Some(io::ErrorKind::PermissionDenied)) => "not permitted",
+        let advice = match (error.operation(), error.io_kind()) {
+            (WalkOperation::ReadDir, io::ErrorKind::NotFound) => "does not exist",
+            (WalkOperation::ReadDir, io::ErrorKind::PermissionDenied) => "not permitted",
             (WalkOperation::ReadIgnore, _) => "ignore rules skipped",
             _ => "not walked",
         };

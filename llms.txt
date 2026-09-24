@@ -30,16 +30,16 @@ Use `is_match_glob_path` for paths: it reads a pattern as a shell and the walker
 
 **Traps that compile and return the wrong result:**
 
-1. `collect()?` returns `Ok` even when the root does not exist or a directory could not be read. Check `result.errors()`. `ErrorPolicy::Skip` discards errors below the root; the default `Collect` keeps them.
+1. `collect()?` returns `Ok` even when the root does not exist or a directory could not be read. Check `result.errors()`, or iterate the result: `for item in result` yields entries as `Ok`, then errors as `Err`. Branch on `error.operation()` and `error.io_kind()`, not the message. `ErrorPolicy::Skip` discards errors below the root; the default `Collect` keeps them.
 2. Walker patterns are anchored at the root, unlike a slash-free `.gitignore` line: `exclude("target/**")` prunes only the top-level `target`. Write `**/target/**` for every depth.
 3. `*` never crosses `/` in the walker or `is_match_glob_path`, unlike `globset`: `*.rs` selects top-level files only; write `**/*.rs`.
 4. `**` is recursive only as a whole path component (`**`, `**/x`, `x/**`, `x/**/y`): `**/x` matches `x` and `a/x`, never `sx`. Elsewhere, as in `a**`, it is an ordinary star run.
 5. A leading `!` is not negation. `Walker::include` and `exclude` reject it and `Pattern::compile` reads a literal `!`. Split a fast-glob or globby list: entries with `!` go to `exclude()` without it, except `!(…)`, which is a negated extglob.
 6. `Walker::options(WalkOptions)` replaces every option; build one `WalkOptions` value and pass it once.
 7. `stream()` ignores `sort(true)`, and `take(n)` counts `Err` items: use `.filter_map(Result::ok).take(n)` or handle errors first.
-8. Returned paths include the root: `Walker::new(".")` yields `./src/lib.rs`. Use `entry.path().strip_prefix(entry.root())` for the relative path; `WalkEntry::path_bytes()` also includes the root.
+8. Returned paths include the root: `Walker::new(".")` yields `./src/lib.rs`. `entry.relative_path()` is `src/lib.rs`, the spelling the patterns matched; `WalkEntry::path_bytes()` also includes the root.
 9. Patterns use `/` and `\` escapes on every platform, Windows included. Never build a pattern with `PathBuf::join`; keep the root in `Walker::new(root)`.
-10. Patterns and candidates are bytes. For a `Path`, pass `path.as_os_str().as_encoded_bytes()`; a `&str` works as it is.
+10. Patterns and candidates are bytes. For a `Path`, pass `ferralk_glob::path_bytes(path)`; a `&str` works as it is.
 11. An include's `**` does not enter hidden directories: `include("**/*.ts")` misses `.cache/x.ts` until `match_hidden(true)`. Excludes are the opposite and cover hidden names as `.gitignore` lines do, even against an include that names one literally: `include(".github/**")` with `exclude("**/*.yml")` drops `.github/workflows/ci.yml`.
 12. There is no pattern-set type like `globset::GlobSet`: keep a `Vec<Pattern>` and ask `iter().any(…)` or `position(…)`.
 

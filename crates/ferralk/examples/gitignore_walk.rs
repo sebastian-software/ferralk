@@ -32,8 +32,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     for entry in result.entries() {
         // `path()` is the root joined with the relative path.
-        let relative = entry.path().strip_prefix(entry.root())?;
-        println!("{}", relative.display());
+        println!("{}", entry.relative_path().display());
     }
 
     // `collect()` returned `Ok`, but a directory that could not be read, even
