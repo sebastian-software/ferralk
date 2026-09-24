@@ -398,7 +398,10 @@ or install a different global allocator.
 An ordinary wildcard does not cover a leading period, so `**/*.ts` skips
 `.react-router/routes.ts` — the period belongs to a directory component, and
 the whole subtree stays out of the result. The rule holds inside one component
-too: `*.rs` matches `.rs` only with `match_hidden(true)`.
+too: `*.rs` matches `.rs` only with `match_hidden(true)`. A negated extglob
+is an ordinary wildcard for this rule: `!(x)` covers neither `.env` nor the
+hidden component of `a/.env`, and naming a hidden exception, as in `!(.env)`,
+opts no other hidden name in.
 `Walker::match_hidden(true)` opts in for include and exclude patterns alike:
 
 ```rust,no_run

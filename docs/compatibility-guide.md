@@ -363,7 +363,12 @@ and covered by the cross-platform corpus. See the
   `PatternOptions::match_hidden` for a compiled pattern, or
   `Walker::match_hidden` for a whole walk, to opt in; this is the
   POSIX-conservative default selected by ADR-0011. It holds inside one
-  component too: `*.rs` matches `.rs` only with `match_hidden` enabled.
+  component too: `*.rs` matches `.rs` only with `match_hidden` enabled. A
+  negated extglob such as `!(x)` is an ordinary wildcard for this rule: it
+  crosses a separator like `*` in the fnmatch reading, but neither consumes a
+  component-leading period nor stops right before one (issue #394). zlob
+  1.6.3's list matcher selects `a/.env` for `!(x)`; the corpus records that
+  verdict with ADR-0011 provenance in `dotfile-*negated-extglob-*`.
 - Under `PatternOptions::case_insensitive`, `[[:upper:]]` and `[[:lower:]]`
   fold symmetrically, so each matches every ASCII letter. Bash's `nocasematch`
   tests a POSIX class against the unfolded byte, so `[[:upper:]]` still
@@ -479,7 +484,8 @@ It is an audit of the current contract, not a second changelog.
 | Final 0.x: extglob escape reading | An extglob escape has only its escaped-byte reading, matching Bash and zlob; see the [matcher entry-point contract](#matcher). |
 | Final 0.x: Git bracket classes at slash endpoints | Slash endpoints preserve Git's range state and verdict; see [Git filesystem adaptations](#git-filesystem-adaptations). |
 | Final 0.x: settle the 1.0 contract | `WalkError::operation()` is typed; the extensible enums require fallback match arms; compiled `Pattern` values have no representation equality; and extglobs obey the same entry-point rules as plain patterns, including depth-zero `**/@(x)`. See the [stability contract](stability.md#public-enum-policy), [usage guide](usage.md#match-paths-deliberately), and [matcher table](#matcher). |
-| Final 0.x: absolute patterns under a root with `..` | A walk root with a `..` component rejects every absolute include or exclude, from `include`, `exclude`, `add_root`, and their `try_` forms, instead of selecting nothing when the pattern diverged from the root's spelling before the `..`; relative patterns are unaffected. See [absolute patterns](#absolute-patterns-and-the-caller-side-rewrite-they-replace). |
+| 1.0.0: absolute patterns under a root with `..` | A walk root with a `..` component rejects every absolute include or exclude, from `include`, `exclude`, `add_root`, and their `try_` forms, instead of selecting nothing when the pattern diverged from the root's spelling before the `..`; relative patterns are unaffected. See [absolute patterns](#absolute-patterns-and-the-caller-side-rewrite-they-replace). |
+| 1.0.0: negated extglobs and hidden components | Without `match_hidden`, `!(…)` selects no hidden component, including one it reaches by crossing a separator; see [deliberate differences](#deliberate-differences) and the [usage guide](usage.md#hidden-paths-two-separate-switches). |
 
 ## Defaults to review
 

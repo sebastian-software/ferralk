@@ -5928,9 +5928,13 @@ fn queue_extglob_group(
             queue_extglob_continuations(program, state, group.rest);
         }
         ExtglobKind::Negated => {
-            let component_end =
-                extglob_component_end(path, path_index, options, group.component_local);
-            state.excluded.resize(component_end - path_index + 1, false);
+            let stop_limit = negated_extglob_stop_limit(
+                path,
+                path_index,
+                extglob_component_end(path, path_index, options, group.component_local),
+                options,
+            );
+            state.excluded.resize(stop_limit - path_index, false);
             state.excluded.fill(false);
             matching_extglob_group_ends(
                 group,
@@ -5940,8 +5944,12 @@ fn queue_extglob_group(
                 state.prefix_sweep_state,
                 state.ends,
             );
+            // An alternative may match past the last permitted stop; the
+            // negation cannot stop there either way, so nothing is excluded.
             for &end in state.ends.iter() {
-                state.excluded[end - path_index] = true;
+                if let Some(excluded) = state.excluded.get_mut(end - path_index) {
+                    *excluded = true;
+                }
             }
             for offset in 0..state.excluded.len() {
                 if !state.excluded[offset] {
@@ -6232,6 +6240,27 @@ fn match_extglob_alternative_exact(
     let mut options = extglob_alternative_options(path, 0, options, root_component_local);
     options.candidate_starts_component = candidate_starts_component;
     Pattern::match_alternatives(&alternative.compiled, options, path)
+}
+
+/// One past the last offset at which a negated group's span may stop, given
+/// the `component_end` its locality allows.
+///
+/// A negation consumes matcher text like an ordinary `*`, so it observes the
+/// same leading-period rule (ADR-0011): without `match_hidden` it neither
+/// consumes the period that starts a component nor stops immediately before
+/// it, which would let a following literal opt into the hidden name
+/// implicitly. The group-start check already refuses a hidden component at
+/// `path_index` itself, so this bounds a span that would otherwise cross a
+/// separator into a hidden component.
+fn negated_extglob_stop_limit(
+    path: &[u8],
+    path_index: usize,
+    component_end: usize,
+    options: PatternOptions,
+) -> usize {
+    (path_index..component_end)
+        .find(|&index| star_stops_before_hidden_component(path, index, options))
+        .unwrap_or(component_end + 1)
 }
 
 fn extglob_component_end(
@@ -7594,6 +7623,58 @@ mod tests {
             .expect("period-enabled extglob compiles");
         assert!(hidden.is_match(".hidden"));
         assert!(!hidden.is_match(".gitignore"));
+    }
+
+    #[test]
+    fn negated_extglob_never_consumes_a_later_leading_period() {
+        // Issue #394: a negation spans matcher text like `*`, so after
+        // crossing a separator it must neither consume the period that starts
+        // the next component nor stop right before it, under any entry point
+        // or engine.
+        let options = PatternOptions::default().extglob(true);
+        let refused = [
+            ("!(x)", "a/.env"),
+            ("!(x)", ".env"),
+            ("a!(x)", "a/.env"),
+            ("src/!(x)", "src/a/.env"),
+            ("!(.env)", "a/.git"),
+            ("!(x)/b", "a/.c/b"),
+            // Like `*.env`, the negation may not stop immediately before the
+            // hidden component either, so the literal period cannot opt the
+            // hidden name in implicitly.
+            ("!(x).env", "a/.env"),
+        ];
+        for (pattern, path) in refused {
+            let matcher = Pattern::compile(pattern, options).expect("extglob compiles");
+            assert!(matcher.engines_agree(path), "{pattern} against {path}");
+            assert!(!matcher.is_match(path), "{pattern} against {path}");
+            assert!(!matcher.is_match_path(path), "{pattern} against {path}");
+            assert!(
+                !matcher.is_match_glob_path(path),
+                "{pattern} against {path}"
+            );
+
+            let hidden = Pattern::compile(pattern, options.match_hidden(true))
+                .expect("period-enabled extglob compiles");
+            assert!(hidden.engines_agree(path), "{pattern} against {path}");
+            assert!(
+                hidden.is_match(path),
+                "{pattern} against {path} with match_hidden"
+            );
+        }
+        let star = Pattern::compile("*.env", options).expect("star compiles");
+        assert!(!star.is_match("a/.env"));
+
+        // A period the pattern writes at the start of its own component still
+        // names the hidden component explicitly.
+        let explicit = Pattern::compile("!(x)/.env", options).expect("extglob compiles");
+        assert!(explicit.is_match("a/.env"));
+        assert!(explicit.is_match_path("a/.env"));
+        assert!(explicit.engines_agree("a/.env"));
+        // A period inside a component is an ordinary byte.
+        let inner = Pattern::compile("!(x)", options).expect("extglob compiles");
+        assert!(inner.is_match("a/b.env"));
+        assert!(inner.is_match_path("a/b.env"));
     }
 
     #[test]
