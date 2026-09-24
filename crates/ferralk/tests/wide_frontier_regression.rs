@@ -195,7 +195,7 @@ fn serial_peak(root: &Path, expected: usize) -> live_heap::Measurement {
         .expect("serial wide walk succeeds");
     let measurement = live_heap::finish();
     assert_eq!(result.entries().len(), expected);
-    std::hint::black_box(result);
+    let _ = std::hint::black_box(result);
     measurement
 }
 
@@ -219,7 +219,7 @@ fn parallel_peak(root: &Path, expected: usize) -> live_heap::Measurement {
         .expect("parallel wide walk succeeds");
     let measurement = live_heap::finish();
     assert_eq!(result.entries().len(), expected);
-    std::hint::black_box(result);
+    let _ = std::hint::black_box(result);
     measurement
 }
 

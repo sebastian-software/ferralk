@@ -132,7 +132,7 @@ fn count_parallel_walk(root: &Path) -> u64 {
 
     let outcome = outcome.expect("parallel allocation fixture walk succeeds");
     assert!(outcome.entries().is_empty());
-    black_box(outcome);
+    let _ = black_box(outcome);
     assert!(
         visited.load(Ordering::Relaxed) >= ENTRIES_PER_DIRECTORY * SMALL_DIRECTORY_COUNT,
         "the allocation pin must reach the fixture entries"

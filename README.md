@@ -161,6 +161,9 @@ let result = Walker::new(".")
     .options(WalkOptions::default().files_only(true).sort(true))
     .collect()?;
 
+// `collect()?` succeeded, but that does not mean the walk did: under the
+// default `ErrorPolicy::Collect` even a root that does not exist is reported
+// in `errors()` below rather than as `Err`.
 for entry in result.entries() {
     println!("{}", entry.path().display());
 }
