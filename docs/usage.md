@@ -58,8 +58,14 @@ is two ordinary stars: through `is_match` and `is_match_glob_path` that equals
 rather than behind the separator and follows the rule above.
 Extglob groups do not introduce a fourth policy: their outer wildcards and
 their alternatives use the same root and component rule selected by the entry
-point. A recursive `**/` prefix may consume zero directories before a group,
-so `**/@(x)` matches both `x` and `a/x` when both options are enabled.
+point. Through `is_match_path` a group directly behind a separator stands where
+a wildcard would, so `src/@(*.ts)` keeps `src/a/b.ts` out exactly like
+`src/*.ts`, `src/!(x)` matches within one component, and a later wildcard
+inside an alternative crosses again as in `a/b*`. Brace alternatives are
+judged one by one, so `{src/@(*.ts),lib/*}` and `{src/@(*.ts),zz}` answer
+alike for `src/a/b.ts`. A recursive `**/` prefix may consume zero directories
+before a group, so `**/@(x)` matches both `x` and `a/x` when both options are
+enabled.
 
 ```rust
 use ferralk_glob::{Pattern, PatternOptions};

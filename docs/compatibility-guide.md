@@ -43,8 +43,13 @@ callers do not need lossy UTF-8 conversion.
 
 Extglob groups use the same root and component rule as the selected entry
 point; enabling extglob never changes which ordinary wildcard positions may
-cross a separator. With recursive double stars enabled, `**/@(x)` matches at
-depth zero (`x`) as well as below a directory (`a/x`).
+cross a separator. Under `is_match_path`, a group directly after `/` takes the
+position of a wildcard there: `src/@(*.ts)` matches like `src/*.ts`, a
+negated group such as `src/!(x)` stays within one component, and a later
+wildcard inside an alternative crosses again as in `a/b*`. Each brace
+alternative is judged on its own, so a sibling never changes its verdict.
+With recursive double stars enabled, `**/@(x)` matches at depth zero (`x`) as
+well as below a directory (`a/x`).
 
 ## Walking
 
@@ -518,6 +523,7 @@ It is an audit of the current contract, not a second changelog.
 | 1.0.0: negated extglobs and hidden components | Without `match_hidden`, `!(…)` selects no hidden component, including one it reaches by crossing a separator; see [deliberate differences](#deliberate-differences) and the [usage guide](usage.md#hidden-paths-two-separate-switches). |
 | 1.0.0: walker `./` on brace alternatives | Includes and excludes ignore one leading `./` on every brace-expanded alternative, as the path matchers do: `{./src/*.rs,lib/*.rs}` selects from both directories instead of silently dropping the `./` alternative, and `{./src/*.rs,./lib/*.rs}` is accepted instead of rejected as an unnormalized `.` component. See [walking](#walking) and the [usage guide](usage.md#walk-filesystems-with-explicit-policy). |
 | 1.0.0: leading `!` in walker patterns | `include`, `exclude`, and their `try_` forms reject a pattern or brace alternative that starts with `!` not followed by `(`, instead of compiling it as a literal `!` that selects nothing; `\!` and `!(…)` are unchanged. See [migrating from fast-glob](#migrating-patterns-from-globset-or-fast-glob). |
+| 1.0.0: extglob position rule in path filters | Under `is_match_path` a group directly after `/` is component-local like a wildcard there, and brace alternatives are judged independently; under both path entry points a separator-crossing star before a component-local one keeps its backtrack point (`**/*.@(ts\|js)` reaches every depth) and a separator spelled inside a group matches as written. See the [matcher table](#matcher) and [usage guide](usage.md#match-paths-deliberately). |
 
 ## Defaults to review
 

@@ -103,6 +103,19 @@ pub(crate) struct NarrowSweepEngine {
     match_hidden: bool,
     /// The option the byte table was folded under, pinned likewise.
     case_insensitive: bool,
+    /// Whether position zero is an ordinary wildcard. It is then
+    /// component-local under `candidate_root_component_wildcard` too, as an
+    /// extglob alternative directly behind a separator has it.
+    root_wildcard: bool,
+}
+
+/// Whether the first token is an ordinary (non-recursive) wildcard, the one
+/// position `candidate_root_component_wildcard` makes component-local.
+fn root_wildcard(tokens: &[Token]) -> bool {
+    matches!(
+        tokens.first(),
+        Some(Token::Any | Token::Class(_) | Token::Star)
+    )
 }
 
 impl SweepEngine {
@@ -133,6 +146,7 @@ impl SweepEngine {
             initial: 0,
             match_hidden: options.match_hidden,
             case_insensitive: options.case_insensitive,
+            root_wildcard: root_wildcard(tokens),
         };
 
         // Wildcard positions answer to the component and leading-dot
@@ -403,7 +417,9 @@ impl NarrowSweepEngine {
         } else if options.root_component_wildcards {
             self.sep_block_glob
         } else {
+            // Position zero is bit zero.
             self.sep_block_component
+                | u64::from(options.candidate_root_component_wildcard && self.root_wildcard)
         };
 
         let separator = is_separator(byte);
@@ -453,6 +469,8 @@ pub(crate) struct WideSweepEngine {
     initial: Vec<u64>,
     match_hidden: bool,
     case_insensitive: bool,
+    /// See [`NarrowSweepEngine::root_wildcard`].
+    root_wildcard: bool,
 }
 
 impl WideSweepEngine {
@@ -485,6 +503,7 @@ impl WideSweepEngine {
             initial: vec![0; word_count],
             match_hidden: options.match_hidden,
             case_insensitive: options.case_insensitive,
+            root_wildcard: root_wildcard(tokens),
         };
         set_bit(&mut engine.accept, position_count);
 
@@ -623,10 +642,22 @@ impl WideSweepEngine {
             None
         };
 
+        // Position zero is bit zero of word zero.
+        let root_block = u64::from(
+            separator
+                && options.component_wildcards
+                && !options.root_component_wildcards
+                && options.candidate_root_component_wildcard
+                && self.root_wildcard,
+        );
+
         let mut carry = 0_u64;
         let mut any = false;
         for index in 0..word_count {
-            let mask = row[index] & !blocked.map_or(0, |bits| bits[index]);
+            let mut mask = row[index] & !blocked.map_or(0, |bits| bits[index]);
+            if index == 0 {
+                mask &= !root_block;
+            }
             let consuming = state[index] & mask;
             let advancing = consuming & !self.stars[index];
             let shifted = (advancing << 1) | carry;

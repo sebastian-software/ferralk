@@ -245,6 +245,33 @@ fn match_hidden_reaches_excludes_and_the_prune_planner_alike() {
     );
 }
 
+/// An extglob behind a component-local star used to lose the recursive
+/// prefix's backtrack point, so `**/*.@(ts|js)` stopped one directory deep
+/// while `**/*.ts` did not (issue #393).
+#[test]
+fn recursive_include_with_an_extglob_suffix_reaches_every_depth() {
+    let fixture = Fixture::new();
+    fixture.write("a.ts");
+    fixture.write("src/b.js");
+    fixture.write("src/lib/c.ts");
+    fixture.write("src/lib/deep/d.js");
+    fixture.write("src/lib/deep/e.rs");
+
+    let selected = paths_from_every_frontend(
+        |walker| walker.include("**/*.@(ts|js)").expect("valid include"),
+        &fixture.root,
+    );
+    assert_eq!(
+        selected,
+        vec![
+            PathBuf::from("a.ts"),
+            PathBuf::from("src/b.js"),
+            PathBuf::from("src/lib/c.ts"),
+            PathBuf::from("src/lib/deep/d.js"),
+        ]
+    );
+}
+
 #[test]
 fn collect_retains_a_disappearing_root_error() {
     let fixture = Fixture::new();
