@@ -120,6 +120,7 @@ These compile and return a plausible, wrong result:
 - Directories are returned unless `files_only(true)`; the root never is.
 - Patterns use `/` and `\` escapes on every platform; never build one with
   `PathBuf::join`. Match a `Path` as `ferralk_glob::path_bytes(path)`.
+  Put a path or user text into a pattern with `ferralk_glob::escape_str`.
 
 ## Before you finish
 

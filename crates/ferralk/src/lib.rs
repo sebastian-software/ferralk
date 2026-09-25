@@ -9650,13 +9650,7 @@ mod tests {
         fixture.write(format!("{name}/src/a.ts"));
         fixture.write(format!("{name}/src/deep/b.ts"));
         let root = fixture.root.join(name);
-        let escaped: String = name
-            .chars()
-            .flat_map(|character| {
-                let syntax = "\\*?[]{}(),|!@+".contains(character);
-                syntax.then_some('\\').into_iter().chain([character])
-            })
-            .collect();
+        let escaped = ferralk_glob::escape_str(name);
 
         let walk = |pattern: &str| -> Vec<PathBuf> {
             let result = Walker::new(&root)
@@ -9682,6 +9676,108 @@ mod tests {
                 .include(fixture.absolute(&format!("/{name}/src/*.ts")))
                 .is_err()
         );
+    }
+
+    /// `ferralk_glob::escape` turns a name into a walker pattern that selects
+    /// that entry and nothing else, as an include and as an exclude, for names
+    /// whose unescaped spelling would select their siblings instead.
+    #[test]
+    fn an_escaped_name_selects_exactly_that_entry() {
+        let fixture = Fixture::new();
+        let syntax = [
+            "a[b]",
+            "{x,y}",
+            "@(q)",
+            "!neg",
+            "+(p)",
+            "c,d",
+            "e f",
+            ".hidden[1]",
+        ];
+        // What the unescaped spellings above would select instead.
+        let siblings = ["a", "b", "x", "y", "q", "neg", "p", "ab"];
+        let mut names = [&syntax[..], &siblings[..]].concat();
+        if cfg!(unix) {
+            // Bytes a Windows name cannot contain.
+            names.extend(["*", "?", r"back\slash", "p|q", "backslash"]);
+        }
+        for name in &names {
+            fixture.write(format!("dir/{name}"));
+        }
+        let root = fixture.root.join("dir");
+        let files = || WalkOptions::default().sort(true).files_only(true);
+
+        for name in &names {
+            let escaped = ferralk_glob::escape(name);
+            let included = Walker::new(&root)
+                .include(&escaped)
+                .expect("an escaped name is a valid include")
+                .options(files())
+                .collect()
+                .expect("walk succeeds");
+            assert_eq!(
+                relative_paths(included.entries(), &root),
+                vec![PathBuf::from(name)],
+                "include {name}"
+            );
+
+            let excluded = Walker::new(&root)
+                .exclude(&escaped)
+                .expect("an escaped name is a valid exclude")
+                .options(files())
+                .collect()
+                .expect("walk succeeds");
+            let mut rest: Vec<PathBuf> = names
+                .iter()
+                .filter(|other| *other != name)
+                .map(PathBuf::from)
+                .collect();
+            rest.sort();
+            assert_eq!(
+                relative_paths(excluded.entries(), &root),
+                rest,
+                "exclude {name}"
+            );
+        }
+    }
+
+    /// Every escaped relative path is a pattern the walker accepts, unless the
+    /// path itself has a shape no walk candidate has: an empty, `.` or `..`
+    /// component, a trailing `/`, or on Windows a byte no name can contain.
+    #[test]
+    fn the_walker_accepts_every_escaped_candidate_path() {
+        const ALPHABET: &[u8] = b"\\*?[]{}(),|!@+-^./aZ: \xc3\xa9";
+        let mut seed = 0x0E5C_A9ED_7A1C_0001_u64;
+        let mut next = move |bound: usize| {
+            seed = seed.wrapping_mul(0x2545_F491_4F6C_DD1D).wrapping_add(1);
+            (usize::try_from(seed >> 33).expect("31 bits fit a usize")) % bound
+        };
+        let mut accepted = 0;
+        for _ in 0..5_000 {
+            let text: Vec<u8> = (0..1 + next(10))
+                .map(|_| ALPHABET[next(ALPHABET.len())])
+                .collect();
+            let path_shaped = text
+                .split(|&byte| byte == b'/')
+                .any(|component| matches!(component, b"" | b"." | b".."));
+            let windows_forbidden =
+                cfg!(windows) && text.iter().any(|byte| b"\\:*?\"<>|".contains(byte));
+            if path_shaped || windows_forbidden {
+                continue;
+            }
+            let escaped = ferralk_glob::escape(&text);
+            let mut walker = Walker::new(".");
+            for result in [
+                walker.try_include(&escaped).map(|_| ()),
+                walker.try_exclude(&escaped).map(|_| ()),
+            ] {
+                if let Err(error) = result {
+                    panic!("{:?} was rejected: {error}", String::from_utf8_lossy(&text));
+                }
+            }
+            accepted += 1;
+        }
+        assert!(accepted > 1_000, "only {accepted} paths were generated");
     }
 
     /// The mode from #83 is about how far a wildcard reaches, and rewriting is

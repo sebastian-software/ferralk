@@ -298,6 +298,9 @@ Using Ferralk:
   walking semantics, and operational guidance.
 - [1.x stability contract](docs/stability.md) — the semver-covered surface,
   MSRV policy, and explicit exclusions.
+- [Consumer pattern contract](docs/consumer-contract.md) — for programs that
+  pass their users' globs on: what 1.x covers, validating and escaping a
+  pattern, and porting from `globset`.
 - [Benchmark evidence](docs/benchmark-evidence.md) — what is measured, how to
   reproduce it, and what it does not establish.
 - [Verification depth](docs/verification-comparison.md) — the checked-in

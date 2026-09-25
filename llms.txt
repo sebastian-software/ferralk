@@ -39,7 +39,7 @@ Use `is_match_glob_path` for paths: it reads a pattern as a shell and the walker
 6. `Walker::options(WalkOptions)` replaces every option; build one `WalkOptions` value and pass it once.
 7. `stream()` ignores `sort(true)`, and `take(n)` counts `Err` items: use `.filter_map(Result::ok).take(n)` or handle errors first.
 8. Returned paths include the root: `Walker::new(".")` yields `./src/lib.rs`. `entry.relative_path()` is `src/lib.rs`, the spelling the patterns matched; `WalkEntry::path_bytes()` also includes the root.
-9. Patterns use `/` and `\` escapes on every platform, Windows included. Never build a pattern with `PathBuf::join`; keep the root in `Walker::new(root)`.
+9. Patterns use `/` and `\` escapes on every platform, Windows included. Never build a pattern with `PathBuf::join`; keep the root in `Walker::new(root)`. To put a path or user text into a pattern literally, use `ferralk_glob::escape_str` (or `escape` for bytes); on Windows replace `\` with `/` first.
 10. Patterns and candidates are bytes. For a `Path`, pass `ferralk_glob::path_bytes(path)`; a `&str` works as it is.
 11. An include's `**` does not enter hidden directories: `include("**/*.ts")` misses `.cache/x.ts` until `match_hidden(true)`. Excludes are the opposite and cover hidden names as `.gitignore` lines do, even against an include that names one literally: `include(".github/**")` with `exclude("**/*.yml")` drops `.github/workflows/ci.yml`.
 12. For a list of globs use `ferralk_glob::PatternSet`, the `globset::GlobSet` counterpart: `PatternSet::new(globs, PatternOptions::walker())?`, then `is_match_glob_path(path)` or `matches_glob_path_into(path, &mut indices)`. Its methods read patterns like the `Pattern` entry point of the same name, so `PatternSet::is_match` crosses `/`; a looped `Vec<Pattern>` answers the same, only slower.
@@ -48,7 +48,7 @@ Use `is_match_glob_path` for paths: it reads a pattern as a shell and the walker
 ## Recipes
 
 - [ferralk recipes](https://docs.rs/ferralk/latest/ferralk/#recipes): tested examples for listing files with `.gitignore`, include and exclude lists from a fast-glob style list, stopping early, continuing past errors, cancelling from another thread, and async use with `spawn_blocking`.
-- [ferralk-glob recipes](https://docs.rs/ferralk-glob/latest/ferralk_glob/#recipes): matching one path against several globs, porting a fast-glob `!` list, matching a `Path`, filtering lists, reporting an invalid pattern at its offset.
+- [ferralk-glob recipes](https://docs.rs/ferralk-glob/latest/ferralk_glob/#recipes): matching one path against several globs, porting a fast-glob `!` list, matching a `Path`, putting literal text into a pattern, filtering lists, reporting an invalid pattern at its offset.
 - [Examples](https://github.com/sebastian-software/ferralk/tree/main/crates/ferralk/examples): one program per recipe, run as `cargo run -p ferralk --example <gitignore_walk|include_exclude|early_stop|keep_going> -- <root>`.
 - [Agent skill](https://raw.githubusercontent.com/sebastian-software/ferralk/main/skills/ferralk/SKILL.md): this guidance as a loadable skill for coding agents.
 
@@ -56,8 +56,9 @@ Use `is_match_glob_path` for paths: it reads a pattern as a shell and the walker
 
 - [Usage guide](https://raw.githubusercontent.com/sebastian-software/ferralk/main/docs/usage.md): every walker default and the switch that changes it, the matcher entry points and options, errors, cancellation, hidden files.
 - [Compatibility guide](https://raw.githubusercontent.com/sebastian-software/ferralk/main/docs/compatibility-guide.md): a migration table from `globset`, `glob`, fast-glob and globby, `ignore`, and `walkdir`, then the mapping from zlob 1.6.3.
+- [Consumer pattern contract](https://raw.githubusercontent.com/sebastian-software/ferralk/main/docs/consumer-contract.md): for a program that passes its users' globs on: what 1.x covers per dialect and entry point, validating with `Walker::try_include`, escaping literal text with `ferralk_glob::escape`, which error fields are stable, and porting from `globset`.
 - [ferralk API](https://docs.rs/ferralk): `Walker`, `WalkOptions`, `WalkResult`, `WalkEntry`, `WalkError`, `ErrorPolicy`, `CancellationToken`.
-- [ferralk-glob API](https://docs.rs/ferralk-glob): `Pattern`, `PatternSet`, `PatternOptions`, `PatternError`, `PatternSetError`.
+- [ferralk-glob API](https://docs.rs/ferralk-glob): `Pattern`, `PatternSet`, `PatternOptions`, `PatternError`, `PatternSetError`, `escape`.
 
 ## Optional
 

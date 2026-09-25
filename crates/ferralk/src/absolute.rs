@@ -16,10 +16,10 @@
 //!
 //! A walk root whose own name contains pattern syntax - `*`, `?`, `[`, `{`,
 //! `\` and the rest - is spelled in front of a pattern with each of those
-//! bytes escaped by a `\`. The part of the pattern that names the root may
-//! contain those escapes and nothing else: an unescaped wildcard there, or an
-//! escape of an ordinary byte, is reported as unrewritable rather than guessed
-//! at.
+//! bytes escaped by a `\`, which is what `ferralk_glob::escape` produces. The
+//! part of the pattern that names the root may contain those escapes and
+//! nothing else: an unescaped wildcard there, or an escape of an ordinary
+//! byte, is reported as unrewritable rather than guessed at.
 
 use std::borrow::Cow;
 
@@ -412,7 +412,8 @@ fn next_component(pattern: &[u8], offset: usize) -> Option<(&[u8], usize)> {
 }
 
 /// Bytes that are pattern syntax somewhere in the walker's dialect, and so the
-/// ones a caller escapes to spell a root whose name contains them.
+/// ones a caller escapes to spell a root whose name contains them: the set
+/// `ferralk_glob::escape` escapes.
 const PATTERN_SYNTAX: &[u8] = b"\\*?[]{}(),|!@+";
 
 /// The name a component at or above the walk root spells, when its only syntax
@@ -746,6 +747,19 @@ mod tests {
             ),
             "a wildcard at or above the walk root cannot be made relative to it"
         );
+    }
+
+    /// The root part accepts exactly the escapes `ferralk_glob::escape`
+    /// produces, so an escaped root always rewrites and nothing else does.
+    #[test]
+    fn the_root_syntax_set_is_what_escape_escapes() {
+        for byte in 0..=u8::MAX {
+            assert_eq!(
+                ferralk_glob::escape([byte]).len() == 2,
+                super::PATTERN_SYNTAX.contains(&byte),
+                "{byte:#04x}"
+            );
+        }
     }
 
     /// What stays refused at or above the root: anything that is not an escape

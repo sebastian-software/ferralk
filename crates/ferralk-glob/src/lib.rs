@@ -145,6 +145,30 @@
 //! A path that `ferralk` walked already carries its root-relative part as
 //! `WalkEntry::relative_path`, the spelling the walker's own patterns match.
 //!
+//! ## Put literal text into a pattern
+//!
+//! A directory name, a path, or user input can contain bytes that are syntax.
+//! [`escape`] and [`escape_str`] make them literal under every option
+//! combination with escaping enabled, so the text can be joined with glob
+//! syntax of the caller's own.
+//!
+//! ```
+//! use ferralk_glob::{Pattern, PatternOptions, escape_str};
+//!
+//! let directory = "reports {2024} [final]";
+//! let glob = format!("{}/**/*.csv", escape_str(directory));
+//! let pattern = Pattern::compile(&glob, PatternOptions::walker())?;
+//!
+//! assert!(pattern.is_match_glob_path("reports {2024} [final]/q1/sales.csv"));
+//! assert!(!pattern.is_match_glob_path("reports 2024 f/q1/sales.csv"));
+//!
+//! // Unescaped, the braces are an alternation and the brackets a class.
+//! let unescaped = Pattern::compile(format!("{directory}/**/*.csv"), PatternOptions::walker())?;
+//! assert!(unescaped.is_match_glob_path("reports 2024 f/q1/sales.csv"));
+//! assert!(!unescaped.is_match_glob_path("reports {2024} [final]/q1/sales.csv"));
+//! # Ok::<(), ferralk_glob::PatternError>(())
+//! ```
+//!
 //! ## Filter a list of paths
 //!
 //! [`Pattern::filter_paths`] keeps zlob's list rule, in which a wildcard in
@@ -4448,6 +4472,110 @@ impl ProvenanceBudget {
 #[must_use]
 pub fn path_bytes(path: &(impl AsRef<OsStr> + ?Sized)) -> &[u8] {
     path.as_ref().as_encoded_bytes()
+}
+
+/// Whether `byte` is pattern syntax under some [`PatternOptions`]: a wildcard,
+/// a class bracket, a brace or its separator, an extglob operator, parenthesis
+/// or separator, or the escape character itself.
+const fn is_syntax_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'\\'
+            | b'*'
+            | b'?'
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+            | b'('
+            | b')'
+            | b','
+            | b'|'
+            | b'!'
+            | b'@'
+            | b'+'
+    )
+}
+
+/// Escapes `text` so that it compiles to a pattern matching exactly `text`.
+///
+/// This is the counterpart of `globset::escape`, for user input or a path that
+/// has to become part of a pattern without its bytes turning into syntax. Every
+/// byte that is syntax under any [`PatternOptions`] gets a `\` in front of it:
+/// `\ * ? [ ] { } ( ) , | ! @ +`. The result is therefore literal whichever
+/// options it is compiled with, as long as
+/// [`escape`](PatternOptions::escape) stays enabled, which it is in both
+/// [`PatternOptions::default`] and [`PatternOptions::walker`].
+///
+/// Only syntax is escaped, not path structure. `/` still separates
+/// components, and a leading `./` is still the one the path entry points
+/// ignore, so the escaped text matches the way the unescaped path would under
+/// that entry point. Case folding, when enabled, applies to the escaped bytes
+/// as to any literal. Because `,` and `|` are escaped too, the result stays
+/// literal inside a brace or extglob alternative, and a leading `!` never
+/// reads as a walker negation.
+///
+/// ```
+/// use ferralk_glob::{Pattern, PatternOptions, escape};
+///
+/// let name = "notes [draft] {v2}.md";
+/// let escaped = escape(name);
+/// assert_eq!(escaped, br"notes \[draft\] \{v2\}.md");
+///
+/// let pattern = Pattern::compile(&escaped, PatternOptions::walker())?;
+/// assert!(pattern.is_match_glob_path(name));
+/// assert!(!pattern.is_match_glob_path("notes d {v2}.md"));
+///
+/// // Escaped text composes with pattern syntax around it.
+/// let mut below = escape("/work/app[1]");
+/// below.extend_from_slice(b"/**/*.{ts,tsx}");
+/// let pattern = Pattern::compile(&below, PatternOptions::walker())?;
+/// assert!(pattern.is_match_glob_path("/work/app[1]/src/main.tsx"));
+/// assert!(!pattern.is_match_glob_path("/work/app1/src/main.tsx"));
+/// # Ok::<(), ferralk_glob::PatternError>(())
+/// ```
+///
+/// [`escape_str`] does the same for a `&str` and returns a `String`.
+#[must_use]
+pub fn escape(text: impl AsRef<[u8]>) -> Vec<u8> {
+    let text = text.as_ref();
+    let mut escaped = Vec::with_capacity(text.len());
+    for &byte in text {
+        if is_syntax_byte(byte) {
+            escaped.push(b'\\');
+        }
+        escaped.push(byte);
+    }
+    escaped
+}
+
+/// [`escape`] for UTF-8 text, returning a `String`.
+///
+/// Every escaped byte is ASCII, so the result is valid UTF-8 whenever the
+/// input is, and it can be formatted into a larger pattern directly.
+///
+/// ```
+/// use ferralk_glob::{Pattern, PatternOptions, escape_str};
+///
+/// let root = "/work/brace{project}";
+/// let pattern = format!("{}/**/*.ts", escape_str(root));
+/// assert_eq!(pattern, r"/work/brace\{project\}/**/*.ts");
+///
+/// let pattern = Pattern::compile(&pattern, PatternOptions::walker())?;
+/// assert!(pattern.is_match_glob_path("/work/brace{project}/src/main.ts"));
+/// assert!(!pattern.is_match_glob_path("/work/braceproject/src/main.ts"));
+/// # Ok::<(), ferralk_glob::PatternError>(())
+/// ```
+#[must_use]
+pub fn escape_str(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if u8::try_from(character).is_ok_and(is_syntax_byte) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 /// Expands brace alternatives into the plain patterns a pattern stands for.
@@ -11637,5 +11765,197 @@ mod tests {
                 "{source} against {candidate}: engines disagree"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::{Pattern, PatternOptions, escape, escape_str};
+
+    /// Every byte that is syntax somewhere, next to ordinary bytes that are
+    /// path structure (`.`, `/`), case-foldable, class-only syntax (`-`, `^`),
+    /// or not UTF-8.
+    const ALPHABET: &[u8] = b"\\*?[]{}(),|!@+-^./aAbZ: \x00\xc3\xa9\xff";
+
+    /// The reproducible generator the other randomized tests here use.
+    fn generator(mut seed: u64) -> impl FnMut(usize) -> usize {
+        move |bound: usize| {
+            seed = seed.wrapping_mul(0x2545_F491_4F6C_DD1D).wrapping_add(1);
+            (usize::try_from(seed >> 33).expect("31 bits fit a usize")) % bound
+        }
+    }
+
+    /// Every option combination with escaping on: 32 of them.
+    fn escaping_options() -> Vec<PatternOptions> {
+        (0..32_u8)
+            .map(|bits| {
+                PatternOptions::default()
+                    .braces(bits & 1 != 0)
+                    .recursive_double_star(bits & 2 != 0)
+                    .extglob(bits & 4 != 0)
+                    .match_hidden(bits & 8 != 0)
+                    .case_insensitive(bits & 16 != 0)
+            })
+            .collect()
+    }
+
+    fn random_text(next: &mut impl FnMut(usize) -> usize, max_len: usize) -> Vec<u8> {
+        (0..next(max_len + 1))
+            .map(|_| ALPHABET[next(ALPHABET.len())])
+            .collect()
+    }
+
+    /// The text itself and near misses: one byte inserted, removed, replaced,
+    /// or case-swapped, a `./` added or removed, and unrelated text.
+    fn candidates(text: &[u8], next: &mut impl FnMut(usize) -> usize) -> Vec<Vec<u8>> {
+        let mut candidates = vec![text.to_vec(), [b"./", text].concat()];
+        if let Some(rest) = text.strip_prefix(b"./") {
+            candidates.push(rest.to_vec());
+        }
+        for _ in 0..12 {
+            let mut candidate = text.to_vec();
+            let at = next(candidate.len() + 1);
+            match next(4) {
+                0 => candidate.insert(at, ALPHABET[next(ALPHABET.len())]),
+                1 if at < candidate.len() => {
+                    candidate.remove(at);
+                }
+                2 if at < candidate.len() => candidate[at] = ALPHABET[next(ALPHABET.len())],
+                3 if at < candidate.len() => candidate[at] ^= 0x20,
+                _ => candidate = random_text(next, 6),
+            }
+            candidates.push(candidate);
+        }
+        candidates
+    }
+
+    fn folded(bytes: &[u8], options: PatternOptions) -> Vec<u8> {
+        if options.case_insensitive {
+            bytes.to_ascii_lowercase()
+        } else {
+            bytes.to_vec()
+        }
+    }
+
+    /// The one leading `./` the path entry points ignore on both sides.
+    fn without_dot_slash(bytes: &[u8]) -> &[u8] {
+        bytes.strip_prefix(b"./").unwrap_or(bytes)
+    }
+
+    /// `escape(text)` compiles under every option combination with escaping on
+    /// and matches `text` and nothing else, where "the same" is what the entry
+    /// point compares: whole bytes for `is_match`, bytes after one leading
+    /// `./` for the path entry points, ASCII-folded under `case_insensitive`.
+    ///
+    /// On Windows a candidate path may use `\` as a separator, so a text with
+    /// a backslash is not a Windows path and those cases are left to POSIX.
+    #[test]
+    fn escaped_text_matches_exactly_itself_under_every_option() {
+        let options = escaping_options();
+        let mut next = generator(0x0E5C_A9ED_7E57_0001);
+        for _ in 0..1_500 {
+            let text = random_text(&mut next, 10);
+            let escaped = escape(&text);
+            if let Ok(utf8) = std::str::from_utf8(&text) {
+                assert_eq!(escape_str(utf8).as_bytes(), escaped, "{utf8:?}");
+            }
+            let candidates = candidates(&text, &mut next);
+            for &options in &options {
+                let shown = || format!("{:?} under {options:?}", String::from_utf8_lossy(&text));
+                let pattern = Pattern::compile(&escaped, options)
+                    .unwrap_or_else(|error| panic!("{error}: {}", shown()));
+                for candidate in &candidates {
+                    if cfg!(windows) && (text.contains(&b'\\') || candidate.contains(&b'\\')) {
+                        continue;
+                    }
+                    let whole = folded(candidate, options) == folded(&text, options);
+                    let path = folded(without_dot_slash(candidate), options)
+                        == folded(without_dot_slash(&text), options);
+                    let candidate_shown = String::from_utf8_lossy(candidate);
+                    assert_eq!(
+                        pattern.is_match(candidate),
+                        whole,
+                        "is_match({candidate_shown:?}): {}",
+                        shown()
+                    );
+                    assert_eq!(
+                        pattern.is_match_path(candidate),
+                        path,
+                        "is_match_path({candidate_shown:?}): {}",
+                        shown()
+                    );
+                    assert_eq!(
+                        pattern.is_match_glob_path(candidate),
+                        path,
+                        "is_match_glob_path({candidate_shown:?}): {}",
+                        shown()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Escaped text stays literal as one alternative of a brace or extglob
+    /// group, which is why `,` and `|` are escaped too.
+    #[test]
+    fn escaped_text_stays_literal_inside_a_group() {
+        let mut next = generator(0x0E5C_A9ED_7E57_0002);
+        for _ in 0..1_500 {
+            // Group alternatives are compared within one component here.
+            let left = random_text(&mut next, 6);
+            let right = random_text(&mut next, 6);
+            if [&left, &right]
+                .iter()
+                .any(|text| text.contains(&b'/') || (cfg!(windows) && text.contains(&b'\\')))
+            {
+                continue;
+            }
+            let options = PatternOptions::walker().match_hidden(next(2) == 0);
+            let braces = [b"{", &escape(&left)[..], b",", &escape(&right), b"}"].concat();
+            let extglob = [b"@(", &escape(&left)[..], b"|", &escape(&right), b")"].concat();
+            for pattern in [braces, extglob] {
+                let shown = || {
+                    format!(
+                        "{:?} for {:?} and {:?}",
+                        String::from_utf8_lossy(&pattern),
+                        String::from_utf8_lossy(&left),
+                        String::from_utf8_lossy(&right)
+                    )
+                };
+                let compiled = Pattern::compile(&pattern, options)
+                    .unwrap_or_else(|error| panic!("{error}: {}", shown()));
+                for candidate in candidates(&left, &mut next).iter().chain([&right]) {
+                    let expected = *candidate == left || *candidate == right;
+                    assert_eq!(
+                        compiled.is_match(candidate),
+                        expected,
+                        "{:?}: {}",
+                        String::from_utf8_lossy(candidate),
+                        shown()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fixed points worth reading: the bytes escaped, the ones left alone,
+    /// and that escaping is not idempotent - it escapes its own `\`.
+    #[test]
+    fn escape_marks_every_syntax_byte_and_nothing_else() {
+        assert_eq!(escape(br"\*?[]{}(),|!@+"), br"\\\*\?\[\]\{\}\(\)\,\|\!\@\+");
+        assert_eq!(escape(b"./a-b^c/.d:e f\xff"), b"./a-b^c/.d:e f\xff");
+        assert_eq!(escape(b""), b"");
+        assert_eq!(escape(escape(b"*")), br"\\\*");
+        assert_eq!(escape_str("caf\u{e9} [1]"), "caf\u{e9} \\[1\\]");
+    }
+
+    /// With escaping switched off a backslash is an ordinary byte, so the
+    /// escaped spelling is not literal there. This is the documented limit.
+    #[test]
+    fn escaped_text_needs_escaping_enabled() {
+        let pattern = Pattern::compile(escape("a*"), PatternOptions::default().escape(false))
+            .expect("valid pattern");
+        assert!(!pattern.is_match("a*"));
+        assert!(pattern.is_match(r"a\*"));
     }
 }

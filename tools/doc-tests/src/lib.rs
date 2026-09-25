@@ -21,6 +21,7 @@ const DOCUMENTS: &[&str] = &[
     "docs/verification-comparison.md",
     "docs/compatibility-guide.md",
     "docs/compatibility-matrix.md",
+    "docs/consumer-contract.md",
     "docs/corpus-format.md",
     "docs/external-release-gates.md",
     "docs/fast-glob-reference.md",
@@ -57,7 +58,7 @@ const DOCUMENTS: &[&str] = &[
 ];
 
 #[cfg(test)]
-const EXPECTED_COMPILED_RUST_FENCES: usize = 22;
+const EXPECTED_COMPILED_RUST_FENCES: usize = 25;
 
 #[cfg(test)]
 struct FencePolicy {
@@ -174,6 +175,12 @@ const FENCE_POLICIES: &[FencePolicy] = &[
     FencePolicy {
         path: "docs/compatibility-matrix.md",
         compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "docs/consumer-contract.md",
+        compiled_rust_fences: 3,
         ignored_rust_fences: 0,
         intentional_text_fragments: &[],
     },
@@ -430,6 +437,9 @@ pub mod compatibility_guide {}
 
 #[doc = include_str!("../../../docs/compatibility-matrix.md")]
 pub mod compatibility_matrix {}
+
+#[doc = include_str!("../../../docs/consumer-contract.md")]
+pub mod consumer_contract {}
 
 #[doc = include_str!("../../../docs/corpus-format.md")]
 pub mod corpus_format {}
