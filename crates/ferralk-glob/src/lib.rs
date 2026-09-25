@@ -1561,7 +1561,8 @@ impl Pattern {
                             tokens,
                             token_index,
                             options,
-                        )),
+                        ))
+                        .handing_over_to(tokens.get(token_index + 1)),
                         deferred,
                         work,
                     ),
@@ -1570,7 +1571,7 @@ impl Pattern {
                         path_index,
                         path,
                         options,
-                        StarSemantics::ordinary(true),
+                        StarSemantics::ordinary(true).handing_over_to(tokens.get(token_index + 1)),
                         deferred,
                         work,
                     ),
@@ -1864,6 +1865,25 @@ impl StarSemantics {
             blocks_hidden_stop: true,
             stops_at_component_start: false,
         }
+    }
+
+    /// The same star in front of `next`, the token it hands over to.
+    ///
+    /// A zero-width stop before a leading period is harmful only when a
+    /// byte-matching token takes the period next. A star behind this one
+    /// cannot consume the period and applies this rule to its own stop, so
+    /// only the last star of a run decides. That makes a run that ends in a
+    /// `**/` prefix exempt, as the prefix is: `****/.h` matches `.h` as
+    /// `**/.h` does. The sweep engine's `dot_stop_block` blocks exactly the
+    /// boundary behind each ordinary star, which is the same rule (#442).
+    const fn handing_over_to(mut self, next: Option<&Token>) -> Self {
+        if matches!(
+            next,
+            Some(Token::Star | Token::RecursiveStar | Token::RecursivePrefix)
+        ) {
+            self.blocks_hidden_stop = false;
+        }
+        self
     }
 }
 
@@ -9412,6 +9432,46 @@ mod tests {
         let inner = Pattern::compile("!(x)", options).expect("extglob compiles");
         assert!(inner.is_match("a/b.env"));
         assert!(inner.is_match_path("a/b.env"));
+    }
+
+    #[test]
+    fn a_star_run_ending_in_a_recursive_prefix_leaves_a_leading_period_to_the_literal() {
+        // Issue #442: a whole-component run of four stars compiles to a
+        // recursive star in front of a `**/` prefix. The prefix is exempt from
+        // the leading-period stop rule, so the run as a whole must be too, in
+        // every engine: `****/.h` matches `.h` as `**/.h` does.
+        let options = PatternOptions::default().recursive_double_star(true);
+        let accepted = [
+            ("****/.", "."),
+            ("****/.h", ".h"),
+            ("****/..", ".."),
+            ("******/.h", ".h"),
+            ("x/****/.h", "x/.h"),
+            ("****/.h", "a/.h"),
+        ];
+        for (pattern, path) in accepted {
+            let compiled = Pattern::compile(pattern, options).expect("pattern compiles");
+            assert!(compiled.engines_agree(path), "{pattern} against {path}");
+            assert!(compiled.is_match(path), "{pattern} against {path}");
+            assert!(compiled.is_match_path(path), "{pattern} against {path}");
+            assert!(
+                compiled.is_match_glob_path(path),
+                "{pattern} against {path}"
+            );
+        }
+        // The exemption ends at the prefix: a wildcard behind it still may not
+        // take the period, and an odd run keeps its ordinary last star.
+        let refused = [("****/*", ".h"), ("****/?h", ".h"), ("*****/.h", ".h")];
+        for (pattern, path) in refused {
+            let compiled = Pattern::compile(pattern, options).expect("pattern compiles");
+            assert!(compiled.engines_agree(path), "{pattern} against {path}");
+            assert!(!compiled.is_match(path), "{pattern} against {path}");
+            assert!(!compiled.is_match_path(path), "{pattern} against {path}");
+            assert!(
+                !compiled.is_match_glob_path(path),
+                "{pattern} against {path}"
+            );
+        }
     }
 
     #[test]
