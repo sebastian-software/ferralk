@@ -127,7 +127,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # One of the two Node lanes in this workflow, next to `standards`. The
+      # The only Node lane in this workflow. The
       # family block is generated from the registry in
       # sebastian-software/ferramenta, so the check needs Node; keeping it in
       # its own job leaves the Rust matrix Node-free.
@@ -146,105 +146,6 @@ jobs:
       # this repository by bumping that pin and re-running it with --write;
       # CONTRIBUTING.md records the procedure.
       - run: ./scripts/readme-family-block.sh --check
-
-  standards:
-    # Standards change 0015 names this gate `Standards / Consistency` across
-    # the org; `standards drift` below keeps the old required check alive
-    # until branch protection is migrated to the new name.
-    name: Standards / Consistency
-    if: github.event_name == 'pull_request' || github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # `standards apply` leaves this file behind when a version needs manual
-      # judgement steps that no CLI can do. Failing here keeps a half-applied
-      # migration from passing as compliant.
-      - name: "Guard: agent step not yet completed for this PR"
-        run: test ! -f .standards/pending.json
-
-      # The second Node lane, set up exactly like `README family block` above.
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: "24"
-      - name: Activate the pinned pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@12.3.4 --activate
-
-      # The marker guard needs `node`, so it sits below the toolchain setup
-      # rather than beside the pending guard it complements.
-      # `.standards/blocked.json` records an agent run that pushed a result it
-      # could not validate. `blocking: true` is the alignment class, with two
-      # members: the pinned CLI does not ship the stamped manifest version, or
-      # the pin is not an exact version literal. Either way `standards check`
-      # exits 3 and the pull request must not merge (only the stamp member also
-      # makes `apply` and `sync` refuse to write). A non-blocking marker is
-      # context for the reviewer — the failures it lists are reported by this
-      # workflow's own lanes. The marker is parsed rather than matched line by
-      # line: JSON may put `"blocking":` and `true` on separate lines, and a guard
-      # whose whole purpose is to fail closed must fail on a marker it cannot
-      # read at all.
-      # `node` rather than `jq`, which the Forgejo node image may lack; the
-      # schema is `BlockedState` in @sebastian-software/standards.
-      - name: "Guard: no blocking agent findings for this PR"
-        run: |
-          node -e "
-          const { existsSync, readFileSync } = require('node:fs');
-          const file = '.standards/blocked.json';
-          if (!existsSync(file)) { process.exit(0); }
-          const raw = readFileSync(file, 'utf8');
-          console.log(raw);
-          const fail = (detail) => { console.error('Refusing to pass ' + file + ': ' + detail); process.exit(1); };
-          let state;
-          try { state = JSON.parse(raw); } catch (error) { fail('it is not valid JSON — ' + error.message); }
-          if (typeof state !== 'object' || state === null || Array.isArray(state)) { fail('it is not a JSON object.'); }
-          const orNull = (value, type) => value === null || typeof value === type;
-          const broken = [
-            ['schemaVersion must be 1', state.schemaVersion !== 1],
-            ['blocking must be a boolean', typeof state.blocking !== 'boolean'],
-            ['reason must be a string', typeof state.reason !== 'string'],
-            ['detectedAt must be a string', typeof state.detectedAt !== 'string'],
-            ['expectedStandardsVersion must be a number', typeof state.expectedStandardsVersion !== 'number'],
-            ['observedStandardsVersion must be a number or null', !orNull(state.observedStandardsVersion, 'number')],
-            ['expectedCliVersion must be a string or null', !orNull(state.expectedCliVersion, 'string')],
-            ['observedCliVersion must be a string or null', !orNull(state.observedCliVersion, 'string')],
-            ['failedChecks must be an array of strings', !Array.isArray(state.failedChecks) || !state.failedChecks.every((entry) => typeof entry === 'string')],
-            ['retry must be a string', typeof state.retry !== 'string'],
-          ].filter((entry) => entry[1]).map((entry) => entry[0]);
-          if (broken.length > 0) { fail('it does not match the documented schema — ' + broken.join('; ')); }
-          if (state.blocking) { fail('the agent could not validate its result.'); }
-          console.log('The agent marker is non-blocking; its findings are reviewer context.');
-          "
-
-      # This repository has no lockfile that could hold the CLI's version, so
-      # the pin lives here and Renovate's custom manager in renovate.json moves
-      # it. An unpinned `dlx` would run whatever was published minutes ago with
-      # this job's token. Raise the pin in the same pull request that runs
-      # `apply`, so the stamp and the CLI that checks it never disagree.
-      #
-      # minimum-release-age=0 stays: pnpm holds versions younger than 24 hours
-      # back, so a pin raised on the day of a standards release would otherwise
-      # not resolve at all.
-      - run: pnpm --config.minimum-release-age=0 dlx @sebastian-software/standards@0.13.0 check
-
-  # Temporary bridge for standards change 0015. Branch protection on `main`
-  # still requires a check named `standards drift`; once it requires
-  # `Standards / Consistency` instead, delete this job. Until then it passes
-  # only when the renamed job succeeded, so a failed, cancelled or skipped
-  # standards run still blocks the merge.
-  standards-drift:
-    name: standards drift
-    if: always() && (github.event_name == 'pull_request' || github.event_name == 'push')
-    needs: standards
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require the Standards / Consistency result
-        env:
-          RESULT: ${{ needs.standards.result }}
-        run: |
-          echo "Standards / Consistency: $RESULT"
-          test "$RESULT" = success
 
   test:
     name: test (${{ matrix.os }})

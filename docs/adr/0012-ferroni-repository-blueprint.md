@@ -149,3 +149,19 @@ intended increase is accepted with a `CPU-Increase-Accepted:` line in the
 pull-request body, as CONTRIBUTING describes. Everything else in the
 2026-09-04 amendment stands: this is a user-space work gate, not a speed gate,
 and it does not gate a release.
+
+## Amendment, 2026-09-25: the standards onboarding is removed
+
+The maintainer removed this repository's onboarding to
+`@sebastian-software/standards` on 2026-09-25, pending a different approach
+to family-wide repository settings. Gone are the `.repometa.json` stamp, the
+`Standards / Consistency` job and its `standards drift` bridge in
+`.github/workflows/ci.yml`, the managed marker section of `AGENTS.md`, and the
+Renovate hooks that tracked the standards version and CLI pin. The files the
+package seeded or managed — `rustfmt.toml`, `rust-toolchain.toml`, the
+community files and issue forms — stay as ordinary repository files that this
+repository maintains itself. The 2026-09-24 amendment's description of how the
+baseline reaches this repository therefore no longer applies; its reference
+point for deliberate deviations (the family baseline in
+sebastian-software/ferramenta#11 and #13) and the CodSpeed, Callgrind and
+Codecov amendments stay as they are.
