@@ -1055,7 +1055,9 @@ impl WalkEntry {
     /// spelling the walk matched its include and exclude patterns against.
     ///
     /// `path()` is the root exactly as it was given, then a separator unless
-    /// the root is empty or already ends in one, then this relative path. So
+    /// the root is empty, already ends in one, or is a bare Windows drive,
+    /// then this relative path. `PathBuf::push` follows the same rule: `C:`
+    /// is the current directory on drive C, so its entries are `C:src`. So
     /// however the root is spelled, none of it shows up here:
     ///
     /// | Root | `path()` | `relative_path()` |
@@ -1773,7 +1775,7 @@ impl RootPlan {
     /// instead of running `strip_prefix` — a component-by-component comparison
     /// — over every entry. Pushing a name is what settles the question: it is
     /// what inserts the separator, and it inserts none when the root already
-    /// ends with one or is empty.
+    /// ends with one, is empty, or is a bare Windows drive such as `C:`.
     fn relative_start(root: &Path) -> usize {
         let mut probe = root.to_path_buf();
         probe.push("x");
@@ -4710,18 +4712,34 @@ fn reset_to_directory(path: &mut PathBuf, directory: &Path) {
 /// `PathBuf::push` inspects every value it is given for a root or a prefix,
 /// which a name from a directory listing never carries. This runs once per
 /// entry, so the separator and the name go straight onto the buffer instead.
-/// The separator rule is `PathBuf::push`'s: none after an empty buffer or one
-/// that already ends in a separator.
+/// The separator rule is `PathBuf::push`'s; see [`needs_separator_before_name`].
 pub(crate) fn push_entry_name(path: &mut PathBuf, name: &OsStr) {
     let buffer = path.as_mut_os_string();
-    let needs_separator = buffer
-        .as_encoded_bytes()
-        .last()
-        .is_some_and(|&byte| byte != b'/' && !(cfg!(windows) && byte == b'\\'));
-    if needs_separator {
+    if needs_separator_before_name(buffer.as_encoded_bytes()) {
         buffer.push(std::path::MAIN_SEPARATOR_STR);
     }
     buffer.push(name);
+}
+
+/// Whether a name appended below `directory` needs a separator first, by
+/// `PathBuf::push`'s rule: not after an empty directory, not after one that
+/// already ends in a separator, and on Windows not after a bare drive.
+///
+/// A bare drive such as `C:` names the current directory on that drive, so
+/// its entries are `C:x`. `C:\x` is below the drive's root, which is
+/// somewhere else (#436). The walker's paths, the root-relative offset, and
+/// every prefix stripped from them follow this one rule.
+pub(crate) fn needs_separator_before_name(directory: &[u8]) -> bool {
+    directory
+        .last()
+        .is_some_and(|&byte| byte != b'/' && !(cfg!(windows) && byte == b'\\'))
+        && !is_bare_drive(directory)
+}
+
+/// Whether `bytes` is exactly a Windows drive prefix, such as `C:`. Always
+/// false elsewhere, where `C:` is an ordinary relative name.
+pub(crate) fn is_bare_drive(bytes: &[u8]) -> bool {
+    cfg!(windows) && matches!(bytes, [letter, b':'] if letter.is_ascii_alphabetic())
 }
 
 /// Copies `path` into a buffer of its own, reusing `spare` when an entry the
@@ -5101,7 +5119,12 @@ mod tests {
 
     #[test]
     fn push_entry_name_follows_path_buf_push() {
-        for root in ["", "/", ".", "./", "dir", "dir/", "/a/b", "a//b"] {
+        // The drive spellings are ordinary relative names off Windows, and
+        // there a bare drive takes no separator (#436).
+        for root in [
+            "", "/", ".", "./", "dir", "dir/", "/a/b", "a//b", "C:", "c:", "C:.", "C:/", "C:\\",
+            "C:x", "1:",
+        ] {
             let mut expected = PathBuf::from(root);
             expected.push("name.rs");
             let mut actual = PathBuf::from(root);
@@ -5116,7 +5139,7 @@ mod tests {
     fn component_suffix_agrees_with_the_byte_offset() {
         for root in [
             "", "/", ".", "./", ".//", "dir", "dir/", "dir//", "/a/b", "a//b/", "a/.", "a/./",
-            "./a/../b", "..", "../..",
+            "./a/../b", "..", "../..", "C:", "C:.", "C:/",
         ] {
             let root = Path::new(root);
             let start = super::RootPlan::relative_start(root);
@@ -10712,6 +10735,71 @@ mod tests {
     /// exclude does not reach that directory at all - `*.tmp` cannot match the
     /// component `a` - so its contents went missing from the walk without any
     /// pattern saying they should.
+    /// A bare drive such as `C:` is the current directory on that drive, so
+    /// its entries are spelled `C:x`, not `C:\x` below the drive's root
+    /// (#436). Walked that way it must list, descend into, ignore, and select
+    /// exactly what the same directory spelled `C:.` or absolutely does.
+    #[cfg(windows)]
+    #[test]
+    fn a_bare_drive_root_walks_the_current_directory_on_that_drive() {
+        let current = std::env::current_dir().expect("current directory");
+        let drive = match current.components().next() {
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::Disk(_)) =>
+            {
+                PathBuf::from(prefix.as_os_str())
+            }
+            _ => return,
+        };
+        let mut dot = drive.clone().into_os_string();
+        dot.push(".");
+        let walk = |root: &Path, include: Option<&str>| {
+            let mut walker = Walker::new(root).respect_git_ignore(true);
+            if let Some(include) = include {
+                walker = walker.include(include).expect("valid include");
+            }
+            let result = walker
+                .options(WalkOptions::default().sort(true).max_depth(2))
+                .collect()
+                .expect("walk succeeds");
+            assert!(
+                result.errors().is_empty(),
+                "root {root:?}: {:?}",
+                result.errors()
+            );
+            result
+                .entries()
+                .iter()
+                .map(|entry| {
+                    assert_eq!(entry.root().join(entry.relative_path()), entry.path());
+                    entry.relative_path().to_path_buf()
+                })
+                .collect::<Vec<_>>()
+        };
+        for include in [None, Some("*"), Some("*/*")] {
+            let expected = walk(&current, include);
+            assert!(!expected.is_empty(), "the current directory has entries");
+            assert_eq!(
+                walk(&drive, include),
+                expected,
+                "{drive:?}, include {include:?}"
+            );
+            assert_eq!(
+                walk(Path::new(&dot), include),
+                expected,
+                "{dot:?}, include {include:?}"
+            );
+        }
+        let first = Walker::new(&drive)
+            .options(WalkOptions::default().sort(true).max_depth(1))
+            .collect()
+            .expect("walk succeeds");
+        let entry = &first.entries()[0];
+        let mut spelled = drive.into_os_string();
+        spelled.push(entry.relative_path());
+        assert_eq!(entry.path().as_os_str(), spelled);
+    }
+
     /// The trap from #94, on the one host that can observe it.
     ///
     /// A pattern built by joining `PathBuf`s carries `\` separators, which this

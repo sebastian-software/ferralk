@@ -135,6 +135,9 @@ impl CandidateRoot {
             Some(scratch.len())
         } else if scratch.starts_with(&self.walk) && scratch.get(self.walk.len()) == Some(&b'/') {
             Some(self.walk.len() + 1)
+        } else if scratch.starts_with(&self.walk) && crate::is_bare_drive(&self.walk) {
+            // Entries below a bare drive follow it without a separator (#436).
+            Some(self.walk.len())
         } else {
             None
         };
