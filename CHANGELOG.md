@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.1.0](https://github.com/sebastian-software/ferralk/compare/v1.0.0...v1.1.0) (2026-09-25)
+
+
+### Features
+
+* **glob:** add escape and document the consumer pattern contract ([#439](https://github.com/sebastian-software/ferralk/issues/439)) ([e258c1d](https://github.com/sebastian-software/ferralk/commit/e258c1d2022d174dbbfb029e772737ec8a37ddc7)), closes [#372](https://github.com/sebastian-software/ferralk/issues/372)
+* **glob:** add PatternSet for matching many globs at once ([#435](https://github.com/sebastian-software/ferralk/issues/435)) ([6fed1e8](https://github.com/sebastian-software/ferralk/commit/6fed1e8d8f39244ae77f0becf9d8fe3e08411f2e))
+* **walker:** add a case-insensitive switch and Verdict::Prune ([#433](https://github.com/sebastian-software/ferralk/issues/433)) ([8a07261](https://github.com/sebastian-software/ferralk/commit/8a07261963b19bb031425ac129ea96a4979214ce)), closes [#428](https://github.com/sebastian-software/ferralk/issues/428)
+* **walker:** add relative paths, typed error kinds and result iteration ([#431](https://github.com/sebastian-software/ferralk/issues/431)) ([dcf5dca](https://github.com/sebastian-software/ferralk/commit/dcf5dcacbd937a7d0b5272851fd0573cad195ca8)), closes [#428](https://github.com/sebastian-software/ferralk/issues/428)
+* **walker:** add Walker::stream_parallel for a streamed parallel walk ([#440](https://github.com/sebastian-software/ferralk/issues/440)) ([16057ba](https://github.com/sebastian-software/ferralk/commit/16057ba32b2b6d2a8946fea9722a7a31581f4e08)), closes [#405](https://github.com/sebastian-software/ferralk/issues/405)
+
+
+### Bug Fixes
+
+* **walker:** accept escaped syntax in the root part of an absolute pattern ([#437](https://github.com/sebastian-software/ferralk/issues/437)) ([a4c2caf](https://github.com/sebastian-software/ferralk/commit/a4c2caf9e252694922fe9e5627292f1c4b887134)), closes [#372](https://github.com/sebastian-software/ferralk/issues/372)
+
+
+### Performance Improvements
+
+* **glob:** cut retained pattern memory and share walker patterns across roots ([#441](https://github.com/sebastian-software/ferralk/issues/441)) ([ec082d8](https://github.com/sebastian-software/ferralk/commit/ec082d8b2c80913681b4c3e186651bbb558d5939)), closes [#405](https://github.com/sebastian-software/ferralk/issues/405)
+
 ## [1.0.0](https://github.com/sebastian-software/ferralk/compare/v1.0.0-rc.1...v1.0.0) (2026-09-24)
 
 

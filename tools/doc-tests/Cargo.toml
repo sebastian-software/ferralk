@@ -1,7 +1,7 @@
 [package]
 name = "doc-tests"
 description = "Unpublished doctest harness for Ferralk's Markdown guides."
-version = "1.0.0"
+version = "1.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
