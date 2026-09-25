@@ -1195,6 +1195,11 @@ fn path_from(path: &Path, start: usize) -> &Path {
 /// remainder `Components::as_path` reports starts at a component, never with a
 /// separator or a lone `.`, and a walked path below its root continues with a
 /// listed name, so it lands on the suffix exactly.
+///
+/// Each step starts a fresh `Components` on the remainder. Resumed after a
+/// drive prefix, one iterator reports `.\x` for `C:.\x` and then skips the
+/// `.` and `x` in one step, past the suffix `x`; a fresh one yields the `.`
+/// as a component of its own.
 #[cfg(not(unix))]
 fn path_from(path: &Path, start: usize) -> &Path {
     path_suffix_by_components(path, start)
@@ -1207,12 +1212,16 @@ fn path_suffix_by_components(path: &Path, start: usize) -> &Path {
         .as_encoded_bytes()
         .len()
         .saturating_sub(start);
-    let mut components = path.components();
+    let mut rest = path;
     loop {
-        let rest = components.as_path();
-        if rest.as_os_str().as_encoded_bytes().len() <= suffix_len || components.next().is_none() {
+        if rest.as_os_str().as_encoded_bytes().len() <= suffix_len {
             return rest;
         }
+        let mut components = rest.components();
+        if components.next().is_none() {
+            return rest;
+        }
+        rest = components.as_path();
     }
 }
 
