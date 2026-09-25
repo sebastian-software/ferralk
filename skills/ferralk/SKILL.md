@@ -114,6 +114,9 @@ These compile and return a plausible, wrong result:
 - In `visit()`, `Verdict::Skip` drops an entry but still walks a directory's
   subtree; return `Verdict::Prune` to leave the directory unopened.
 - `stream()` ignores `sort(true)`, and `take(n)` counts `Err` items.
+  `stream()` is single-threaded whatever `threads(n)` says; use
+  `stream_parallel()` to stream from `threads(n)` workers, in no particular
+  order, with the same two traps.
 - Entry paths include the root (`./src/lib.rs` for `Walker::new(".")`), and so
   does `path_bytes()`. Use `entry.relative_path()` for matching or printing
   relative paths.
