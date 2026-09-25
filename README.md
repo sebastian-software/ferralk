@@ -115,14 +115,14 @@ API it covers, and a consumer-visible change to any of it is a major release.
 `1.0.0-rc.1`; the [compatibility guide](docs/compatibility-guide.md#contract-change-audit-since-090)
 lists every behavior change since 0.9.0, including the ones 1.0.0 makes. Both
 crates are published on crates.io; use the current
-1.0.0 release line for applications. <!-- x-release-please-version -->
+1.1.0 release line for applications. <!-- x-release-please-version -->
 
 ## Install
 
 ```toml
 [dependencies]
-ferralk = "1.0.0" # x-release-please-version
-ferralk-glob = "1.0.0" # x-release-please-version
+ferralk = "1.1.0" # x-release-please-version
+ferralk-glob = "1.1.0" # x-release-please-version
 ```
 
 Depend on `ferralk-glob` alone when you only match strings or paths you already

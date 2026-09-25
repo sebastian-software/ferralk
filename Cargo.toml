@@ -10,7 +10,7 @@ description = "Glob matching and parallel filesystem walking, byte-first, with a
 # Release Please rewrites this line and every member's `version`; members and
 # internal requirements carry concrete versions rather than inheriting one,
 # because it cannot rewrite an inherited `version.workspace = true`.
-version = "1.0.0"
+version = "1.1.0"
 readme = "crates/ferralk/README.md"
 authors.workspace = true
 edition.workspace = true
@@ -108,7 +108,7 @@ unstable-test-hooks = ["ferralk-glob/unstable-test-hooks"]
 
 [dependencies]
 crossbeam-deque = "0.8.7"
-ferralk-glob = { path = "crates/ferralk-glob", version = "1.0.0" }
+ferralk-glob = { path = "crates/ferralk-glob", version = "1.1.0" }
 memchr = "2.8.3"
 
 [target.'cfg(unix)'.dependencies]
