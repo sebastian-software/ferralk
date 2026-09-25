@@ -231,14 +231,11 @@ impl RuleSetBuilder {
         let root = glob_path_bytes(root);
         let root = without_dot_components(&root);
         // The separator between the directory and what follows it belongs to
-        // the prefix, unless the directory already ends in one. The empty
-        // root is used by the fuzz helper, where candidates are already
-        // relative and so have no prefix to remove.
-        let root_len = if root.is_empty() {
-            0
-        } else {
-            root.len() + usize::from(!root.ends_with(b"/"))
-        };
+        // the prefix, unless the walk spelled its entries without one: after
+        // a trailing separator or a bare Windows drive (#436). The empty root
+        // is used by the fuzz helper, where candidates are already relative
+        // and so have no prefix to remove.
+        let root_len = root.len() + usize::from(crate::needs_separator_before_name(&root));
         Self {
             root_len,
             case_insensitive,
