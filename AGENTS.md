@@ -13,36 +13,8 @@
   corresponding CI jobs cover the other platform and compile its cfg-gated
   fuzz targets.
 - Follow `CONTRIBUTING.md#communicate-pre-10-contract-changes`: PR titles use
-  Conventional Commit syntax, and a consumer-visible pre-1.0 behavior change
-  needs both `!` and a filled-in `BREAKING CHANGE:` footer.
+  Conventional Commit syntax. Since 1.0 the contract in `docs/stability.md` is
+  in force: a consumer-visible change to it needs `!` and a filled-in
+  `BREAKING CHANGE:` footer and means a major release.
 - Preserve byte-first path handling, explicit wildcard semantics, and the
   existing documentation and benchmark evidence requirements.
-
----
-
-<!-- sebastian-software-consumer-agents:start -->
-
-# Standards-managed repo guardrails
-
-- Do not hand-edit managed files or standards-owned marker sections.
-- If `standards check` reports drift, run `standards apply` or update standards.
-- The repository's own gate may omit `standards check`; CI can still fail on it.
-
-Node repositories:
-
-- Fix or format every file reported by `oxfmt` whenever practical.
-- For generated files, prefer formatting in the generator step.
-- If formatting is not viable, use repo-local `.prettierignore`.
-- Never add repo-specific ignores to managed `.oxfmtrc.json`.
-
-Rust repositories:
-
-- Keep `cargo fmt --all --check` and
-  `cargo clippy --workspace --all-targets --all-features -- -D warnings` green.
-- Lint levels belong in `[workspace.lints]`, never in managed `rustfmt.toml`.
-- `rust-version` in `Cargo.toml` is the only MSRV; every other mention is a
-  derived copy.
-- Record a cargo-deny finding as a narrow, commented exception in `deny.toml` —
-  never by widening the org allow-list.
-
-<!-- sebastian-software-consumer-agents:end -->

@@ -43,7 +43,7 @@ repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repository_root"
 
 # The root README carries the full block: a sentence and one table per family
-# group, placed above the standards-owned branding footer. The two published
+# group, placed above the mdtheme-rendered branding footer. The two published
 # crate READMEs are what crates.io renders, so they carry the `registry`
 # variant instead: two plain-Markdown lines, no HTML and no tables.
 render() {
