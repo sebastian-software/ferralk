@@ -266,10 +266,18 @@ impl PathFilter {
         let plain_needs_copy = alternatives
             .iter()
             .any(|alternative| !is_program(alternative) && needs_copy(alternative));
+        let programs = alternatives.iter().filter(|item| is_program(item)).count();
+        let plain = alternatives.len() - programs;
+        // Sized up front: the filter lives as long as the pattern.
+        let (copies, whole) = if plain_needs_copy {
+            (plain, 0)
+        } else {
+            (0, plain)
+        };
         let mut filter = Self {
-            compiled: Vec::new(),
-            programs: Vec::new(),
-            whole: Vec::new(),
+            compiled: Vec::with_capacity(copies),
+            programs: Vec::with_capacity(programs),
+            whole: Vec::with_capacity(whole),
         };
         for (index, alternative) in alternatives.iter().enumerate() {
             if is_program(alternative) {
@@ -689,7 +697,23 @@ impl Pattern {
         let (viability, offset) = walker_path_analysis(&compiled.alternatives, &mut budget)?;
         compiled.walker_path_viability = viability;
         compiled.walker_path_problem_offset = offset;
+        compiled.release_compile_state();
         Ok(compiled)
+    }
+
+    /// Drops what only the compile reads.
+    ///
+    /// The walker path shapes and the extglob source provenance exist for
+    /// [`walker_path_analysis`], whose verdict is stored on the pattern.
+    /// Nothing a match reads changes.
+    fn release_compile_state(&mut self) {
+        let copies = self
+            .path_filter
+            .iter_mut()
+            .flat_map(|filter| filter.compiled.iter_mut());
+        for alternative in self.alternatives.iter_mut().chain(copies) {
+            alternative.release_compile_state();
+        }
     }
 
     /// Summarizes whether a walker can represent a match from this pattern.
@@ -737,7 +761,6 @@ impl Pattern {
                 braces: false,
                 ..options
             };
-            let mut alternatives = Vec::new();
             ensure_source_brace_compiled_ir_lower_bound(
                 pattern,
                 parse_options,
@@ -751,6 +774,9 @@ impl Pattern {
                 provenance_budget,
             )?;
             ensure_brace_compiled_ir_lower_bound(&expanded, parse_options, budget)?;
+            // Every expanded alternative compiles to exactly one, so the
+            // pattern keeps no spare capacity.
+            let mut alternatives = Vec::with_capacity(expanded.len());
             for alternative in expanded {
                 // The path entry points ignore one leading `./` on every
                 // expanded alternative, not only at the start of the source,
@@ -896,7 +922,14 @@ impl Pattern {
             leading_dot_is_normalized,
         )?;
         let fast_path = FastPath::compile(&tokens, options);
-        let sweep = compile_sweep(&tokens, &fast_path, extglob.as_ref(), options, budget)?;
+        let sweep = compile_sweep(
+            &tokens,
+            &fast_path,
+            extglob.as_deref(),
+            options,
+            budget,
+            None,
+        )?;
         let walker_path_shape = walker_path.finish();
         Self::from_alternatives(
             vec![CompiledAlternative {
@@ -1002,8 +1035,9 @@ impl Pattern {
         if fast_paths {
             self.alternative_fast_path = None;
         }
+        let options = self.options;
         for alternative in self.compiled_alternatives_mut() {
-            alternative.strip_engines(fast_paths, sweeps, prefilters);
+            alternative.strip_engines(options, fast_paths, sweeps, prefilters);
         }
     }
 
@@ -1438,7 +1472,17 @@ impl Pattern {
         budget.charge(tokens.len(), 0)?;
         let mut provenance_budget = ProvenanceBudget::new();
         let extglob = compile_extglob(&raw, options, budget, &mut provenance_budget, None, false)?;
-        let sweep = compile_sweep(&tokens, &fast_path, extglob.as_ref(), options, budget)?;
+        // Without a removed `./` the copy has its original's tokens, and the
+        // same tokens under the same options build the same engine.
+        let built = alternative.sweep.as_ref().filter(|_| !leading_dot_slash);
+        let sweep = compile_sweep(
+            &tokens,
+            &fast_path,
+            extglob.as_deref(),
+            options,
+            budget,
+            built,
+        )?;
         Ok(CompiledAlternative {
             extglob,
             raw,
@@ -2246,7 +2290,7 @@ struct CompiledAlternative {
     /// The compiled extglob program, present exactly when this alternative
     /// carries extglob syntax and the option is on. Matching borrows it; the
     /// interpreter used to re-derive all of it from `raw` on every call.
-    extglob: Option<CompiledExtglob>,
+    extglob: Option<Box<CompiledExtglob>>,
     /// Necessary conditions on a candidate, read off `tokens` at compile time
     /// and checked before the general engine runs. See [`Prefilter`].
     prefilter: Prefilter,
@@ -2259,15 +2303,46 @@ struct CompiledAlternative {
     /// [`compile_sweep`] found the tokens suitable. It answers exactly like
     /// the memoized matcher and replaces it in the dispatch, never a fast
     /// path and never an extglob program.
-    sweep: Option<Box<SweepEngine>>,
+    sweep: Option<SweepEngine>,
 }
 
 impl CompiledAlternative {
+    /// See [`Pattern::release_compile_state`]. Descends into extglob arms,
+    /// whose shapes the analysis read as well.
+    fn release_compile_state(&mut self) {
+        self.walker_path_shape = WalkerPathShape::default();
+        if let Some(program) = &mut self.extglob {
+            program.walker_source_provenance = None;
+            for group in &mut program.groups {
+                for alternative in group
+                    .alternatives
+                    .iter_mut()
+                    .chain(group.through_separator.iter_mut())
+                {
+                    for nested in &mut alternative.compiled {
+                        nested.release_compile_state();
+                    }
+                }
+            }
+        }
+    }
+
     /// Removes accelerated engines, descending into extglob alternatives so a
     /// differential run pins one engine for the sub-matches too.
     #[cfg(any(test, feature = "unstable-test-hooks"))]
-    fn strip_engines(&mut self, fast_paths: bool, sweeps: bool, prefilters: bool) {
+    fn strip_engines(
+        &mut self,
+        options: PatternOptions,
+        fast_paths: bool,
+        sweeps: bool,
+        prefilters: bool,
+    ) {
         if fast_paths {
+            // With its fast path gone the engine the compile deferred is what
+            // answers, as it did when every such alternative carried one.
+            if !sweeps && sweep_is_deferred(self) {
+                self.sweep = SweepEngine::build(&self.tokens, options).ok();
+            }
             self.fast_path = None;
         }
         if sweeps {
@@ -2284,7 +2359,7 @@ impl CompiledAlternative {
                     .chain(group.through_separator.iter_mut())
                 {
                     for nested in &mut alternative.compiled {
-                        nested.strip_engines(fast_paths, sweeps, prefilters);
+                        nested.strip_engines(options, fast_paths, sweeps, prefilters);
                     }
                 }
             }
@@ -2296,17 +2371,27 @@ impl CompiledAlternative {
 ///
 /// An extglob program keeps its own interpreter, and the literal and
 /// deterministic fast paths win the dispatch under every option profile, so
-/// building an engine behind either would spend budget on dead tables. Every
-/// other shape may reach the general path under another option profile, or
-/// retains the engine as a differential oracle behind a starred fast path, and
-/// gets an engine when its positions fit one word.
+/// building an engine behind either would spend budget on dead tables.
+///
+/// A starred fast path that also answers under the component policy wins the
+/// dispatch of every entry point as well, so a top-level alternative never
+/// runs the engine behind it either. The engine is charged but not built: an
+/// extglob arm's prefix scan does run it, and
+/// [`compile_extglob_alternative`] builds it there, and the differential
+/// hooks build it on demand as their oracle. Every other shape may reach the
+/// general path under some option profile and gets its engine here.
+///
+/// `built` is an engine already compiled from these very tokens under these
+/// options. It is shared instead of building a second copy of its tables,
+/// and charged as if it were built, so the budget does not depend on it.
 fn compile_sweep(
     tokens: &[Token],
     fast_path: &Option<FastPath>,
     extglob: Option<&CompiledExtglob>,
     options: PatternOptions,
     budget: &mut IrBudget,
-) -> Result<Option<Box<SweepEngine>>, PatternError> {
+    built: Option<&SweepEngine>,
+) -> Result<Option<SweepEngine>, PatternError> {
     if extglob.is_some()
         || matches!(
             fast_path,
@@ -2315,7 +2400,32 @@ fn compile_sweep(
     {
         return Ok(None);
     }
+    if fast_path
+        .as_ref()
+        .is_some_and(FastPath::supports_component_wildcards)
+    {
+        SweepEngine::charge(tokens, budget)?;
+        return Ok(None);
+    }
+    if let Some(built) = built {
+        SweepEngine::charge(tokens, budget)?;
+        return Ok(Some(built.clone()));
+    }
     SweepEngine::compile(tokens, options, budget)
+}
+
+/// Whether `alternative` carries an engine [`compile_sweep`] paid for but did
+/// not build, because its fast path answers every top-level entry point.
+fn sweep_is_deferred(alternative: &CompiledAlternative) -> bool {
+    alternative.sweep.is_none()
+        && alternative.extglob.is_none()
+        && alternative.fast_path.as_ref().is_some_and(|fast_path| {
+            fast_path.supports_component_wildcards()
+                && !matches!(
+                    fast_path,
+                    FastPath::LiteralTokens(_) | FastPath::DeterministicTokens(_)
+                )
+        })
 }
 
 /// Conditions every candidate the general engine accepts must already satisfy.
@@ -2497,13 +2607,17 @@ fn keep_longer_run(best: &mut Option<Vec<u8>>, run: &mut Vec<u8>) {
 /// written as `/`. Any other token in `run` would be a caller bug and is
 /// counted as nothing, which keeps the run shorter and the filter weaker.
 fn run_bytes(run: &[Token]) -> Vec<u8> {
-    run.iter()
-        .flat_map(|token| match token {
-            Token::Literal(literal) => literal.as_slice(),
-            _ => b"/".as_slice(),
-        })
-        .copied()
-        .collect()
+    fn bytes(token: &Token) -> &[u8] {
+        match token {
+            Token::Literal(literal) => literal,
+            _ => b"/",
+        }
+    }
+    let mut collected = Vec::with_capacity(run.iter().map(|token| bytes(token).len()).sum());
+    for token in run {
+        collected.extend_from_slice(bytes(token));
+    }
+    collected
 }
 
 fn token_min_length(token: &Token) -> usize {
@@ -3982,7 +4096,7 @@ impl WalkerPathSummary {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct WalkerPathShape {
     leading_dot_is_normalized: bool,
     components: Vec<WalkerComponent>,
@@ -4285,9 +4399,12 @@ fn class_members(values: Vec<ClassValue>) -> Vec<ClassMember> {
     members
 }
 
+/// Ends the current literal run. The token gets an exact copy and the run's
+/// buffer is kept for the next one, so a literal retains no spare capacity.
 fn flush_literals(tokens: &mut Vec<Token>, literals: &mut Vec<u8>) {
     if !literals.is_empty() {
-        tokens.push(Token::Literal(std::mem::take(literals)));
+        tokens.push(Token::Literal(literals.clone()));
+        literals.clear();
     }
 }
 
@@ -6086,7 +6203,7 @@ fn compile_extglob(
     provenance_budget: &mut ProvenanceBudget,
     walker_source_provenance: Option<&SourceProvenance>,
     leading_dot_is_normalized: bool,
-) -> Result<Option<CompiledExtglob>, PatternError> {
+) -> Result<Option<Box<CompiledExtglob>>, PatternError> {
     if !options.extglob || !contains_extglob(pattern, options.escape) {
         return Ok(None);
     }
@@ -6169,7 +6286,7 @@ fn compile_extglob(
             _ => None,
         })
         .collect();
-    Ok(Some(CompiledExtglob {
+    Ok(Some(Box::new(CompiledExtglob {
         literal_prefix,
         steps,
         groups,
@@ -6179,7 +6296,7 @@ fn compile_extglob(
         trailing_globstar_separator,
         walker_source_provenance: walker_source_provenance.cloned(),
         leading_dot_is_normalized,
-    }))
+    })))
 }
 
 /// Classifies one byte offset the way the interpreter classified it.
@@ -6347,7 +6464,7 @@ fn compile_extglob_alternative(
         root_component_wildcards: false,
         ..options
     };
-    let compiled = Pattern::compile_within(
+    let mut compiled = Pattern::compile_within(
         alternative,
         options,
         budget,
@@ -6357,6 +6474,14 @@ fn compile_extglob_alternative(
         bounds,
     )?
     .alternatives;
+    // An arm's prefix scan runs the engine whatever fast path the arm has,
+    // so the engine deferred for a top-level alternative is built here. The
+    // compile already charged it.
+    for compiled in &mut compiled {
+        if sweep_is_deferred(compiled) {
+            compiled.sweep = Some(SweepEngine::build(&compiled.tokens, options)?);
+        }
+    }
     let width = fixed_token_width(&compiled);
     Ok(ExtglobAlternative {
         compiled,
@@ -7718,10 +7843,11 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     use super::LiteralSuffix;
     use super::{
-        AlternativeFastPath, ExtglobStep, FailedStates, FastPath, Pattern, PatternOptions,
-        Prefilter, Token, WalkerPathViability, extglob_failed_len, extglob_failed_stats,
-        extglob_pending_peak, extglob_scratch_capacities, positive_extglob_scratch_capacities,
-        scratch_capacities,
+        AlternativeFastPath, ComponentBounds, ExtglobStep, FailedStates, FastPath, IrBudget,
+        Pattern, PatternOptions, Prefilter, ProvenanceBudget, SweepEngine, Token,
+        WalkerPathViability, extglob_failed_len, extglob_failed_stats, extglob_pending_peak,
+        extglob_scratch_capacities, positive_extglob_scratch_capacities, scratch_capacities,
+        sweep_is_deferred,
     };
 
     fn compile(pattern: &str) -> Pattern {
@@ -11332,6 +11458,83 @@ mod tests {
         let candidate = [b"a".repeat(70), b"xB".to_vec()].concat();
         assert!(oversized.is_match(&candidate));
         assert!(oversized.engines_agree(&candidate));
+    }
+
+    #[test]
+    fn sweeps_behind_a_complete_fast_path_are_built_only_where_they_run() {
+        // A starred fast path that also answers under the component policy
+        // wins every top-level dispatch, so its engine is not built there.
+        let options = PatternOptions::walker();
+        for source in ["*.rs", "**/*.rs", "src/**/*.rs"] {
+            let pattern = Pattern::compile(source, options).unwrap();
+            let alternative = &pattern.alternatives[0];
+            assert!(
+                alternative
+                    .fast_path
+                    .as_ref()
+                    .is_some_and(FastPath::supports_component_wildcards),
+                "{source} keeps its complete fast path"
+            );
+            assert!(alternative.sweep.is_none(), "{source} builds no engine");
+            assert!(sweep_is_deferred(alternative));
+            // The differential oracle still gets its engine on demand.
+            let mut sweep_only = pattern.clone();
+            sweep_only.strip_engines(true, false, false);
+            assert!(sweep_only.alternatives[0].sweep.is_some());
+            for path in ["lib.rs", "src/lib.rs", "src/.x.rs", "src/lib.ts"] {
+                assert!(pattern.engines_agree(path), "{source} against {path}");
+            }
+        }
+
+        // An extglob arm's prefix scan runs the engine whatever its fast path
+        // is, so the arm keeps one.
+        let extglob = Pattern::compile("*(*.rs|x)", options).unwrap();
+        let program = extglob.alternatives[0].extglob.as_ref().unwrap();
+        let arm = &program.groups[0].alternatives[0].compiled[0];
+        assert!(matches!(arm.fast_path, Some(FastPath::StarSuffix { .. })));
+        assert!(arm.sweep.is_some());
+
+        // Budget use does not depend on whether the engine was built: the
+        // same pattern charges as much as one whose engine is.
+        let mut deferred = IrBudget::new();
+        Pattern::compile_within(
+            b"*.rs",
+            options,
+            &mut deferred,
+            &mut ProvenanceBudget::new(),
+            None,
+            false,
+            ComponentBounds::WHOLE,
+        )
+        .unwrap();
+        let mut built = IrBudget::new();
+        let tokens = [Token::Star, Token::Literal(b".rs".to_vec())];
+        built.charge(tokens.len(), 0).unwrap();
+        SweepEngine::compile(&tokens, options, &mut built).unwrap();
+        assert_eq!(deferred.remaining, built.remaining);
+    }
+
+    #[test]
+    fn list_filter_copies_share_their_originals_engine() {
+        // `docs/*.md` needs a component copy for `is_match_path`; with the
+        // same tokens the copy reads its original's tables instead of
+        // building its own.
+        let pattern = Pattern::compile("docs/*.md", PatternOptions::walker()).unwrap();
+        let filter = pattern.path_filter.as_ref().expect("a component copy");
+        let (Some(original), Some(copy)) =
+            (&pattern.alternatives[0].sweep, &filter.compiled[0].sweep)
+        else {
+            panic!("both run the sweep");
+        };
+        assert!(original.shares_tables_with(copy));
+        assert!(pattern.is_match_path("docs/a.md"));
+        assert!(!pattern.is_match_path("docs/a/b.md"));
+
+        // A removed `./` changes the tokens, so that copy builds its own.
+        let dotted = Pattern::compile("./docs/*.md", PatternOptions::walker()).unwrap();
+        let filter = dotted.path_filter.as_ref().expect("a stripped copy");
+        assert!(filter.compiled[0].sweep.is_some());
+        assert!(dotted.is_match_glob_path("docs/a.md"));
     }
 
     #[test]

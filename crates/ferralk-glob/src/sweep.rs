@@ -23,6 +23,8 @@
 //! each policy is one precomputed block mask, chosen per call, while the byte
 //! table and the star structure are shared.
 
+use std::sync::Arc;
+
 use crate::{IrBudget, PatternError, PatternOptions, TOO_MUCH_COMPILED_IR, Token, is_separator};
 
 /// Most byte-consuming positions the single-register sweep may hold.
@@ -34,10 +36,12 @@ const MAX_NARROW_POSITIONS: usize = 63;
 
 /// What one compiled engine charges against the shared IR budget.
 ///
-/// The engine is a fixed-size block — dominated by the 2 KiB byte table — so
-/// it is charged as its size in [`Token`]-sized units, the currency the
-/// budget already counts.
-const NARROW_IR_UNITS: usize = size_of::<NarrowSweepEngine>().div_ceil(size_of::<Token>());
+/// The engine is a fixed-size block — dominated by the 2 KiB byte table it is
+/// built with — so it is charged as the size of its widest form in
+/// [`Token`]-sized units, the currency the budget already counts, whichever
+/// column width it is stored at. The value is pinned by a test: it decides
+/// which patterns fit the budget.
+const NARROW_IR_UNITS: usize = size_of::<NarrowSweepEngine<u64>>().div_ceil(size_of::<Token>());
 
 /// Persistent and temporary word rows allocated while compiling a wide sweep.
 ///
@@ -58,11 +62,67 @@ const WIDE_WORD_ROWS_AT_COMPILE: usize = 256 + 9 + 3;
 /// component and leading-dot policies left out; those depend on where in the
 /// candidate the byte sits, so they are applied per byte as block masks. Case
 /// folding and class membership are resolved into the table at compile time.
+///
+/// The tables are shared: a clone refers to the same tables, which is how a
+/// list-filter copy with the same tokens carries its original's engine.
+///
+/// A narrow engine stores its byte table at the narrowest column width that
+/// holds its positions, so a short pattern keeps a 256-byte table rather than
+/// a 2 KiB one. Each width is its own variant, dispatched once per candidate
+/// rather than once per byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SweepEngine {
-    Narrow(Box<NarrowSweepEngine>),
-    Wide(Box<WideSweepEngine>),
+    Narrow8(Arc<NarrowSweepEngine<u8>>),
+    Narrow16(Arc<NarrowSweepEngine<u16>>),
+    Narrow32(Arc<NarrowSweepEngine<u32>>),
+    Narrow64(Arc<NarrowSweepEngine<u64>>),
+    Wide(Arc<WideSweepEngine>),
 }
+
+/// Runs `$narrow` with `$engine` bound to whichever narrow engine `$sweep`
+/// is, at its own column width, or `$wide` for the multiword engine.
+macro_rules! dispatch {
+    ($sweep:expr, $engine:ident => $narrow:expr, $wide:ident => $wide_body:expr) => {
+        match $sweep {
+            SweepEngine::Narrow8($engine) => $narrow,
+            SweepEngine::Narrow16($engine) => $narrow,
+            SweepEngine::Narrow32($engine) => $narrow,
+            SweepEngine::Narrow64($engine) => $narrow,
+            SweepEngine::Wide($wide) => $wide_body,
+        }
+    };
+}
+
+/// One byte-table entry: the positions a byte reaches, at a width that holds
+/// every position of the engine.
+pub(crate) trait Column: Copy + Default + Eq + std::fmt::Debug {
+    /// Positions this width holds.
+    const POSITIONS: usize;
+    /// `positions`, every one of which is below [`Self::POSITIONS`].
+    fn narrowed(positions: u64) -> Self;
+    fn positions(self) -> u64;
+}
+
+macro_rules! column {
+    ($($width:ty),*) => {$(
+        impl Column for $width {
+            const POSITIONS: usize = <$width>::BITS as usize;
+
+            #[inline]
+            fn narrowed(positions: u64) -> Self {
+                debug_assert!(positions >> (Self::POSITIONS - 1) >> 1 == 0);
+                positions as Self
+            }
+
+            #[inline]
+            fn positions(self) -> u64 {
+                u64::from(self)
+            }
+        }
+    )*};
+}
+
+column!(u8, u16, u32, u64);
 
 /// Mutable state of one sweep. Extglob repetition keeps one per alternative
 /// and injects a new start boundary whenever the previous repetition reaches
@@ -73,9 +133,9 @@ pub(crate) enum SweepState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NarrowSweepEngine {
+pub(crate) struct NarrowSweepEngine<C> {
     /// Positions consuming each byte, before any policy mask.
-    table: [u64; 256],
+    table: [C; 256],
     /// Positions that repeat and may be skipped: every star-like token.
     stars: u64,
     /// `stars` without the `RecursivePrefix` positions: the closure after a
@@ -137,14 +197,36 @@ impl SweepEngine {
         tokens: &[Token],
         options: PatternOptions,
         budget: &mut IrBudget,
-    ) -> Result<Option<Box<Self>>, PatternError> {
+    ) -> Result<Option<Self>, PatternError> {
+        Self::charge(tokens, budget)?;
+        Self::build(tokens, options).map(Some)
+    }
+
+    /// Charges `budget` exactly what [`Self::compile`] charges, without
+    /// building the engine.
+    ///
+    /// An alternative whose fast path answers every entry point never runs
+    /// its engine, so it is not built; charging for it all the same keeps
+    /// which patterns fit the budget independent of that choice.
+    pub(crate) fn charge(tokens: &[Token], budget: &mut IrBudget) -> Result<(), PatternError> {
         let position_count = position_count(tokens)?;
         if position_count > MAX_NARROW_POSITIONS {
-            return WideSweepEngine::compile(tokens, options, position_count, budget)
-                .map(|engine| Some(Box::new(Self::Wide(Box::new(engine)))));
+            WideSweepEngine::charge(position_count, budget)
+        } else {
+            budget.charge(NARROW_IR_UNITS, 0)
         }
-        budget.charge(NARROW_IR_UNITS, 0)?;
+    }
 
+    /// Builds the engine [`Self::charge`] has already paid for.
+    pub(crate) fn build(tokens: &[Token], options: PatternOptions) -> Result<Self, PatternError> {
+        let position_count = position_count(tokens)?;
+        if position_count > MAX_NARROW_POSITIONS {
+            return WideSweepEngine::build(tokens, options, position_count)
+                .map(|engine| Self::Wide(Arc::new(engine)));
+        }
+
+        // Built at full width, then stored at the narrowest one that holds
+        // every position.
         let mut engine = NarrowSweepEngine {
             table: [0_u64; 256],
             stars: 0,
@@ -267,7 +349,12 @@ impl SweepEngine {
         }
         engine.initial = eclose(1, engine.stars);
         engine.initial_mid_component = eclose(1, engine.stars_mid_component);
-        Ok(Some(Box::new(Self::Narrow(Box::new(engine)))))
+        Ok(match position_count {
+            0..=8 => Self::Narrow8(Arc::new(engine.narrowed())),
+            9..=16 => Self::Narrow16(Arc::new(engine.narrowed())),
+            17..=32 => Self::Narrow32(Arc::new(engine.narrowed())),
+            _ => Self::Narrow64(Arc::new(engine)),
+        })
     }
 
     /// Matches the entire candidate, byte by byte.
@@ -276,16 +363,18 @@ impl SweepEngine {
     /// rest were folded into the tables when the pattern was compiled, and
     /// they never change between entry points of one [`Pattern`](crate::Pattern).
     pub(crate) fn is_match(&self, path: &[u8], options: PatternOptions) -> bool {
-        let mut state = self.empty_state();
-        self.inject_start(&mut state, options.candidate_starts_component);
-        let mut at_component_start = options.candidate_starts_component;
-        for &byte in path {
-            if !self.advance(&mut state, byte, at_component_start, options) {
-                return false;
+        dispatch!(self, engine => engine.is_match(path, options), _wide => {
+            let mut state = self.empty_state();
+            self.inject_start(&mut state, options.candidate_starts_component);
+            let mut at_component_start = options.candidate_starts_component;
+            for &byte in path {
+                if !self.advance(&mut state, byte, at_component_start, options) {
+                    return false;
+                }
+                at_component_start = is_separator(byte);
             }
-            at_component_start = is_separator(byte);
-        }
-        self.accepts(&state)
+            self.accepts(&state)
+        })
     }
 
     pub(crate) fn matching_prefix_ends(
@@ -300,28 +389,37 @@ impl SweepEngine {
         // rows, so keep those on the caller's thread-local extglob scratch
         // instead of allocating them for every group encounter. Narrow
         // sweeps deliberately leave that retained wide state intact.
-        let mut narrow = SweepState::Narrow(0);
-        let state = match self {
-            Self::Narrow(_) => &mut narrow,
-            Self::Wide(_) => {
-                let state = retained_wide.get_or_insert_with(|| self.empty_state());
-                self.reset_state(state);
-                state
-            }
-        };
-        self.inject_start(state, options.candidate_starts_component);
-        if self.accepts(state) {
-            output.push(base);
-        }
-        let mut at_component_start = options.candidate_starts_component;
-        for (offset, &byte) in path.iter().enumerate() {
-            if !self.advance(state, byte, at_component_start, options) {
-                break;
-            }
+        dispatch!(self, engine => engine.matching_prefix_ends(path, options, base, output), _wide => {
+            let state = retained_wide.get_or_insert_with(|| self.empty_state());
+            self.reset_state(state);
+            self.inject_start(state, options.candidate_starts_component);
             if self.accepts(state) {
-                output.push(base + offset + 1);
+                output.push(base);
             }
-            at_component_start = is_separator(byte);
+            let mut at_component_start = options.candidate_starts_component;
+            for (offset, &byte) in path.iter().enumerate() {
+                if !self.advance(state, byte, at_component_start, options) {
+                    break;
+                }
+                if self.accepts(state) {
+                    output.push(base + offset + 1);
+                }
+                at_component_start = is_separator(byte);
+            }
+        })
+    }
+
+    /// Whether `self` and `other` are one engine, shared rather than built
+    /// twice.
+    #[cfg(test)]
+    pub(crate) fn shares_tables_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Narrow8(one), Self::Narrow8(two)) => Arc::ptr_eq(one, two),
+            (Self::Narrow16(one), Self::Narrow16(two)) => Arc::ptr_eq(one, two),
+            (Self::Narrow32(one), Self::Narrow32(two)) => Arc::ptr_eq(one, two),
+            (Self::Narrow64(one), Self::Narrow64(two)) => Arc::ptr_eq(one, two),
+            (Self::Wide(one), Self::Wide(two)) => Arc::ptr_eq(one, two),
+            _ => false,
         }
     }
 
@@ -341,60 +439,52 @@ impl SweepEngine {
     }
 
     pub(crate) fn empty_state(&self) -> SweepState {
-        match self {
-            Self::Narrow(_) => SweepState::Narrow(0),
-            Self::Wide(engine) => SweepState::Wide {
-                state: vec![0; engine.stars.len()],
-                next: vec![0; engine.stars.len()],
-            },
-        }
+        dispatch!(self, _engine => SweepState::Narrow(0), engine => SweepState::Wide {
+            state: vec![0; engine.stars.len()],
+            next: vec![0; engine.stars.len()],
+        })
     }
 
     /// Clears a retained state for another pass through this engine. A state
     /// with a different representation or width belongs to another engine and
     /// is replaced once; steady-state extglob repetitions keep their buffers.
     pub(crate) fn reset_state(&self, state: &mut SweepState) {
-        match self {
-            Self::Narrow(_) => match state {
-                SweepState::Narrow(value) => *value = 0,
-                SweepState::Wide { .. } => *state = self.empty_state(),
-            },
-            Self::Wide(engine) => match state {
-                SweepState::Wide {
-                    state: current,
-                    next,
-                } if current.len() == engine.stars.len() && next.len() == engine.stars.len() => {
-                    current.fill(0);
-                    next.fill(0);
-                }
-                SweepState::Wide { .. } | SweepState::Narrow(_) => *state = self.empty_state(),
-            },
-        }
+        dispatch!(self, _engine => match state {
+            SweepState::Narrow(value) => *value = 0,
+            SweepState::Wide { .. } => *state = self.empty_state(),
+        }, engine => match state {
+            SweepState::Wide {
+                state: current,
+                next,
+            } if current.len() == engine.stars.len() && next.len() == engine.stars.len() => {
+                current.fill(0);
+                next.fill(0);
+            }
+            SweepState::Wide { .. } | SweepState::Narrow(_) => *state = self.empty_state(),
+        })
     }
 
     /// Adds the start boundary, closed for a candidate offset that does or
     /// does not start a path component.
     pub(crate) fn inject_start(&self, state: &mut SweepState, starts_component: bool) {
-        match (self, state) {
-            (Self::Narrow(engine), SweepState::Narrow(state)) => {
-                *state |= if starts_component {
-                    engine.initial
-                } else {
-                    engine.initial_mid_component
-                };
+        dispatch!(self, engine => {
+            let SweepState::Narrow(state) = state else {
+                unreachable!("a sweep state belongs to its engine");
+            };
+            *state |= engine.initial(starts_component);
+        }, engine => {
+            let SweepState::Wide { state, .. } = state else {
+                unreachable!("a sweep state belongs to its engine");
+            };
+            let initial = if starts_component {
+                &engine.initial
+            } else {
+                &engine.initial_mid_component
+            };
+            for (state, initial) in state.iter_mut().zip(initial) {
+                *state |= *initial;
             }
-            (Self::Wide(engine), SweepState::Wide { state, .. }) => {
-                let initial = if starts_component {
-                    &engine.initial
-                } else {
-                    &engine.initial_mid_component
-                };
-                for (state, initial) in state.iter_mut().zip(initial) {
-                    *state |= *initial;
-                }
-            }
-            _ => unreachable!("a sweep state belongs to its engine"),
-        }
+        })
     }
 
     pub(crate) fn advance(
@@ -404,31 +494,108 @@ impl SweepEngine {
         at_component_start: bool,
         options: PatternOptions,
     ) -> bool {
-        match (self, state) {
-            (Self::Narrow(engine), SweepState::Narrow(state)) => {
-                *state = engine.advance(*state, byte, at_component_start, options);
-                *state != 0
-            }
-            (Self::Wide(engine), SweepState::Wide { state, next }) => {
-                engine.advance(state, next, byte, at_component_start, options)
-            }
-            _ => unreachable!("a sweep state belongs to its engine"),
-        }
+        dispatch!(self, engine => {
+            let SweepState::Narrow(state) = state else {
+                unreachable!("a sweep state belongs to its engine");
+            };
+            *state = engine.advance(*state, byte, at_component_start, options);
+            *state != 0
+        }, engine => {
+            let SweepState::Wide { state, next } = state else {
+                unreachable!("a sweep state belongs to its engine");
+            };
+            engine.advance(state, next, byte, at_component_start, options)
+        })
     }
 
     pub(crate) fn accepts(&self, state: &SweepState) -> bool {
-        match (self, state) {
-            (Self::Narrow(engine), SweepState::Narrow(state)) => state & engine.accept != 0,
-            (Self::Wide(engine), SweepState::Wide { state, .. }) => state
+        dispatch!(self, engine => {
+            let SweepState::Narrow(state) = state else {
+                unreachable!("a sweep state belongs to its engine");
+            };
+            state & engine.accept != 0
+        }, engine => {
+            let SweepState::Wide { state, .. } = state else {
+                unreachable!("a sweep state belongs to its engine");
+            };
+            state
                 .iter()
                 .zip(&engine.accept)
-                .any(|(state, accept)| state & accept != 0),
-            _ => unreachable!("a sweep state belongs to its engine"),
+                .any(|(state, accept)| state & accept != 0)
+        })
+    }
+}
+
+impl NarrowSweepEngine<u64> {
+    /// The same engine with its byte table stored at width `C`, which holds
+    /// every position.
+    fn narrowed<C: Column>(&self) -> NarrowSweepEngine<C> {
+        NarrowSweepEngine {
+            table: self.table.map(C::narrowed),
+            stars: self.stars,
+            stars_mid_component: self.stars_mid_component,
+            sep_block_component: self.sep_block_component,
+            sep_block_glob: self.sep_block_glob,
+            dot_block: self.dot_block,
+            dot_stop_block: self.dot_stop_block,
+            accept: self.accept,
+            initial: self.initial,
+            initial_mid_component: self.initial_mid_component,
+            match_hidden: self.match_hidden,
+            case_insensitive: self.case_insensitive,
+            root_wildcard: self.root_wildcard,
         }
     }
 }
 
-impl NarrowSweepEngine {
+impl<C: Column> NarrowSweepEngine<C> {
+    fn initial(&self, starts_component: bool) -> u64 {
+        if starts_component {
+            self.initial
+        } else {
+            self.initial_mid_component
+        }
+    }
+
+    /// [`SweepEngine::is_match`] for this width, one register throughout.
+    fn is_match(&self, path: &[u8], options: PatternOptions) -> bool {
+        let mut state = self.initial(options.candidate_starts_component);
+        let mut at_component_start = options.candidate_starts_component;
+        for &byte in path {
+            state = self.advance(state, byte, at_component_start, options);
+            if state == 0 {
+                return false;
+            }
+            at_component_start = is_separator(byte);
+        }
+        state & self.accept != 0
+    }
+
+    /// [`SweepEngine::matching_prefix_ends`] for this width.
+    fn matching_prefix_ends(
+        &self,
+        path: &[u8],
+        options: PatternOptions,
+        base: usize,
+        output: &mut Vec<usize>,
+    ) {
+        let mut state = self.initial(options.candidate_starts_component);
+        if state & self.accept != 0 {
+            output.push(base);
+        }
+        let mut at_component_start = options.candidate_starts_component;
+        for (offset, &byte) in path.iter().enumerate() {
+            state = self.advance(state, byte, at_component_start, options);
+            if state == 0 {
+                break;
+            }
+            if state & self.accept != 0 {
+                output.push(base + offset + 1);
+            }
+            at_component_start = is_separator(byte);
+        }
+    }
+
     fn advance(
         &self,
         mut state: u64,
@@ -452,7 +619,7 @@ impl NarrowSweepEngine {
         };
 
         let separator = is_separator(byte);
-        let mut mask = self.table[usize::from(byte)];
+        let mut mask = self.table[usize::from(byte)].positions();
         if separator {
             mask &= !sep_block;
         } else if byte == b'.' && at_component_start {
@@ -512,12 +679,7 @@ pub(crate) struct WideSweepEngine {
 }
 
 impl WideSweepEngine {
-    fn compile(
-        tokens: &[Token],
-        options: PatternOptions,
-        position_count: usize,
-        budget: &mut IrBudget,
-    ) -> Result<Self, PatternError> {
+    fn charge(position_count: usize, budget: &mut IrBudget) -> Result<(), PatternError> {
         let word_count = (position_count + 1).div_ceil(u64::BITS as usize);
         let peak_words = word_count
             .checked_mul(WIDE_WORD_ROWS_AT_COMPILE)
@@ -525,8 +687,15 @@ impl WideSweepEngine {
         let peak_bytes = peak_words
             .checked_mul(size_of::<u64>())
             .ok_or_else(|| PatternError::new(0, TOO_MUCH_COMPILED_IR))?;
-        budget.charge(peak_bytes.div_ceil(size_of::<Token>()), 0)?;
+        budget.charge(peak_bytes.div_ceil(size_of::<Token>()), 0)
+    }
 
+    fn build(
+        tokens: &[Token],
+        options: PatternOptions,
+        position_count: usize,
+    ) -> Result<Self, PatternError> {
+        let word_count = (position_count + 1).div_ceil(u64::BITS as usize);
         let table_len = 256_usize
             .checked_mul(word_count)
             .ok_or_else(|| PatternError::new(0, TOO_MUCH_COMPILED_IR))?;
@@ -776,7 +945,7 @@ const fn eclose(state: u64, stars: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_NARROW_POSITIONS, SweepEngine, eclose, position_count};
+    use super::{MAX_NARROW_POSITIONS, NARROW_IR_UNITS, SweepEngine, eclose, position_count};
     use crate::{IrBudget, PatternOptions, Token};
 
     /// The closure spelled as the loop the bit trick replaces.
@@ -820,6 +989,54 @@ mod tests {
             1 << MAX_NARROW_POSITIONS,
             "a run ending at the cap must close into the accept boundary"
         );
+    }
+
+    #[test]
+    fn narrow_engines_keep_their_budget_charge() {
+        // The charge decides which patterns compile, so storing the table at
+        // a narrower width must not move it: 67 units is the full-width
+        // engine.
+        assert_eq!(NARROW_IR_UNITS, 67);
+        let tokens = [Token::Star, Token::Literal(b".rs".to_vec())];
+        let mut charged = IrBudget::new();
+        SweepEngine::charge(&tokens, &mut charged).expect("fits the budget");
+        let mut compiled = IrBudget::new();
+        SweepEngine::compile(&tokens, PatternOptions::default(), &mut compiled)
+            .expect("fits the budget");
+        assert_eq!(charged.remaining, compiled.remaining);
+        assert_eq!(IrBudget::new().remaining - charged.remaining, 67);
+    }
+
+    #[test]
+    fn narrow_engines_take_the_narrowest_width_that_holds_their_positions() {
+        let options = PatternOptions::default();
+        let literal = |len: usize| [Token::Literal(vec![b'a'; len]), Token::Star];
+        let width = |tokens: &[Token]| match SweepEngine::build(tokens, options).unwrap() {
+            SweepEngine::Narrow8(_) => 8,
+            SweepEngine::Narrow16(_) => 16,
+            SweepEngine::Narrow32(_) => 32,
+            SweepEngine::Narrow64(_) => 64,
+            SweepEngine::Wide(_) => 0,
+        };
+        // A literal of `len` bytes and a star take `len + 1` positions.
+        assert_eq!(width(&literal(7)), 8);
+        assert_eq!(width(&literal(8)), 16);
+        assert_eq!(width(&literal(15)), 16);
+        assert_eq!(width(&literal(16)), 32);
+        assert_eq!(width(&literal(31)), 32);
+        assert_eq!(width(&literal(32)), 64);
+        assert_eq!(width(&literal(62)), 64);
+        assert_eq!(width(&literal(63)), 0);
+        // Every width answers alike at its boundary positions.
+        for len in [7, 8, 15, 16, 31, 32, 62] {
+            let engine = SweepEngine::build(&literal(len), options).unwrap();
+            let exact = vec![b'a'; len];
+            let longer = [exact.as_slice(), b"xyz"].concat();
+            let short = vec![b'a'; len - 1];
+            assert!(engine.is_match(&exact, options), "{len}");
+            assert!(engine.is_match(&longer, options), "{len}");
+            assert!(!engine.is_match(&short, options), "{len}");
+        }
     }
 
     #[test]

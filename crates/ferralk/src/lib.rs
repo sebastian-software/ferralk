@@ -1728,8 +1728,11 @@ struct RootPlan {
     /// Byte index at which the root-relative part of any path built under this
     /// root begins. See [`RootPlan::relative_start`].
     relative_start: usize,
-    includes: Vec<TraversalPattern>,
-    excludes: Vec<TraversalPattern>,
+    /// Shared between roots where the root does not change the compiled
+    /// pattern, which is every relative pattern: a walk of several trees keeps
+    /// one copy of each rather than one per root.
+    includes: Vec<Arc<TraversalPattern>>,
+    excludes: Vec<Arc<TraversalPattern>>,
 }
 
 /// Builder for a filesystem walk: its roots, include and exclude patterns,
@@ -2172,7 +2175,14 @@ impl Walker {
     /// already configured cannot be rewritten for the new root.
     pub fn try_add_root(&mut self, root: impl Into<PathBuf>) -> Result<&mut Self, PatternError> {
         let mut plan = RootPlan::new(root.into());
-        self.compile_sources_for(&mut plan, self.include_options(), self.exclude_options())?;
+        // A relative pattern compiles the same under every root, so the new
+        // root shares the first root's copy.
+        self.compile_sources_for(
+            &mut plan,
+            self.include_options(),
+            self.exclude_options(),
+            Some(&self.roots[0]),
+        )?;
         self.roots.push(plan);
         Ok(self)
     }
@@ -2201,25 +2211,32 @@ impl Walker {
 
     /// Compiles every configured include and exclude for `plan`, which must
     /// hold no patterns yet, or reports the first rejection.
+    ///
+    /// `shared` is a root already compiled under the same options. The root
+    /// does not change a relative pattern, so `plan` takes that root's copy of
+    /// each one instead of compiling its own.
     fn compile_sources_for(
         &self,
         plan: &mut RootPlan,
         include_options: PatternOptions,
         exclude_options: PatternOptions,
+        shared: Option<&RootPlan>,
     ) -> Result<(), PatternError> {
         let root_bytes = glob_path_bytes(&plan.path);
-        for source in &self.include_sources {
-            plan.includes.push(compile_for_root(
+        for (index, source) in self.include_sources.iter().enumerate() {
+            plan.includes.push(share_or_compile_for_root(
                 source,
                 root_bytes.as_ref(),
                 include_options,
+                shared.map(|shared| &shared.includes[index]),
             )?);
         }
-        for source in &self.exclude_sources {
-            plan.excludes.push(compile_for_root(
+        for (index, source) in self.exclude_sources.iter().enumerate() {
+            plan.excludes.push(share_or_compile_for_root(
                 source,
                 root_bytes.as_ref(),
                 exclude_options,
+                shared.map(|shared| &shared.excludes[index]),
             )?);
         }
         Ok(())
@@ -2240,10 +2257,24 @@ impl Walker {
         &self,
         pattern: &[u8],
         options: PatternOptions,
-    ) -> Result<Vec<TraversalPattern>, PatternError> {
+    ) -> Result<Vec<Arc<TraversalPattern>>, PatternError> {
+        if absolute::is_relative(pattern, absolute::Syntax::NATIVE) {
+            // The root does not change a relative pattern, so every root
+            // shares one compile, and a pattern one root rejects every root
+            // rejects.
+            let compiled = Arc::new(compile_for_root(
+                pattern,
+                glob_path_bytes(&self.roots[0].path).as_ref(),
+                options,
+            )?);
+            return Ok(vec![compiled; self.roots.len()]);
+        }
         self.roots
             .iter()
-            .map(|root| compile_for_root(pattern, glob_path_bytes(&root.path).as_ref(), options))
+            .map(|root| {
+                compile_for_root(pattern, glob_path_bytes(&root.path).as_ref(), options)
+                    .map(Arc::new)
+            })
             .collect()
     }
 
@@ -2274,9 +2305,25 @@ impl Walker {
         }
         self.match_hidden = enabled;
         let options = self.include_options();
-        for root in &mut self.roots {
-            for pattern in &mut root.includes {
-                pattern.recompile(options);
+        // A pattern the roots share is a relative one, which every root holds
+        // at the same index as the first: it is recompiled once and stays
+        // shared.
+        let mut first_root: Vec<(Arc<TraversalPattern>, Arc<TraversalPattern>)> =
+            Vec::with_capacity(self.include_sources.len());
+        for (root_index, root) in self.roots.iter_mut().enumerate() {
+            for (index, pattern) in root.includes.iter_mut().enumerate() {
+                if let Some((previous, fresh)) = first_root.get(index)
+                    && root_index > 0
+                    && Arc::ptr_eq(previous, pattern)
+                {
+                    *pattern = Arc::clone(fresh);
+                    continue;
+                }
+                let fresh = Arc::new(pattern.recompiled(options));
+                let previous = std::mem::replace(pattern, Arc::clone(&fresh));
+                if root_index == 0 {
+                    first_root.push((previous, fresh));
+                }
             }
         }
         self
@@ -2355,15 +2402,13 @@ impl Walker {
         let exclude_options = exclude_pattern_options().case_insensitive(enabled);
         // Every root is compiled before any of them is replaced, so a pattern
         // that fails leaves the walker as it was rather than half folded.
-        let roots = self
-            .roots
-            .iter()
-            .map(|root| {
-                let mut plan = RootPlan::new(root.path.clone());
-                self.compile_sources_for(&mut plan, include_options, exclude_options)?;
-                Ok(plan)
-            })
-            .collect::<Result<Vec<_>, PatternError>>()?;
+        // Every root after the first shares that root's relative patterns.
+        let mut roots: Vec<RootPlan> = Vec::with_capacity(self.roots.len());
+        for root in &self.roots {
+            let mut plan = RootPlan::new(root.path.clone());
+            self.compile_sources_for(&mut plan, include_options, exclude_options, roots.first())?;
+            roots.push(plan);
+        }
         self.roots = roots;
         self.case_insensitive = enabled;
         Ok(self)
@@ -2865,6 +2910,23 @@ pub(crate) fn glob_bytes_into<'a>(bytes: &[u8], scratch: &'a mut Vec<u8>) -> &'a
     scratch
 }
 
+/// The compiled pattern of `source` for `root`: `shared`, the copy another
+/// root holds under the same options, when `source` is relative and the root
+/// therefore changes nothing, and a fresh compile otherwise.
+fn share_or_compile_for_root(
+    source: &[u8],
+    root: &[u8],
+    options: PatternOptions,
+    shared: Option<&Arc<TraversalPattern>>,
+) -> Result<Arc<TraversalPattern>, PatternError> {
+    if let Some(shared) = shared
+        && absolute::is_relative(source, absolute::Syntax::NATIVE)
+    {
+        return Ok(Arc::clone(shared));
+    }
+    compile_for_root(source, root, options).map(Arc::new)
+}
+
 /// Compiles one include or exclude for one root, rewriting it if it is
 /// absolute.
 ///
@@ -2876,7 +2938,7 @@ fn compile_for_root(
     options: PatternOptions,
 ) -> Result<TraversalPattern, PatternError> {
     match walker_pattern_for_root(pattern, root, absolute::Syntax::NATIVE, options)? {
-        Some(usable) => TraversalPattern::compile(&usable, options),
+        Some((usable, matcher)) => TraversalPattern::with_matcher(&usable, options, matcher),
         // Compiled even though it can never match, so that a pattern the caller
         // wrote badly is still reported, and kept rather than dropped, because
         // dropping an include would widen the walk to everything instead of
@@ -2889,7 +2951,8 @@ fn compile_for_root(
     }
 }
 
-/// The bytes the walker will compile for `root`, or the reason it will not.
+/// The bytes the walker will compile for `root`, with the matcher they compile
+/// to, or the reason it will not.
 ///
 /// `None` is the verdict that the pattern names paths outside this root and can
 /// select nothing here. The path-shaped check runs after the rewrite and only
@@ -2901,7 +2964,7 @@ fn walker_pattern_for_root(
     root: &[u8],
     syntax: absolute::Syntax,
     options: PatternOptions,
-) -> Result<Option<Vec<u8>>, PatternError> {
+) -> Result<Option<(Vec<u8>, Pattern)>, PatternError> {
     let Some(rewritten) = rewrite_pattern_for_root_with_source(pattern, root, syntax)? else {
         return Ok(None);
     };
@@ -2912,7 +2975,7 @@ fn walker_pattern_for_root(
         parsed.walker_path_problem_offset(),
     )
     .map_err(|error| rebase_pattern_error(error, rewritten.source_start))?;
-    Ok(Some(rewritten.bytes))
+    Ok(Some((rewritten.bytes, parsed)))
 }
 
 struct RewrittenPattern {
@@ -3108,6 +3171,25 @@ struct TraversalPattern {
 
 impl TraversalPattern {
     fn compile(source: &[u8], options: PatternOptions) -> Result<Self, PatternError> {
+        Self::build(source, options, None)
+    }
+
+    /// Builds the pattern around `matcher`, which [`walker_pattern_for_root`]
+    /// already compiled from these bytes under these options to validate
+    /// them. Compiling it a second time would build the same pattern.
+    fn with_matcher(
+        source: &[u8],
+        options: PatternOptions,
+        matcher: Pattern,
+    ) -> Result<Self, PatternError> {
+        Self::build(source, options, Some(matcher))
+    }
+
+    fn build(
+        source: &[u8],
+        options: PatternOptions,
+        matcher: Option<Pattern>,
+    ) -> Result<Self, PatternError> {
         let directories_only = source.len() > 1 && source.ends_with(b"/");
         let pattern = if directories_only {
             &source[..source.len() - 1]
@@ -3139,9 +3221,13 @@ impl TraversalPattern {
                 None => alternative,
             })
             .collect::<Vec<_>>();
+        let matcher = match matcher {
+            Some(matcher) => matcher,
+            None => Pattern::compile(pattern, options)?,
+        };
         Ok(Self {
             source: source.to_vec(),
-            matcher: Pattern::compile(pattern, options)?,
+            matcher,
             directories_only,
             subtree_root,
             // The prefilters are literal prefixes and literal extensions, so
@@ -3157,19 +3243,18 @@ impl TraversalPattern {
         })
     }
 
-    /// Recompiles the pattern under changed matcher options.
+    /// The pattern recompiled under changed matcher options.
     ///
     /// `match_hidden` is a matching-time policy - it decides whether a wildcard
     /// may cover a leading period - and never a question of syntax, so a source
     /// that compiled once compiles again.
-    fn recompile(&mut self, options: PatternOptions) {
-        let source = std::mem::take(&mut self.source);
+    fn recompiled(&self, options: PatternOptions) -> Self {
+        let mut recompiled = Self::compile(&self.source, options)
+            .expect("a compiled pattern stays valid when only match_hidden changes");
         // Whether the pattern can reach this root is a question about the root,
         // which `match_hidden` does not change.
-        let never_matches = self.never_matches;
-        *self = Self::compile(&source, options)
-            .expect("a compiled pattern stays valid when only match_hidden changes");
-        self.never_matches = never_matches;
+        recompiled.never_matches = self.never_matches;
+        recompiled
     }
 
     /// Whether the pattern selects this candidate under `mode`.
@@ -9903,6 +9988,91 @@ mod tests {
         assert_eq!(
             walk(WildcardMode::SeparatorCrossing),
             vec![PathBuf::from("src/a.ts"), PathBuf::from("src/deep/b.ts")]
+        );
+    }
+
+    /// The root never changes a relative pattern, so the roots of one walker
+    /// hold one copy of it, whether the root came before or after the pattern
+    /// and across a later `match_hidden` recompile. An absolute pattern is
+    /// rewritten per root and keeps one copy each.
+    #[test]
+    fn roots_share_every_relative_pattern() {
+        let fixture = Fixture::new();
+        fixture.write("one/src/a.ts");
+        fixture.write("one/src/.hidden.ts");
+        fixture.write("two/src/b.ts");
+        let one = fixture.root.join("one");
+        let two = fixture.root.join("two");
+        let absolute = fixture.absolute("/one/src/*.ts");
+
+        let walker = Walker::new(&one)
+            .include("src/*.ts")
+            .expect("valid include")
+            .exclude("**/skip/**")
+            .expect("valid exclude")
+            .add_root(&two)
+            .expect("the patterns compile for the new root")
+            .include(&absolute)
+            .expect("valid absolute include")
+            .include("lib/**")
+            .expect("valid include")
+            .match_hidden(true)
+            .options(WalkOptions::default().sort(true).files_only(true));
+        let [first, second] = walker.roots.as_slice() else {
+            panic!("two roots");
+        };
+        assert!(std::sync::Arc::ptr_eq(
+            &first.includes[0],
+            &second.includes[0]
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &first.excludes[0],
+            &second.excludes[0]
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.includes[1],
+            &second.includes[1]
+        ));
+        assert!(second.includes[1].never_matches);
+        assert!(std::sync::Arc::ptr_eq(
+            &first.includes[2],
+            &second.includes[2]
+        ));
+
+        // Recompiling every root for case folding keeps the sharing.
+        let folded = walker
+            .clone()
+            .case_insensitive(true)
+            .expect("folding compiles every pattern again");
+        let [first, second] = folded.roots.as_slice() else {
+            panic!("two roots");
+        };
+        for (one, two) in [
+            (&first.includes[0], &second.includes[0]),
+            (&first.includes[2], &second.includes[2]),
+            (&first.excludes[0], &second.excludes[0]),
+        ] {
+            assert!(std::sync::Arc::ptr_eq(one, two));
+        }
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.includes[1],
+            &second.includes[1]
+        ));
+
+        let result = walker.collect().expect("walk succeeds");
+        let mut paths = result
+            .entries()
+            .iter()
+            .map(|entry| entry.path().to_path_buf())
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                one.join("src/.hidden.ts"),
+                one.join("src/a.ts"),
+                two.join("src/b.ts"),
+            ]
         );
     }
 

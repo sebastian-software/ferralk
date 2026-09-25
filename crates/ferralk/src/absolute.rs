@@ -357,6 +357,14 @@ fn deverbatimize<'a>(bytes: &'a [u8], syntax: Syntax) -> Cow<'a, [u8]> {
     }
 }
 
+/// Whether [`rewrite_in`] reads `pattern` as root-relative under every root.
+///
+/// That verdict is taken before the root is looked at, so such a pattern
+/// compiles to the same walker pattern for each root it is applied under.
+pub(crate) fn is_relative(pattern: &[u8], syntax: Syntax) -> bool {
+    absolute_prefix(&deverbatimize(pattern, syntax), syntax).is_none()
+}
+
 /// Length of the prefix that makes `bytes` absolute, if it is.
 ///
 /// On Windows a single leading separator is deliberately not enough, matching
@@ -472,7 +480,7 @@ fn dot_dot_component(pattern: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rewrite, Syntax, rewrite_in};
+    use super::{Rewrite, Syntax, is_relative, rewrite_in};
 
     /// Convenience for the common assertion: this rewrote to these bytes.
     fn rooted(pattern: &str, root: &str, syntax: Syntax) -> String {
@@ -609,6 +617,39 @@ mod tests {
     #[test]
     fn a_trailing_backslash_is_left_to_the_compiler() {
         assert_eq!(rejection(r"src\", Syntax::Windows), None);
+    }
+
+    /// The walker shares a relative pattern between roots on the strength
+    /// of this verdict, so it must be exactly the one `rewrite_in` reaches,
+    /// under every root.
+    #[test]
+    fn a_relative_verdict_is_the_one_every_root_gets() {
+        let patterns = [
+            "src/**",
+            "/src/**",
+            "//server/share/x",
+            "C:/repo/x",
+            "c:x",
+            "\\\\?\\C:\\x",
+            "//?/C:/x",
+            "\\x",
+            "./a",
+            "",
+            "*",
+        ];
+        let roots = ["/repo", "C:/repo", "//server/share", "relative", ""];
+        for syntax in [Syntax::Posix, Syntax::Windows] {
+            for pattern in patterns {
+                for root in roots {
+                    let rewritten = rewrite_in(pattern.as_bytes(), root.as_bytes(), syntax);
+                    assert_eq!(
+                        is_relative(pattern.as_bytes(), syntax),
+                        matches!(rewritten, Ok(Rewrite::Relative)),
+                        "{pattern:?} under {root:?} with {syntax:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
