@@ -5446,7 +5446,8 @@ enum ExtglobStep {
     Star {
         next: usize,
         /// Ordinary stars cannot stop immediately before a leading period.
-        /// A syntactic recursive `**/` prefix is the sole exemption.
+        /// A whole-component star run ending in a recursive `**/` prefix is
+        /// exempt, including longer even runs such as `****/`.
         blocks_leading_period: bool,
     },
     /// `?`.
@@ -6188,12 +6189,12 @@ impl PositiveExtglobBuilder<'_> {
                         token_position_component_local(tokens, token_index, root_component_local),
                     )),
                     start,
-                    StarSemantics::ordinary(false),
+                    StarSemantics::ordinary(false).handing_over_to(tokens.get(token_index + 1)),
                 )?,
                 Token::RecursiveStar => self.star(
                     PositiveExtglobMatcher::Wildcard(WildcardScope::Recursive),
                     start,
-                    StarSemantics::ordinary(true),
+                    StarSemantics::ordinary(true).handing_over_to(tokens.get(token_index + 1)),
                 )?,
                 Token::RecursivePrefix => self.star(
                     PositiveExtglobMatcher::Wildcard(WildcardScope::Recursive),
@@ -6443,7 +6444,8 @@ fn compile_extglob_step(
             ExtglobStep::Star {
                 next,
                 blocks_leading_period: !(options.recursive_double_star
-                    && next - index == 2
+                    && next - index >= 2
+                    && (next - index).is_multiple_of(2)
                     && pattern.get(next) == Some(&b'/')
                     && starts_component_at(pattern, index, options.escape, ComponentBounds::WHOLE)),
             }
@@ -7343,18 +7345,28 @@ fn extglob_group_allows_literal_leading_period(group: &ExtglobGroup) -> bool {
             matches!(
                 alternative.tokens.first(),
                 Some(Token::Literal(literal)) if literal.first() == Some(&b'.')
-            )
+            ) || alternative_starts_with_recursive_prefix(&alternative.tokens)
         })
     }) || group.through_separator.iter().any(|alternative| {
-        // An alternative that begins with a `**/` may leave a leading period
-        // to what follows, as `**/.h` matches `.h` (#422). The `**/` itself
-        // consumes no hidden component, and every token after it keeps its
-        // own rule.
+        // A trailing `**` compiled together with the outer separator can
+        // leave a leading period to what follows, as `**/.h` does (#422).
         alternative
             .compiled
             .iter()
-            .any(|alternative| matches!(alternative.tokens.first(), Some(Token::RecursivePrefix)))
+            .any(|alternative| alternative_starts_with_recursive_prefix(&alternative.tokens))
     })
+}
+
+/// A leading even run of recursive stars may hand over to its final `**/`
+/// without consuming a hidden component. Odd runs end in an ordinary star
+/// and still block the leading period (#442, #445).
+fn alternative_starts_with_recursive_prefix(tokens: &[Token]) -> bool {
+    matches!(
+        tokens
+            .iter()
+            .find(|token| !matches!(token, Token::RecursiveStar)),
+        Some(Token::RecursivePrefix)
+    )
 }
 
 fn queue_extglob_group(
@@ -9321,7 +9333,7 @@ mod tests {
     }
 
     #[test]
-    fn extglob_recursive_prefix_exemption_requires_exactly_two_stars() {
+    fn extglob_recursive_prefix_exemption_follows_even_star_runs() {
         let options = PatternOptions::default()
             .extglob(true)
             .recursive_double_star(true);
@@ -9352,6 +9364,20 @@ mod tests {
             }
         ));
         assert!(!ordinary.is_match(".hidden/foo"));
+
+        let longer = Pattern::compile("****/@(.h)", options).expect("extglob compiles");
+        assert!(matches!(
+            longer.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("the pattern carries an extglob program")
+                .steps[0],
+            ExtglobStep::Star {
+                next: 4,
+                blocks_leading_period: false
+            }
+        ));
+        assert!(longer.is_match(".h"));
     }
 
     #[test]
@@ -10632,6 +10658,10 @@ mod tests {
             ("@(**|b)/a", &["**/a", "b/a"]),
             ("?(**)/a", &["**/a", "/a"]),
             ("@(**)/.a", &["**/.a"]),
+            ("@(**/.a)", &["**/.a"]),
+            ("@(****)/.a", &["****/.a"]),
+            ("****/@(.a)", &["****/.a"]),
+            (r"@(x\\|****/.a)", &["x\\", "****/.a"]),
             ("@(**)/*", &["**/*"]),
             ("@(**)/?", &["**/?"]),
             ("a/@(**)/b", &["a/**/b"]),
@@ -10758,6 +10788,45 @@ mod tests {
                 pattern.engines_agree(candidate),
                 "{source} against {candidate}"
             );
+        }
+    }
+
+    #[test]
+    fn extglob_recursive_prefix_hidden_literal_matches_inlined_form() {
+        let options = PatternOptions::default()
+            .extglob(true)
+            .recursive_double_star(true);
+        for (group, inline) in [
+            ("@(**)/.h", "**/.h"),
+            ("**/@(.h)", "**/.h"),
+            ("@(**/.h)", "**/.h"),
+            ("@(****)/.h", "****/.h"),
+            ("****/@(.h)", "****/.h"),
+            (r"@(x\\|****/.h)", "****/.h"),
+        ] {
+            let grouped = Pattern::compile(group, options).expect("group compiles");
+            let inlined = Pattern::compile(inline, options).expect("inline compiles");
+            for path in [".h", "a/.h", "a/b/.h"] {
+                let answers = |pattern: &Pattern| {
+                    [
+                        pattern.is_match(path),
+                        pattern.is_match_path(path),
+                        pattern.is_match_glob_path(path),
+                    ]
+                };
+                assert_eq!(
+                    answers(&grouped),
+                    answers(&inlined),
+                    "{group} against {path}"
+                );
+                assert_eq!(answers(&grouped), [true; 3], "{group} against {path}");
+                assert!(grouped.engines_agree(path), "{group} against {path}");
+            }
+        }
+        for pattern in ["@(****)/*", "****/@(*h)", "@(*****)/.h"] {
+            let compiled = Pattern::compile(pattern, options).expect("pattern compiles");
+            assert!(!compiled.is_match_glob_path(".h"), "{pattern}");
+            assert!(compiled.engines_agree(".h"), "{pattern}");
         }
     }
 
