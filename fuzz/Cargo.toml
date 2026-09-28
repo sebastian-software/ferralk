@@ -10,7 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 corpus = { path = "../tools/corpus" }
-fast-glob = "=1.1.1"
+fast-glob = "=1.1.2"
 ferralk-glob = { path = "../crates/ferralk-glob", features = ["unstable-test-hooks"] }
 libfuzzer-sys = "=0.4.13"
 serde_json = "=1.0.151"
