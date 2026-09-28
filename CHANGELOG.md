@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.1](https://github.com/sebastian-software/ferralk/compare/v1.1.0...v1.1.1) (2026-09-28)
+
+
+### Bug Fixes
+
+* **glob:** let a star run ending in a `**/` prefix leave a leading period to the literal ([#444](https://github.com/sebastian-software/ferralk/issues/444)) ([018aafe](https://github.com/sebastian-software/ferralk/commit/018aafe71b90f4ab0a21cd64c10a9804a2fa4b5b))
+* **walker:** spell entries below a bare drive root without a separator ([#446](https://github.com/sebastian-software/ferralk/issues/446)) ([b1af75b](https://github.com/sebastian-software/ferralk/commit/b1af75b716025a57dfbb37b88bfc1495d646e3e3))
+
 ## [1.1.0](https://github.com/sebastian-software/ferralk/compare/v1.0.0...v1.1.0) (2026-09-25)
 
 
