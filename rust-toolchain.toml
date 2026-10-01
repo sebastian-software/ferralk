@@ -2,5 +2,5 @@
 # checked by its own CI job. Tracking stable means rustfmt output can shift
 # between stable releases; pin a version here if that must not happen.
 [toolchain]
-channel = "stable"
+channel = "1.99.0"
 components = ["clippy", "rustfmt"]
