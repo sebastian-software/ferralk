@@ -133,7 +133,7 @@ jobs:
       # its own job leaves the Rust matrix Node-free.
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: "24"
+          node-version: "24.21.0"
       # The generator is fetched straight from Git with a `&path:` fragment,
       # which is pnpm syntax, so `pnpm dlx` is what has to run it. Corepack
       # ships with Node; pinning the pnpm version keeps this lane as
