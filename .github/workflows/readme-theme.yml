@@ -16,6 +16,6 @@ jobs:
       - name: Install the pinned Markdown generator
         uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
         with:
-          version: 2026.9.5
+          version: 2026.10.6
           install_args: --locked
       - run: mise run readme:check
