@@ -1,0 +1,17 @@
+node_modules/
+build/
+.DS_Store
+app/routes.ts
+app/data/site.json
+app/data/navigation.json
+app/data/benchmarks.json
+# Generated from canonical repository documentation.
+app/routes/reference/
+app/routes/evidence/
+app/routes/architecture/
+app/routes/contributing/
+app/routes/archive/
+app/routes/guide/usage.md
+app/routes/guide/migration.md
+app/routes/guide/getting-started.md
+app/routes/archive.md

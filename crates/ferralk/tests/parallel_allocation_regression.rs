@@ -140,6 +140,25 @@ fn count_parallel_walk(root: &Path) -> u64 {
     allocations
 }
 
+fn portable_reader_floor() -> u64 {
+    let fixture = Fixture::new(1);
+    let directory = fixture.root.join("batch-0");
+    let count = || {
+        process_counter::start();
+        for entry in fs::read_dir(&directory).expect("read control directory") {
+            black_box(entry.expect("read control entry").file_name());
+        }
+        process_counter::finish()
+    };
+    let populated = count();
+    for entry in fs::read_dir(&directory).expect("read control directory") {
+        fs::remove_file(entry.expect("read control entry").path()).expect("clear control file");
+    }
+    populated
+        .checked_sub(count())
+        .expect("the populated standard reader cannot allocate less than the empty reader")
+}
+
 #[test]
 fn parallel_workers_do_not_gain_per_entry_allocations() {
     let small = Fixture::new(SMALL_DIRECTORY_COUNT);
@@ -158,18 +177,15 @@ fn parallel_workers_do_not_gain_per_entry_allocations() {
             panic!("the larger fixture allocated less ({large_allocations} < {small_allocations})")
         });
     let added_entries = (LARGE_DIRECTORY_COUNT - SMALL_DIRECTORY_COUNT) * ENTRIES_PER_DIRECTORY;
-    // The serial allocation pin establishes these unavoidable reader floors:
-    // Linux ReadDir owns a CString and an OsString for each name, while other
-    // portable readers own one OsString. Native readers reuse their buffers.
+    // Keep the fixed scheduler budget independent of std::fs's own per-entry
+    // name storage, which can change between platforms and Rust releases.
     let backend_floor = if cfg!(any(
         all(feature = "native-linux", target_os = "linux"),
         all(feature = "native-macos", target_os = "macos")
     )) {
         0
-    } else if cfg!(target_os = "linux") {
-        (added_entries * 2) as u64
     } else {
-        added_entries as u64
+        portable_reader_floor() * added_entries as u64 / ENTRIES_PER_DIRECTORY as u64
     };
     let allowed = backend_floor + PARALLEL_GROWTH_BUDGET;
     assert!(

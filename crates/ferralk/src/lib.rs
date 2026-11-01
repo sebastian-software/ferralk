@@ -2215,7 +2215,6 @@ impl Walker {
     }
 
     /// The roots this walk starts from, in the order they were added.
-    #[must_use]
     pub fn roots(&self) -> impl ExactSizeIterator<Item = &Path> {
         self.roots.iter().map(|root| root.path.as_path())
     }

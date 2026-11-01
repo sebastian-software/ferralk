@@ -1,0 +1,16 @@
+{
+  "extends": "ardo/tsconfig",
+  "compilerOptions": {
+    "allowJs": true,
+    "skipLibCheck": true,
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "isolatedModules": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true
+  },
+  "include": ["app/**/*", "*.ts", "*.config.ts", "scripts/**/*.mjs"],
+  "exclude": ["node_modules", "build"]
+}

@@ -1,0 +1,31 @@
+{
+  "files": [
+    "src/main.ts",
+    "src/components/button.tsx",
+    "packages/ui/index.ts",
+    "public/legacy.ts",
+    "node_modules/vendor/index.ts",
+    "dist/main.js",
+    ".cache/old.ts"
+  ],
+  "ignore": "node_modules/\ndist/",
+  "samples": [
+    {
+      "id": "scoped",
+      "label": "Source roots only",
+      "pattern": "{src,packages}/**/*.{ts,tsx}",
+      "paths": ["packages/ui/index.ts", "src/components/button.tsx", "src/main.ts"]
+    },
+    {
+      "id": "unscoped",
+      "label": "The whole project",
+      "pattern": "**/*.{ts,tsx}",
+      "paths": [
+        "packages/ui/index.ts",
+        "public/legacy.ts",
+        "src/components/button.tsx",
+        "src/main.ts"
+      ]
+    }
+  ]
+}

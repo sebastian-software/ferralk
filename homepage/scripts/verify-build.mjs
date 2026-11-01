@@ -1,0 +1,224 @@
+/* eslint-disable security/detect-non-literal-fs-filename -- Built files and route targets stay inside the verified site output. */
+import { access, readFile } from "node:fs/promises";
+import { extname, join, normalize, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { expectedPages } from "./site-pages.mjs";
+
+const outputDirectory = new URL("../build/client/", import.meta.url);
+const read = async (page) => {
+  const html = await readFile(new URL(page, outputDirectory), "utf8");
+  return html.replaceAll(/<!--.*?-->/g, "");
+};
+const pageFiles = await Promise.all(expectedPages.map(async (page) => [page, await read(page)]));
+const linkCount = await verifyRenderedPages(pageFiles);
+verifyFocusableMarkdownCodeBlocks(await read("guide/getting-started/index.html"));
+verifyFocusableMarkdownTables(await read("reference/patterns/index.html"));
+for (const [page, html] of pageFiles) {
+  if (
+    !html.includes('class="ferra-header ferra-wrap"') ||
+    !html.includes('class="ferra-footer ferra-wrap"')
+  )
+    throw new Error(`${page} is missing the shared family shell.`);
+  if (html.includes("site.css")) throw new Error(`${page} still uses project-specific CSS.`);
+}
+console.log(
+  `Verified ${expectedPages.length} pages and ${linkCount} internal links and fragments.`,
+);
+
+async function verifyRenderedPages(pages) {
+  const context = {
+    outputPath: fileURLToPath(outputDirectory),
+    pageIds: new Map(),
+  };
+  for (const [page, html] of pages) {
+    const tags = htmlTags(html);
+    assertPageStructure(page, tags);
+    context.pageIds.set(page, collectIds(tags));
+  }
+
+  let internalLinks = 0;
+  for (const [page, html] of pages) internalLinks += await verifyPageLinks(page, html, context);
+  return internalLinks;
+}
+
+function verifyFocusableMarkdownTables(html) {
+  const tables = htmlTags(html).filter((tag) => tag.name === "table");
+  if (tables.length === 0) {
+    throw new Error("The rendered API guide has no Markdown tables to verify.");
+  }
+
+  const accessible = [
+    ...html.matchAll(/<div\s[^>]*role="region"[^>]*tabindex="0"[^>]*>[\s\S]*?<table\b/g),
+  ];
+  if (accessible.length !== tables.length) {
+    throw new Error("Every Markdown table must have a focusable scrolling region.");
+  }
+}
+
+function verifyFocusableMarkdownCodeBlocks(html) {
+  const blocks = htmlTags(html).filter((tag) => tag.name === "pre");
+  if (blocks.length === 0) {
+    throw new Error("The rendered getting-started guide has no Markdown code blocks to verify.");
+  }
+
+  const missingTabIndex = blocks.filter((block) => attribute(block.raw, "tabindex") !== "0");
+  if (missingTabIndex.length > 0) {
+    throw new Error(
+      `The rendered getting-started guide has ${missingTabIndex.length} Markdown code block(s) without keyboard focus.`,
+    );
+  }
+}
+
+function assertPageStructure(page, tags) {
+  const h1Count = tags.filter((tag) => tag.name === "h1").length;
+  if (h1Count !== 1) throw new Error(`${page} must contain exactly one h1; found ${h1Count}.`);
+  const mainCount = tags.filter(
+    (tag) => tag.name === "main" || attribute(tag.raw, "role") === "main",
+  ).length;
+  if (mainCount !== 1)
+    throw new Error(`${page} must contain exactly one main landmark; found ${mainCount}.`);
+}
+
+async function verifyPageLinks(page, html, context) {
+  let links = 0;
+  for (const tag of htmlTags(html)) {
+    if (tag.name === "a" && (await verifyInternalLink(page, tag, context))) links++;
+  }
+  return links;
+}
+
+async function verifyInternalLink(page, tag, context) {
+  const rawHref = attribute(tag.raw, "href");
+  if (rawHref === undefined) return false;
+  const href = decodeHtml(rawHref).trim();
+  if (href === "") return false;
+
+  const sourcePath = page === "index.html" ? "/" : `/${page.replaceAll(/index\.html$/g, "")}`;
+  const targetUrl = new URL(href, new URL(sourcePath, "https://ferralk.dev"));
+  if (targetUrl.origin !== "https://ferralk.dev") return false;
+
+  const targetPath = resolveTargetPath({
+    targetUrl,
+    href,
+    sourcePage: page,
+    outputPath: context.outputPath,
+  });
+  const absolutePath = resolve(context.outputPath, targetPath);
+  await access(absolutePath).catch(() => {
+    throw new Error(`${page} links to a missing built file: ${href} (${targetPath})`);
+  });
+  await verifyFragment({ page, targetPath, targetUrl, absolutePath, href, context });
+  return true;
+}
+
+function resolveTargetPath({ targetUrl, href, sourcePage, outputPath }) {
+  const decodedPath = decodeURIComponent(targetUrl.pathname);
+  let targetPath = normalize(decodedPath.replaceAll(/^\/+/g, ""));
+  if (targetPath === "" || decodedPath.endsWith("/") || !extname(targetPath))
+    targetPath = join(targetPath, "index.html");
+  const absolutePath = resolve(outputPath, targetPath);
+  const relativePath = relative(outputPath, absolutePath);
+  if (relativePath === ".." || relativePath.startsWith(`..${sep}`))
+    throw new Error(`${sourcePage} links outside the built site: ${href}`);
+  return targetPath;
+}
+
+async function verifyFragment({ page, targetPath, targetUrl, absolutePath, href, context }) {
+  const fragment = decodeURIComponent(targetUrl.hash.slice(1));
+  if (!fragment || !targetPath.endsWith(".html")) return;
+  let ids = context.pageIds.get(targetPath);
+  if (ids === undefined) {
+    const html = await readFile(absolutePath, "utf8");
+    ids = collectIds(htmlTags(html));
+    context.pageIds.set(targetPath, ids);
+  }
+  if (!ids.has(fragment)) throw new Error(`${page} links to a missing fragment: ${href}`);
+}
+
+function collectIds(tags) {
+  return new Set(
+    tags
+      .map((tag) => attribute(tag.raw, "id"))
+      .filter((id) => id !== undefined)
+      .map((id) => decodeHtml(id)),
+  );
+}
+
+function htmlTags(html) {
+  return [...html.matchAll(/<([a-z][a-z0-9:-]*)\b[^<>]*>/gi)].map((match) => ({
+    name: match[1].toLowerCase(),
+    raw: match[0],
+    index: match.index,
+  }));
+}
+
+function attribute(tag, name) {
+  const wantedName = name.toLowerCase();
+  const cursor = { index: skipTagName(tag) };
+  while (cursor.index < tag.length) {
+    skipWhitespace(tag, cursor);
+    if (tag[cursor.index] === "/" || tag[cursor.index] === ">") break;
+    const attributeName = readAttributeName(tag, cursor);
+    if (attributeName === "") continue;
+    const value = readAttributeValue(tag, cursor);
+    if (attributeName === wantedName) return value;
+  }
+}
+
+function skipTagName(tag) {
+  let index = 1;
+  while (index < tag.length && !/[\s/>]/.test(tag[index])) index++;
+  return index;
+}
+
+function skipWhitespace(tag, cursor) {
+  while (cursor.index < tag.length && /\s/.test(tag[cursor.index])) cursor.index++;
+}
+
+function readAttributeName(tag, cursor) {
+  const start = cursor.index;
+  while (cursor.index < tag.length && !/[\s=/>]/.test(tag[cursor.index])) cursor.index++;
+  if (start === cursor.index) {
+    cursor.index++;
+    return "";
+  }
+  return tag.slice(start, cursor.index).toLowerCase();
+}
+
+function readAttributeValue(tag, cursor) {
+  skipWhitespace(tag, cursor);
+  if (tag[cursor.index] !== "=") return "";
+  cursor.index++;
+  skipWhitespace(tag, cursor);
+  return readQuotedValue(tag, cursor) ?? readUnquotedValue(tag, cursor);
+}
+
+function readQuotedValue(tag, cursor) {
+  const quote = tag[cursor.index];
+  if (quote !== '"' && quote !== "'") return;
+  const start = ++cursor.index;
+  while (cursor.index < tag.length && tag[cursor.index] !== quote) cursor.index++;
+  const value = tag.slice(start, cursor.index);
+  cursor.index++;
+  return value;
+}
+
+function readUnquotedValue(tag, cursor) {
+  const start = cursor.index;
+  while (cursor.index < tag.length && !/[\s>]/.test(tag[cursor.index])) cursor.index++;
+  return tag.slice(start, cursor.index);
+}
+
+function decodeHtml(value) {
+  return value
+    .replaceAll(/&amp;/gi, "&")
+    .replaceAll(/&quot;/gi, '"')
+    .replaceAll(/&#39;|&apos;/gi, "'")
+    .replaceAll(/&lt;/gi, "<")
+    .replaceAll(/&gt;/gi, ">")
+    .replaceAll(/&#(\d+);?/g, (_, digits) => String.fromCodePoint(Number(digits)))
+    .replaceAll(/&#x([\da-f]+);?/gi, (_, digits) =>
+      String.fromCodePoint(Number.parseInt(digits, 16)),
+    );
+}
