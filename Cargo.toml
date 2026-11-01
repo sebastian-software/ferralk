@@ -149,7 +149,7 @@ rust-version = "1.96"
 authors = ["Sebastian Software GmbH"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sebastian-software/ferralk"
-homepage = "https://github.com/sebastian-software/ferralk"
+homepage = "https://ferralk.dev"
 keywords = ["glob", "filesystem", "walk", "ignore", "ferramenta"]
 categories = ["filesystem", "development-tools"]
 

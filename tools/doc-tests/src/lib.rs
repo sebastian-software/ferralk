@@ -55,10 +55,12 @@ const DOCUMENTS: &[&str] = &[
     "docs/adr/readme-theme-composition.md",
     "fuzz/README.md",
     "skills/ferralk/SKILL.md",
+    "homepage/README.md",
+    "homepage/content/getting-started.md",
 ];
 
 #[cfg(test)]
-const EXPECTED_COMPILED_RUST_FENCES: usize = 25;
+const EXPECTED_COMPILED_RUST_FENCES: usize = 27;
 
 #[cfg(test)]
 struct FencePolicy {
@@ -70,6 +72,18 @@ struct FencePolicy {
 
 #[cfg(test)]
 const FENCE_POLICIES: &[FencePolicy] = &[
+    FencePolicy {
+        path: "homepage/README.md",
+        compiled_rust_fences: 0,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
+    FencePolicy {
+        path: "homepage/content/getting-started.md",
+        compiled_rust_fences: 2,
+        ignored_rust_fences: 0,
+        intentional_text_fragments: &[],
+    },
     FencePolicy {
         path: ".github/pull_request_template.md",
         compiled_rust_fences: 0,
@@ -539,6 +553,12 @@ pub mod fuzzing {}
 
 #[doc = include_str!("../../../skills/ferralk/SKILL.md")]
 pub mod consumer_skill {}
+
+#[doc = include_str!("../../../homepage/README.md")]
+pub mod website_readme {}
+
+#[doc = include_str!("../../../homepage/content/getting-started.md")]
+pub mod website_getting_started {}
 
 #[cfg(test)]
 mod tests {
@@ -1380,7 +1400,9 @@ mod tests {
                 if !is_excluded_directory(root, &path) {
                     collect_markdown_files(root, &path, discovered);
                 }
-            } else if path.extension().is_some_and(|extension| extension == "md") {
+            } else if path.extension().is_some_and(|extension| extension == "md")
+                && !is_generated_site_document(root, &path)
+            {
                 discovered.insert(
                     path.strip_prefix(root)
                         .expect("documentation file is below the docs root")
@@ -1389,6 +1411,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Generated website routes mirror the canonical documents already checked
+    // above. The handwritten guide remains in the inventory and compiles here.
+    fn is_generated_site_document(root: &Path, path: &Path) -> bool {
+        let relative = path
+            .strip_prefix(root)
+            .expect("site file is below the root");
+        relative.starts_with("homepage/app/routes")
     }
 
     fn is_excluded_directory(root: &Path, directory: &Path) -> bool {
@@ -1403,7 +1434,9 @@ mod tests {
         let relative = directory
             .strip_prefix(root)
             .expect("repository directory is below the repository root");
-        if relative.starts_with(Path::new(".claude").join("worktrees")) {
+        if relative.starts_with(Path::new(".claude").join("worktrees"))
+            || relative.starts_with("homepage/build")
+        {
             return true;
         }
         relative.components().any(|component| {

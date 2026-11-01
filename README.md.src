@@ -12,6 +12,9 @@
 Ferralk finds files. Glob matching and parallel filesystem walking, byte-first,
 with an unsafe-free matcher.
 
+[Explore Ferralk](https://ferralk.dev) or
+[start with the Rust guide](https://ferralk.dev/guide/getting-started/).
+
 Give it a glob such as `{src,packages}/**/*.{ts,tsx}` and it walks the tree in
 parallel, applies `.gitignore` the way Git does, and opens only the directories
 the pattern can reach. Filenames stay raw bytes and native `Path` values from

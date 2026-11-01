@@ -149,20 +149,17 @@ fn assert_walk_growth_per_entry(
     let growth = two_batches.checked_sub(one_batch).unwrap_or_else(|| {
         panic!("{label}: the larger fixture allocated less ({two_batches} < {one_batch})")
     });
-    // After the first sibling directory has populated the reusable listing,
-    // native readers should pay only constant directory/task setup for the
-    // equally wide second sibling. Portable readers always pay for the
-    // OsString returned by DirEntry::file_name; on Linux, std::fs::ReadDir also
-    // copies each readdir name into an owned CString before yielding it.
+    // Native readers reuse their name buffers. For the portable backend,
+    // measure std::fs's per-entry cost separately: the standard reader may
+    // change its own name storage between platforms or Rust releases. This
+    // leaves the walker's additional allocations under the same fixed budget.
     let backend_floor = if cfg!(any(
         all(feature = "native-linux", target_os = "linux"),
         all(feature = "native-macos", target_os = "macos")
     )) {
         0
-    } else if cfg!(target_os = "linux") {
-        (entries_per_directory * 2) as u64
     } else {
-        entries_per_directory as u64
+        portable_reader_floor(entries_per_directory)
     };
     let allowed = backend_floor + CONSTANT_GROWTH_BUDGET;
     assert!(
@@ -170,6 +167,23 @@ fn assert_walk_growth_per_entry(
         "{label}: a second {entries_per_directory}-entry sibling grew allocations by {growth}; \
          backend floor plus constant budget is {allowed} ({one_batch} -> {two_batches})"
     );
+}
+
+fn portable_reader_floor(entries_per_directory: usize) -> u64 {
+    let empty = Fixture::new(1, 0, false);
+    let populated = Fixture::new(1, entries_per_directory, false);
+    let count = |fixture: &Fixture| {
+        allocation_counter::measure(|| {
+            for entry in fs::read_dir(fixture.root.join("batch-0")).expect("read control directory")
+            {
+                black_box(entry.expect("read control entry").file_name());
+            }
+        })
+        .count_total
+    };
+    count(&populated)
+        .checked_sub(count(&empty))
+        .expect("the populated standard reader cannot allocate less than the empty reader")
 }
 
 #[test]
