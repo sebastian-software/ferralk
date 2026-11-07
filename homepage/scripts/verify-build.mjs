@@ -29,6 +29,8 @@ for (const [page, html] of pageFiles) {
   if (html.includes("site.css")) throw new Error(`${page} still uses project-specific CSS.`);
 }
 verifyHomepage(pageFiles.find(([page]) => page === "index.html")?.[1] ?? "");
+verifyDocsPages(pageFiles);
+await verifyNoFerra(pageFiles);
 await verifyScopedCss();
 console.log(
   `Verified ${expectedPages.length} pages and ${linkCount} internal links and fragments.`,
@@ -46,6 +48,65 @@ function verifyHomepage(html) {
   }
   if (!html.includes('data-product="ferralk"')) {
     throw new Error("The homepage opening should show Ferralk's own instrument.");
+  }
+}
+
+/** Documentation pages read in the Monografie reading layout inside Ardo's shell. */
+function verifyDocsPages(pages) {
+  for (const [page, html] of pages) {
+    if (page === "index.html") continue;
+    for (const fragment of [
+      'class="mono mono-docs fk-docs"',
+      "mono-ardo-shell",
+      'class="mono-reading"',
+      'class="mono-section-rail"',
+      'class="mono-guide-navigation"',
+      'class="mono-prose"',
+    ]) {
+      if (!html.includes(fragment)) throw new Error(`${page} is missing ${fragment}.`);
+    }
+  }
+}
+
+/**
+ * No page renders a Ferra class or loads the Ferra stylesheets: the built
+ * pages, the bundled CSS and the site's imports are all on Monografie.
+ */
+async function verifyNoFerra(pages) {
+  for (const [page, html] of pages) {
+    const ferra = htmlTags(html).flatMap((tag) =>
+      retiredFerraClasses(decodeHtml(attribute(tag.raw, "class") ?? "").split(/\s+/)),
+    );
+    if (ferra.length > 0) throw new Error(`${page} renders Ferra classes: ${ferra.join(", ")}.`);
+  }
+  await verifyNoFerraStyles();
+  await verifyNoFerraImports();
+}
+
+/** The Monografie entry's identity classes are the only ferra- names a page may keep. */
+function retiredFerraClasses(names) {
+  const kept = new Set(["ferra-mark", "ferra-instrument", "ferra-workshop-logo"]);
+  return names.filter((name) => name.startsWith("ferra-") && !kept.has(name));
+}
+
+async function verifyNoFerraStyles() {
+  const assets = await readdir(new URL("assets/", outputDirectory), { recursive: true });
+  for (const file of assets.filter((name) => name.endsWith(".css"))) {
+    const css = await readFile(new URL(`assets/${file}`, outputDirectory), "utf8");
+    const ferra = retiredFerraClasses([...css.matchAll(/\.(ferra-[\w-]+)/g)].map((m) => m[1]));
+    if (ferra.length > 0) {
+      throw new Error(`assets/${file} bundles Ferra styles: ${[...new Set(ferra)].join(", ")}.`);
+    }
+  }
+}
+
+async function verifyNoFerraImports() {
+  const sources = await readdir(new URL("../app/", import.meta.url), { recursive: true });
+  for (const file of sources.filter((name) => /\.(?:tsx?|mdx|css)$/.test(name))) {
+    const source = await readFile(new URL(`../app/${file}`, import.meta.url), "utf8");
+    if (/ferramenta-family\/(?:ferra(?:-ardo)?\.css|ferra)["']/.test(source)) {
+      throw new Error(`app/${file} imports the Ferra entry or its stylesheets.`);
+    }
   }
 }
 
