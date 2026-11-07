@@ -1,0 +1,7 @@
+/* Temporary: Shiki's GitHub Light comment gray reads 4.39:1 on the Monografie
+   code sheet. The fix is in ferramenta-family (ferramenta PR #138); this rule
+   goes once the pin includes it. The inline color needs the override. */
+.fk-docs :is(.ardo-code-block, .ardo-shiki) span[style*="--shiki-light:#6E7781" i],
+.fk-docs :is(.ardo-code-block, .ardo-shiki) span[style*="color:#6E7781" i] {
+  color: #59636e !important;
+}

@@ -72,7 +72,7 @@ try {
   await verifySearch(page, origin);
   await page.emulateMedia({ reducedMotion: "reduce" });
   const motion = await page
-    .locator(".ferra-page, .ferra-page *, .mono, .mono *")
+    .locator(".mono, .mono *")
     .evaluateAll((elements) =>
       elements
         .map((element) => getComputedStyle(element).animationDuration)
@@ -286,7 +286,7 @@ async function verifyHeader(page, pageFile, viewport) {
   }
   assert.equal(homeMenu, "none", `${pageFile} shows a second menu at ${viewport.name}`);
   const drawer = await display(page, selectors.menu);
-  const sidebar = await display(page, ".ferra-reading-navigation");
+  const sidebar = await display(page, ".mono-reading-navigation");
   assert(
     drawer !== "none" || sidebar !== "none",
     `${pageFile} offers no documentation navigation at ${viewport.name}`,
