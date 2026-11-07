@@ -21,6 +21,12 @@
     "ferralk",
     "zlob",
     "extglobs",
-    "globset"
+    "globset",
+    "extglob",
+    "Ferra",
+    "globwalk",
+    "jwalk",
+    "Monografie",
+    "walkdir"
   ]
 }

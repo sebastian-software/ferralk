@@ -1,0 +1,16 @@
+# Renders the homepage samples with the published ferralk crates from
+# crates.io, not the workspace sources. The empty [workspace] table keeps this
+# package out of the repository's Cargo workspace. Run it through
+# `pnpm sample:write` in homepage/, which checks the pin against the release.
+[package]
+name = "ferralk-homepage-samples"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+ferralk = "=1.1.0"
+ferralk-glob = "=1.1.0"
+serde_json = "1"

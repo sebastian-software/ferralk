@@ -1,5 +1,5 @@
 /* eslint-disable security/detect-non-literal-fs-filename -- Source and output paths come from the repository-owned document manifest. */
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { posix } from "node:path";
 import { format } from "oxfmt";
 
@@ -28,7 +28,9 @@ for (const document of documents) {
 const cargo = await readFile(new URL("Cargo.toml", repository), "utf8");
 const version = /^version = "([^"]+)"/m.exec(cargo)?.[1];
 if (!version) throw new Error("The package has no release version.");
-await writeData("site.json", { version });
+const declared = /^rust-version = "([^"]+)"$/m.exec(cargo)?.[1];
+if (!declared) throw new Error("Cargo.toml must declare the minimum supported Rust version.");
+await writeData("site.json", { version, rustVersion: declared });
 const labels = {
   guide: "Guide",
   reference: "Reference",
@@ -46,25 +48,35 @@ await writeData(
     return { id, label, to: pages[0].to, pages };
   }),
 );
-const evidence = await readFile(new URL("docs/benchmark-evidence.md", repository), "utf8");
-const portable = evidence.split("### Portable backend\n")[1]?.split("### macOS-native backend")[0];
-if (!portable) throw new Error("The published portable benchmark table is missing.");
-const rows = portable
-  .split("\n")
-  .filter((line) => line.startsWith("| ") && !line.startsWith("| ---") && !line.startsWith("| Arm"))
-  .map((line) => {
-    const [name, unscoped, scoped] = line
-      .split("|")
-      .slice(1, -1)
-      .map((cell) => cell.trim().replaceAll("*", "").replaceAll("`", ""));
-    return { name, unscoped, scoped };
-  });
-const date = /## Expanded library comparison on this machine, (\d{4}-\d{2}-\d{2})/.exec(
-  evidence,
-)?.[1];
-if (!date || !rows.some((row) => row.name === "ferralk, 4 threads"))
-  throw new Error("Benchmark metadata is missing.");
-await writeData("benchmarks.json", { date, rows });
+
+// The corpus counts on the homepage: every checked-in case, by where its
+// expected answer comes from. They change with every new case, so they are
+// derived here rather than committed with the homepage samples.
+const corpusEntries = await readdir(new URL("corpus/", repository));
+const corpusFiles = corpusEntries.filter((file) => file.endsWith(".jsonl")).toSorted();
+const cases = [];
+for (const file of corpusFiles) {
+  const text = await readFile(new URL(`corpus/${file}`, repository), "utf8");
+  for (const line of text.split("\n").filter((entry) => entry.trim() !== "")) {
+    cases.push(JSON.parse(line));
+  }
+}
+const bySource = (source) => cases.filter((entry) => entry.source === source).length;
+const zlobSource = cases.map((entry) => entry.source).find((source) => source.startsWith("zlob_"));
+if (!zlobSource) throw new Error("The corpus has no zlob reference cases.");
+const corpus = {
+  cases: cases.length,
+  topics: corpusFiles.length,
+  zlobVersion: zlobSource.slice("zlob_".length).replaceAll("_", "."),
+  zlob: bySource(zlobSource),
+  git: bySource("git_check_ignore"),
+  fastGlob: bySource("fast_glob"),
+  handwritten: bySource("handwritten"),
+  decided: cases.filter((entry) => entry.adr !== undefined).length,
+};
+if (corpus.zlob + corpus.git + corpus.fastGlob + corpus.handwritten !== corpus.cases)
+  throw new Error("A corpus case has a source the homepage does not name.");
+await writeData("corpus.json", corpus);
 
 async function writeData(name, value) {
   const result = await format(name, JSON.stringify(value));

@@ -400,6 +400,7 @@ once outside their match loop.
 | Host | MacBook Pro (MacBookPro18,1), Apple M1 Pro, 10 cores (8 performance, 2 efficiency), 32 GB RAM |
 | OS | macOS 26.6.2, build 25G83; Darwin 25.6.0, arm64 |
 | Benchmark revision | `261df0d` plus this pull request's default-worker-budget change; every arm in these tables pins its own thread count, so the change moves none of them |
+| Ferralk version | 0.12.0, the workspace version at that revision |
 | Toolchain | rustc/cargo 1.97.1, LLVM 22.1.6 |
 | Benchmark stack | Criterion 0.8.2, release profile; exact dependency versions are locked in `Cargo.lock` |
 | zlob toolchain | Zig 0.16.0, Apple libclang 21.0.0 from Xcode |
