@@ -4,7 +4,7 @@ build/
 app/routes.ts
 app/data/site.json
 app/data/navigation.json
-app/data/benchmarks.json
+app/data/corpus.json
 # Generated from canonical repository documentation.
 app/routes/reference/
 app/routes/evidence/

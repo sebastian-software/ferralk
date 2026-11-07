@@ -1,5 +1,5 @@
 /* eslint-disable security/detect-non-literal-fs-filename -- Built files and route targets stay inside the verified site output. */
-import { access, readFile } from "node:fs/promises";
+import { access, readdir, readFile } from "node:fs/promises";
 import { extname, join, normalize, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,17 +14,82 @@ const pageFiles = await Promise.all(expectedPages.map(async (page) => [page, awa
 const linkCount = await verifyRenderedPages(pageFiles);
 verifyFocusableMarkdownCodeBlocks(await read("guide/getting-started/index.html"));
 verifyFocusableMarkdownTables(await read("reference/patterns/index.html"));
+const { version } = JSON.parse(
+  await readFile(new URL("../app/data/site.json", import.meta.url), "utf8"),
+);
 for (const [page, html] of pageFiles) {
-  if (
-    !html.includes('class="ferra-header ferra-wrap"') ||
-    !html.includes('class="ferra-footer ferra-wrap"')
-  )
-    throw new Error(`${page} is missing the shared family shell.`);
+  for (const fragment of [
+    'class="mono-header"',
+    'class="mono-footer"',
+    `<span class="mono-release" title="Current release">v${version}</span>`,
+    "https://ferramenta.dev",
+  ]) {
+    if (!html.includes(fragment)) throw new Error(`${page} is missing ${fragment}.`);
+  }
   if (html.includes("site.css")) throw new Error(`${page} still uses project-specific CSS.`);
 }
+verifyHomepage(pageFiles.find(([page]) => page === "index.html")?.[1] ?? "");
+await verifyScopedCss();
 console.log(
   `Verified ${expectedPages.length} pages and ${linkCount} internal links and fragments.`,
 );
+
+/** The homepage reads on the Monografie page and keeps its published anchors. */
+function verifyHomepage(html) {
+  if (!html.includes('class="mono fk-home"')) {
+    throw new Error("The homepage should use the Monografie page.");
+  }
+  for (const id of ["overview", "example", "names", "speed", "verification", "start"]) {
+    if (!html.includes(`id="${id}"`)) {
+      throw new Error(`Preserve the published homepage anchor #${id}.`);
+    }
+  }
+  if (!html.includes('data-product="ferralk"')) {
+    throw new Error("The homepage opening should show Ferralk's own instrument.");
+  }
+}
+
+/** A selector list split at its top-level commas, so `:is(a, b)` stays whole. */
+function selectorList(prelude) {
+  const selectors = [""];
+  let depth = 0;
+  for (const char of prelude) {
+    if (char === "(") depth += 1;
+    if (char === ")") depth -= 1;
+    if (char === "," && depth === 0) selectors.push("");
+    else selectors[selectors.length - 1] += char;
+  }
+  return selectors;
+}
+
+/**
+ * Shared presentation lives in ferramenta-family. The site styles only its own
+ * homepage specimens and shell seams, next to their components, under fk-.
+ */
+async function verifyScopedCss() {
+  const appFiles = await readdir(new URL("../app/", import.meta.url), { recursive: true });
+  for (const file of appFiles.filter((name) => name.endsWith(".css"))) {
+    if (!file.startsWith("components/")) {
+      throw new Error(
+        `Keep ${file} beside its specimen in app/components/, or in ferramenta-family.`,
+      );
+    }
+    const css = await readFile(new URL(`../app/${file}`, import.meta.url), "utf8");
+    const preludes = css
+      .replaceAll(/\/\*[\s\S]*?\*\//g, "")
+      .split("{")
+      .slice(0, -1)
+      .map((chunk) =>
+        chunk.slice(Math.max(chunk.lastIndexOf("}"), chunk.lastIndexOf(";")) + 1).trim(),
+      )
+      .filter((prelude) => !prelude.startsWith("@"));
+    for (const selector of preludes.flatMap((prelude) => selectorList(prelude))) {
+      if (!selector.includes(".fk-")) {
+        throw new Error(`${file}: scope "${selector.trim()}" to an fk- class.`);
+      }
+    }
+  }
+}
 
 async function verifyRenderedPages(pages) {
   const context = {

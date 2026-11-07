@@ -1,0 +1,38 @@
+/* The Monografie chrome inside Ardo's shell, on the homepage (fk-home) and on
+   documentation pages (fk-docs). */
+
+/* Ardo pads its layout for a fixed header; the Monografie header is sticky. */
+.fk-home .ferra-ardo-shell > div {
+  padding-block-start: 0;
+}
+
+/* Anchors and the reading layout's sticky panels clear the 60px sticky header. */
+html:has(.fk-home, .fk-docs) {
+  scroll-padding-top: 76px;
+}
+.fk-docs :is(.ferra-reading-navigation, .ferra-reading-outline) {
+  top: 84px;
+  max-height: calc(100svh - 108px);
+}
+
+@media (max-width: 960px) {
+  /* The documentation drawer carries the navigation and the brand leads home,
+     so the menu button steps aside and the drawer and search sit at the end. */
+  .fk-docs .mono-header .mono-menu-button {
+    display: none;
+  }
+  .fk-docs .mono-header .mono-header-actions {
+    margin-left: auto;
+  }
+}
+
+/* Search closes the header row, so its shortcut hint opens toward the page
+   instead of past the right edge of a phone screen. */
+:is(.fk-home, .fk-docs)
+  .mono-header-actions
+  button[aria-label="Search"]
+  > span[aria-hidden="true"] {
+  left: auto;
+  right: 0;
+  transform: none;
+}

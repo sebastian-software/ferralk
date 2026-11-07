@@ -10,6 +10,9 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
+      - "corpus/**"
+      - "tools/bench/benches/matcher.rs"
+      - ".release-please-manifest.json"
       - ".github/workflows/homepage.yml"
   push:
     branches: [main]
@@ -21,6 +24,9 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
+      - "corpus/**"
+      - "tools/bench/benches/matcher.rs"
+      - ".release-please-manifest.json"
       - ".github/workflows/homepage.yml"
   workflow_dispatch:
 

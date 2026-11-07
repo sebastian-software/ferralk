@@ -1,0 +1,187 @@
+/* The homepage's specimens. Scoped with fk-, colors from the Monografie
+   --mono-* tokens. */
+
+.fk-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin: 56px 0 -48px;
+}
+/* Long choices wrap inside their control instead of widening a phone screen,
+   here and in the speed chart's three tasks. */
+.fk-toggles .mono-seg,
+.fk-home .mono-toggles .mono-seg {
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+.fk-toggles .mono-seg code {
+  font: inherit;
+  font-family: var(--mono-mono);
+}
+.fk-single.mono-facing {
+  grid-template-columns: minmax(0, 1fr);
+}
+.fk-single.mono-facing::before {
+  display: none;
+}
+.fk-facing .mono-sheet,
+.fk-single .mono-sheet {
+  min-width: 0;
+}
+
+/* Code and files, numbered line by line; wrapped lines hang under the first. */
+.fk-lines {
+  list-style: none;
+  counter-reset: fk-line;
+  margin: 0;
+  padding: 0;
+  font: 400 13px/1.6 var(--mono-mono);
+  color: var(--mono-ink);
+}
+.fk-lines li {
+  counter-increment: fk-line;
+  display: grid;
+  grid-template-columns: 2.5ch minmax(0, 1fr);
+  gap: 12px;
+  min-height: 1.6em;
+}
+.fk-lines li::before {
+  content: counter(fk-line);
+  text-align: right;
+  color: var(--mono-ink-3);
+  user-select: none;
+}
+.fk-lines code {
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-indent: -4ch;
+}
+
+/* The matcher's paths, each with its verdict. */
+.fk-paths {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.fk-paths li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 16px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--mono-hair-2);
+}
+.fk-paths li:first-child {
+  padding-top: 0;
+}
+.fk-paths code {
+  font: 400 14px/1.5 var(--mono-mono);
+  color: var(--mono-ink-3);
+  overflow-wrap: anywhere;
+}
+.fk-paths span {
+  font: 400 13px/1.5 var(--mono-sans);
+  color: var(--mono-ink-3);
+}
+.fk-paths li[data-selected] code {
+  color: var(--mono-ink);
+}
+.fk-paths li[data-selected] span {
+  font-weight: 600;
+  color: var(--mono-ink);
+}
+
+/* The walk's result and its errors. */
+.fk-found,
+.fk-errors {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font: 400 13px/1.6 var(--mono-mono);
+  color: var(--mono-ink);
+}
+.fk-found li,
+.fk-errors li {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--mono-hair-2);
+  overflow-wrap: anywhere;
+}
+.fk-found li:first-child {
+  padding-top: 0;
+}
+.fk-errors code {
+  display: block;
+  font: inherit;
+}
+.fk-errors span {
+  display: block;
+  font: 400 13px/1.45 var(--mono-sans);
+  color: var(--mono-ink-2);
+}
+.fk-sub {
+  font: 600 13px/1.3 var(--mono-sans);
+  color: var(--mono-ink-2);
+  margin: 22px 0 6px;
+}
+.fk-clear {
+  font: 400 15px/1.55 var(--mono-sans);
+  color: var(--mono-ink-2);
+  margin: 0;
+}
+.fk-details {
+  margin-top: 18px;
+  font: 400 14px/1.5 var(--mono-sans);
+}
+.fk-details summary {
+  cursor: pointer;
+  color: var(--mono-oxide);
+  width: max-content;
+  max-width: 100%;
+}
+.fk-details .mono-facing {
+  margin-top: 24px;
+}
+
+/* Byte names: a table that scrolls inside its own region on narrow screens. */
+.fk-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.fk-scroll:focus-visible {
+  outline: 2px solid var(--mono-ink);
+  outline-offset: 4px;
+}
+.fk-bytes {
+  min-width: 640px;
+}
+.fk-scroll + .mono-caption {
+  margin-top: 14px;
+}
+.fk-bytes code {
+  font: 400 13px/1.5 var(--mono-mono);
+  white-space: nowrap;
+}
+/* A row's name reads like the rest of its row, not like a column heading. */
+.fk-bytes th[scope="row"] {
+  font-weight: 400;
+  border-bottom-color: var(--mono-hair-2);
+}
+.fk-bytes th[scope="row"] small {
+  display: block;
+  font: 400 12px/1.4 var(--mono-sans);
+  color: var(--mono-ink-3);
+}
+.fk-bytes td span {
+  color: var(--mono-ink-3);
+}
+.fk-proofs.mono-proofs {
+  margin-top: 28px;
+}
+
+@media (max-width: 640px) {
+  /* The package sets facing pages 48px apart here; keep 16px under the toggles. */
+  .fk-toggles {
+    margin: 40px 0 -32px;
+  }
+}
