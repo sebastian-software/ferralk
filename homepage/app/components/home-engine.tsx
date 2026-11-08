@@ -1,7 +1,6 @@
 import { ArdoLink as Link } from "ardo/runtime";
 import {
   MonoCredit,
-  MonoLeadIn,
   MonoPassage,
   MonoProofs,
   MonoSection,
@@ -112,9 +111,9 @@ export function Speed() {
         }}
       >
         <p>
-          <MonoLeadIn>Finding files comes first</MonoLeadIn> in almost every build, lint and test
-          run, and a tool that watches for changes repeats it again and again. Its cost grows with
-          everything in the project, including the folders nobody asked about.
+          Finding files comes first in almost every build, lint and test run, and a tool that
+          watches for changes repeats it again and again. Its cost grows with everything in the
+          project, including the folders nobody asked about.
         </p>
       </MonoPassage>
       <p>
@@ -148,10 +147,10 @@ export function Verification() {
     >
       <MonoPassage note={{ term: note.title, children: note.body }}>
         <p>
-          <MonoLeadIn>Ferralk learns from zlob</MonoLeadIn>, a fast glob library written in Zig. Its
-          matching and walking behavior was recorded from zlob {corpus.zlobVersion} and frozen, so a
-          new zlob release can never move the expectations. The implementation is independent: plain
-          Rust with its own API and no C interface.
+          Ferralk learns from zlob, a fast glob library written in Zig. Its matching and walking
+          behavior was recorded from zlob {corpus.zlobVersion} and frozen, so a new zlob release can
+          never move the expectations. The implementation is independent: plain Rust with its own
+          API and no C interface.
         </p>
       </MonoPassage>
       <p>
