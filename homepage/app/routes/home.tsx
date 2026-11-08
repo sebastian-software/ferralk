@@ -48,7 +48,6 @@ function Opening() {
     <MonoOpening
       product="ferralk"
       instrumentLabel="Ferralk's instrument: a steel rail with an engraved scale that forks into three branches, each ending at a tabbed file leaf. A rust-brown arm pivots from the fork toward one branch, and a dark block stops the lower branch halfway."
-      caption="A path gate: the selector turns toward the branch the pattern names, and a stop closes another before the walk goes down it."
       kicker={`Ferralk ${releaseLine}, ${lowerFirst(ferralk.what)} for Rust`}
       title="Find files. Skip whole folders."
       subtitle="Name the folders, and the rest stays closed."
