@@ -1,5 +1,5 @@
 import { ArdoLink as Link } from "ardo/runtime";
-import { MonoCredit, MonoLeadIn, MonoPassage, MonoSection } from "ferramenta-family/monografie";
+import { MonoCredit, MonoPassage, MonoSection } from "ferramenta-family/monografie";
 
 import { registryNote } from "./home-data";
 import { BytesSpecimen, MatcherSpecimen, WalkSpecimen } from "./walk-specimens";
@@ -17,11 +17,11 @@ export function Explainer() {
         }}
       >
         <p>
-          <MonoLeadIn>Before a build tool</MonoLeadIn> compiles anything, before a linter checks a
-          single line, it has to know which files to look at. Nobody lists them one by one. You
-          write a pattern instead: <code>src/**/*.ts</code> means every TypeScript file anywhere
-          under <code>src</code>. Such patterns are called globs, and you have typed them in a
-          terminal, in a <code>.gitignore</code> and in the settings of nearly every tool you use.
+          Before a build tool compiles anything, before a linter checks a single line, it has to
+          know which files to look at. Nobody lists them one by one. You write a pattern instead:{" "}
+          <code>src/**/*.ts</code> means every TypeScript file anywhere under <code>src</code>. Such
+          patterns are called globs, and you have typed them in a terminal, in a{" "}
+          <code>.gitignore</code> and in the settings of nearly every tool you use.
         </p>
       </MonoPassage>
       <MonoPassage
@@ -65,8 +65,8 @@ export function Pruning() {
         }}
       >
         <p>
-          <MonoLeadIn>A JavaScript project</MonoLeadIn> may hold a few thousand source files beside
-          a <code>node_modules</code> folder with tens of thousands more. A walker that lists
+          A JavaScript project may hold a few thousand source files beside a{" "}
+          <code>node_modules</code> folder with tens of thousands more. A walker that lists
           everything and filters afterwards pays for every one of those folders, even when the
           question was only about <code>src</code>. The pattern{" "}
           <code>{"{src,packages}/**/*.ts"}</code> already says where the answer can be: under{" "}
@@ -112,11 +112,10 @@ export function Names() {
         }}
       >
         <p>
-          <MonoLeadIn>To your file system</MonoLeadIn>, a name is a sequence of bytes. Most of them
-          spell valid UTF-8 text, but old archives, mounted disks and other systems bring names in
-          older encodings such as Latin-1. A program that turns such a name into text has to replace
-          what it cannot read, and the replacement character looks the same for every unreadable
-          byte.
+          To your file system, a name is a sequence of bytes. Most of them spell valid UTF-8 text,
+          but old archives, mounted disks and other systems bring names in older encodings such as
+          Latin-1. A program that turns such a name into text has to replace what it cannot read,
+          and the replacement character looks the same for every unreadable byte.
         </p>
       </MonoPassage>
       <MonoPassage note={{ side: "right", term: note.title, children: note.body }}>
