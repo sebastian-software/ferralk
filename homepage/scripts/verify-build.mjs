@@ -58,9 +58,9 @@ function verifyDocsPages(pages) {
     for (const fragment of [
       'class="mono mono-docs fk-docs"',
       "mono-ardo-shell",
-      'class="mono-reading"',
-      'class="mono-section-rail"',
-      'class="mono-guide-navigation"',
+      'class="ardo-sidebar-tabs ',
+      'class="ardo-sidebar-tabs ',
+      'class="ardo-sidebar ',
       'class="mono-prose"',
     ]) {
       if (!html.includes(fragment)) throw new Error(`${page} is missing ${fragment}.`);
