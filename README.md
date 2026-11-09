@@ -92,7 +92,7 @@ compatible with zlob and deliberately has no C ABI.
   against `fast-glob` and the frozen zlob reference, AddressSanitizer, Miri,
   and loom models of the scheduler protocol, across Linux, macOS, and Windows.
   [Verification depth](docs/verification-comparison.md#counts) counts what a
-  pull request actually runs, and how the count was taken. Twenty ADRs
+  pull request actually runs, and how the count was taken. The ADRs
   record the decisions rather than leaving them to be rediscovered. Performance
   is measured on every pull request and never used as a gate.
 

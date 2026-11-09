@@ -118,12 +118,12 @@ libc = "0.2.189"
 unicode-normalization = "0.1.25"
 
 [dev-dependencies]
-allocation-counter = "=0.8.1"
+allocation-counter = "0.8.1"
 corpus = { path = "tools/corpus" }
 # The engine ADR-0014 replaced, kept for the test that compares the two rule
 # matchers over generated rules and paths.
-ignore = "=0.4.33"
-loom = "=0.7.2"
+ignore = "0.4.33"
+loom = "0.7.2"
 serde_json.workspace = true
 
 [lints]
@@ -161,6 +161,6 @@ unsafe_code = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(docsrs)'] }
 
 [workspace.dependencies]
-jsonschema = { version = "=0.52.1", default-features = false }
-serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
+jsonschema = { version = "0.52.1", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"

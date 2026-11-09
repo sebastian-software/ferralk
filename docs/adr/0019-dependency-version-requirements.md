@@ -1,6 +1,6 @@
 # ADR-0019: Caret requirements in the published crates, exact pins everywhere else
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0021](0021-dependency-range-policy.md)
 - **Date:** 2026-09-06
 
 ## Context

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import { expect } from "playwright/test";
 import { preview } from "vite";
 
 import { expectedPages, pagePath } from "./site-pages.mjs";
@@ -149,19 +150,35 @@ async function verifyNavigation(page, origin) {
   await page.getByRole("heading", { name: "Getting started", level: 1, exact: true }).waitFor();
   const menu = page.locator(selectors.menu);
   await focusMenuByKeyboard(page, menu);
-  await page.keyboard.press("Enter");
-  await page.getByRole("dialog").waitFor();
+  await openNavigationMenu(page, menu);
   await page.keyboard.press("Escape");
   await page.getByRole("dialog").waitFor({ state: "detached" });
   assert(
     await menu.evaluate((element) => element === document.activeElement),
     "Menu focus was not restored",
   );
-  await page.keyboard.press("Enter");
-  await page.getByRole("dialog").getByRole("link", { name: "Using Ferralk", exact: true }).click();
+  const dialog = await openNavigationMenu(page, menu);
+  await dialog.getByRole("link", { name: "Using Ferralk", exact: true }).click();
   await page.waitForURL((url) => url.pathname.startsWith("/guide/usage"));
   await page.getByRole("dialog").waitFor({ state: "detached" });
   await verifyLandscape(page, origin);
+}
+/** Ardo's document can load before its page module hydrates the menu. */
+async function openNavigationMenu(page, menu) {
+  await expect
+    .poll(
+      async () => {
+        if ((await menu.getAttribute("aria-expanded")) !== "true") {
+          await menu.press("Enter");
+        }
+        return menu.getAttribute("aria-expanded");
+      },
+      { timeout: 30_000, message: "The navigation menu did not become interactive" },
+    )
+    .toBe("true");
+  const dialog = page.getByRole("dialog");
+  await dialog.waitFor({ state: "visible" });
+  return dialog;
 }
 async function focusMenuByKeyboard(page, menu) {
   let reached = false;
@@ -186,9 +203,10 @@ async function verifyLandscape(page, origin) {
     await table.evaluate((element) => element === document.activeElement),
     "Markdown tables are not keyboard focusable",
   );
-  await page.locator(selectors.menu).focus();
-  await page.keyboard.press("Enter");
-  const lastLink = page.getByRole("dialog").getByRole("link").last();
+  const menu = page.locator(selectors.menu);
+  await menu.focus();
+  const dialog = await openNavigationMenu(page, menu);
+  const lastLink = dialog.getByRole("link").last();
   await lastLink.focus();
   const bounds = await lastLink.boundingBox();
   assert(

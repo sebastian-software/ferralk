@@ -1,7 +1,7 @@
 # Oxc fast-glob reference
 
-The second matcher reference is the Rust crate `fast-glob` `1.1.2`, pinned in
-the harness and fuzz workspace (verified 2026-11-09). Its upstream repository
+The second matcher reference is the Rust crate `fast-glob` `1.1.2`, locked in
+the harness and fuzz workspace lockfiles (verified 2026-11-09). Its upstream repository
 is `https://github.com/oxc-project/fast-glob`. The original reference was
 `1.1.0`, selected by Oxc's workspace at source commit
 `8783524015b1e6ff1c39ccf426df0bb07cbbc588` on 2026-08-18.
