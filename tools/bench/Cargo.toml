@@ -23,7 +23,7 @@ zlob = { version = "=1.6.5", optional = true }
 
 [dev-dependencies]
 criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
-fast-glob = "=1.1.1"
+fast-glob = "=1.1.2"
 globwalk = "=0.9.1"
 globset = "=0.4.20"
 ignore = "=0.4.33"
