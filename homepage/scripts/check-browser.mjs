@@ -198,9 +198,13 @@ async function verifyLandscape(page, origin) {
   await page.keyboard.press("Escape");
 }
 async function verifySearch(page, origin) {
-  for (const width of [320, 1440]) {
+  for (const { path, width } of [
+    { path: "/", width: 320 },
+    { path: "/architecture/adr/0003-two-published-crates-no-c-abi/", width: 640 },
+    { path: "/", width: 1440 },
+  ]) {
     await page.setViewportSize({ width, height: 900 });
-    await page.goto(new URL("/", origin).href, { waitUntil: "load" });
+    await page.goto(new URL(path, origin).href, { waitUntil: "load" });
     const search = page.locator(selectors.search);
     await search
       .locator("kbd")
@@ -208,9 +212,7 @@ async function verifySearch(page, origin) {
       .evaluate((element) => {
         element.textContent = "Ctrl";
       });
-    await search.hover();
-    const hint = await search.locator('span[aria-hidden="true"]').boundingBox();
-    assert(hint && hint.x >= 0 && hint.x + hint.width <= width, "Search hint leaves the viewport");
+    await verifyShortcut({ page, search, path, width });
     await search.click();
     const dialog = page.getByRole("dialog");
     await dialog.locator("input").fill("consumer pattern contract");
@@ -222,6 +224,29 @@ async function verifySearch(page, origin) {
       "Search focus was not restored",
     );
   }
+}
+/** Shortcut hints stay readable from their first visible frame. */
+async function verifyShortcut({ page, search, path, width }) {
+  await search.hover();
+  const shortcut = search.locator('span[aria-hidden="true"]');
+  assert.equal(
+    await shortcut.evaluate((element) => getComputedStyle(element).opacity),
+    "1",
+    "The search shortcut should appear at full contrast immediately on hover",
+  );
+  await verifyAccessibility(page, path, { name: `${width}px search hover` });
+  const hint = await shortcut.boundingBox();
+  assert(hint && hint.x >= 0 && hint.x + hint.width <= width, "Search hint leaves the viewport");
+  await page.mouse.move(0, 0);
+  await search.focus();
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Shift+Tab");
+  assert.equal(
+    await shortcut.evaluate((element) => getComputedStyle(element).opacity),
+    "1",
+    "The search shortcut should appear at full contrast immediately on focus",
+  );
+  await verifyAccessibility(page, path, { name: `${width}px search focus` });
 }
 async function capture(page, origin) {
   await mkdir(join(tmpdir(), "ferralk-review"), { recursive: true });
