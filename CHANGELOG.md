@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.2.0](https://github.com/sebastian-software/ferralk/compare/v1.1.0...v1.2.0) (2026-11-09)
+
+
+### Features
+
+* GitHub as the header's mark, on Ardo 6.4 ([#465](https://github.com/sebastian-software/ferralk/issues/465)) ([df602c9](https://github.com/sebastian-software/ferralk/commit/df602c9e37eb5764c83524814fdc52423d7ef2a0))
+
+
+### Bug Fixes
+
+* **deps:** preserve compatible dependency ranges ([#449](https://github.com/sebastian-software/ferralk/issues/449)) ([3294ee5](https://github.com/sebastian-software/ferralk/commit/3294ee576fac3847d3187f02e51867d9a94f69e4))
+* **deps:** update actions/setup-node action to v7.1.0 ([#453](https://github.com/sebastian-software/ferralk/issues/453)) ([05c1e4e](https://github.com/sebastian-software/ferralk/commit/05c1e4e87c0af834b6aafc5faee01eb0267ce9b8))
+* **deps:** update dependency jdx/mise to v2026.11.4 ([#450](https://github.com/sebastian-software/ferralk/issues/450)) ([2354efb](https://github.com/sebastian-software/ferralk/commit/2354efb80ac742f3f04e2b625eeedf720426526a))
+* **deps:** update dependency node to v24.22.2 ([#452](https://github.com/sebastian-software/ferralk/issues/452)) ([5cb801f](https://github.com/sebastian-software/ferralk/commit/5cb801f7002fb20b9afe01b5348732c625813df5))
+* **deps:** update rust crate fast-glob to v1.1.2 ([#451](https://github.com/sebastian-software/ferralk/issues/451)) ([7f0f00c](https://github.com/sebastian-software/ferralk/commit/7f0f00c195f09726c84448e095c6b3dbea6d99e7))
+* **glob:** align extglob globstars with hidden literals ([#455](https://github.com/sebastian-software/ferralk/issues/455)) ([b1a5599](https://github.com/sebastian-software/ferralk/commit/b1a559954b2ecaa813a4c26556e7e846ee034580))
+* **glob:** let a star run ending in a `**/` prefix leave a leading period to the literal ([#444](https://github.com/sebastian-software/ferralk/issues/444)) ([018aafe](https://github.com/sebastian-software/ferralk/commit/018aafe71b90f4ab0a21cd64c10a9804a2fa4b5b))
+* keep table text off the frame ([#466](https://github.com/sebastian-software/ferralk/issues/466)) ([fcaa041](https://github.com/sebastian-software/ferralk/commit/fcaa04113686cee3340c26f8b2eefd15d8f29871))
+* **walker:** spell entries below a bare drive root without a separator ([#446](https://github.com/sebastian-software/ferralk/issues/446)) ([b1af75b](https://github.com/sebastian-software/ferralk/commit/b1af75b716025a57dfbb37b88bfc1495d646e3e3))
+
 ## [1.1.0](https://github.com/sebastian-software/ferralk/compare/v1.0.0...v1.1.0) (2026-09-25)
 
 
