@@ -167,7 +167,7 @@ importers:
   .:
     dependencies:
       ardo:
-        specifier: ^6.4.1
+        specifier: 6.4.1
         version: 6.4.1(@types/node@26.6.6)(esbuild@0.28.2)(jiti@2.7.0)(supports-color@9.4.0)(typescript@6.0.3)
       ferramenta-family:
         specifier: github:sebastian-software/ferramenta#2c6efd9861f57657f2898f381fb771018e0e6b66&path:/packages/family
@@ -177,13 +177,13 @@ importers:
         specifier: 4.13.0
         version: 4.13.0
       eslint:
-        specifier: ^10.11.0
+        specifier: 10.14.0
         version: 10.14.0(jiti@2.7.0)(supports-color@9.4.0)
       eslint-config-setup:
-        specifier: ^0.5.2
+        specifier: 0.5.2
         version: 0.5.2(@types/estree@1.0.10)(@typescript-eslint/eslint-plugin@8.72.1(@typescript-eslint/parser@8.72.1(eslint@10.14.0(jiti@2.7.0)(supports-color@9.4.0))(supports-color@9.4.0)(typescript@6.0.3))(eslint@10.14.0(jiti@2.7.0)(supports-color@9.4.0))(supports-color@9.4.0)(typescript@6.0.3))(@typescript-eslint/utils@8.72.1(eslint@10.14.0(jiti@2.7.0)(supports-color@9.4.0))(supports-color@9.4.0)(typescript@6.0.3))(eslint@10.14.0(jiti@2.7.0)(supports-color@9.4.0))(oxlint@1.90.0)(supports-color@9.4.0)(typescript@6.0.3)
       jiti:
-        specifier: ^2.7.0
+        specifier: 2.7.0
         version: 2.7.0
       oxfmt:
         specifier: ^0.70.0
@@ -195,10 +195,10 @@ importers:
         specifier: 1.63.0
         version: 1.63.0
       typescript:
-        specifier: ^6.0.3
+        specifier: 6.0.3
         version: 6.0.3
       vite:
-        specifier: ^8.3.0
+        specifier: 8.3.5
         version: 8.3.5(@types/node@26.6.6)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.1)
 
 packages:

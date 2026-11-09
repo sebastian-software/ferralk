@@ -13,4 +13,4 @@ publish = false
 [dependencies]
 ferralk = "=1.1.0"
 ferralk-glob = "=1.1.0"
-serde_json = "1"
+serde_json = "=1.0.154"
