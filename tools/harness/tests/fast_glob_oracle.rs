@@ -22,17 +22,27 @@ fn common_subset_replays_against_oxc_fast_glob() {
         assert_eq!(case.source, Source::FastGlob);
         let pattern = decode_bytes(&case.pattern).expect("decode pattern");
         let candidate = decode_bytes(&case.path).expect("decode candidate");
-        fast_glob::validate(&pattern)
-            .unwrap_or_else(|error| panic!("{}:{}: {error}", path.display(), line_number + 1));
-
-        let expected_reference = case.oracle_expected.unwrap_or(case.expected);
-        assert_eq!(
-            fast_glob::glob_match(&pattern, &candidate),
-            expected_reference,
-            "{}:{}: fast-glob result",
-            path.display(),
-            line_number + 1
-        );
+        if case.id == "fastglob-brace-groups-eleven" {
+            // Since 1.1.2 the reference rejects this recorded limit up front;
+            // matching an invalid pattern has an unspecified result.
+            assert_eq!(
+                fast_glob::validate(&pattern)
+                    .expect_err("eleven groups exceed the reference limit")
+                    .kind,
+                fast_glob::ErrorKind::TooManyBraceGroups
+            );
+        } else {
+            fast_glob::validate(&pattern)
+                .unwrap_or_else(|error| panic!("{}:{}: {error}", path.display(), line_number + 1));
+            let expected_reference = case.oracle_expected.unwrap_or(case.expected);
+            assert_eq!(
+                fast_glob::glob_match(&pattern, &candidate),
+                expected_reference,
+                "{}:{}: fast-glob result",
+                path.display(),
+                line_number + 1
+            );
+        }
         let compiled = Pattern::compile(&pattern, options(&case.flags))
             .unwrap_or_else(|error| panic!("{}:{}: {error}", path.display(), line_number + 1));
         // fast-glob keeps an ordinary wildcard inside one path component, so a
