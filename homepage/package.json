@@ -17,8 +17,8 @@
     "verify": "pnpm sample:check && pnpm lint && pnpm format:check && pnpm typecheck && pnpm build && pnpm browser:check"
   },
   "dependencies": {
-    "ardo": "^6.0.0",
-    "ferramenta-family": "github:sebastian-software/ferramenta#f9081592db47d051d95e2c9b2e00905103d71213&path:/packages/family"
+    "ardo": "^6.4.1",
+    "ferramenta-family": "github:sebastian-software/ferramenta#2c6efd9861f57657f2898f381fb771018e0e6b66&path:/packages/family"
   },
   "devDependencies": {
     "axe-core": "4.13.0",

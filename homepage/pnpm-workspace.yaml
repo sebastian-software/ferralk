@@ -4,3 +4,6 @@ packages:
 allowBuilds:
   esbuild: true
   unrs-resolver: true
+
+minimumReleaseAgeExclude:
+  - ardo@6.4.1

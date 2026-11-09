@@ -50,9 +50,6 @@ const links = [
   <a key="api" href="https://docs.rs/ferralk">
     API
   </a>,
-  <a key="github" href="https://github.com/sebastian-software/ferralk">
-    GitHub
-  </a>,
 ];
 
 /** Every page on Monografie's Ardo shell; the documentation adds its menu, search and reading layout. */
@@ -63,6 +60,7 @@ export default function Root() {
       name="Ferralk"
       release={site.version}
       links={links}
+      repository="https://github.com/sebastian-software/ferralk"
       sections={sections}
       components={{ input: TaskStatus }}
       homeClassName="fk-home"
