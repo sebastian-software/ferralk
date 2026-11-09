@@ -1,27 +1,14 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "github>sebastian-software/renovate-config",
-    "helpers:pinGitHubActionDigests"
+    "github>sebastian-software/renovate-config"
   ],
-  "labels": ["dependencies"],
-  "rangeStrategy": "pin",
   "packageRules": [
     {
       "description": "Keep the semantic oracle on the ADR-0007 frozen zlob release",
       "matchManagers": ["cargo"],
       "matchFileNames": ["tools/oracle/**"],
       "enabled": false
-    },
-    {
-      "description": "ADR-0019: the published crates carry caret requirements for their library dependencies; tools, fuzz targets and dev-dependencies stay pinned",
-      "matchManagers": ["cargo"],
-      "matchFileNames": [
-        "Cargo.toml",
-        "crates/ferralk-glob/Cargo.toml"
-      ],
-      "matchDepTypes": ["dependencies"],
-      "rangeStrategy": "replace"
     }
   ]
 }

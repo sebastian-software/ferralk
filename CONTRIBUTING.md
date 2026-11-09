@@ -164,7 +164,7 @@ file into `NIGHTLY_TOOLCHAIN` rather than restating the date, and
 `cargo test -p doc-tests` fails if a workflow names a dated nightly itself.
 Locally, pass the same toolchain explicitly, for example
 `cargo +"$(cat .github/nightly-toolchain)" fuzz run pattern_parser`; the
-seeded `rust-toolchain.toml` selects stable for everything else. Bumping the
+seeded `rust-toolchain.toml` selects a pinned stable release for everything else. Bumping the
 pin changes the rustdoc JSON the public API snapshots are rendered from, so a
 bump regenerates `docs/api/` in the same pull request.
 

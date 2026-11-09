@@ -1,6 +1,6 @@
-# Development tracks stable; the MSRV is `rust-version` in Cargo.toml and is
-# checked by its own CI job. Tracking stable means rustfmt output can shift
-# between stable releases; pin a version here if that must not happen.
+# The development toolchain is explicit so rustfmt and compiler behavior stay
+# reproducible between Renovate updates. The MSRV is `rust-version` in Cargo.toml
+# and is checked by its own CI job.
 [toolchain]
-channel = "stable"
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]
