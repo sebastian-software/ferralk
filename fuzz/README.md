@@ -29,8 +29,10 @@ Filtered or unparseable inputs return libFuzzer's rejected-corpus verdict, so
 they cannot displace comparable inputs in the evolving corpus. The shared
 globstar subset includes every `**`, whole-component or attached, since both
 engines read it as recursive only as a whole path component (ADR-0020); a
-trailing `/**` and a whole-component run of three or more stars keep the
-documented structural exclusion.
+trailing `/**`, a whole-component run of three or more stars, attached-star
+handoffs, and brace backtracking keep their documented structural exclusions.
+The two scheduled failures from issue #447 are preserved in the executable
+corpus and replayed by the subset-boundary test.
 
 `cargo test --manifest-path fuzz/Cargo.toml --lib --locked` checks the subset
 boundary and replays every checked-in differential seed through both matchers.
