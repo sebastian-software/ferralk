@@ -72,6 +72,8 @@ pub fn in_shared_subset(pattern: &[u8], path: &[u8]) -> bool {
     let mut index = 0;
     let mut brace_depth = 0_usize;
     let mut brace_groups = 0_usize;
+    let mut recursive_prefix_seen = false;
+    let mut attached_run_after_recursive = false;
     while index < pattern.len() {
         match pattern[index] {
             b'\\' => {
@@ -96,10 +98,30 @@ pub fn in_shared_subset(pattern: &[u8], path: &[u8]) -> bool {
                 if !double_star_is_shared(pattern, index) {
                     return false;
                 }
+                if index == 0 || pattern[index - 1] != b'*' {
+                    let end = index
+                        + pattern[index..]
+                            .iter()
+                            .take_while(|&&byte| byte == b'*')
+                            .count();
+                    if pattern.get(end) == Some(&b'/') {
+                        if index == 0 || pattern[index - 1] == b'/' {
+                            recursive_prefix_seen = true;
+                        } else if recursive_prefix_seen && (end - index).is_multiple_of(2) {
+                            attached_run_after_recursive = true;
+                        }
+                    }
+                }
             }
             b'{' | b'}' | b',' => {
                 match pattern[index] {
                     b'{' => {
+                        // Backtracking from a brace resets fast-glob's match
+                        // start. An earlier attached even star run can then
+                        // be mistaken for a whole-component globstar (#447).
+                        if attached_run_after_recursive {
+                            return false;
+                        }
                         // fast-glob caps brace nesting; one level is common
                         // ground.
                         brace_depth += 1;
@@ -119,9 +141,8 @@ pub fn in_shared_subset(pattern: &[u8], path: &[u8]) -> bool {
                         }
                         brace_depth -= 1;
                     }
-                    // A comma separates alternatives inside a brace group and
-                    // is an ordinary byte outside one, but fast-glob does not
-                    // always return to that reading after a group closes.
+                    // Keep the conservative boundary from the former
+                    // comma-after-braces defect, fixed in fast-glob 1.1.2.
                     _ => {
                         if brace_depth == 0 {
                             return false;
@@ -185,8 +206,11 @@ fn has_leading_dot_slash_alternative(pattern: &[u8]) -> bool {
     if !pattern.contains(&b'{') {
         return pattern.starts_with(b"./");
     }
-    expand_braces(pattern, matcher_options())
-        .is_ok_and(|alternatives| alternatives.iter().any(|pattern| pattern.starts_with(b"./")))
+    expand_braces(pattern, matcher_options()).is_ok_and(|alternatives| {
+        alternatives
+            .iter()
+            .any(|pattern| pattern.starts_with(b"./"))
+    })
 }
 
 /// Both engines unescape a metacharacter.
@@ -197,8 +221,8 @@ fn is_shared_escape(byte: u8) -> bool {
 /// Returns the index just past a shared-syntax character class.
 fn class_end(pattern: &[u8], open: usize, inside_brace: bool) -> Option<usize> {
     let mut scan = open + 1;
-    // A negated class implicitly contains the separator, which only fast-glob
-    // lets a class accept.
+    // Retain the conservative exclusion for separator-containing classes;
+    // fast-glob 1.1.2 fixes the recorded negated-class example.
     if matches!(pattern.get(scan), Some(b'!' | b'^')) {
         return None;
     }
@@ -216,8 +240,8 @@ fn class_end(pattern: &[u8], open: usize, inside_brace: bool) -> Option<usize> {
         match pattern.get(scan) {
             None => return None,
             Some(b']') => return Some(scan + 1),
-            // Only fast-glob lets a class accept a separator, and brace
-            // expansion inside a class rewrites the class itself.
+            // Keep separator-containing classes outside the subset; brace
+            // expansion inside a class also rewrites the class itself.
             Some(b'/' | b'{' | b'}') => return None,
             Some(b',') if inside_brace => return None,
             Some(b'-') => {
@@ -244,8 +268,8 @@ fn class_end(pattern: &[u8], open: usize, inside_brace: bool) -> Option<usize> {
                 } else {
                     (next, scan + 2)
                 };
-                // A range that spans the separator accepts it, which is the
-                // same divergence as writing `/` in the class directly.
+                // A range spanning the separator keeps the same conservative
+                // exclusion as writing `/` in the class directly.
                 if start <= b'/' && b'/' <= end {
                     return None;
                 }
@@ -366,9 +390,42 @@ mod tests {
     }
 
     #[test]
+    fn brace_backtracking_reference_failures_stay_outside_the_shared_subset() {
+        let mut regressions = 0;
+        for line in include_str!("../../corpus/fast-glob.jsonl").lines() {
+            let case = corpus::parse_case(line).expect("parse fast-glob case");
+            if !case.id.starts_with("fastglob-brace-backtracking-") {
+                continue;
+            }
+            let pattern = corpus::decode_bytes(&case.pattern).expect("decode pattern");
+            let candidate = corpus::decode_bytes(&case.path).expect("decode candidate");
+            assert!(
+                !in_shared_subset(&pattern, &candidate),
+                "{} must not reach the differential assertion",
+                case.id
+            );
+            regressions += 1;
+        }
+        assert_eq!(regressions, 3);
+
+        for pattern in [b"**/a****/{}".as_slice(), b"**/a**/{b,}", b"**/a**/{}/b"] {
+            assert!(!in_shared_subset(pattern, b"a/a"));
+        }
+        for pattern in [
+            b"**/a**/b".as_slice(),
+            b"a**/{}",
+            b"**/a*/{}",
+            b"**/a***/{}",
+            br"**/[**]/{}",
+            br"**/a\**/{}",
+        ] {
+            assert!(in_shared_subset(pattern, b"a/a"), "{pattern:?}");
+        }
+    }
+
+    #[test]
     fn every_checked_in_differential_seed_reaches_both_matchers() {
-        let seed_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("corpus/ferralk_vs_fast_glob");
+        let seed_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/ferralk_vs_fast_glob");
         let mut seeds = fs::read_dir(&seed_dir)
             .expect("read differential seed directory")
             .map(|entry| entry.expect("read differential seed entry").path())
