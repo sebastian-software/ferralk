@@ -277,7 +277,7 @@ async function verifyHeader(page, pageFile, viewport) {
   );
   // Documentation pages fold the header's links into Ardo's menu where Ardo's
   // sidebar folds away.
-  const wide = viewport.width >= (pageFile === "index.html" ? 961 : 1025);
+  const wide = viewport.width >= (pageFile === "index.html" ? 961 : 1024);
   const links = await display(page, ".mono-header .mono-menu");
   if (wide) assert.notEqual(links, "none", `${pageFile} hides the header links on wide screens`);
   else assert.equal(links, "none", `${pageFile} shows the header links at ${viewport.name}`);
