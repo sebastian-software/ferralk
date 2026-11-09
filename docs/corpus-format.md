@@ -167,10 +167,14 @@ empty branch of a leading repeating extglob in
 defects rather than Ferralk policy decisions.
 
 `fast-glob` 1.1 is a secondary differential oracle, not Ferralk's semantic
-authority. Its eight recorded disagreements cover the trailing-`**` elision,
-backslash and POSIX-class syntax, separator handling in classes, leading `./`
-normalization, and its brace-group limit. They carry `oracle_defect: true` to
-state that no Ferralk contract decision is pending on their result.
+authority. Its recorded disagreements cover the trailing-`**` elision,
+backslash and POSIX-class syntax, leading `./` normalization, its brace-group
+limit, and the brace-backtracking defect from issue #447. They carry
+`oracle_defect: true` to state that no Ferralk contract decision is pending on
+their result. Version 1.1.2 fixes the recorded separator-class and
+comma-after-braces defects; those cases now assert agreement without changing Ferralk's
+verdicts. Its eleven-group validation limit is checked as an error rather than
+an unspecified matching result.
 
 ## What the zlob oracle skips
 
