@@ -227,6 +227,21 @@ overrides the proposed version. Publishing the GitHub release runs
 `.github/workflows/publish.yml`, which publishes `ferralk-glob` and then
 `ferralk`.
 
+### Recovering a partial crate release
+
+Re-run the original failed Publish crates run on its original release revision.
+The publisher checks each exact version in the crates.io sparse index, skips
+versions already published, and waits for the first crate to become visible
+before uploading its dependent. Yanked versions, registry lookup failures, and
+Cargo permission or validation errors remain failures. A completed release is a
+no-op. The skip checks version existence, not archive-content equality; use the
+original revision and build inputs when resuming.
+
+If recovery requires a source change after either crate was uploaded, prepare a
+new coordinated version through Release Please. Existing crates.io versions
+cannot be replaced. `python3 scripts/publish-crates.py --dry-run` packages both
+crates without uploading; it does not establish publication permissions.
+
 ## 1.0 release checklist
 
 This is the checklist the 1.0 release train was planned with; the
