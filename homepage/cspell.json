@@ -1,6 +1,6 @@
 {
   "version": "0.2",
-  "ignorePaths": [".standards/"],
+  "ignorePaths": [],
   "words": [
     "ardo",
     "ferramenta",
@@ -16,7 +16,6 @@
     "pnpm",
     "pofile",
     "polib",
-    "repometa",
     "unforked",
     "ferralk",
     "zlob",

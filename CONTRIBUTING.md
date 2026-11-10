@@ -196,10 +196,9 @@ pins and outputs together. Never edit generated family text by hand.
 
 ## Releases
 
-Release Please cuts every release from `main` following the org product
-template (`reference/release-please/rust-product-release-config.json` in
-`sebastian-software/standards`): one component, `ferralk`, at the repository
-root, versioned by the `rust` strategy. That strategy needs a real package at
+Project-owned Release Please configuration cuts every release from `main`,
+with shared [project-infra guidance](https://github.com/sebastian-software/project-infra/blob/v0.3.0/skills/project-infra/references/ci-and-releases.md):
+one component, `ferralk`, at the repository root, versioned by the `rust` strategy. That strategy needs a real package at
 the root, so the root `Cargo.toml` is the `ferralk` package. Its sources stay
 in `crates/ferralk/`, and its `include` list keeps the published file set to
 those sources plus the repository's license texts and `NOTICE`. One release
