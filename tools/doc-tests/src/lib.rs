@@ -687,9 +687,8 @@ mod tests {
         }
     }
 
-    /// The org product template (`sebastian-software/standards`,
-    /// `reference/release-please/rust-product-release-config.json`): one
-    /// component at `.`, the `rust` strategy, and no Cargo manifest in
+    /// The project-owned Release Please contract: one component at `.`, the
+    /// `rust` strategy, and no Cargo manifest in
     /// `extra-files`. The strategy versions the root package, every listed
     /// workspace member, their internal requirements, and the root
     /// `Cargo.lock` itself; it can do that only for members listed by explicit

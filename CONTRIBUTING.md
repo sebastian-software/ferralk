@@ -196,10 +196,9 @@ pins and outputs together. Never edit generated family text by hand.
 
 ## Releases
 
-Release Please cuts every release from `main` following the org product
-template (`reference/release-please/rust-product-release-config.json` in
-`sebastian-software/standards`): one component, `ferralk`, at the repository
-root, versioned by the `rust` strategy. That strategy needs a real package at
+Project-owned Release Please configuration cuts every release from `main`,
+with shared [project-infra guidance](https://github.com/sebastian-software/project-infra/blob/v0.3.0/skills/project-infra/references/ci-and-releases.md):
+one component, `ferralk`, at the repository root, versioned by the `rust` strategy. That strategy needs a real package at
 the root, so the root `Cargo.toml` is the `ferralk` package. Its sources stay
 in `crates/ferralk/`, and its `include` list keeps the published file set to
 those sources plus the repository's license texts and `NOTICE`. One release
@@ -226,6 +225,21 @@ release history continues. A `Release-As: <version>` footer on `main` still
 overrides the proposed version. Publishing the GitHub release runs
 `.github/workflows/publish.yml`, which publishes `ferralk-glob` and then
 `ferralk`.
+
+### Recovering a partial crate release
+
+Re-run the original failed Publish crates run on its original release revision.
+The publisher checks each exact version in the crates.io sparse index, skips
+versions already published, and waits for the first crate to become visible
+before uploading its dependent. Yanked versions, registry lookup failures, and
+Cargo permission or validation errors remain failures. A completed release is a
+no-op. The skip checks version existence, not archive-content equality; use the
+original revision and build inputs when resuming.
+
+If recovery requires a source change after either crate was uploaded, prepare a
+new coordinated version through Release Please. Existing crates.io versions
+cannot be replaced. `python3 scripts/publish-crates.py --dry-run` packages both
+crates without uploading; it does not establish publication permissions.
 
 ## 1.0 release checklist
 

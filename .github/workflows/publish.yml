@@ -57,25 +57,8 @@ jobs:
         if: ${{ github.event_name == 'release' || inputs.publish }}
         continue-on-error: true
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-      - name: Publish ferralk-glob
+      - name: Publish crates in dependency order
         if: ${{ github.event_name == 'release' || inputs.publish }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked -p ferralk-glob
-
-      - name: Publish ferralk after registry sync
-        if: ${{ github.event_name == 'release' || inputs.publish }}
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          for attempt in {1..10}; do
-            if cargo publish --locked -p ferralk; then
-              exit 0
-            fi
-
-            if [ "$attempt" -eq 10 ]; then
-              exit 1
-            fi
-
-            sleep 15
-          done
+        run: python3 scripts/publish-crates.py
