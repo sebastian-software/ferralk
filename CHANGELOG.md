@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.1](https://github.com/sebastian-software/ferralk/compare/v1.2.0...v1.2.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* **release:** resume partial crate publication ([#472](https://github.com/sebastian-software/ferralk/issues/472)) ([f175d32](https://github.com/sebastian-software/ferralk/commit/f175d325779c13431a657b2ad11554f321027289))
+
 ## [1.2.0](https://github.com/sebastian-software/ferralk/compare/v1.1.0...v1.2.0) (2026-11-09)
 
 
