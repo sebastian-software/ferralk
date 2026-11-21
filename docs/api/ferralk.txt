@@ -200,6 +200,7 @@ pub const fn ferralk::WalkOptions::keep_git_dir(self, bool) -> Self
 pub const fn ferralk::WalkOptions::max_depth(self, usize) -> Self
 pub const fn ferralk::WalkOptions::metadata(self, bool) -> Self
 pub const fn ferralk::WalkOptions::resolve_symlink_kind(self, bool) -> Self
+pub const fn ferralk::WalkOptions::same_file_system(self, bool) -> Self
 pub const fn ferralk::WalkOptions::skip_hidden(self, bool) -> Self
 pub const fn ferralk::WalkOptions::sort(self, bool) -> Self
 impl core::clone::Clone for ferralk::WalkOptions

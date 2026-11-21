@@ -1105,3 +1105,124 @@ fn a_leading_bang_is_refused_instead_of_selecting_nothing() {
         [PathBuf::from("!src/b.ts")]
     );
 }
+
+#[test]
+fn same_file_system_keeps_same_volume_entries_across_frontends() {
+    let fixture = Fixture::new();
+    fixture.write("nested/file.txt");
+    let expected = paths_from_every_frontend_with(
+        WalkOptions::default().same_file_system(true),
+        |walker| walker,
+        &fixture.root,
+    );
+    assert_eq!(
+        expected,
+        vec![PathBuf::from("nested"), PathBuf::from("nested/file.txt")]
+    );
+    let mut parallel: Vec<_> = Walker::new(&fixture.root)
+        .options(WalkOptions::default().same_file_system(true))
+        .stream_parallel()
+        .map(|entry| {
+            entry
+                .expect("parallel stream succeeds")
+                .path()
+                .strip_prefix(&fixture.root)
+                .unwrap()
+                .to_path_buf()
+        })
+        .collect();
+    parallel.sort();
+    assert_eq!(parallel, expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn same_file_system_prunes_a_followed_link_to_another_device() {
+    use std::os::unix::fs::MetadataExt;
+    let fixture = Fixture::new();
+    let other = Path::new("/dev");
+    let Ok(metadata) = fs::metadata(other) else {
+        return;
+    };
+    if metadata.dev() == fs::metadata(&fixture.root).unwrap().dev() {
+        return;
+    }
+    fixture.write("local/file");
+    fixture.link(other, "other");
+    let followed = WalkOptions::default()
+        .same_file_system(true)
+        .follow_symlinks(true);
+    let expected = paths_from_every_frontend_with(followed, |walker| walker, &fixture.root);
+    assert!(expected.contains(&PathBuf::from("other")));
+    assert!(
+        !expected
+            .iter()
+            .any(|path| path != Path::new("other") && path.starts_with("other"))
+    );
+    assert!(expected.contains(&PathBuf::from("local/file")));
+    let mut parallel: Vec<_> = Walker::new(&fixture.root)
+        .options(followed)
+        .stream_parallel()
+        .map(|entry| {
+            entry
+                .expect("parallel stream succeeds")
+                .path()
+                .strip_prefix(&fixture.root)
+                .unwrap()
+                .to_path_buf()
+        })
+        .collect();
+    parallel.sort();
+    assert_eq!(parallel, expected);
+    let not_followed = paths_from_every_frontend_with(
+        WalkOptions::default().same_file_system(true),
+        |walker| walker,
+        &fixture.root,
+    );
+    assert!(not_followed.contains(&PathBuf::from("other")));
+    assert!(
+        !not_followed
+            .iter()
+            .any(|path| path != Path::new("other") && path.starts_with("other"))
+    );
+    // An explicit symlink root is opened even without follow_symlinks.
+    let root_alias = Walker::new(fixture.root.join("other"))
+        .options(WalkOptions::default().same_file_system(true).max_depth(1))
+        .collect()
+        .unwrap();
+    assert!(root_alias.errors().is_empty());
+    assert!(!root_alias.entries().is_empty());
+}
+
+#[test]
+fn same_file_system_reports_missing_root_in_all_frontends() {
+    use ferralk::{ErrorPolicy, WalkOperation};
+    let fixture = Fixture::new();
+    let root = fixture.root.join("missing");
+    for policy in [ErrorPolicy::Collect, ErrorPolicy::Skip, ErrorPolicy::Abort] {
+        let walker = || {
+            Walker::new(&root)
+                .error_policy(policy)
+                .options(WalkOptions::default().same_file_system(true))
+        };
+        let collected = walker().collect();
+        let check = |error: &ferralk::WalkError| {
+            assert_eq!(error.operation(), WalkOperation::Metadata);
+            assert_eq!(error.path(), root);
+        };
+        if policy == ErrorPolicy::Abort {
+            check(&collected.unwrap_err());
+        } else {
+            let result = collected.unwrap();
+            assert_eq!(result.errors().len(), 1);
+            check(&result.errors()[0]);
+        }
+        for error in [
+            walker().stream().next().unwrap().unwrap_err(),
+            walker().stream_parallel().next().unwrap().unwrap_err(),
+        ] {
+            assert_eq!(error.operation(), WalkOperation::Metadata);
+            assert_eq!(error.path(), root);
+        }
+    }
+}

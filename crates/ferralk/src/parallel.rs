@@ -832,6 +832,21 @@ fn walk_directory(
                     return;
                 }
             }
+            if shared.walker.options.same_file_system {
+                match super::enter_filesystem(
+                    shared.backend,
+                    &path,
+                    &shared.walker.roots[root].filesystem,
+                    is_root,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => return,
+                    Err(source) => {
+                        shared.record_error(WalkOperation::Metadata, path, source, is_root);
+                        return;
+                    }
+                }
+            }
             let ancestors = if shared.walker.options.follow_symlinks {
                 match shared.backend.cycle_key(&path) {
                     Ok(key) => {
