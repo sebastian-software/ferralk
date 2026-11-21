@@ -444,6 +444,7 @@ dependencies = [
  "memchr",
  "serde_json",
  "unicode-normalization",
+ "winapi-util",
 ]
 
 [[package]]

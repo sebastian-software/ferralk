@@ -785,6 +785,7 @@ pub enum WildcardMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WalkOptions {
     follow_symlinks: bool,
+    same_file_system: bool,
     sort: bool,
     metadata: bool,
     directories_only: bool,
@@ -806,6 +807,24 @@ impl WalkOptions {
     #[must_use]
     pub const fn follow_symlinks(mut self, enabled: bool) -> Self {
         self.follow_symlinks = enabled;
+        self
+    }
+
+    /// Restricts directory descent to the filesystem of each root, off by default.
+    ///
+    /// A selected boundary directory is still returned, but its children are not read.
+    /// Root symlinks are always followed; followed directory links are checked against
+    /// the root's target filesystem. Unfollowed links and files remain leaf entries.
+    /// Identity failures are reported as [`WalkOperation::Metadata`] under
+    /// [`ErrorPolicy`] and prevent descent. Unix compares device numbers, so bind
+    /// mounts of the same device remain traversable; Windows compares volume serial
+    /// numbers. The path-based check is not a security boundary against concurrent
+    /// filesystem changes.
+    /// On platforms other than Unix and Windows, enabling it reports an unsupported
+    /// metadata error for each root.
+    #[must_use]
+    pub const fn same_file_system(mut self, enabled: bool) -> Self {
+        self.same_file_system = enabled;
         self
     }
 
@@ -1732,6 +1751,8 @@ pub(crate) fn keep_every_entry(_: &WalkEntry) -> Verdict {
 #[derive(Debug, Clone)]
 struct RootPlan {
     path: PathBuf,
+    // Cleared at each walk; its root task initializes it before scheduling children.
+    filesystem: std::sync::OnceLock<u64>,
     /// Shared with every entry produced under this root, so an entry can name
     /// its root and find its root-relative part without each one owning a
     /// copy of the path.
@@ -1796,6 +1817,7 @@ impl RootPlan {
         let relative_start = Self::relative_start(&path);
         Self {
             relative_start,
+            filesystem: std::sync::OnceLock::new(),
             shared: Arc::new(SharedRoot::new(path.clone(), relative_start)),
             path,
             includes: Vec::new(),
@@ -2684,10 +2706,11 @@ impl Walker {
     /// The one traversal `collect` and `visit` share, so a visitor cannot
     /// observe a different tree than a plain collect would.
     fn walk<B: DirectoryBackend + Sync>(
-        self,
+        mut self,
         backend: &B,
         visitor: EntryVisitor<'_>,
     ) -> Result<WalkResult, WalkError> {
+        self.reset_filesystems();
         backend.begin_walk();
         if self.threads > 1 {
             return parallel::collect(self, backend, visitor);
@@ -2725,7 +2748,8 @@ impl Walker {
     /// Every item is a `Result`, so iterator adapters count errors as items:
     /// `take(10)` stops after ten *items*, which may be fewer than ten
     /// entries. See [`WalkStream`] for the idioms.
-    pub fn stream(self) -> WalkStream {
+    pub fn stream(mut self) -> WalkStream {
+        self.reset_filesystems();
         SystemBackend.begin_walk();
         // Reversed, because the stream pops from the back and the roots are
         // walked in the order the caller added them.
@@ -2815,8 +2839,17 @@ impl Walker {
     /// # std::fs::remove_dir_all(&root)?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn stream_parallel(self) -> ParallelWalkStream {
+    pub fn stream_parallel(mut self) -> ParallelWalkStream {
+        self.reset_filesystems();
         ParallelWalkStream::new(self)
+    }
+
+    fn reset_filesystems(&mut self) {
+        if self.options.same_file_system {
+            for root in &mut self.roots {
+                root.filesystem = std::sync::OnceLock::new();
+            }
+        }
     }
 
     fn may_descend_into(&self, root: usize, relative: &[u8]) -> bool {
@@ -2854,6 +2887,7 @@ impl Walker {
     fn allows_descriptor_relative_descent(&self) -> bool {
         !self.respect_git_ignore
             && !self.options.follow_symlinks
+            && !self.options.same_file_system
             && !self.options.metadata
             && !self.options.resolve_symlink_kind
     }
@@ -3673,6 +3707,28 @@ trait DirectoryBackend {
         fs::metadata(path)
     }
 
+    /// Identifies the filesystem reached by a directory path, following links.
+    fn filesystem_id(&self, path: &Path) -> std::io::Result<u64> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            self.metadata(path).map(|metadata| metadata.dev())
+        }
+        #[cfg(windows)]
+        {
+            let handle = winapi_util::Handle::from_path_any(path)?;
+            winapi_util::file::information(handle).map(|info| info.volume_serial_number())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "filesystem identity is unavailable on this platform",
+            ))
+        }
+    }
+
     /// Does not follow symlinks; fills in the metadata option of an entry.
     fn symlink_metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
         fs::symlink_metadata(path)
@@ -3819,6 +3875,25 @@ impl AncestorChain {
             key,
             parent: self.0.clone(),
         }))))
+    }
+}
+
+/// Checks a scheduled directory before reading it; the root establishes its own boundary.
+fn enter_filesystem(
+    backend: &(impl DirectoryBackend + ?Sized),
+    path: &Path,
+    root: &std::sync::OnceLock<u64>,
+    is_root: bool,
+) -> std::io::Result<bool> {
+    let current = backend.filesystem_id(path)?;
+    if is_root {
+        let _ = root.set(current);
+        Ok(true)
+    } else {
+        let expected = root
+            .get()
+            .ok_or_else(|| std::io::Error::other("root filesystem identity is unavailable"))?;
+        Ok(*expected == current)
     }
 }
 
@@ -4432,6 +4507,20 @@ impl WalkStream {
         mut task: DirectoryTask,
     ) -> Option<Result<WalkEntry, WalkError>> {
         let is_root = task.depth == 0;
+        if self.walker.options.same_file_system {
+            match enter_filesystem(
+                &SystemBackend,
+                &task.path,
+                &self.walker.roots[task.root].filesystem,
+                is_root,
+            ) {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(source) => {
+                    return self.error(WalkOperation::Metadata, task.path, source, is_root);
+                }
+            }
+        }
         if self.walker.options.follow_symlinks {
             task.ancestors = match SystemBackend.cycle_key(&task.path) {
                 Ok(key) => task.ancestors.enter(key)?,
@@ -4852,6 +4941,20 @@ impl<'walker> WalkState<'walker> {
         for error in std::mem::take(&mut task.ignore_errors) {
             let (path, source) = error.into_parts();
             self.handle_error(IGNORE_FILE_OPERATION, path, source, false)?;
+        }
+        if self.walker.options.same_file_system {
+            match enter_filesystem(
+                backend,
+                &task.path,
+                &self.walker.roots[task.root].filesystem,
+                is_root,
+            ) {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
+                Err(source) => {
+                    return self.handle_error(WalkOperation::Metadata, task.path, source, is_root);
+                }
+            }
         }
         if self.walker.options.follow_symlinks {
             let Some(ancestors) =
@@ -5453,6 +5556,7 @@ mod tests {
             WalkOptions::default().follow_symlinks(true),
             WalkOptions::default().metadata(true),
             WalkOptions::default().resolve_symlink_kind(true),
+            WalkOptions::default().same_file_system(true),
         ] {
             assert!(
                 !Walker::new(".")
@@ -5518,6 +5622,211 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    struct FilesystemBackend {
+        first: PathBuf,
+        second: PathBuf,
+        failing: Option<PathBuf>,
+        calls: AtomicUsize,
+    }
+
+    impl super::DirectoryBackend for FilesystemBackend {
+        fn read_directory(
+            &self,
+            path: &Path,
+            follow: bool,
+            refuse: bool,
+            listing: &mut super::Listing,
+        ) -> std::io::Result<()> {
+            super::DirectoryBackend::read_directory(
+                &super::StdBackend,
+                path,
+                follow,
+                refuse,
+                listing,
+            )
+        }
+        fn filesystem_id(&self, path: &Path) -> std::io::Result<u64> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.failing.as_deref() == Some(path) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected identity failure",
+                ));
+            }
+            if path == self.first.join("boundary") || path.starts_with(self.second.as_path()) {
+                Ok(2)
+            } else {
+                Ok(1)
+            }
+        }
+    }
+
+    #[test]
+    fn filesystem_boundaries_are_per_root_and_identity_errors_obey_policy() {
+        let first = Fixture::new();
+        let second = Fixture::new();
+        first.write("local/one");
+        first.write("boundary/hidden");
+        second.write("nested/two");
+        let mut backend = FilesystemBackend {
+            first: first.root.clone(),
+            second: second.root.clone(),
+            failing: None,
+            calls: AtomicUsize::new(0),
+        };
+        for threads in [1, 4] {
+            let walker = Walker::new(&first.root)
+                .add_root(&second.root)
+                .unwrap()
+                .add_root(&first.root)
+                .unwrap()
+                .threads(threads);
+            let default = walker.clone().collect_with(&backend).unwrap();
+            assert!(
+                default
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.path().ends_with("boundary/hidden"))
+            );
+            assert_eq!(
+                backend.calls.load(Ordering::Relaxed),
+                0,
+                "the default must not query identity"
+            );
+            let restricted = walker
+                .options(WalkOptions::default().same_file_system(true))
+                .collect_with(&backend)
+                .unwrap();
+            assert!(restricted.errors().is_empty());
+            assert_eq!(
+                restricted
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.path() == first.root.join("boundary"))
+                    .count(),
+                2
+            );
+            assert!(
+                !restricted
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.path().ends_with("boundary/hidden"))
+            );
+            assert!(
+                restricted
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.path().ends_with("nested/two"))
+            );
+            let visited = Walker::new(&first.root)
+                .threads(threads)
+                .options(WalkOptions::default().same_file_system(true))
+                .walk(&backend, &|_| Verdict::Keep)
+                .unwrap();
+            assert!(
+                visited
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.path() == first.root.join("boundary"))
+            );
+            assert!(
+                !visited
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.path().ends_with("boundary/hidden"))
+            );
+            backend.calls.store(0, Ordering::Relaxed);
+        }
+        // A cloned builder never retains an identity from a previous execution.
+        let walker =
+            Walker::new(&first.root).options(WalkOptions::default().same_file_system(true));
+        walker.roots[0].filesystem.set(99).unwrap();
+        let fresh = walker.clone().collect_with(&backend).unwrap();
+        assert!(
+            fresh
+                .entries()
+                .iter()
+                .any(|entry| entry.path().ends_with("local/one"))
+        );
+        backend.calls.store(0, Ordering::Relaxed);
+        let shallow = Walker::new(&first.root)
+            .options(WalkOptions::default().same_file_system(true).max_depth(1))
+            .collect_with(&backend)
+            .unwrap();
+        assert!(
+            shallow
+                .entries()
+                .iter()
+                .any(|entry| entry.path() == first.root.join("boundary"))
+        );
+        assert_eq!(
+            backend.calls.swap(0, Ordering::Relaxed),
+            1,
+            "a depth-limited child is never queried"
+        );
+        let pruned = Walker::new(&first.root)
+            .options(WalkOptions::default().same_file_system(true))
+            .walk(&backend, &|_| Verdict::Prune)
+            .unwrap();
+        assert!(pruned.entries().is_empty());
+        assert_eq!(
+            backend.calls.swap(0, Ordering::Relaxed),
+            1,
+            "a visitor-pruned child is never queried"
+        );
+        let files = Walker::new(&first.root)
+            .options(
+                WalkOptions::default()
+                    .same_file_system(true)
+                    .files_only(true),
+            )
+            .collect_with(&backend)
+            .unwrap();
+        assert!(
+            !files
+                .entries()
+                .iter()
+                .any(|entry| entry.path() == first.root.join("boundary"))
+        );
+        assert!(
+            !files
+                .entries()
+                .iter()
+                .any(|entry| entry.path().ends_with("boundary/hidden"))
+        );
+        for failing in [first.root.clone(), first.root.join("boundary")] {
+            backend.failing = Some(failing.clone());
+            for threads in [1, 4] {
+                for policy in [ErrorPolicy::Collect, ErrorPolicy::Skip, ErrorPolicy::Abort] {
+                    let result = Walker::new(&first.root)
+                        .threads(threads)
+                        .error_policy(policy)
+                        .options(WalkOptions::default().same_file_system(true))
+                        .collect_with(&backend);
+                    if policy == ErrorPolicy::Abort {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.path(), failing);
+                        assert_eq!(error.operation(), super::WalkOperation::Metadata);
+                    } else {
+                        let result = result.unwrap();
+                        let expected =
+                            usize::from(policy == ErrorPolicy::Collect || failing == first.root);
+                        assert_eq!(result.errors().len(), expected);
+                        if failing != first.root {
+                            assert!(result.entries().iter().any(|entry| entry.path() == failing));
+                        }
+                        assert!(
+                            !result
+                                .entries()
+                                .iter()
+                                .any(|entry| entry.path().ends_with("boundary/hidden"))
+                        );
+                    }
+                }
+            }
         }
     }
 
