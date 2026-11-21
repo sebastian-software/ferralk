@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/sebastian-software/ferralk/compare/v1.2.1...v1.3.0) (2026-11-21)
+
+
+### Features
+
+* **walker:** keep traversal on each root filesystem ([#477](https://github.com/sebastian-software/ferralk/issues/477)) ([c257330](https://github.com/sebastian-software/ferralk/commit/c257330892229ef8578d744ebd531e628691e6a1))
+
 ## [1.2.1](https://github.com/sebastian-software/ferralk/compare/v1.2.0...v1.2.1) (2026-11-10)
 
 
