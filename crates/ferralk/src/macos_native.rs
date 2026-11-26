@@ -1929,17 +1929,19 @@ mod tests {
             .expect("a walk has a root")
             .to_path_buf();
         let (ignores, ignore_errors) = crate::IgnoreScope::for_root(walker, &StdBackend, &root);
-        let task = crate::DirectoryTask {
-            path: root.clone(),
-            open: crate::DirectoryOpen::default(),
-            depth: 0,
-            root: 0,
-            ancestors: crate::AncestorChain::default(),
-            ignores,
+        let task = crate::RootTask {
+            task: crate::DirectoryTask {
+                path: root.clone(),
+                open: crate::DirectoryOpen::default(),
+                depth: 0,
+                root: 0,
+                ancestors: crate::AncestorChain::default(),
+                ignores,
+            },
             ignore_errors,
         };
         state
-            .walk_directory(&StdBackend, task)
+            .walk_root(&StdBackend, task)
             .expect("portable walk succeeds");
         if walker.options.sort {
             state

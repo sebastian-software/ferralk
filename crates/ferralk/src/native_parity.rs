@@ -172,16 +172,18 @@ fn walk_with_backend(
         .expect("a walk has a root")
         .to_path_buf();
     let (ignores, ignore_errors) = IgnoreScope::for_root(walker, backend, &root);
-    let task = DirectoryTask {
-        path: root.clone(),
-        open: crate::DirectoryOpen::default(),
-        depth: 0,
-        root: 0,
-        ancestors: crate::AncestorChain::default(),
-        ignores,
+    let task = crate::RootTask {
+        task: DirectoryTask {
+            path: root.clone(),
+            open: crate::DirectoryOpen::default(),
+            depth: 0,
+            root: 0,
+            ancestors: crate::AncestorChain::default(),
+            ignores,
+        },
         ignore_errors,
     };
-    state.walk_directory(backend, task)?;
+    state.walk_root(backend, task)?;
     Ok((state.entries, state.errors))
 }
 
