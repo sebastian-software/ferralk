@@ -2710,21 +2710,38 @@ impl Walker {
         backend: &B,
         visitor: EntryVisitor<'_>,
     ) -> Result<WalkResult, WalkError> {
+        if self.is_cancelled() {
+            return Ok(WalkResult {
+                entries: Vec::new(),
+                errors: Vec::new(),
+                cancelled: true,
+            });
+        }
         self.reset_filesystems();
         backend.begin_walk();
         if self.threads > 1 {
             return parallel::collect(self, backend, visitor);
         }
+        let Some(root_tasks) = self.root_tasks(backend) else {
+            return Ok(WalkResult {
+                entries: Vec::new(),
+                errors: Vec::new(),
+                cancelled: true,
+            });
+        };
         let mut state = WalkState::new(&self, visitor);
         // Use the same injector-to-worker transfer as the parallel backend. The
         // serial baseline owns one local queue and deliberately drains it
         // before returning.
         let scheduler = scheduler::Scheduler::new();
-        for task in self.root_tasks(backend) {
+        for task in root_tasks {
             scheduler.push(task);
         }
         let worker = scheduler.worker();
         while let Some(task) = scheduler.steal_into(&worker).or_else(|| worker.pop()) {
+            if state.check_cancellation() {
+                break;
+            }
             state.walk_directory(backend, task)?;
         }
         if self.options.sort {
@@ -2748,22 +2765,17 @@ impl Walker {
     /// Every item is a `Result`, so iterator adapters count errors as items:
     /// `take(10)` stops after ten *items*, which may be fewer than ten
     /// entries. See [`WalkStream`] for the idioms.
+    ///
+    /// Nothing starts until the first call to `next`: creating a stream does
+    /// not open directories, discover Git repositories, or read ignore files.
     pub fn stream(mut self) -> WalkStream {
         self.reset_filesystems();
-        SystemBackend.begin_walk();
-        // Reversed, because the stream pops from the back and the roots are
-        // walked in the order the caller added them.
-        let mut pending = self
-            .root_tasks(&SystemBackend)
-            .into_iter()
-            .map(SerialTask::Directory)
-            .collect::<Vec<_>>();
-        pending.reverse();
         WalkStream {
-            pending,
+            pending: Vec::new(),
             walker: self,
             scratch: Vec::new(),
             pending_errors: Vec::new(),
+            started: false,
             cancelled: false,
             stopped: false,
         }
@@ -2892,24 +2904,38 @@ impl Walker {
             && !self.options.resolve_symlink_kind
     }
 
+    fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    }
+
     /// The tasks a walk starts from: one per root, in order.
-    fn root_tasks<B: DirectoryBackend + ?Sized>(&self, backend: &B) -> Vec<DirectoryTask> {
-        self.roots
-            .iter()
-            .enumerate()
-            .map(|(index, plan)| {
-                let (ignores, ignore_errors) = IgnoreScope::for_root(self, backend, &plan.path);
-                DirectoryTask {
-                    path: plan.path.clone(),
-                    open: DirectoryOpen::default(),
-                    depth: 0,
-                    root: index,
-                    ancestors: AncestorChain::default(),
-                    ignores,
-                    ignore_errors,
-                }
-            })
-            .collect()
+    ///
+    /// Returns `None` if cancellation was observed before or while building
+    /// root tasks so callers never mistake an abbreviated task list for a
+    /// completed walk.
+    fn root_tasks<B: DirectoryBackend + ?Sized>(&self, backend: &B) -> Option<Vec<DirectoryTask>> {
+        let mut tasks = Vec::with_capacity(self.roots.len());
+        for (index, plan) in self.roots.iter().enumerate() {
+            if self.is_cancelled() {
+                return None;
+            }
+            let (ignores, ignore_errors) = IgnoreScope::for_root(self, backend, &plan.path);
+            tasks.push(DirectoryTask {
+                path: plan.path.clone(),
+                open: DirectoryOpen::default(),
+                depth: 0,
+                root: index,
+                ancestors: AncestorChain::default(),
+                ignores,
+                ignore_errors,
+            });
+        }
+        if self.is_cancelled() {
+            return None;
+        }
+        Some(tasks)
     }
 }
 
@@ -4411,6 +4437,9 @@ pub struct WalkStream {
     scratch: Vec<DirectoryScratch>,
     /// Ignore-file failures discovered while preparing the current directory.
     pending_errors: Vec<PendingWalkError>,
+    /// Whether root tasks have been queued. Deferred until the first `next`
+    /// call so a pre-cancelled or unused stream performs no I/O.
+    started: bool,
     cancelled: bool,
     stopped: bool,
 }
@@ -4502,14 +4531,30 @@ impl WalkStream {
         }
     }
 
+    fn start(&mut self, backend: &impl DirectoryBackend) -> bool {
+        self.started = true;
+        backend.begin_walk();
+        let Some(root_tasks) = self.walker.root_tasks(backend) else {
+            self.cancelled = true;
+            self.stopped = true;
+            return false;
+        };
+        // Reversed, because the stream pops from the back and the roots are
+        // walked in the order the caller added them.
+        self.pending
+            .extend(root_tasks.into_iter().rev().map(SerialTask::Directory));
+        true
+    }
+
     fn prepare_directory(
         &mut self,
+        backend: &impl DirectoryBackend,
         mut task: DirectoryTask,
     ) -> Option<Result<WalkEntry, WalkError>> {
         let is_root = task.depth == 0;
         if self.walker.options.same_file_system {
             match enter_filesystem(
-                &SystemBackend,
+                backend,
                 &task.path,
                 &self.walker.roots[task.root].filesystem,
                 is_root,
@@ -4522,7 +4567,7 @@ impl WalkStream {
             }
         }
         if self.walker.options.follow_symlinks {
-            task.ancestors = match SystemBackend.cycle_key(&task.path) {
+            task.ancestors = match backend.cycle_key(&task.path) {
                 Ok(key) => task.ancestors.enter(key)?,
                 Err(source) => {
                     return self.error(CYCLE_KEY_OPERATION, task.path, source, is_root);
@@ -4530,7 +4575,7 @@ impl WalkStream {
             };
         }
         let mut scratch = self.scratch.pop().unwrap_or_default();
-        let read_result = SystemBackend.read_scheduled_directory(
+        let read_result = backend.read_scheduled_directory(
             &task.path,
             &task.open,
             self.walker.options.follow_symlinks,
@@ -4547,7 +4592,7 @@ impl WalkStream {
         }
         let (ignores, mut entered_errors) = std::mem::take(&mut task.ignores).enter(
             &self.walker,
-            &SystemBackend,
+            backend,
             &task.path,
             &scratch.listing,
         );
@@ -4569,13 +4614,14 @@ impl WalkStream {
     /// the remaining siblings into a directory-task queue.
     fn resume_directory(
         &mut self,
+        backend: &impl DirectoryBackend,
         mut frame: DirectoryFrame,
     ) -> Option<Result<WalkEntry, WalkError>> {
         let path = frame.task.path.as_path();
         let depth = frame.task.depth;
         let suspended_identity = frame.task.open.suspended_identity();
         if frame.next_entry < frame.scratch.listing.entries().len()
-            && let Err(source) = SystemBackend.restore_directory_open(
+            && let Err(source) = backend.restore_directory_open(
                 path,
                 suspended_identity,
                 !self.walker.options.follow_symlinks && depth > 0,
@@ -4601,7 +4647,7 @@ impl WalkStream {
             );
             let action = classify_entry(
                 &self.walker,
-                &SystemBackend,
+                backend,
                 &frame.scratch.path,
                 &frame.scratch.listing.entries()[index],
                 &frame.ignores,
@@ -4624,7 +4670,7 @@ impl WalkStream {
                 }
                 EntryAction::Descend(task) => {
                     reset_to_directory(&mut frame.scratch.path, path);
-                    frame.suspend(&SystemBackend);
+                    frame.suspend(backend);
                     self.pending.push(SerialTask::Resume(frame));
                     self.pending.push(SerialTask::Directory(task));
                     return None;
@@ -4632,7 +4678,7 @@ impl WalkStream {
                 EntryAction::DescendAndEmit(entry, task) => {
                     let entry = entry.with_path(frame.scratch.path.clone());
                     reset_to_directory(&mut frame.scratch.path, path);
-                    frame.suspend(&SystemBackend);
+                    frame.suspend(backend);
                     self.pending.push(SerialTask::Resume(frame));
                     self.pending.push(SerialTask::Directory(task));
                     // Streaming has always delivered a directory before its
@@ -4648,7 +4694,7 @@ impl WalkStream {
                         return result;
                     }
                     if let Some(task) = descend {
-                        frame.suspend(&SystemBackend);
+                        frame.suspend(backend);
                         self.pending.push(SerialTask::Resume(frame));
                         self.pending.push(SerialTask::Directory(task));
                         return result;
@@ -4691,24 +4737,29 @@ impl WalkStream {
         frame.scratch.listing.clear();
         self.scratch.push(frame.scratch);
     }
-}
 
-impl Iterator for WalkStream {
-    type Item = Result<WalkEntry, WalkError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next_with(
+        &mut self,
+        backend: &impl DirectoryBackend,
+    ) -> Option<Result<WalkEntry, WalkError>> {
         while !self.stopped {
             if self.check_cancellation() {
                 self.stopped = true;
                 return None;
+            }
+            if !self.started {
+                if !self.start(backend) {
+                    return None;
+                }
+                continue;
             }
             if let Some(error) = self.pending_errors.pop() {
                 return Some(Err(error.into_walk_error()));
             }
             let task = self.pending.pop()?;
             let result = match task {
-                SerialTask::Directory(task) => self.prepare_directory(task),
-                SerialTask::Resume(frame) => self.resume_directory(frame),
+                SerialTask::Directory(task) => self.prepare_directory(backend, task),
+                SerialTask::Resume(frame) => self.resume_directory(backend, frame),
                 SerialTask::Record(entry) => Some(Ok(entry)),
             };
             if result.is_some() {
@@ -4716,6 +4767,14 @@ impl Iterator for WalkStream {
             }
         }
         None
+    }
+}
+
+impl Iterator for WalkStream {
+    type Item = Result<WalkEntry, WalkError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_with(&SystemBackend)
     }
 }
 
@@ -6283,15 +6342,16 @@ mod tests {
             .push(std::ffi::OsStr::new("must-not-leak"), false, false);
         stream.scratch.push(scratch);
 
+        assert!(stream.start(&super::SystemBackend));
         let SerialTask::Directory(task) = stream
             .pending
             .pop()
             .expect("the root is queued for reading")
         else {
-            panic!("a fresh stream starts with its root directory task");
+            panic!("a started stream starts with its root directory task");
         };
         let error = stream
-            .prepare_directory(task)
+            .prepare_directory(&super::SystemBackend, task)
             .expect("the failed root produces an error")
             .expect_err("a missing root cannot yield an entry");
         assert_eq!(error.operation().as_str(), "read_dir");
@@ -12134,12 +12194,13 @@ mod tests {
         // Feed the stream the same completed listing native and portable
         // readers create. This isolates delivery order from a host filesystem
         // that usually supplies a file type without a fallible stat.
+        assert!(stream.start(&super::SystemBackend));
         let SerialTask::Directory(mut task) = stream
             .pending
             .pop()
             .expect("the root is queued for reading")
         else {
-            panic!("a fresh stream starts with its root directory task");
+            panic!("a started stream starts with its root directory task");
         };
         let ignores = std::mem::take(&mut task.ignores);
         let mut scratch = DirectoryScratch {
@@ -12332,20 +12393,32 @@ mod tests {
                 .resolve_symlink_kind(true),
         );
 
-        // A target that is not there answers the question: dropped, no error.
-        let backend = UnreadableLinkBackend {
-            root: fixture.root.clone(),
-            kind: std::io::ErrorKind::NotFound,
-        };
-        let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
-        state
-            .walk_directory(
-                &backend,
-                directory_task(&walker, &backend, fixture.root.clone()),
-            )
-            .expect("a broken link does not end the walk");
-        assert!(state.entries.is_empty(), "a broken link is not a file");
-        assert!(state.errors.is_empty(), "a broken link is not an error");
+        // A target that is not there — whether missing or traversing a
+        // non-directory — answers the question: dropped, no error.
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::NotADirectory,
+        ] {
+            let backend = UnreadableLinkBackend {
+                root: fixture.root.clone(),
+                kind,
+            };
+            let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
+            state
+                .walk_directory(
+                    &backend,
+                    directory_task(&walker, &backend, fixture.root.clone()),
+                )
+                .expect("a broken link does not end the walk");
+            assert!(
+                state.entries.is_empty(),
+                "a broken link ({kind:?}) is not a file"
+            );
+            assert!(
+                state.errors.is_empty(),
+                "a broken link ({kind:?}) is not an error"
+            );
+        }
 
         // A target we were not allowed to look at does not: dropped and
         // reported, so the walk cannot silently lose an entry it could not
@@ -12433,6 +12506,128 @@ mod tests {
             ),
             1,
             "one stat, for the symlink only"
+        );
+        assert_eq!(
+            count(
+                WalkOptions::default()
+                    .files_only(true)
+                    .directories_only(true)
+                    .resolve_symlink_kind(true)
+            ),
+            0,
+            "contradictory kind filters can never emit any entry"
+        );
+    }
+
+    #[test]
+    fn resolving_skips_stat_for_symlinks_rejected_by_includes_or_kind_filters() {
+        struct CountingIncludeLinkBackend {
+            root: PathBuf,
+            file_target: PathBuf,
+            statted: std::sync::Mutex<Vec<PathBuf>>,
+        }
+
+        impl super::DirectoryBackend for CountingIncludeLinkBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                listing.clear();
+                if path == self.root {
+                    listing.push("outside-link".as_ref(), false, true);
+                    listing.push("dir-link".as_ref(), false, true);
+                    listing.push("src".as_ref(), true, false);
+                } else if path == self.root.join("src") {
+                    listing.push("inside-link".as_ref(), false, true);
+                }
+                Ok(())
+            }
+
+            fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+                self.statted
+                    .lock()
+                    .expect("lock statted")
+                    .push(path.to_path_buf());
+                if path == self.root.join("src/inside-link") {
+                    fs::metadata(&self.file_target)
+                } else {
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                }
+            }
+        }
+
+        let fixture = Fixture::new();
+        fixture.write("target.txt");
+        let file_target = fixture.root.join("target.txt");
+        let run = |walker: Walker| {
+            let backend = CountingIncludeLinkBackend {
+                root: fixture.root.clone(),
+                file_target: file_target.clone(),
+                statted: std::sync::Mutex::new(Vec::new()),
+            };
+            let result = walker
+                .collect_with(&backend)
+                .expect("walk should not abort on non-included symlinks");
+            let statted = backend.statted.into_inner().expect("unlock statted");
+            (result, statted)
+        };
+
+        for options in [
+            WalkOptions::default()
+                .files_only(true)
+                .resolve_symlink_kind(true),
+            WalkOptions::default()
+                .directories_only(true)
+                .resolve_symlink_kind(true),
+        ] {
+            let (result, statted) = run(Walker::new(&fixture.root)
+                .threads(1)
+                .include("src/**")
+                .expect("valid include")
+                .error_policy(ErrorPolicy::Abort)
+                .options(options));
+            assert!(result.errors().is_empty());
+            assert_eq!(
+                statted,
+                vec![fixture.root.join("src/inside-link")],
+                "only symlinks surviving includes may be statted"
+            );
+        }
+
+        let (result, statted) = run(Walker::new(&fixture.root)
+            .threads(1)
+            .include("dir-link/")
+            .expect("valid directory-only include")
+            .error_policy(ErrorPolicy::Abort)
+            .options(
+                WalkOptions::default()
+                    .directories_only(true)
+                    .resolve_symlink_kind(true),
+            ));
+        assert!(result.entries().is_empty());
+        assert!(result.errors().is_empty());
+        assert!(
+            statted.is_empty(),
+            "directory-only include does not match an unfollowed symlink, so it must not stat"
+        );
+
+        let (result, statted) = run(Walker::new(&fixture.root)
+            .threads(1)
+            .error_policy(ErrorPolicy::Abort)
+            .options(
+                WalkOptions::default()
+                    .files_only(true)
+                    .directories_only(true)
+                    .resolve_symlink_kind(true),
+            ));
+        assert!(result.entries().is_empty());
+        assert!(result.errors().is_empty());
+        assert!(
+            statted.is_empty(),
+            "contradictory kind filters must never stat any symlink"
         );
     }
 
@@ -12770,6 +12965,558 @@ mod tests {
             .stream();
         assert!(cancelled.next().is_none());
         assert!(cancelled.was_cancelled());
+    }
+
+    #[test]
+    fn pre_cancelled_walk_performs_no_root_or_ignore_io() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct IoCountingBackend {
+            begin_walks: AtomicUsize,
+            read_dirs: AtomicUsize,
+            read_ignores: AtomicUsize,
+            metadata: AtomicUsize,
+            symlink_metadata: AtomicUsize,
+            cycle_keys: AtomicUsize,
+        }
+
+        impl IoCountingBackend {
+            fn total_calls(&self) -> usize {
+                self.begin_walks.load(Ordering::Relaxed)
+                    + self.read_dirs.load(Ordering::Relaxed)
+                    + self.read_ignores.load(Ordering::Relaxed)
+                    + self.metadata.load(Ordering::Relaxed)
+                    + self.symlink_metadata.load(Ordering::Relaxed)
+                    + self.cycle_keys.load(Ordering::Relaxed)
+            }
+
+            fn reset(&self) {
+                self.begin_walks.store(0, Ordering::Relaxed);
+                self.read_dirs.store(0, Ordering::Relaxed);
+                self.read_ignores.store(0, Ordering::Relaxed);
+                self.metadata.store(0, Ordering::Relaxed);
+                self.symlink_metadata.store(0, Ordering::Relaxed);
+                self.cycle_keys.store(0, Ordering::Relaxed);
+            }
+        }
+
+        impl super::DirectoryBackend for IoCountingBackend {
+            fn begin_walk(&self) {
+                self.begin_walks.fetch_add(1, Ordering::Relaxed);
+                super::SystemBackend.begin_walk();
+            }
+
+            fn read_directory(
+                &self,
+                path: &Path,
+                follow_symlinks: bool,
+                refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                self.read_dirs.fetch_add(1, Ordering::Relaxed);
+                super::SystemBackend.read_directory(
+                    path,
+                    follow_symlinks,
+                    refuse_final_symlink,
+                    listing,
+                )
+            }
+
+            fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+                self.read_ignores.fetch_add(1, Ordering::Relaxed);
+                super::SystemBackend.read_ignore_file(path)
+            }
+
+            fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+                self.metadata.fetch_add(1, Ordering::Relaxed);
+                super::SystemBackend.metadata(path)
+            }
+
+            fn symlink_metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+                self.symlink_metadata.fetch_add(1, Ordering::Relaxed);
+                super::SystemBackend.symlink_metadata(path)
+            }
+
+            fn cycle_key(&self, path: &Path) -> std::io::Result<super::CycleKey> {
+                self.cycle_keys.fetch_add(1, Ordering::Relaxed);
+                super::SystemBackend.cycle_key(path)
+            }
+        }
+
+        static STATIC_BACKEND: IoCountingBackend = IoCountingBackend {
+            begin_walks: AtomicUsize::new(0),
+            read_dirs: AtomicUsize::new(0),
+            read_ignores: AtomicUsize::new(0),
+            metadata: AtomicUsize::new(0),
+            symlink_metadata: AtomicUsize::new(0),
+            cycle_keys: AtomicUsize::new(0),
+        };
+
+        let fixture = Fixture::new();
+        fixture.write(".git/info/exclude");
+        fixture.write(".gitignore");
+        fixture.write("nested/src/main.rs");
+        let walk_root = fixture.root.join("nested");
+
+        let backend = IoCountingBackend::default();
+        // Sanity check: an un-cancelled walk on this fixture actually performs
+        // Git discovery and reads the repository/ancestor ignore files.
+        let uncancelled = Walker::new(&walk_root)
+            .threads(1)
+            .respect_git_ignore(true)
+            .collect_with(&backend)
+            .expect("uncancelled walk succeeds");
+        assert!(!uncancelled.was_cancelled());
+        assert!(
+            backend.read_ignores.load(Ordering::Relaxed) > 0,
+            "fixture must exercise ancestor/repository ignore reads"
+        );
+        assert!(backend.read_dirs.load(Ordering::Relaxed) > 0);
+        backend.reset();
+
+        let pre_cancelled = CancellationToken::default();
+        pre_cancelled.cancel();
+
+        // collect() and visit() across both serial and parallel routes.
+        for threads in [1, 4] {
+            let result = Walker::new(&walk_root)
+                .threads(threads)
+                .respect_git_ignore(true)
+                .cancellation(pre_cancelled.clone())
+                .collect_with(&backend)
+                .expect("pre-cancelled collect succeeds");
+            assert!(result.was_cancelled());
+            assert!(result.entries().is_empty());
+            assert!(result.errors().is_empty());
+            assert_eq!(
+                backend.total_calls(),
+                0,
+                "pre-cancelled collect(threads={threads}) must perform zero backend I/O"
+            );
+
+            let visited = AtomicUsize::new(0);
+            let visitor = |_: &super::WalkEntry| {
+                visited.fetch_add(1, Ordering::Relaxed);
+                super::Verdict::Keep
+            };
+            let result = Walker::new(&walk_root)
+                .threads(threads)
+                .respect_git_ignore(true)
+                .cancellation(pre_cancelled.clone())
+                .walk(&backend, &visitor)
+                .expect("pre-cancelled visit succeeds");
+            assert!(result.was_cancelled());
+            assert!(result.entries().is_empty());
+            assert!(result.errors().is_empty());
+            assert_eq!(visited.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                backend.total_calls(),
+                0,
+                "pre-cancelled visit(threads={threads}) must perform zero backend I/O"
+            );
+        }
+
+        // parallel::collect() and parallel::stream() directly, guarding
+        // parallel::run() even if entered after Walker::walk.
+        let result = super::parallel::collect(
+            Walker::new(&walk_root)
+                .threads(4)
+                .respect_git_ignore(true)
+                .cancellation(pre_cancelled.clone()),
+            &backend,
+            &super::keep_every_entry,
+        )
+        .expect("pre-cancelled parallel::collect succeeds");
+        assert!(result.was_cancelled());
+        assert!(result.entries().is_empty());
+        assert!(result.errors().is_empty());
+        assert_eq!(
+            backend.total_calls(),
+            0,
+            "pre-cancelled parallel::collect must perform zero backend I/O"
+        );
+
+        STATIC_BACKEND.reset();
+        let (sink, receiver) = super::parallel_stream::test_sink(4);
+        super::parallel::stream(
+            Walker::new(&walk_root)
+                .threads(4)
+                .respect_git_ignore(true)
+                .cancellation(pre_cancelled.clone()),
+            &STATIC_BACKEND,
+            sink,
+        )
+        .expect("pre-cancelled parallel::stream succeeds");
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            STATIC_BACKEND.total_calls(),
+            0,
+            "pre-cancelled parallel::stream must perform zero backend I/O"
+        );
+
+        // WalkStream: pre-cancelled before stream().
+        let mut stream = Walker::new(&walk_root)
+            .respect_git_ignore(true)
+            .cancellation(pre_cancelled.clone())
+            .stream();
+        assert!(!stream.was_cancelled());
+        assert!(stream.next_with(&backend).is_none());
+        assert!(stream.was_cancelled());
+        assert_eq!(
+            backend.total_calls(),
+            0,
+            "pre-cancelled stream() must perform zero backend I/O"
+        );
+
+        // WalkStream: cancelled after stream() and before the first next().
+        let deferred_cancel = CancellationToken::default();
+        let mut stream = Walker::new(&walk_root)
+            .respect_git_ignore(true)
+            .cancellation(deferred_cancel.clone())
+            .stream();
+        deferred_cancel.cancel();
+        assert!(stream.next_with(&backend).is_none());
+        assert!(stream.was_cancelled());
+        assert_eq!(
+            backend.total_calls(),
+            0,
+            "stream() cancelled before first next() must perform zero backend I/O"
+        );
+    }
+
+    #[test]
+    fn cancellation_during_root_setup_preserves_was_cancelled_and_stops_remaining_roots() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct CancelOnBeginWalk {
+            token: CancellationToken,
+            read_dirs: AtomicUsize,
+            read_ignores: AtomicUsize,
+        }
+
+        impl super::DirectoryBackend for CancelOnBeginWalk {
+            fn begin_walk(&self) {
+                self.token.cancel();
+            }
+
+            fn read_directory(
+                &self,
+                path: &Path,
+                follow_symlinks: bool,
+                refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                self.read_dirs.fetch_add(1, Ordering::Relaxed);
+                super::SystemBackend.read_directory(
+                    path,
+                    follow_symlinks,
+                    refuse_final_symlink,
+                    listing,
+                )
+            }
+
+            fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+                self.read_ignores.fetch_add(1, Ordering::Relaxed);
+                super::SystemBackend.read_ignore_file(path)
+            }
+        }
+
+        let fixture = Fixture::new();
+        fixture.write("repo-a/.git/info/exclude");
+        fixture.write("repo-a/.gitignore");
+        fixture.write("repo-a/nested/a.txt");
+        fixture.write("repo-b/.git/info/exclude");
+        fixture.write("repo-b/.gitignore");
+        fixture.write("repo-b/nested/b.txt");
+        let root_a = fixture.root.join("repo-a/nested");
+        let root_b = fixture.root.join("repo-b/nested");
+
+        // Case 1: token fires inside `begin_walk` (after `Walker::walk`'s
+        // upfront check, before `root_tasks` reads any root).
+        for threads in [1, 4] {
+            let token = CancellationToken::default();
+            let backend = CancelOnBeginWalk {
+                token: token.clone(),
+                read_dirs: AtomicUsize::new(0),
+                read_ignores: AtomicUsize::new(0),
+            };
+            let result = Walker::new(&root_a)
+                .threads(threads)
+                .respect_git_ignore(true)
+                .cancellation(token)
+                .collect_with(&backend)
+                .expect("cancelled collect succeeds");
+            assert!(
+                result.was_cancelled(),
+                "collect(threads={threads}) must preserve cancellation from begin_walk"
+            );
+            assert!(result.entries().is_empty());
+            assert!(result.errors().is_empty());
+            assert_eq!(backend.read_dirs.load(Ordering::Relaxed), 0);
+            assert_eq!(backend.read_ignores.load(Ordering::Relaxed), 0);
+
+            let token = CancellationToken::default();
+            let backend = CancelOnBeginWalk {
+                token: token.clone(),
+                read_dirs: AtomicUsize::new(0),
+                read_ignores: AtomicUsize::new(0),
+            };
+            let visited = AtomicUsize::new(0);
+            let visitor = |_: &super::WalkEntry| {
+                visited.fetch_add(1, Ordering::Relaxed);
+                super::Verdict::Keep
+            };
+            let result = Walker::new(&root_a)
+                .threads(threads)
+                .respect_git_ignore(true)
+                .cancellation(token)
+                .walk(&backend, &visitor)
+                .expect("cancelled visit succeeds");
+            assert!(
+                result.was_cancelled(),
+                "visit(threads={threads}) must preserve cancellation from begin_walk"
+            );
+            assert!(result.entries().is_empty());
+            assert!(result.errors().is_empty());
+            assert_eq!(visited.load(Ordering::Relaxed), 0);
+            assert_eq!(backend.read_dirs.load(Ordering::Relaxed), 0);
+            assert_eq!(backend.read_ignores.load(Ordering::Relaxed), 0);
+        }
+
+        let token = CancellationToken::default();
+        let backend = CancelOnBeginWalk {
+            token: token.clone(),
+            read_dirs: AtomicUsize::new(0),
+            read_ignores: AtomicUsize::new(0),
+        };
+        let mut stream = Walker::new(&root_a)
+            .respect_git_ignore(true)
+            .cancellation(token)
+            .stream();
+        assert!(stream.next_with(&backend).is_none());
+        assert!(
+            stream.was_cancelled(),
+            "stream must preserve cancellation from begin_walk"
+        );
+        assert_eq!(backend.read_dirs.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.read_ignores.load(Ordering::Relaxed), 0);
+
+        // Case 2: two-root walk where cancellation fires during root 1's
+        // ignore-file setup; root 2 must not be read and `was_cancelled` must
+        // be `true` across every frontend.
+        struct CancelDuringFirstRoot {
+            token: CancellationToken,
+            read_dirs: AtomicUsize,
+            ignore_paths: Mutex<Vec<PathBuf>>,
+        }
+
+        impl super::DirectoryBackend for CancelDuringFirstRoot {
+            fn read_directory(
+                &self,
+                path: &Path,
+                follow_symlinks: bool,
+                refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                self.read_dirs.fetch_add(1, Ordering::Relaxed);
+                super::SystemBackend.read_directory(
+                    path,
+                    follow_symlinks,
+                    refuse_final_symlink,
+                    listing,
+                )
+            }
+
+            fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+                self.ignore_paths
+                    .lock()
+                    .expect("lock ignore_paths")
+                    .push(path.to_path_buf());
+                self.token.cancel();
+                super::SystemBackend.read_ignore_file(path)
+            }
+        }
+
+        let repo_a = fixture.root.join("repo-a");
+        let repo_a_canonical = fs::canonicalize(&repo_a).unwrap_or_else(|_| repo_a.clone());
+        let repo_b = fixture.root.join("repo-b");
+        let repo_b_canonical = fs::canonicalize(&repo_b).unwrap_or_else(|_| repo_b.clone());
+        let assert_no_second_root = |paths: &[PathBuf], label: &str| {
+            assert!(
+                !paths.is_empty(),
+                "{label}: root 1 must have triggered ignore reading"
+            );
+            assert!(
+                paths.iter().all(|path| {
+                    (path.starts_with(&repo_a) || path.starts_with(&repo_a_canonical))
+                        && !path.starts_with(&repo_b)
+                        && !path.starts_with(&repo_b_canonical)
+                }),
+                "{label}: only root 1 may be inspected after cancellation, saw {paths:?}"
+            );
+        };
+
+        for threads in [1, 4] {
+            let token = CancellationToken::default();
+            let backend = CancelDuringFirstRoot {
+                token: token.clone(),
+                read_dirs: AtomicUsize::new(0),
+                ignore_paths: Mutex::new(Vec::new()),
+            };
+            let result = Walker::new(&root_a)
+                .add_root(&root_b)
+                .expect("valid second root")
+                .threads(threads)
+                .respect_git_ignore(true)
+                .cancellation(token)
+                .collect_with(&backend)
+                .expect("cancelled 2-root collect succeeds");
+            assert!(
+                result.was_cancelled(),
+                "2-root collect(threads={threads}) must report cancellation"
+            );
+            assert!(result.entries().is_empty());
+            assert!(result.errors().is_empty());
+            assert_eq!(backend.read_dirs.load(Ordering::Relaxed), 0);
+            assert_no_second_root(
+                &backend.ignore_paths.into_inner().expect("unlock"),
+                "collect",
+            );
+
+            let token = CancellationToken::default();
+            let backend = CancelDuringFirstRoot {
+                token: token.clone(),
+                read_dirs: AtomicUsize::new(0),
+                ignore_paths: Mutex::new(Vec::new()),
+            };
+            let visited = AtomicUsize::new(0);
+            let visitor = |_: &super::WalkEntry| {
+                visited.fetch_add(1, Ordering::Relaxed);
+                super::Verdict::Keep
+            };
+            let result = Walker::new(&root_a)
+                .add_root(&root_b)
+                .expect("valid second root")
+                .threads(threads)
+                .respect_git_ignore(true)
+                .cancellation(token)
+                .walk(&backend, &visitor)
+                .expect("cancelled 2-root visit succeeds");
+            assert!(
+                result.was_cancelled(),
+                "2-root visit(threads={threads}) must report cancellation"
+            );
+            assert!(result.entries().is_empty());
+            assert!(result.errors().is_empty());
+            assert_eq!(visited.load(Ordering::Relaxed), 0);
+            assert_eq!(backend.read_dirs.load(Ordering::Relaxed), 0);
+            assert_no_second_root(&backend.ignore_paths.into_inner().expect("unlock"), "visit");
+        }
+
+        let token = CancellationToken::default();
+        let backend = CancelDuringFirstRoot {
+            token: token.clone(),
+            read_dirs: AtomicUsize::new(0),
+            ignore_paths: Mutex::new(Vec::new()),
+        };
+        let result = super::parallel::collect(
+            Walker::new(&root_a)
+                .add_root(&root_b)
+                .expect("valid second root")
+                .threads(4)
+                .respect_git_ignore(true)
+                .cancellation(token),
+            &backend,
+            &super::keep_every_entry,
+        )
+        .expect("cancelled 2-root parallel::collect succeeds");
+        assert!(result.was_cancelled());
+        assert!(result.entries().is_empty());
+        assert!(result.errors().is_empty());
+        assert_eq!(backend.read_dirs.load(Ordering::Relaxed), 0);
+        assert_no_second_root(
+            &backend.ignore_paths.into_inner().expect("unlock"),
+            "parallel::collect",
+        );
+
+        let token = CancellationToken::default();
+        let backend = CancelDuringFirstRoot {
+            token: token.clone(),
+            read_dirs: AtomicUsize::new(0),
+            ignore_paths: Mutex::new(Vec::new()),
+        };
+        let mut stream = Walker::new(&root_a)
+            .add_root(&root_b)
+            .expect("valid second root")
+            .respect_git_ignore(true)
+            .cancellation(token)
+            .stream();
+        assert!(stream.next_with(&backend).is_none());
+        assert!(
+            stream.was_cancelled(),
+            "2-root stream must report cancellation"
+        );
+        assert_eq!(backend.read_dirs.load(Ordering::Relaxed), 0);
+        assert_no_second_root(
+            &backend.ignore_paths.into_inner().expect("unlock"),
+            "stream",
+        );
+    }
+
+    #[test]
+    fn stream_constructor_defers_ancestor_ignore_reads_until_first_next() {
+        let fixture = Fixture::new();
+        fixture.write(".git/HEAD");
+        fixture.write("nested/keep.txt");
+        fixture.write("nested/drop.tmp");
+        let nested = fixture.root.join("nested");
+
+        // Construct serial and parallel streams BEFORE the ancestor `.gitignore`
+        // exists. An eager constructor would snapshot the missing ignore file
+        // and fail to filter `drop.tmp` on iteration.
+        let serial_stream = Walker::new(&nested).respect_git_ignore(true).stream();
+        let parallel_1 = Walker::new(&nested)
+            .threads(1)
+            .respect_git_ignore(true)
+            .stream_parallel();
+        let parallel_4 = Walker::new(&nested)
+            .threads(4)
+            .respect_git_ignore(true)
+            .stream_parallel();
+
+        fs::write(fixture.root.join(".gitignore"), b"*.tmp\n")
+            .expect("write ancestor .gitignore after stream construction");
+
+        let collect_relative =
+            |items: Vec<Result<super::WalkEntry, super::WalkError>>| -> Vec<PathBuf> {
+                let mut paths = items
+                    .into_iter()
+                    .map(|item| item.expect("fixture walk succeeds"))
+                    .map(|entry| entry.relative_path().to_path_buf())
+                    .collect::<Vec<_>>();
+                paths.sort();
+                paths
+            };
+
+        assert_eq!(
+            collect_relative(serial_stream.collect()),
+            vec![PathBuf::from("keep.txt")],
+            "stream() must read ancestor .gitignore lazily on first next()"
+        );
+        assert_eq!(
+            collect_relative(parallel_1.collect()),
+            vec![PathBuf::from("keep.txt")],
+            "stream_parallel(threads=1) must read ancestor .gitignore lazily on first next()"
+        );
+        assert_eq!(
+            collect_relative(parallel_4.collect()),
+            vec![PathBuf::from("keep.txt")],
+            "stream_parallel(threads=4) must read ancestor .gitignore lazily on first next()"
+        );
     }
 
     #[test]
