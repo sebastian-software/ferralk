@@ -4463,7 +4463,10 @@ impl WalkStream {
     }
 
     fn check_cancellation(&mut self) -> bool {
-        self.cancelled |= self
+        if self.cancelled {
+            return true;
+        }
+        self.cancelled = self
             .walker
             .cancellation
             .as_ref()
@@ -4515,6 +4518,15 @@ impl WalkStream {
         &mut self,
         mut task: DirectoryTask,
     ) -> Option<Result<WalkEntry, WalkError>> {
+        let root_ignore_errors = std::mem::take(&mut task.ignore_errors);
+        if !root_ignore_errors.is_empty()
+            && let Some(error) = self.queue_ignore_errors(root_ignore_errors)
+        {
+            if !self.stopped {
+                self.pending.push(SerialTask::Directory(task));
+            }
+            return Some(error);
+        }
         let is_root = task.depth == 0;
         if self.walker.options.same_file_system {
             match enter_filesystem(
@@ -4554,23 +4566,21 @@ impl WalkStream {
             self.scratch.push(scratch);
             return self.error(WalkOperation::ReadDir, task.path, source, is_root);
         }
-        let (ignores, mut entered_errors) = std::mem::take(&mut task.ignores).enter(
+        let (ignores, entered_errors) = std::mem::take(&mut task.ignores).enter(
             &self.walker,
             &SystemBackend,
             &task.path,
             &scratch.listing,
         );
-        task.ignore_errors.append(&mut entered_errors);
         scratch.path.clear();
         scratch.path.push(&task.path);
-        let ignore_errors = std::mem::take(&mut task.ignore_errors);
         self.pending.push(SerialTask::Resume(DirectoryFrame {
             task,
             ignores,
             scratch,
             next_entry: 0,
         }));
-        self.queue_ignore_errors(ignore_errors)
+        self.queue_ignore_errors(entered_errors)
     }
 
     /// Continues one listing until it emits, fails, descends, or finishes.
@@ -4671,6 +4681,11 @@ impl WalkStream {
         }
         let mut deferred_errors = Vec::new();
         while let Some(error) = frame.scratch.listing.take_deferred_error() {
+            if self.check_cancellation() {
+                self.stopped = true;
+                self.finish_directory(frame);
+                return None;
+            }
             deferred_errors.push(PendingWalkError {
                 operation: WalkOperation::ReadDir,
                 path: error.path,
@@ -4714,7 +4729,10 @@ impl Iterator for WalkStream {
             if let Some(error) = self.pending_errors.pop() {
                 return Some(Err(error.into_walk_error()));
             }
-            let task = self.pending.pop()?;
+            let Some(task) = self.pending.pop() else {
+                self.stopped = true;
+                return None;
+            };
             let result = match task {
                 SerialTask::Directory(task) => self.prepare_directory(task),
                 SerialTask::Resume(frame) => self.resume_directory(frame),
@@ -5027,6 +5045,9 @@ impl<'walker> WalkState<'walker> {
         mut frame: DirectoryFrame,
         pending: &mut Vec<SerialTask>,
     ) -> Result<(), WalkError> {
+        if self.check_cancellation() {
+            return self.finish_directory(frame);
+        }
         let path = frame.task.path.as_path();
         let depth = frame.task.depth;
         let suspended_identity = frame.task.open.suspended_identity();
@@ -5139,6 +5160,9 @@ impl<'walker> WalkState<'walker> {
             }
         }
         while let Some(error) = frame.scratch.listing.take_deferred_error() {
+            if self.check_cancellation() {
+                break;
+            }
             if let Err(error) = self.handle_error(
                 WalkOperation::ReadDir,
                 error.path,
@@ -5198,7 +5222,10 @@ impl<'walker> WalkState<'walker> {
     }
 
     fn check_cancellation(&mut self) -> bool {
-        self.cancelled |= self
+        if self.cancelled {
+            return true;
+        }
+        self.cancelled = self
             .walker
             .cancellation
             .as_ref()
@@ -6314,6 +6341,297 @@ mod tests {
                 .is_empty()
         );
         assert!(stream.next().is_none(), "partial entries must not leak");
+    }
+
+    /// Root-level ancestor ignore-file errors must be delivered even when the
+    /// root directory itself cannot be read, matching `collect()` and
+    /// `stream_parallel()` under every `ErrorPolicy`.
+    #[test]
+    fn stream_preserves_root_ignore_errors_when_root_fails() {
+        let fixture = Fixture::new();
+        // Mark the fixture as a Git repository and place directories where
+        // ancestor `.gitignore` files live so reading them fails portably on
+        // every OS (including when running as root).
+        fs::create_dir_all(fixture.root.join(".git")).expect("create .git dir");
+        let root_gitignore = fixture.root.join(".gitignore");
+        let sub_gitignore = fixture.root.join("sub").join(".gitignore");
+        fs::create_dir_all(&root_gitignore).expect("create unreadable root .gitignore");
+        fs::create_dir_all(&sub_gitignore).expect("create unreadable sub .gitignore");
+        let missing_root = fixture.root.join("sub").join("missing-root");
+
+        let describe_errors = |errors: &[super::WalkError]| {
+            errors
+                .iter()
+                .map(|error| {
+                    (
+                        error.operation().as_str().to_owned(),
+                        error.path().to_path_buf(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // ErrorPolicy::Collect: both ancestor ignore errors arrive first in
+        // order, followed by the root `read_dir` error.
+        let expected_collect = vec![
+            ("read_ignore".to_owned(), root_gitignore.clone()),
+            ("read_ignore".to_owned(), sub_gitignore.clone()),
+            ("read_dir".to_owned(), missing_root.clone()),
+        ];
+        for threads in [1, 4] {
+            let collected = Walker::new(&missing_root)
+                .threads(threads)
+                .respect_git_ignore(true)
+                .error_policy(ErrorPolicy::Collect)
+                .collect()
+                .expect("Collect returns Ok with recorded errors");
+            assert!(collected.entries().is_empty());
+            assert_eq!(
+                describe_errors(collected.errors()),
+                expected_collect,
+                "collect({threads} threads)"
+            );
+        }
+        let streamed_errors = Walker::new(&missing_root)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Collect)
+            .stream()
+            .map(|item| item.expect_err("only errors are expected"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            describe_errors(&streamed_errors),
+            expected_collect,
+            "stream() must preserve root ignore errors when root fails"
+        );
+        let parallel_stream_errors = Walker::new(&missing_root)
+            .threads(4)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Collect)
+            .stream_parallel()
+            .map(|item| item.expect_err("only errors are expected"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            describe_errors(&parallel_stream_errors),
+            expected_collect,
+            "stream_parallel() must preserve root ignore errors when root fails"
+        );
+
+        // ErrorPolicy::Abort: the first root ignore error aborts before the
+        // root directory is opened.
+        for threads in [1, 4] {
+            let error = Walker::new(&missing_root)
+                .threads(threads)
+                .respect_git_ignore(true)
+                .error_policy(ErrorPolicy::Abort)
+                .collect()
+                .expect_err("Abort returns the first ignore error");
+            assert_eq!(error.operation().as_str(), "read_ignore");
+            assert_eq!(error.path(), root_gitignore);
+        }
+        let stream_abort = Walker::new(&missing_root)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Abort)
+            .stream()
+            .collect::<Vec<_>>();
+        assert_eq!(stream_abort.len(), 1);
+        let error = stream_abort[0]
+            .as_ref()
+            .expect_err("Abort yields the first root ignore error");
+        assert_eq!(error.operation().as_str(), "read_ignore");
+        assert_eq!(error.path(), root_gitignore);
+
+        // ErrorPolicy::Skip: non-root ignore errors are dropped and the root
+        // `read_dir` error is still reported.
+        let stream_skip = Walker::new(&missing_root)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Skip)
+            .stream()
+            .map(|item| item.expect_err("root error is kept under Skip"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            describe_errors(&stream_skip),
+            vec![("read_dir".to_owned(), missing_root)]
+        );
+    }
+
+    /// Unwinding suspended serial ancestor frames after `Verdict::Stop` or
+    /// cancellation must not call `restore_directory_open` (which would re-open
+    /// vanished ancestors and turn a stopped walk into a `ReadDir` error) and
+    /// must not drain deferred errors after stopping on the last entry.
+    #[test]
+    fn serial_resume_skips_restore_directory_open_and_deferred_errors_after_stop_or_cancel() {
+        struct SuspendedAncestorBackend {
+            root: PathBuf,
+            suspend_calls: std::sync::atomic::AtomicUsize,
+            after_stop: std::sync::atomic::AtomicBool,
+            restore_after_stop_calls: std::sync::atomic::AtomicUsize,
+            deferred_on_leaf: bool,
+        }
+
+        impl super::DirectoryBackend for SuspendedAncestorBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                listing.clear();
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .expect("walk only reads descendants of its root")
+                    .to_str()
+                    .expect("fixture paths are UTF-8")
+                    .replace('\\', "/");
+                match relative.as_str() {
+                    "" => {
+                        listing.push("a".as_ref(), true, false);
+                        listing.push("after-a.txt".as_ref(), false, false);
+                    }
+                    "a" => {
+                        listing.push("b".as_ref(), true, false);
+                        listing.push("after-b.txt".as_ref(), false, false);
+                    }
+                    "a/b" => {
+                        listing.push("c.txt".as_ref(), false, false);
+                        if self.deferred_on_leaf {
+                            listing.defer_error(
+                                path.join("deferred"),
+                                std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    "deferred",
+                                ),
+                            );
+                        }
+                    }
+                    other => panic!("unexpected directory read: {other}"),
+                }
+                Ok(())
+            }
+
+            fn suspend_directory_open(
+                &self,
+                _listing: &mut super::Listing,
+            ) -> Option<super::DirectoryIdentity> {
+                self.suspend_calls.fetch_add(1, Ordering::Relaxed);
+                #[cfg(any(
+                    all(feature = "native-macos", target_os = "macos"),
+                    all(feature = "native-linux", target_os = "linux")
+                ))]
+                {
+                    Some((1, 1))
+                }
+                #[cfg(not(any(
+                    all(feature = "native-macos", target_os = "macos"),
+                    all(feature = "native-linux", target_os = "linux")
+                )))]
+                {
+                    None
+                }
+            }
+
+            fn restore_directory_open(
+                &self,
+                _path: &Path,
+                _expected: Option<super::DirectoryIdentity>,
+                _refuse_final_symlink: bool,
+                _listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                if self.after_stop.load(Ordering::Acquire) {
+                    self.restore_after_stop_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "suspended ancestor vanished",
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        let root = PathBuf::from("/serial-resume-stop");
+
+        for policy in [ErrorPolicy::Abort, ErrorPolicy::Collect] {
+            // Verdict::Stop on the sole (and last) entry of `a/b`, which also
+            // carries a deferred error, while `a` and `root` are suspended with
+            // unvisited siblings.
+            let backend = SuspendedAncestorBackend {
+                root: root.clone(),
+                suspend_calls: std::sync::atomic::AtomicUsize::new(0),
+                after_stop: std::sync::atomic::AtomicBool::new(false),
+                restore_after_stop_calls: std::sync::atomic::AtomicUsize::new(0),
+                deferred_on_leaf: true,
+            };
+            let result = Walker::new(&root)
+                .threads(1)
+                .error_policy(policy)
+                .walk(&backend, &|entry| {
+                    if entry.basename() == Some("c.txt".as_ref()) {
+                        backend.after_stop.store(true, Ordering::Release);
+                        Verdict::Stop
+                    } else {
+                        Verdict::Keep
+                    }
+                })
+                .expect("Verdict::Stop must not fail restoring suspended ancestors or draining deferred errors");
+            assert_eq!(
+                backend.suspend_calls.load(Ordering::Relaxed),
+                2,
+                "{policy:?}: both `root` and `a` were suspended"
+            );
+            assert_eq!(
+                backend.restore_after_stop_calls.load(Ordering::Relaxed),
+                0,
+                "{policy:?}: restore_directory_open must not run after Verdict::Stop"
+            );
+            assert!(result.was_cancelled(), "{policy:?}");
+            assert!(
+                result.errors().is_empty(),
+                "{policy:?}: {:?}",
+                result.errors()
+            );
+
+            // External cancellation fired on the last entry of `a/b` (so `a/b`
+            // finishes its loop before the next stride check, and suspended
+            // ancestors `a` and `root` are unwound).
+            let backend = SuspendedAncestorBackend {
+                root: root.clone(),
+                suspend_calls: std::sync::atomic::AtomicUsize::new(0),
+                after_stop: std::sync::atomic::AtomicBool::new(false),
+                restore_after_stop_calls: std::sync::atomic::AtomicUsize::new(0),
+                deferred_on_leaf: true,
+            };
+            let token = CancellationToken::default();
+            let walk_token = token.clone();
+            let result = Walker::new(&root)
+                .threads(1)
+                .error_policy(policy)
+                .cancellation(walk_token)
+                .walk(&backend, &|entry| {
+                    if entry.basename() == Some("c.txt".as_ref()) {
+                        backend.after_stop.store(true, Ordering::Release);
+                        token.cancel();
+                    }
+                    Verdict::Keep
+                })
+                .expect("external cancellation must not fail restoring suspended ancestors");
+            assert_eq!(
+                backend.suspend_calls.load(Ordering::Relaxed),
+                2,
+                "{policy:?}: both `root` and `a` were suspended"
+            );
+            assert_eq!(
+                backend.restore_after_stop_calls.load(Ordering::Relaxed),
+                0,
+                "{policy:?}: restore_directory_open must not run after cancellation"
+            );
+            assert!(result.was_cancelled(), "{policy:?}");
+            assert!(
+                result.errors().is_empty(),
+                "{policy:?}: {:?}",
+                result.errors()
+            );
+        }
     }
 
     /// Counts what a walk reads, so tests can pin how often it happens.

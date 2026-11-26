@@ -146,7 +146,7 @@ fn run<B: DirectoryBackend + Sync>(
             idle: &idle,
             shards: &shards,
         };
-        pool.grow();
+        let _ = pool.grow();
         run_worker_catching_panics(pool, &mut caller);
         std::mem::take(&mut caller.entries)
     });
@@ -289,32 +289,37 @@ impl<'scope, 'env> HelperPool<'scope, 'env> {
     /// Starts helpers while queued directories outnumber the running workers
     /// and the thread budget has room. Cheap enough to call after every
     /// directory: a full pool costs the two atomic loads that reject the claim.
-    fn grow(self) {
+    ///
+    /// Returns `false` if the walk stopped before or during growth (for
+    /// instance, a refused spawn under `ErrorPolicy::Abort` or a closed stream
+    /// sink).
+    fn grow(self) -> bool {
         while !self.shared.should_stop() {
             // A helper the operating system refused to start capped the pool
             // for this walk: the workers that exist finish it, and no
             // directory boundary retries the refused spawn.
             if self.shared.helpers_capped.load(Ordering::Acquire) {
-                return;
+                return true;
             }
             if !self.shared.tree_is_worth_helpers() {
-                return;
+                return true;
             }
             let Some(slot) = self
                 .shared
                 .coordinator
                 .claim_worker_slot(self.shared.walker.threads)
             else {
-                return;
+                return true;
             };
             // Dropping the slot here releases it again for a later attempt.
             let Some(scratch) = lock(self.idle).pop() else {
-                return;
+                return true;
             };
             if !self.spawn(slot, scratch) {
-                return;
+                return !self.shared.should_stop();
             }
         }
+        false
     }
 
     /// Reports whether the pool may keep growing after this attempt.
@@ -365,6 +370,16 @@ fn finish(shared: Arc<Shared>, mut entries: Vec<WalkEntry>) -> Result<WalkResult
         errors: std::mem::take(&mut *lock(&shared.errors)),
         cancelled: shared.should_stop(),
     })
+}
+
+/// What [`Shared::emit`] tells its caller to do after asking the visitor.
+enum EmitOutcome {
+    /// The entry's subtree may be walked and the current listing continues.
+    Descend,
+    /// Skip this entry's subtree (`Verdict::Prune`), but continue the listing.
+    Prune,
+    /// Stop the walk immediately (`Verdict::Stop`).
+    Stop,
 }
 
 struct Shared<'backend> {
@@ -467,11 +482,12 @@ impl<'backend> Shared<'backend> {
     /// buffer the last dropped entry gave back — so a worker whose visitor
     /// keeps nothing runs without allocating.
     ///
-    /// Returns whether the entry's subtree may still be walked: not after a
-    /// [`Verdict::Prune`], and not after a stop. The caller asks before it
-    /// schedules the directory, so pruning is a decision about one task and
-    /// never reaches the scheduler's accounting.
-    fn emit(&self, worker: &mut WorkerScratch, emitted: EmittedEntry) -> bool {
+    /// Distinguishes [`EmitOutcome::Prune`] (skip this directory's subtree but
+    /// keep classifying siblings) from [`EmitOutcome::Stop`] (stop the current
+    /// listing immediately). The caller asks before it schedules the directory,
+    /// so pruning is a decision about one task and never reaches the
+    /// scheduler's accounting.
+    fn emit(&self, worker: &mut WorkerScratch, emitted: EmittedEntry) -> EmitOutcome {
         let WorkerScratch {
             entries,
             path,
@@ -482,20 +498,20 @@ impl<'backend> Shared<'backend> {
         match (self.visitor)(&entry) {
             Verdict::Keep => {
                 entries.push(entry);
-                true
+                EmitOutcome::Descend
             }
             Verdict::Skip => {
                 *spare = entry.path;
-                true
+                EmitOutcome::Descend
             }
             Verdict::Prune => {
                 *spare = entry.path;
-                false
+                EmitOutcome::Prune
             }
             Verdict::Stop => {
                 *spare = entry.path;
                 self.stop();
-                false
+                EmitOutcome::Stop
             }
         }
     }
@@ -508,16 +524,19 @@ impl<'backend> Shared<'backend> {
     /// Entries buffered after the walk stopped are dropped, so none of them
     /// trails the error that ended it under `ErrorPolicy::Abort`.
     ///
+    /// Returns `false` if the walk stopped (either already stopped or because
+    /// the consumer closed its channel).
+    ///
     /// Callers test `self.sink` first and pass it in, once per directory or
     /// per cancellation stride, so a collecting walk never gets this far and
     /// pays nothing per entry for the stream's existence.
-    fn flush_stream(&self, sink: &StreamSink, worker: &mut WorkerScratch) {
+    fn flush_stream(&self, sink: &StreamSink, worker: &mut WorkerScratch) -> bool {
         if worker.entries.is_empty() {
-            return;
+            return true;
         }
         if self.should_stop() {
             worker.entries.clear();
-            return;
+            return false;
         }
         // Sized after the batch it replaces: a narrow directory does not pay
         // for a full batch, and a wide listing keeps a full-batch buffer.
@@ -525,16 +544,21 @@ impl<'backend> Shared<'backend> {
         let batch = std::mem::replace(&mut worker.entries, Vec::with_capacity(capacity));
         if !sink.send(StreamMessage::Entries(batch)) {
             self.stop();
+            return false;
         }
+        true
     }
 
+    /// Records a recoverable error under the configured policy. Returns `false`
+    /// once the error ended the walk (under `ErrorPolicy::Abort` or because the
+    /// streaming consumer closed its channel).
     fn record_error(
         &self,
         operation: WalkOperation,
         path: PathBuf,
         source: std::io::Error,
         is_root: bool,
-    ) {
+    ) -> bool {
         let error = WalkError::new(operation, path, source);
         match self.walker.error_policy {
             ErrorPolicy::Abort => {
@@ -543,15 +567,22 @@ impl<'backend> Shared<'backend> {
                     *abort_error = Some(error);
                     self.stop();
                 }
+                false
             }
-            ErrorPolicy::Skip if !is_root => {}
+            ErrorPolicy::Skip if !is_root => true,
             ErrorPolicy::Skip | ErrorPolicy::Collect => match &self.sink {
-                None => lock(&self.errors).push(error),
+                None => {
+                    lock(&self.errors).push(error);
+                    true
+                }
                 // A stream delivers a kept error in band, when it happens,
                 // rather than after the walk.
                 Some(sink) => {
                     if !sink.send(StreamMessage::Error(error)) {
                         self.stop();
+                        false
+                    } else {
+                        true
                     }
                 }
             },
@@ -565,7 +596,7 @@ impl<'backend> Shared<'backend> {
     /// any other.
     fn record_spawn_failure(&self, source: std::io::Error) {
         self.helpers_capped.store(true, Ordering::Release);
-        self.record_error(
+        let _ = self.record_error(
             WalkOperation::SpawnWorker,
             self.walker
                 .roots()
@@ -694,6 +725,9 @@ fn catch_worker_panic<T>(shared: &Shared, work: impl FnOnce() -> T) -> Option<T>
 /// itself.
 fn drain_alone(shared: &Shared, caller: &mut WorkerScratch) -> bool {
     loop {
+        if shared.should_stop() {
+            return false;
+        }
         let has_work = !caller.queue.is_empty() || !shared.scheduler.is_empty();
         if has_work && shared.tree_is_worth_helpers() {
             return true;
@@ -706,9 +740,6 @@ fn drain_alone(shared: &Shared, caller: &mut WorkerScratch) -> bool {
             return false;
         };
         let _task = shared.coordinator.claim_task();
-        if shared.should_stop() {
-            return false;
-        }
         process_directory(shared, caller, directory, None);
     }
 }
@@ -721,7 +752,7 @@ fn run_worker(pool: HelperPool<'_, '_>, worker: &mut WorkerScratch) {
             process_directory(shared, worker, directory, Some(pool));
             // The directory may have opened the tree up, so re-check whether
             // the walk can use more of the configured thread budget.
-            pool.grow();
+            let _ = pool.grow();
         }
         #[cfg(test)]
         join_worker_rendezvous(shared);
@@ -797,7 +828,7 @@ fn process_directory(
 ) {
     walk_directory(shared, worker, task, pool);
     if let Some(sink) = &shared.sink {
-        shared.flush_stream(sink, worker);
+        let _ = shared.flush_stream(sink, worker);
     }
 }
 
@@ -827,8 +858,9 @@ fn walk_directory(
             let is_root = depth == 0;
             for error in ignore_errors {
                 let (path, source) = error.into_parts();
-                shared.record_error(super::IGNORE_FILE_OPERATION, path, source, false);
-                if shared.should_stop() {
+                if !shared.record_error(super::IGNORE_FILE_OPERATION, path, source, false)
+                    || shared.should_stop()
+                {
                     return;
                 }
             }
@@ -842,7 +874,7 @@ fn walk_directory(
                     Ok(true) => {}
                     Ok(false) => return,
                     Err(source) => {
-                        shared.record_error(WalkOperation::Metadata, path, source, is_root);
+                        let _ = shared.record_error(WalkOperation::Metadata, path, source, is_root);
                         return;
                     }
                 }
@@ -856,7 +888,7 @@ fn walk_directory(
                         ancestors
                     }
                     Err(source) => {
-                        shared.record_error(CYCLE_KEY_OPERATION, path, source, is_root);
+                        let _ = shared.record_error(CYCLE_KEY_OPERATION, path, source, is_root);
                         return;
                     }
                 }
@@ -870,7 +902,7 @@ fn walk_directory(
                 !shared.walker.options.follow_symlinks && depth > 0,
                 &mut worker.listing,
             ) {
-                shared.record_error(WalkOperation::ReadDir, path, source, is_root);
+                let _ = shared.record_error(WalkOperation::ReadDir, path, source, is_root);
                 return;
             }
             // One add for the whole listing: the entries it returned, and the listing
@@ -886,8 +918,9 @@ fn walk_directory(
                 ignores.enter(&shared.walker, shared.backend, &path, &worker.listing);
             for error in ignore_errors {
                 let (path, source) = error.into_parts();
-                shared.record_error(super::IGNORE_FILE_OPERATION, path, source, false);
-                if shared.should_stop() {
+                if !shared.record_error(super::IGNORE_FILE_OPERATION, path, source, false)
+                    || shared.should_stop()
+                {
                     return;
                 }
             }
@@ -918,13 +951,16 @@ fn walk_directory(
             if shared.should_stop() {
                 return;
             }
-            if let Some(pool) = pool {
-                pool.grow();
+            if let Some(pool) = pool
+                && !pool.grow()
+            {
+                return;
             }
             if let Some(sink) = &shared.sink
                 && worker.entries.len() >= STREAM_BATCH_SIZE
+                && !shared.flush_stream(sink, worker)
             {
-                shared.flush_stream(sink, worker);
+                return;
             }
         }
         // The entry's path exists only for as long as it is being decided
@@ -945,10 +981,16 @@ fn walk_directory(
                 ignore_bytes_scratch: &mut worker.ignore_bytes,
             },
         );
-        act(shared, worker, action);
+        let should_continue = act(shared, worker, action);
         reset_to_directory(&mut worker.path, &path);
+        if !should_continue {
+            return;
+        }
     }
-    if end_index < worker.listing.entries().len() && !shared.should_stop() {
+    if end_index < worker.listing.entries().len() {
+        if shared.should_stop() {
+            return;
+        }
         let listing = std::mem::take(&mut worker.listing);
         shared.schedule_shared(ParallelTask::Continuation(Box::new(Continuation {
             path,
@@ -962,37 +1004,56 @@ fn walk_directory(
         return;
     }
     while let Some(error) = worker.listing.take_deferred_error() {
-        shared.record_error(
+        if shared.should_stop() {
+            return;
+        }
+        if !shared.record_error(
             WalkOperation::ReadDir,
             error.path,
             error.source.into_io_error(),
             false,
-        );
+        ) {
+            return;
+        }
     }
 }
 
 /// Carries out what classification decided about one entry. The entry's path
 /// is still on the worker's scratch, which is where `emit` copies it from.
-fn act(shared: &Shared, worker: &mut WorkerScratch, action: EntryAction) {
+///
+/// Returns `false` once this entry ended the walk (by `Verdict::Stop`,
+/// `ErrorPolicy::Abort`, or a closed stream sink), so the caller stops the
+/// current listing immediately instead of waiting for the next cancellation
+/// stride.
+fn act(shared: &Shared, worker: &mut WorkerScratch, action: EntryAction) -> bool {
     match action {
-        EntryAction::Skip => {}
-        EntryAction::Descend(task) => shared.schedule(&worker.queue, ParallelTask::Directory(task)),
+        EntryAction::Skip => true,
+        EntryAction::Descend(task) => {
+            shared.schedule(&worker.queue, ParallelTask::Directory(task));
+            true
+        }
         // The visitor is asked first, because its verdict may prune the
         // directory. A pruned task is dropped before it is ever counted.
-        EntryAction::DescendAndEmit(entry, task) => {
-            if shared.emit(worker, entry) {
+        EntryAction::DescendAndEmit(entry, task) => match shared.emit(worker, entry) {
+            EmitOutcome::Descend => {
                 shared.schedule(&worker.queue, ParallelTask::Directory(task));
+                true
             }
-        }
+            EmitOutcome::Prune => true,
+            EmitOutcome::Stop => false,
+        },
         // Nothing to walk below this entry, so `Prune` is `Skip` for it.
-        EntryAction::Emit(entry) => {
-            shared.emit(worker, entry);
-        }
+        EntryAction::Emit(entry) => !matches!(shared.emit(worker, entry), EmitOutcome::Stop),
+        // Record the error before scheduling any descent so `ErrorPolicy::Abort`
+        // or a closed stream sink never wakes helpers for discarded work.
         EntryAction::Failed { failure, descend } => {
+            if !shared.record_error(failure.operation, failure.path, failure.source, false) {
+                return false;
+            }
             if let Some(task) = descend {
                 shared.schedule(&worker.queue, ParallelTask::Directory(task));
             }
-            shared.record_error(failure.operation, failure.path, failure.source, false);
+            true
         }
     }
 }
@@ -1978,5 +2039,333 @@ mod tests {
             .expect("the same token can drive a later walk");
         let _ = fs::remove_dir_all(&root);
         assert!(!reused.was_cancelled());
+    }
+
+    /// `Verdict::Stop` must halt the worker's current listing immediately rather
+    /// than classifying up to `CANCELLATION_STRIDE - 1` more entries, and must
+    /// never fall through to draining deferred directory errors (even on the
+    /// last entry or on a listing longer than `LISTING_BATCH_SIZE`).
+    #[test]
+    fn verdict_stop_halts_the_current_listing_immediately_and_skips_deferred_errors() {
+        struct FlatListingBackend {
+            root: PathBuf,
+            entries: Vec<(String, bool)>,
+            deferred_error: bool,
+            dir_reads: AtomicUsize,
+        }
+
+        impl crate::DirectoryBackend for FlatListingBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                listing: &mut crate::Listing,
+            ) -> std::io::Result<()> {
+                self.dir_reads.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(
+                    path, self.root,
+                    "child directory must not be read after Stop"
+                );
+                listing.clear();
+                for (name, is_dir) in &self.entries {
+                    listing.push(name.as_ref(), *is_dir, false);
+                }
+                if self.deferred_error {
+                    listing.defer_error(
+                        self.root.join("deferred-entry"),
+                        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "deferred"),
+                    );
+                }
+                Ok(())
+            }
+        }
+
+        let root = PathBuf::from("/parallel-verdict-stop");
+
+        // Stop on entry 0 (both file and directory) within a single stride:
+        // visitor must be called exactly once and no child directory read.
+        for first_is_dir in [false, true] {
+            let mut entries = vec![("first".to_owned(), first_is_dir)];
+            for index in 1..20 {
+                entries.push((format!("entry-{index:02}"), index % 2 == 0));
+            }
+            let backend = FlatListingBackend {
+                root: root.clone(),
+                entries,
+                deferred_error: true,
+                dir_reads: AtomicUsize::new(0),
+            };
+            let visitor_calls = AtomicUsize::new(0);
+            let result = Walker::new(&root)
+                .threads(4)
+                .error_policy(ErrorPolicy::Abort)
+                .walk(&backend, &|_| {
+                    visitor_calls.fetch_add(1, Ordering::Relaxed);
+                    crate::Verdict::Stop
+                })
+                .expect("Verdict::Stop must not turn into an abort error");
+            assert_eq!(
+                visitor_calls.load(Ordering::Relaxed),
+                1,
+                "first_is_dir={first_is_dir}: visitor must not run after Stop"
+            );
+            assert_eq!(backend.dir_reads.load(Ordering::Relaxed), 1);
+            assert!(result.entries().is_empty());
+            assert!(result.errors().is_empty());
+            assert!(result.was_cancelled());
+        }
+
+        // Stop on the very last entry of a directory carrying a deferred error,
+        // under both Abort and Collect, and also on a listing wider than
+        // LISTING_BATCH_SIZE where a continuation would otherwise be queued.
+        for (count, stop_at) in [(3, 2), (super::LISTING_BATCH_SIZE + 8, 5)] {
+            for policy in [ErrorPolicy::Abort, ErrorPolicy::Collect] {
+                let entries = (0..count)
+                    .map(|index| (format!("file-{index:04}.txt"), false))
+                    .collect();
+                let backend = FlatListingBackend {
+                    root: root.clone(),
+                    entries,
+                    deferred_error: true,
+                    dir_reads: AtomicUsize::new(0),
+                };
+                let visitor_calls = AtomicUsize::new(0);
+                let result = Walker::new(&root)
+                    .threads(4)
+                    .error_policy(policy)
+                    .walk(&backend, &|_| {
+                        let seen = visitor_calls.fetch_add(1, Ordering::Relaxed);
+                        if seen == stop_at {
+                            crate::Verdict::Stop
+                        } else {
+                            crate::Verdict::Keep
+                        }
+                    })
+                    .expect("Stop must not drain deferred errors under Abort");
+                assert_eq!(
+                    visitor_calls.load(Ordering::Relaxed),
+                    stop_at + 1,
+                    "count={count} policy={policy:?}"
+                );
+                assert_eq!(result.entries().len(), stop_at);
+                assert!(
+                    result.errors().is_empty(),
+                    "count={count} policy={policy:?}: deferred errors must be skipped after Stop"
+                );
+                assert!(result.was_cancelled());
+            }
+        }
+    }
+
+    /// Under `ErrorPolicy::Abort` or when a streaming consumer has closed its
+    /// channel, `EntryAction::Failed` must record the error before scheduling
+    /// any descent and halt the listing immediately without classifying
+    /// subsequent entries or descending into children.
+    #[test]
+    fn abort_and_closed_sink_stop_immediately_without_scheduling_descent() {
+        struct FailingMetadataBackend {
+            root: PathBuf,
+            dir_reads: AtomicUsize,
+            metadata_calls: AtomicUsize,
+        }
+
+        impl crate::DirectoryBackend for FailingMetadataBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                listing: &mut crate::Listing,
+            ) -> std::io::Result<()> {
+                self.dir_reads.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(
+                    path, self.root,
+                    "no child directory may be read after abort or closed sink"
+                );
+                listing.clear();
+                for index in 0..20 {
+                    listing.push(format!("dir-{index:02}").as_ref(), true, false);
+                }
+                Ok(())
+            }
+
+            fn symlink_metadata(&self, _path: &Path) -> std::io::Result<fs::Metadata> {
+                self.metadata_calls.fetch_add(1, Ordering::Relaxed);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected metadata failure",
+                ))
+            }
+        }
+
+        let root = PathBuf::from("/parallel-abort-order");
+
+        // ErrorPolicy::Abort: error on dir-00 stops before dir-01..dir-19 and
+        // never schedules dir-00 for descent.
+        let backend = FailingMetadataBackend {
+            root: root.clone(),
+            dir_reads: AtomicUsize::new(0),
+            metadata_calls: AtomicUsize::new(0),
+        };
+        let error = Walker::new(&root)
+            .threads(4)
+            .options(WalkOptions::default().metadata(true))
+            .error_policy(ErrorPolicy::Abort)
+            .collect_with(&backend)
+            .expect_err("metadata failure aborts the walk");
+        assert_eq!(error.operation().as_str(), "symlink_metadata");
+        assert_eq!(error.path(), root.join("dir-00"));
+        assert_eq!(
+            backend.metadata_calls.load(Ordering::Relaxed),
+            1,
+            "Abort must stop immediately instead of classifying remaining entries in the stride"
+        );
+        assert_eq!(
+            backend.dir_reads.load(Ordering::Relaxed),
+            1,
+            "descend must not be scheduled before recording the abort error"
+        );
+
+        // Closed StreamSink under ErrorPolicy::Collect: failed send on dir-00's
+        // error stops immediately without scheduling dir-00 or classifying
+        // dir-01..dir-19.
+        let backend = FailingMetadataBackend {
+            root: root.clone(),
+            dir_reads: AtomicUsize::new(0),
+            metadata_calls: AtomicUsize::new(0),
+        };
+        let walker = Arc::new(
+            Walker::new(&root)
+                .threads(4)
+                .options(WalkOptions::default().metadata(true))
+                .error_policy(ErrorPolicy::Collect),
+        );
+        let (sink, receiver) = crate::parallel_stream::test_sink(1);
+        drop(receiver);
+        let mut shared = Shared::new(Arc::clone(&walker), &backend, &crate::keep_every_entry);
+        shared.sink = Some(sink);
+        let shared = Arc::new(shared);
+        let result = super::run(&walker, &backend, shared)
+            .expect("closed stream sink stops cleanly without abort error");
+        assert!(result.was_cancelled());
+        assert_eq!(
+            backend.metadata_calls.load(Ordering::Relaxed),
+            1,
+            "closed sink must stop immediately on the failing entry"
+        );
+        assert_eq!(
+            backend.dir_reads.load(Ordering::Relaxed),
+            1,
+            "descend must not be scheduled after a closed sink stops the walk"
+        );
+    }
+
+    /// Direct unit test of `act()` on `EntryAction::Failed { descend: Some(..) }`:
+    /// under `ErrorPolicy::Abort` or a closed `StreamSink`, the error is
+    /// recorded first and no child task is pushed onto the worker queue,
+    /// shared injector, or coordinator pending count (and no helper spawn is
+    /// attempted). Under `ErrorPolicy::Collect` with no closed sink, the child
+    /// task is scheduled as expected.
+    #[test]
+    fn act_leaves_no_child_task_queued_on_abort_or_closed_sink() {
+        use crate::{
+            AncestorChain, DirectoryOpen, WalkOperation,
+            classify::{DirectoryTask, EntryAction, EntryFailure},
+            gitignore::IgnoreScope,
+        };
+
+        let root = PathBuf::from("/parallel-act-failed");
+        let make_action = || EntryAction::Failed {
+            failure: EntryFailure {
+                operation: WalkOperation::SymlinkMetadata,
+                path: root.join("dir-00"),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected metadata failure",
+                ),
+            },
+            descend: Some(DirectoryTask {
+                path: root.join("dir-00"),
+                open: DirectoryOpen::default(),
+                depth: 1,
+                root: 0,
+                ancestors: AncestorChain::default(),
+                ignores: IgnoreScope::default(),
+                ignore_errors: Vec::new(),
+            }),
+        };
+
+        // 1. ErrorPolicy::Abort: `act()` returns `false` and queues nothing.
+        let walker = Arc::new(
+            Walker::new(&root)
+                .threads(4)
+                .error_policy(ErrorPolicy::Abort),
+        );
+        let shared = Shared::new(walker, &crate::SystemBackend, &crate::keep_every_entry);
+        let mut worker = super::WorkerScratch::new(0);
+        let stealer = worker.queue.stealer();
+        let _ = take_worker_spawn_attempts();
+        assert!(
+            !super::act(&shared, &mut worker, make_action()),
+            "ErrorPolicy::Abort must stop the current listing"
+        );
+        assert!(shared.should_stop());
+        assert!(worker.queue.is_empty());
+        assert!(worker.queue.pop().is_none());
+        assert!(stealer.is_empty());
+        assert!(shared.scheduler.is_empty());
+        assert_eq!(
+            shared.coordinator.pending(),
+            0,
+            "Abort must not schedule the failed entry's descent task"
+        );
+        assert_eq!(take_worker_spawn_attempts(), 0);
+        assert!(lock(&shared.abort_error).is_some());
+
+        // 2. Closed StreamSink under ErrorPolicy::Collect: `act()` returns
+        // `false` and queues nothing.
+        let walker = Arc::new(
+            Walker::new(&root)
+                .threads(4)
+                .error_policy(ErrorPolicy::Collect),
+        );
+        let (sink, receiver) = crate::parallel_stream::test_sink(1);
+        drop(receiver);
+        let mut shared = Shared::new(walker, &crate::SystemBackend, &crate::keep_every_entry);
+        shared.sink = Some(sink);
+        let mut worker = super::WorkerScratch::new(0);
+        let stealer = worker.queue.stealer();
+        let _ = take_worker_spawn_attempts();
+        assert!(
+            !super::act(&shared, &mut worker, make_action()),
+            "a closed stream sink must stop the current listing"
+        );
+        assert!(shared.should_stop());
+        assert!(worker.queue.is_empty());
+        assert!(worker.queue.pop().is_none());
+        assert!(stealer.is_empty());
+        assert!(shared.scheduler.is_empty());
+        assert_eq!(
+            shared.coordinator.pending(),
+            0,
+            "a closed sink must not schedule the failed entry's descent task"
+        );
+        assert_eq!(take_worker_spawn_attempts(), 0);
+
+        // 3. Control case: ErrorPolicy::Collect without a closed sink records
+        // the error and does schedule the descent task.
+        let walker = Arc::new(
+            Walker::new(&root)
+                .threads(4)
+                .error_policy(ErrorPolicy::Collect),
+        );
+        let shared = Shared::new(walker, &crate::SystemBackend, &crate::keep_every_entry);
+        let mut worker = super::WorkerScratch::new(0);
+        assert!(super::act(&shared, &mut worker, make_action()));
+        assert!(!shared.should_stop());
+        assert_eq!(shared.coordinator.pending(), 1);
+        assert!(worker.queue.pop().is_some());
+        assert_eq!(lock(&shared.errors).len(), 1);
     }
 }
