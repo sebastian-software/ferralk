@@ -19,10 +19,11 @@ parser shapes.
 `cargo run --manifest-path fuzz/Cargo.toml --bin generate_macos_native_seeds`
 and `cargo run --manifest-path fuzz/Cargo.toml --bin generate_linux_native_seeds`
 regenerate the native records byte-for-byte; the matching native tests replay
-and validate every checked-in seed before CI fuzzes it. The Linux generator
-finds the repository from its Cargo manifest, so it can run from any directory;
-its checked-in native corpus is intentionally little-endian, matching the
-reviewed Linux native-backend targets.
+and validate every checked-in seed before CI fuzzes it. Both generators
+derive their output root from `CARGO_MANIFEST_DIR` (point `--manifest-path`
+at `fuzz/Cargo.toml` from any directory); the checked-in Linux native corpus
+is intentionally little-endian, matching the reviewed Linux native-backend
+targets.
 
 `ferralk_vs_fast_glob` is differential: it feeds one pattern and one candidate
 to both Ferralk and Oxc fast-glob and asserts the same verdict. It keeps only

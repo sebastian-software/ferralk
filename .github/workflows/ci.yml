@@ -5,8 +5,9 @@ on:
   push:
     branches: [main]
   schedule:
-    # Surface RustSec advisories and Rust stable-release drift in quiet phases.
-    # Only security-audit and msrv-policy run on this trigger.
+    # Surface RustSec advisories, dependency-policy drift, and Rust
+    # stable-release drift in quiet phases. Only security-audit,
+    # dependency-policy, and msrv-policy run on this trigger.
     - cron: "0 6 * * 1"
   # Runs only the MSRV policy check, without the ordinary CI matrix.
   workflow_dispatch:
@@ -149,7 +150,7 @@ jobs:
         run: |
           npm install --global corepack@0.36.0
           corepack enable
-          corepack prepare pnpm@12.3.4 --activate
+          corepack prepare pnpm@12.21.0 --activate
       # The script holds the generator commit pin. A registry change reaches
       # this repository by bumping that pin and re-running it with --write;
       # CONTRIBUTING.md records the procedure.
@@ -234,7 +235,8 @@ jobs:
       - run: cargo test -p ferralk --features native-macos --locked
       - run: >-
           cargo check --manifest-path fuzz/Cargo.toml
-          --bin macos_dirent_parser --bin macos_bulk_record_parser --locked
+          --bin macos_dirent_parser --bin macos_bulk_record_parser
+          --bin generate_macos_native_seeds --locked
 
   linux-native:
     name: ${{ matrix.name }}
@@ -257,7 +259,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy -p ferralk --features native-linux --all-targets --locked -- -D warnings
       - run: cargo test -p ferralk --features native-linux --locked
-      - run: cargo check --manifest-path fuzz/Cargo.toml --bin linux_dirent_parser --locked
+      - run: >-
+          cargo check --manifest-path fuzz/Cargo.toml
+          --bin linux_dirent_parser --bin generate_linux_native_seeds --locked
 
   msrv:
     name: msrv (workspace rust-version)

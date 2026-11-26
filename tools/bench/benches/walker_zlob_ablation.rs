@@ -40,6 +40,8 @@ use zlob::{
 const THREADS: usize = 4;
 const FILTER: &str = "**/*.{ts,tsx}";
 
+static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
 struct Fixture {
     root: PathBuf,
     files: usize,
@@ -49,12 +51,13 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let unique = format!(
-            "ferralk-zlob-ablation-{}-{}",
+            "ferralk-zlob-ablation-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock is after epoch")
-                .as_nanos()
+                .as_nanos(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         );
         let root = std::env::temp_dir().join(unique);
         let mut files = 0;

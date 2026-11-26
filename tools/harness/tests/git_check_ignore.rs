@@ -5,8 +5,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
 use corpus::{CaseKind, Source, decode_bytes, parse_case};
 use ferralk::{WalkOptions, Walker};
@@ -184,8 +187,9 @@ fn root_spellings_match_git_ls_files() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock is after epoch")
         .as_nanos();
+    let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
     let repository = std::env::temp_dir().join(format!(
-        "ferralk-root-spelling-{}-{unique}",
+        "ferralk-root-spelling-{}-{unique}-{sequence}",
         std::process::id()
     ));
     fs::create_dir(&repository).expect("create root-spelling repository");

@@ -87,13 +87,13 @@ impl Fixture {
     fn new(directories: usize) -> Self {
         let root = loop {
             let candidate = std::env::temp_dir().join(format!(
-                "ferralk-parallel-allocations-{}-{}",
+                "ferralk-parallel-allocations-{}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .expect("system clock is after epoch")
-                    .as_nanos()
-                    + NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed) as u128
+                    .as_nanos(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
             ));
             match fs::create_dir(&candidate) {
                 Ok(()) => break candidate,

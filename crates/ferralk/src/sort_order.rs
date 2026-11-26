@@ -275,13 +275,13 @@ mod tests {
         /// differently under byte and component order.
         fn awkward() -> Self {
             let root = std::env::temp_dir().join(format!(
-                "ferralk-sort-{}-{}",
+                "ferralk-sort-{}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .expect("system clock is after unix epoch")
-                    .as_nanos()
-                    + NEXT_FIXTURE.fetch_add(1, AtomicOrdering::Relaxed) as u128
+                    .as_nanos(),
+                NEXT_FIXTURE.fetch_add(1, AtomicOrdering::Relaxed)
             ));
             for directory in ["a", "a/b", "a/b-c", "a-b", "a b", "a.b/c", "a!/x", "b"] {
                 fs::create_dir_all(root.join(directory)).expect("create fixture directory");
