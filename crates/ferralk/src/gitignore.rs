@@ -24,9 +24,9 @@ use std::{
 
 use super::glob_path_bytes;
 use super::{
-    DirectoryBackend, Listing, Walker,
+    BoundedFileRead, DirectoryBackend, Listing, Walker,
     ignore_rules::{RuleSet, RuleSetBuilder, without_dot_components, without_dot_components_into},
-    read_bounded_file,
+    read_bounded_file, read_bounded_prefix_no_follow,
 };
 
 /// Ignore files of a directory, in increasing precedence: a later file wins.
@@ -399,11 +399,11 @@ fn read_rules<B: DirectoryBackend + ?Sized>(
     for file in files {
         let path = directory.join(file);
         match backend.read_ignore_file(&path) {
-            Ok(contents) => match validate_rule_count(&contents) {
+            Ok(BoundedFileRead::Contents(contents)) => match validate_rule_count(&contents) {
                 Ok(()) => add_rules(&mut builder, &contents),
                 Err(source) => errors.push(IgnoreReadError::new(path, source)),
             },
-            Err(source) if ignored_in_tree_read_error(&source) => {}
+            Ok(BoundedFileRead::Missing | BoundedFileRead::NotRegular) => {}
             Err(source) => errors.push(IgnoreReadError::new(path, source)),
         }
     }
@@ -435,11 +435,11 @@ fn read_repository_rules<B: DirectoryBackend + ?Sized>(
     let path = layout.common_directory.join(REPOSITORY_EXCLUDE_FILE);
     let mut errors = Vec::new();
     match backend.read_repository_file(&path) {
-        Ok(contents) => match validate_rule_count(&contents) {
+        Ok(BoundedFileRead::Contents(contents)) => match validate_rule_count(&contents) {
             Ok(()) => add_rules(&mut builder, &contents),
             Err(source) => errors.push(IgnoreReadError::new(path, source)),
         },
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(BoundedFileRead::Missing | BoundedFileRead::NotRegular) => {}
         Err(source) => errors.push(IgnoreReadError::new(path, source)),
     }
     (builder.build(), errors)
@@ -462,19 +462,68 @@ fn validate_rule_count(contents: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn ignored_in_tree_read_error(error: &std::io::Error) -> bool {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        return true;
+/// Git's `setup.c::validate_headref` reads at most 255 bytes (`char buffer[256]`)
+/// from `HEAD` to check whether it starts with a valid symbolic ref or OID.
+const MAX_GIT_HEAD_PROBE_BYTES: u64 = 255;
+
+fn has_git_head(directory: &Path) -> bool {
+    let head = directory.join("HEAD");
+    let Ok(metadata) = fs::symlink_metadata(&head) else {
+        return false;
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        // With `core.preferSymlinkRefs=true`, Git writes `HEAD` as a symlink
+        // targeting `refs/heads/<branch>`, which dangles on an unborn branch.
+        // Any `HEAD` symlink whose target does not start with `refs/` is
+        // rejected by Git's `validate_headref` without following it.
+        return fs::read_link(&head).is_ok_and(|target| {
+            let bytes = target.as_os_str().as_encoded_bytes();
+            bytes.starts_with(b"refs/") || (cfg!(windows) && bytes.starts_with(b"refs\\"))
+        });
     }
-    #[cfg(not(unix))]
-    if error.kind() == std::io::ErrorKind::InvalidInput {
-        return true;
+    if !file_type.is_file() {
+        return false;
     }
-    #[cfg(unix)]
-    if error.raw_os_error() == Some(libc::ELOOP) {
-        return true;
+    matches!(
+        read_bounded_prefix_no_follow(&head, MAX_GIT_HEAD_PROBE_BYTES),
+        Ok(BoundedFileRead::Contents(contents)) if is_valid_git_head_contents(&contents)
+    )
+}
+
+/// Validates `HEAD` contents the way Git's `validate_headref` does: either
+/// `ref:` followed by Git's `isspace` (`' '`, `'\t'`, `'\n'`, `'\r'`) and
+/// `refs/`, or a detached hex object ID prefix (40 hex digits for SHA-1, which
+/// also accepts 64-digit SHA-256 object IDs and trailing text).
+fn is_valid_git_head_contents(contents: &[u8]) -> bool {
+    if let Some(mut rest) = contents.strip_prefix(b"ref:") {
+        while let Some((first, tail)) = rest.split_first() {
+            if matches!(*first, b' ' | b'\t' | b'\n' | b'\r') {
+                rest = tail;
+            } else {
+                break;
+            }
+        }
+        return rest.starts_with(b"refs/");
     }
-    false
+    contents.len() >= 40 && contents[..40].iter().all(u8::is_ascii_hexdigit)
+}
+
+fn is_searchable_directory(path: &Path) -> bool {
+    // Appending `.` asks the OS to traverse `path` itself: on Unix this checks
+    // search (`X_OK`) permission without unsafe `access(2)` calls, matching
+    // Git's `access(path, X_OK)` check on `objects/` and `refs/`.
+    fs::metadata(path.join(".")).is_ok_and(|metadata| metadata.is_dir())
+}
+
+fn is_git_private_directory(path: &Path) -> bool {
+    is_searchable_directory(path) && has_git_head(path)
+}
+
+fn is_git_common_directory(path: &Path) -> bool {
+    is_searchable_directory(path)
+        && is_searchable_directory(&path.join("objects"))
+        && is_searchable_directory(&path.join("refs"))
 }
 
 /// The private git directory and its common directory. They are the same for
@@ -492,6 +541,9 @@ struct RepositoryLayout {
 /// Only the exact `gitdir: ` pointer format Git writes is accepted. The path
 /// has one line, may be absolute or relative to the pointer file, and may use
 /// a single `commondir` indirection relative to the resulting git directory.
+/// Pointer targets are verified to carry Git's directory structure (`HEAD` in
+/// the private directory, plus `objects/` and `refs/` in the common directory)
+/// before any metadata is read from them.
 fn repository_layout(root: &Path) -> Option<(PathBuf, RepositoryLayout)> {
     let mut directory = Some(root);
     while let Some(candidate) = directory {
@@ -525,25 +577,28 @@ fn repository_layout_at(
         return None;
     }
 
-    let private_directory = resolve_metadata_path(
-        root,
-        parse_gitdir_pointer(&read_bounded_file(&dot_git).ok()?)?,
-    )?;
-    let common_dir = private_directory.join("commondir");
-    match read_bounded_file(&common_dir) {
-        Ok(contents) => Some(RepositoryLayout {
-            common_directory: resolve_metadata_path(
-                &private_directory,
-                parse_metadata_path(&contents)?,
-            )?,
-            private_directory,
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(RepositoryLayout {
-            common_directory: private_directory.clone(),
-            private_directory,
-        }),
-        Err(_) => None,
+    let Ok(BoundedFileRead::Contents(pointer_contents)) = read_bounded_file(&dot_git) else {
+        return None;
+    };
+    let private_directory = resolve_metadata_path(root, parse_gitdir_pointer(&pointer_contents)?)?;
+    if !is_git_private_directory(&private_directory) {
+        return None;
     }
+    let common_dir = private_directory.join("commondir");
+    let common_directory = match read_bounded_file(&common_dir) {
+        Ok(BoundedFileRead::Contents(contents)) => {
+            resolve_metadata_path(&private_directory, parse_metadata_path(&contents)?)?
+        }
+        Ok(BoundedFileRead::Missing) => private_directory.clone(),
+        Ok(BoundedFileRead::NotRegular) | Err(_) => return None,
+    };
+    if !is_git_common_directory(&common_directory) {
+        return None;
+    }
+    Some(RepositoryLayout {
+        private_directory,
+        common_directory,
+    })
 }
 
 #[derive(Default)]
@@ -586,11 +641,14 @@ impl GitIgnoreAdaptation {
 
 fn read_repository_config(layout: &RepositoryLayout) -> GitConfig {
     let mut config = GitConfig::default();
-    if let Ok(contents) = read_bounded_file(&layout.common_directory.join("config")) {
+    if let Ok(BoundedFileRead::Contents(contents)) =
+        read_bounded_file(&layout.common_directory.join("config"))
+    {
         apply_config(&mut config, &contents);
     }
     if config.worktree_config == Some(true)
-        && let Ok(contents) = read_bounded_file(&layout.private_directory.join("config.worktree"))
+        && let Ok(BoundedFileRead::Contents(contents)) =
+            read_bounded_file(&layout.private_directory.join("config.worktree"))
     {
         // Worktree config is read after the common config, so its last value
         // wins just as `git config --worktree` does.
@@ -934,9 +992,40 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        GitConfig, MAX_IGNORE_RULES, RuleSetBuilder, add_rules, apply_config, logical_config_lines,
-        parse_git_bool, validate_rule_count,
+        GitConfig, MAX_IGNORE_RULES, RuleSetBuilder, add_rules, apply_config,
+        is_valid_git_head_contents, logical_config_lines, parse_git_bool, validate_rule_count,
     };
+
+    #[test]
+    fn git_head_contents_validation_matches_git_headref_forms() {
+        assert!(is_valid_git_head_contents(b"ref: refs/heads/main\n"));
+        assert!(is_valid_git_head_contents(b"ref:\trefs/heads/main\r\n"));
+        assert!(is_valid_git_head_contents(b"ref:\nrefs/heads/main\n"));
+        assert!(is_valid_git_head_contents(b"ref:\r\nrefs/heads/main\n"));
+        assert!(is_valid_git_head_contents(b"ref: refs/heads/.invalid\n"));
+        assert!(is_valid_git_head_contents(
+            b"0123456789abcdef0123456789abcdef01234567\n"
+        ));
+        assert!(is_valid_git_head_contents(
+            b"0123456789abcdef0123456789abcdef01234567 trailing\n"
+        ));
+        assert!(is_valid_git_head_contents(
+            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\r\n"
+        ));
+
+        assert!(!is_valid_git_head_contents(b""));
+        assert!(!is_valid_git_head_contents(b"\n"));
+        assert!(!is_valid_git_head_contents(b"not a git head\n"));
+        assert!(!is_valid_git_head_contents(b"ref: ../outside\n"));
+        assert!(!is_valid_git_head_contents(b"ref:\x0brefs/heads/main\n"));
+        assert!(!is_valid_git_head_contents(b"ref:\x0crefs/heads/main\n"));
+        assert!(!is_valid_git_head_contents(
+            b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n"
+        ));
+        assert!(!is_valid_git_head_contents(
+            b"0123456789abcdef0123456789abcdef0123456\n"
+        ));
+    }
 
     #[test]
     fn ignore_rule_count_has_a_hard_limit() {
