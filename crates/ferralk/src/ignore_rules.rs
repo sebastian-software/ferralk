@@ -61,12 +61,15 @@ fn component_options(case_insensitive: bool) -> PatternOptions {
 /// revisiting only if ignore files that large turn up in practice.
 #[derive(Debug)]
 pub(crate) struct RuleSet {
-    /// Bytes of the directory the rules are anchored to, separator included.
+    /// Normalized glob prefix of the directory the rules are anchored to,
+    /// trailing separator included unless the root is empty or a bare Windows
+    /// drive.
     ///
     /// Candidates arrive as the whole path, converted once for the entire
-    /// chain, so each set slices off its own prefix instead of walking the
-    /// components again.
-    root_len: usize,
+    /// chain, so each set strips its own prefix instead of walking the
+    /// components again. Checking the prefix also prevents a mismatched
+    /// spelling from slicing mid-filename.
+    root_prefix: Vec<u8>,
     precompose_unicode: bool,
     rules: Vec<Rule>,
 }
@@ -84,7 +87,17 @@ impl RuleSet {
     /// byte-exact path is allocation-free; enabled precomposition allocates
     /// only when a valid UTF-8 component actually changes under NFC.
     pub(crate) fn matched(&self, path: &[u8], is_dir: bool) -> Option<bool> {
-        let candidate = path.get(self.root_len..).unwrap_or(path);
+        let candidate = if self.root_prefix.is_empty() {
+            path
+        } else {
+            let rest = path.strip_prefix(self.root_prefix.as_slice())?;
+            if self.root_prefix.ends_with(b"/") {
+                let extra = rest.iter().take_while(|&&byte| byte == b'/').count();
+                &rest[extra..]
+            } else {
+                rest
+            }
+        };
         if self.precompose_unicode {
             let candidate = normalize_candidate(candidate);
             self.matched_candidate(&candidate, is_dir)
@@ -220,7 +233,7 @@ fn split_component(candidate: &[u8]) -> (&[u8], &[u8]) {
 
 /// Collects the rules of one or more ignore files for the same directory.
 pub(crate) struct RuleSetBuilder {
-    root_len: usize,
+    root_prefix: Vec<u8>,
     case_insensitive: bool,
     precompose_unicode: bool,
     rules: Vec<Rule>,
@@ -229,15 +242,20 @@ pub(crate) struct RuleSetBuilder {
 impl RuleSetBuilder {
     pub(crate) fn new(root: &Path, case_insensitive: bool, precompose_unicode: bool) -> Self {
         let root = glob_path_bytes(root);
-        let root = without_dot_components(&root);
+        let mut root_prefix = without_dot_components(&root).into_owned();
+        while root_prefix.ends_with(b"//") {
+            root_prefix.pop();
+        }
         // The separator between the directory and what follows it belongs to
         // the prefix, unless the walk spelled its entries without one: after
         // a trailing separator or a bare Windows drive (#436). The empty root
         // is used by the fuzz helper, where candidates are already relative
         // and so have no prefix to remove.
-        let root_len = root.len() + usize::from(crate::needs_separator_before_name(&root));
+        if crate::needs_separator_before_name(&root_prefix) {
+            root_prefix.push(b'/');
+        }
         Self {
-            root_len,
+            root_prefix,
             case_insensitive,
             precompose_unicode,
             rules: Vec::new(),
@@ -254,7 +272,7 @@ impl RuleSetBuilder {
 
     pub(crate) fn build(self) -> RuleSet {
         RuleSet {
-            root_len: self.root_len,
+            root_prefix: self.root_prefix,
             precompose_unicode: self.precompose_unicode,
             rules: self.rules,
         }
@@ -270,14 +288,6 @@ pub(crate) fn without_dot_components(path: &[u8]) -> Cow<'_, [u8]> {
     }
 
     let mut normalized = Vec::with_capacity(path.len());
-    without_dot_components_into(path, &mut normalized);
-    Cow::Owned(normalized)
-}
-
-/// The same lexical view, written into a caller-owned buffer so a walk that
-/// spells every candidate pays no allocation per entry.
-pub(crate) fn without_dot_components_into(path: &[u8], normalized: &mut Vec<u8>) {
-    normalized.clear();
     let mut wrote_component = false;
     for component in path.split(|byte| *byte == b'/') {
         if component == b"." {
@@ -289,6 +299,7 @@ pub(crate) fn without_dot_components_into(path: &[u8], normalized: &mut Vec<u8>)
         normalized.extend_from_slice(component);
         wrote_component = true;
     }
+    Cow::Owned(normalized)
 }
 
 /// Fuzz entry point for the rule layer.
@@ -722,7 +733,7 @@ fn normalize_bracket_class(
 
 /// Writes a range's upper endpoint so the compiler cannot read it as syntax.
 fn push_range_endpoint(result: &mut Vec<u8>, upper: u8) {
-    if matches!(upper, b'\\' | b'-' | b'[') {
+    if matches!(upper, b'\\' | b'-' | b'[' | b']') {
         result.push(b'\\');
     }
     result.push(upper);
@@ -790,6 +801,9 @@ fn trailing_backslashes(text: &[u8]) -> usize {
 fn longest_literal_run(part: &[u8]) -> Option<Vec<u8>> {
     let mut longest: Vec<u8> = Vec::new();
     let mut current: Vec<u8> = Vec::new();
+    // Shared across all classes in `part`: once `find_posix_closer` reports no
+    // `:]` in the remaining suffix, no later `[:` opener can close either.
+    let mut has_posix_closer = true;
     let mut index = 0;
     while index < part.len() {
         match part[index] {
@@ -806,8 +820,9 @@ fn longest_literal_run(part: &[u8]) -> Option<Vec<u8>> {
             }
             b'[' => {
                 // Skip the class: its contents match a single byte, not
-                // themselves. A POSIX name brings its own brackets, so `[:x:]`
-                // is skipped whole rather than ending the class at its `]`.
+                // themselves. Backslash escapes protect `]` and `[`, and a
+                // POSIX name brings its own brackets, so `[:x:]` is skipped
+                // whole rather than ending the class at its `]`.
                 let mut scan = index + 1;
                 if matches!(part.get(scan), Some(b'!' | b'^')) {
                     scan += 1;
@@ -816,14 +831,20 @@ fn longest_literal_run(part: &[u8]) -> Option<Vec<u8>> {
                     scan += 1;
                 }
                 while scan < part.len() && part[scan] != b']' {
-                    if part[scan] == b'[' && part.get(scan + 1) == Some(&b':') {
+                    if part[scan] == b'\\' {
+                        scan = (scan + 2).min(part.len());
+                    } else if has_posix_closer
+                        && part[scan] == b'['
+                        && part.get(scan + 1) == Some(&b':')
+                    {
                         match find_posix_closer(&part[scan + 2..]) {
                             Some(end) => scan += 2 + end + 2,
-                            // The rest of an unclosed POSIX class cannot be a
-                            // literal run. Skipping it also keeps malformed
-                            // input linear instead of re-scanning the suffix
-                            // at every nested `[:` opener.
-                            None => scan = part.len(),
+                            // Remember that no `:]` remains in `part` so later
+                            // `[:` openers stay linear without re-scanning.
+                            None => {
+                                has_posix_closer = false;
+                                scan += 1;
+                            }
                         }
                     } else {
                         scan += 1;
@@ -1011,7 +1032,7 @@ mod tests {
 
     /// The candidate as the walker hands it over: the whole path in glob bytes.
     fn candidate(root: &Path, path: &str) -> Vec<u8> {
-        root.join(path).to_string_lossy().into_owned().into_bytes()
+        crate::glob_path_bytes(&root.join(path)).into_owned()
     }
 
     fn ours(rule: &str, path: &str, is_dir: bool) -> Option<bool> {
@@ -1264,6 +1285,135 @@ mod tests {
         assert_eq!(fuzz_rule_bytes(b"[]/]", b"]", false), Some(true));
         assert_eq!(fuzz_rule_bytes(b"[]/]", b"x/]", false), None);
         assert_eq!(fuzz_rule_bytes(b"[!]/]", b"a", false), Some(true));
+    }
+
+    #[test]
+    fn escaped_brackets_inside_classes_keep_accurate_literal_gates() {
+        assert_eq!(longest_literal_run(b"[\\]a]"), None);
+        assert_eq!(longest_literal_run(b"[a\\]b]"), None);
+        assert_eq!(longest_literal_run(b"[a\\]foo]x"), None);
+        assert_eq!(longest_literal_run(b"[a\\]foo]xy"), Some(b"xy".to_vec()));
+        assert_eq!(longest_literal_run(b"[!\\]a]xy"), Some(b"xy".to_vec()));
+        assert_eq!(longest_literal_run(b"[]\\]a]xy"), Some(b"xy".to_vec()));
+        assert_eq!(longest_literal_run(b"[\\\\]xy"), Some(b"xy".to_vec()));
+        assert_eq!(longest_literal_run(b"[a\\[:digit:]]"), None);
+        assert_eq!(
+            longest_literal_run(b"[a\\[:digit:]]xy"),
+            Some(b"]xy".to_vec())
+        );
+        assert_eq!(
+            longest_literal_run(b"[a\\[:digit:]foo]x"),
+            Some(b"foo]x".to_vec())
+        );
+        assert_eq!(longest_literal_run(b"[[:foo]bar"), Some(b"bar".to_vec()));
+
+        assert_eq!(fuzz_rule_bytes(b"[\\]a]", b"]", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"[\\]a]", b"a", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"[\\]a]", b"a]", false), None);
+
+        for candidate in [b"a".as_slice(), b"]", b"b"] {
+            assert_eq!(fuzz_rule_bytes(b"[a\\]b]", candidate, false), Some(true));
+        }
+        assert_eq!(fuzz_rule_bytes(b"[a\\]b]", b"b]", false), None);
+
+        for candidate in [b"ax".as_slice(), b"]x", b"fx", b"ox"] {
+            assert_eq!(fuzz_rule_bytes(b"[a\\]foo]x", candidate, false), Some(true));
+        }
+        assert_eq!(fuzz_rule_bytes(b"[a\\]foo]x", b"foo]x", false), None);
+
+        for candidate in [b"a]".as_slice(), b"[]", b":]", b"d]"] {
+            assert_eq!(
+                fuzz_rule_bytes(b"[a\\[:digit:]]", candidate, false),
+                Some(true)
+            );
+        }
+        assert_eq!(fuzz_rule_bytes(b"[a\\[:digit:]]", b"0]", false), None);
+        assert_eq!(fuzz_rule_bytes(b"[a\\[:digit:]]", b"a", false), None);
+    }
+
+    #[test]
+    fn ranges_ending_or_starting_in_escaped_closing_bracket_match_git() {
+        // On Windows, `\` is a path separator in `is_match_glob_path` and
+        // cannot match inside a single path component.
+        let expected_backslash = if cfg!(windows) { None } else { Some(true) };
+
+        for candidate in [b"A".as_slice(), b"Z", b"[", b"]"] {
+            assert_eq!(fuzz_rule_bytes(b"[A-\\]]", candidate, false), Some(true));
+        }
+        assert_eq!(
+            fuzz_rule_bytes(b"[A-\\]]", b"\\", false),
+            expected_backslash
+        );
+        for candidate in [b"A]".as_slice(), b"^", b"a"] {
+            assert_eq!(fuzz_rule_bytes(b"[A-\\]]", candidate, false), None);
+        }
+
+        for candidate in [b"0".as_slice(), b"A", b"Z", b"[", b"]"] {
+            assert_eq!(fuzz_rule_bytes(b"[/-\\]]", candidate, false), Some(true));
+        }
+        assert_eq!(
+            fuzz_rule_bytes(b"[/-\\]]", b"\\", false),
+            expected_backslash
+        );
+        for candidate in [b".".as_slice(), b"^", b"a"] {
+            assert_eq!(fuzz_rule_bytes(b"[/-\\]]", candidate, false), None);
+        }
+
+        for candidate in [b"A".as_slice(), b"Z", b"[", b"]", b"z"] {
+            assert_eq!(fuzz_rule_bytes(b"[A-\\]z]", candidate, false), Some(true));
+        }
+        assert_eq!(
+            fuzz_rule_bytes(b"[A-\\]z]", b"\\", false),
+            expected_backslash
+        );
+        assert_eq!(fuzz_rule_bytes(b"[A-\\]z]", b"a", false), None);
+
+        for candidate in [b"]".as_slice(), b"^", b"_", b"a", b"z"] {
+            assert_eq!(fuzz_rule_bytes(b"[\\]-z]", candidate, false), Some(true));
+        }
+        assert_eq!(fuzz_rule_bytes(b"[\\]-z]", b"[", false), None);
+
+        assert_eq!(fuzz_rule_bytes(b"[!A-\\]]", b"A", false), None);
+        assert_eq!(fuzz_rule_bytes(b"[!A-\\]]", b"]", false), None);
+        assert_eq!(fuzz_rule_bytes(b"[!A-\\]]", b"a", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"[a-\\]]", b"a", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"[a-\\]]", b"]", false), None);
+        assert_eq!(fuzz_rule_bytes(b"[a-\\]]", b"-", false), None);
+    }
+
+    #[test]
+    fn rule_set_normalizes_root_slashes_and_rejects_mismatched_prefixes() {
+        for root in [
+            Path::new("/repo"),
+            Path::new("/repo/"),
+            Path::new("/repo//"),
+            Path::new("/repo///"),
+        ] {
+            let mut builder = RuleSetBuilder::new(root, false, false);
+            builder.add_line("/foo.txt");
+            builder.add_line("sub/bar.txt");
+            let rules = builder.build();
+
+            assert_eq!(rules.matched(b"/repo/foo.txt", false), Some(true));
+            assert_eq!(rules.matched(b"/repo//foo.txt", false), Some(true));
+            assert_eq!(rules.matched(b"/repo/sub/bar.txt", false), Some(true));
+            assert_eq!(rules.matched(b"/repo//sub/bar.txt", false), Some(true));
+            assert_eq!(rules.matched(b"/repo/deep/foo.txt", false), None);
+            assert_eq!(rules.matched(b"/other/foo.txt", false), None);
+            assert_eq!(rules.matched(b"/foo.txt", false), None);
+        }
+
+        for root in [Path::new("/"), Path::new("//")] {
+            let mut builder = RuleSetBuilder::new(root, false, false);
+            builder.add_line("/foo.txt");
+            builder.add_line("sub/bar.txt");
+            let rules = builder.build();
+
+            assert_eq!(rules.matched(b"/foo.txt", false), Some(true));
+            assert_eq!(rules.matched(b"//foo.txt", false), Some(true));
+            assert_eq!(rules.matched(b"/sub/bar.txt", false), Some(true));
+            assert_eq!(rules.matched(b"/deep/foo.txt", false), None);
+        }
     }
 
     #[test]

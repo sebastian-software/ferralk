@@ -25,7 +25,7 @@ use std::{
 use super::glob_path_bytes;
 use super::{
     BoundedFileRead, DirectoryBackend, Listing, Walker,
-    ignore_rules::{RuleSet, RuleSetBuilder, without_dot_components, without_dot_components_into},
+    ignore_rules::{RuleSet, RuleSetBuilder},
     read_bounded_file, read_bounded_prefix_no_follow,
 };
 
@@ -89,21 +89,37 @@ pub(crate) struct IgnoreScope {
 #[derive(Debug, Clone)]
 struct CandidateRoot {
     walk: Vec<u8>,
+    walk_prefix: Vec<u8>,
     discovery: Vec<u8>,
+    discovery_prefix: Vec<u8>,
     walk_path: PathBuf,
     discovery_path: PathBuf,
 }
 
+/// The glob-byte prefix every entry below `directory` begins with, matching
+/// [`crate::push_entry_name`].
+fn entry_prefix(directory: &[u8]) -> Vec<u8> {
+    let mut prefix = directory.to_vec();
+    if crate::needs_separator_before_name(&prefix) {
+        prefix.push(b'/');
+    }
+    prefix
+}
+
 impl CandidateRoot {
     fn between(walk: &Path, discovery: &Path) -> Option<Self> {
-        let mut walk_bytes = without_dot_components(&glob_path_bytes(walk)).into_owned();
-        while walk_bytes.len() > 1 && walk_bytes.ends_with(b"/") {
-            walk_bytes.pop();
+        let walk_bytes = glob_path_bytes(walk).into_owned();
+        let walk_prefix = entry_prefix(&walk_bytes);
+        let mut discovery_bytes = glob_path_bytes(discovery).into_owned();
+        while discovery_bytes.ends_with(b"//") {
+            discovery_bytes.pop();
         }
-        let discovery_bytes = without_dot_components(&glob_path_bytes(discovery)).into_owned();
-        (walk_bytes != discovery_bytes).then(|| Self {
+        let discovery_prefix = entry_prefix(&discovery_bytes);
+        (walk_prefix != discovery_prefix).then(|| Self {
             walk: walk_bytes,
+            walk_prefix,
             discovery: discovery_bytes,
+            discovery_prefix,
             walk_path: walk.to_path_buf(),
             discovery_path: discovery.to_path_buf(),
         })
@@ -128,30 +144,18 @@ impl CandidateRoot {
     /// spelling, into `scratch`, which the caller keeps for the whole walk so
     /// that this costs one copy per entry and no allocation.
     fn spell_into<'a>(&self, candidate: &[u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
-        without_dot_components_into(candidate, scratch);
-        let relative_start = if self.walk.is_empty() {
-            Some(0)
-        } else if scratch.as_slice() == self.walk {
-            Some(scratch.len())
-        } else if scratch.starts_with(&self.walk) && scratch.get(self.walk.len()) == Some(&b'/') {
-            Some(self.walk.len() + 1)
-        } else if scratch.starts_with(&self.walk) && crate::is_bare_drive(&self.walk) {
-            // Entries below a bare drive follow it without a separator (#436).
-            Some(self.walk.len())
+        scratch.clear();
+        if let Some(relative) = candidate.strip_prefix(self.walk_prefix.as_slice()) {
+            if relative.is_empty() {
+                scratch.extend_from_slice(&self.discovery);
+            } else {
+                scratch.extend_from_slice(&self.discovery_prefix);
+                scratch.extend_from_slice(relative);
+            }
+        } else if candidate == self.walk.as_slice() {
+            scratch.extend_from_slice(&self.discovery);
         } else {
-            None
-        };
-        if let Some(relative_start) = relative_start {
-            let separator: &[u8] =
-                if relative_start < scratch.len() && !self.discovery.ends_with(b"/") {
-                    b"/"
-                } else {
-                    b""
-                };
-            scratch.splice(
-                ..relative_start,
-                self.discovery.iter().chain(separator).copied(),
-            );
+            scratch.extend_from_slice(candidate);
         }
         scratch
     }
@@ -255,7 +259,7 @@ impl IgnoreScope {
         let candidate = glob_path_bytes(path);
         match self.candidate_root.as_ref() {
             Some(root) => node.verdict(root.spell_into(&candidate, scratch), is_dir),
-            None => node.verdict(&without_dot_components(&candidate), is_dir),
+            None => node.verdict(&candidate, is_dir),
         }
         .unwrap_or(false)
     }
@@ -272,7 +276,7 @@ impl IgnoreScope {
         };
         match self.candidate_root.as_ref() {
             Some(root) => node.verdict(root.spell_into(candidate, scratch), is_dir),
-            None => node.verdict(&without_dot_components(candidate), is_dir),
+            None => node.verdict(candidate, is_dir),
         }
         .unwrap_or(false)
     }
@@ -992,7 +996,7 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        GitConfig, MAX_IGNORE_RULES, RuleSetBuilder, add_rules, apply_config,
+        CandidateRoot, GitConfig, MAX_IGNORE_RULES, RuleSetBuilder, add_rules, apply_config,
         is_valid_git_head_contents, logical_config_lines, parse_git_bool, validate_rule_count,
     };
 
@@ -1025,6 +1029,149 @@ mod tests {
         assert!(!is_valid_git_head_contents(
             b"0123456789abcdef0123456789abcdef0123456\n"
         ));
+    }
+
+    #[test]
+    fn candidate_root_maps_slash_roots_and_repeated_trailing_slashes() {
+        let mut scratch = Vec::new();
+
+        // Windows drive-root walk spelled `/` or `\` against `C:/` or `//?/C:/`.
+        for discovery in [Path::new("C:/"), Path::new("//?/C:/")] {
+            let root = CandidateRoot::between(Path::new("/"), discovery)
+                .expect("drive-relative root requires spelling translation");
+            let expected_file = format!("{}foo.txt", discovery.display());
+            let expected_nested = format!("{}sub/bar.txt", discovery.display());
+            assert_eq!(
+                root.spell_into(b"/foo.txt", &mut scratch),
+                expected_file.as_bytes()
+            );
+            assert_eq!(
+                root.spell_into(b"/sub/bar.txt", &mut scratch),
+                expected_nested.as_bytes()
+            );
+            assert_eq!(
+                root.spell_into(b"/", &mut scratch),
+                discovery.as_os_str().as_encoded_bytes()
+            );
+
+            let mut builder = RuleSetBuilder::new(discovery, false, false);
+            builder.add_line("/foo.txt");
+            builder.add_line("sub/bar.txt");
+            let rules = builder.build();
+            assert_eq!(
+                rules.matched(root.spell_into(b"/foo.txt", &mut scratch), false),
+                Some(true)
+            );
+            assert_eq!(
+                rules.matched(root.spell_into(b"/sub/bar.txt", &mut scratch), false),
+                Some(true)
+            );
+            assert_eq!(
+                rules.matched(root.spell_into(b"/deep/foo.txt", &mut scratch), false),
+                None
+            );
+        }
+
+        // Unix `.//`, `.//.`, `/repo//`, `repo//`, `./repo//`, `//`, `/repo/./sub`.
+        for (walk, discovery, entry, expected) in [
+            (
+                ".//",
+                "/repo",
+                b".//foo.txt".as_slice(),
+                b"/repo/foo.txt".as_slice(),
+            ),
+            (".//", "/repo", b".//sub/bar.txt", b"/repo/sub/bar.txt"),
+            (".//.", "/repo", b".//./foo.txt", b"/repo/foo.txt"),
+            (".", "/repo", b"./foo.txt", b"/repo/foo.txt"),
+            ("./", "/repo", b"./foo.txt", b"/repo/foo.txt"),
+            ("/repo//", "/repo", b"/repo//foo.txt", b"/repo/foo.txt"),
+            (
+                "/repo//",
+                "/repo",
+                b"/repo//sub/bar.txt",
+                b"/repo/sub/bar.txt",
+            ),
+            ("/repo//.", "/repo", b"/repo//./foo.txt", b"/repo/foo.txt"),
+            (
+                "repo//",
+                "/tmp/repo",
+                b"repo//foo.txt",
+                b"/tmp/repo/foo.txt",
+            ),
+            (
+                "./repo//",
+                "/tmp/repo",
+                b"./repo//foo.txt",
+                b"/tmp/repo/foo.txt",
+            ),
+            ("//", "/", b"//foo.txt", b"/foo.txt"),
+            ("//", "/", b"//sub/bar.txt", b"/sub/bar.txt"),
+            (
+                "/repo/./sub",
+                "/repo/sub",
+                b"/repo/./sub/foo.txt",
+                b"/repo/sub/foo.txt",
+            ),
+        ] {
+            let root = CandidateRoot::between(Path::new(walk), Path::new(discovery))
+                .unwrap_or_else(|| panic!("expected CandidateRoot for {walk:?} -> {discovery:?}"));
+            assert_eq!(
+                root.spell_into(entry, &mut scratch),
+                expected,
+                "{walk:?} -> {discovery:?}"
+            );
+        }
+
+        // Fast-path identity spellings need no per-entry translation.
+        for (walk, discovery) in [
+            ("/repo", "/repo"),
+            ("/repo/", "/repo"),
+            ("/", "/"),
+            ("C:/", "C:/"),
+            ("//server/share/", "//server/share/"),
+        ] {
+            assert!(
+                CandidateRoot::between(Path::new(walk), Path::new(discovery)).is_none(),
+                "expected no CandidateRoot for {walk:?} -> {discovery:?}"
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            for (walk, discovery, entry, expected) in [
+                (
+                    r"\",
+                    r"C:\",
+                    b"/foo.txt".as_slice(),
+                    b"C:/foo.txt".as_slice(),
+                ),
+                (r"C:", r"C:\repo", b"C:foo.txt", b"C:/repo/foo.txt"),
+                (r"C:.", r"C:\repo", b"C:./foo.txt", b"C:/repo/foo.txt"),
+                (r"C:\\", r"C:\", b"C://foo.txt", b"C:/foo.txt"),
+                (
+                    r"C:\repo\\",
+                    r"C:\repo",
+                    b"C:/repo//foo.txt",
+                    b"C:/repo/foo.txt",
+                ),
+                (
+                    r"\\server\share\\",
+                    r"\\server\share\",
+                    b"//server/share//foo.txt",
+                    b"//server/share/foo.txt",
+                ),
+            ] {
+                let root = CandidateRoot::between(Path::new(walk), Path::new(discovery))
+                    .unwrap_or_else(|| {
+                        panic!("expected Windows CandidateRoot for {walk:?} -> {discovery:?}")
+                    });
+                assert_eq!(
+                    root.spell_into(entry, &mut scratch),
+                    expected,
+                    "{walk:?} -> {discovery:?}"
+                );
+            }
+        }
     }
 
     #[test]

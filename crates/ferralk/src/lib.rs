@@ -8636,7 +8636,10 @@ mod tests {
                 .options(WalkOptions::default().sort(true).files_only(true))
                 .collect()
                 .expect("relative-root walk succeeds");
-            let expected = if matches!(spelling.to_str(), Some("sub/" | "./sub/")) {
+            let expected = if matches!(
+                spelling.to_str(),
+                Some("sub/" | "sub//" | "./sub/" | "./sub//")
+            ) {
                 vec![PathBuf::from("keep.rs")]
             } else {
                 vec![PathBuf::from("keep.rs"), PathBuf::from("sub/keep.rs")]
@@ -8665,12 +8668,18 @@ mod tests {
         for (working_directory, spelling) in [
             (fixture.root.join("src"), "."),
             (fixture.root.join("src"), "./"),
+            (fixture.root.join("src"), ".//"),
             (fixture.root.clone(), "src"),
             (fixture.root.clone(), "src/"),
+            (fixture.root.clone(), "src//"),
             (fixture.root.clone(), "./src/"),
+            (fixture.root.clone(), "./src//"),
             (fixture.root.join("src"), "sub/"),
+            (fixture.root.join("src"), "sub//"),
             (fixture.root.join("src"), "./sub/"),
+            (fixture.root.join("src"), "./sub//"),
             (fixture.root.join("src"), "../src/"),
+            (fixture.root.join("src"), "../src//"),
         ] {
             let status = Command::new(std::env::current_exe().expect("locate test binary"))
                 .args([
@@ -8685,6 +8694,84 @@ mod tests {
             assert!(
                 status.success(),
                 "relative-root child failed for {spelling:?}: {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_trailing_slashes_on_absolute_roots_keep_ignore_anchors() {
+        let fixture = Fixture::new();
+        for path in [
+            "excluded.txt",
+            "anchored.txt",
+            "keep.txt",
+            "sub/excluded.txt",
+            "sub/root_anchored.txt",
+            "sub/local_anchored.txt",
+            "sub/keep.txt",
+        ] {
+            fixture.write(path);
+        }
+        let info = fixture.root.join(".git").join("info");
+        fs::create_dir_all(&info).expect("create .git/info");
+        fs::write(info.join("exclude"), b"/excluded.txt\nsub/excluded.txt\n")
+            .expect("write repository excludes");
+        fs::write(
+            fixture.root.join(".gitignore"),
+            b"/anchored.txt\nsub/root_anchored.txt\n",
+        )
+        .expect("write root gitignore");
+        fs::write(
+            fixture.root.join("sub/.gitignore"),
+            b"/local_anchored.txt\n",
+        )
+        .expect("write nested gitignore");
+
+        let canonical = fs::canonicalize(&fixture.root).expect("canonicalize fixture root");
+        // On Windows, `fs::canonicalize` returns a verbatim `\\?\...` path
+        // where forward slashes and repeated separators bypass Win32
+        // normalization; exercise both `/` and `\` suffixes on the non-verbatim
+        // root there, and both non-canonical and canonical roots on Unix.
+        let mut cases: Vec<(&Path, &str)> = vec![(&fixture.root, "//"), (&fixture.root, "///")];
+        if cfg!(windows) {
+            cases.push((&fixture.root, "\\\\"));
+            cases.push((&fixture.root, "\\\\\\"));
+        } else {
+            cases.push((&canonical, "//"));
+            cases.push((&canonical, "///"));
+        }
+        for (base, suffix) in cases {
+            let mut repo_root = base.as_os_str().to_os_string();
+            repo_root.push(suffix);
+            let repo_root = PathBuf::from(repo_root);
+            let walked = Walker::new(&repo_root)
+                .respect_git_ignore(true)
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("walk repository with trailing slashes");
+            assert_eq!(
+                relative_paths(walked.entries(), &repo_root),
+                vec![
+                    PathBuf::from(".gitignore"),
+                    PathBuf::from("keep.txt"),
+                    PathBuf::from("sub/.gitignore"),
+                    PathBuf::from("sub/keep.txt"),
+                ],
+                "root spelling {repo_root:?}",
+            );
+
+            let mut sub_root = base.join("sub").into_os_string();
+            sub_root.push(suffix);
+            let sub_root = PathBuf::from(sub_root);
+            let walked = Walker::new(&sub_root)
+                .respect_git_ignore(true)
+                .options(WalkOptions::default().sort(true).files_only(true))
+                .collect()
+                .expect("walk subtree with trailing slashes");
+            assert_eq!(
+                relative_paths(walked.entries(), &sub_root),
+                vec![PathBuf::from(".gitignore"), PathBuf::from("keep.txt")],
+                "subtree spelling {sub_root:?}",
             );
         }
     }
