@@ -41,13 +41,13 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let unique = format!(
-            "ferralk-preset-{}-{}",
+            "ferralk-preset-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock is after epoch")
-                .as_nanos()
-                + NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed) as u128
+                .as_nanos(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         );
         let root = std::env::temp_dir().join(unique);
         fs::create_dir_all(&root).expect("create fixture root");

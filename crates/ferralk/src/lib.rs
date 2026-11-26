@@ -4244,29 +4244,54 @@ pub(crate) struct DeferredListingError {
     source: DeferredIoError,
 }
 
+// `std::io::RawOsError` is still unstable (rust-lang/rust#107792), so match
+// stdlib's platform alias locally to stay portable across UEFI and all other
+// targets without nightly features.
+#[cfg(target_os = "uefi")]
+type RawOsError = usize;
+#[cfg(not(target_os = "uefi"))]
+type RawOsError = i32;
+
 /// An `io::Error` representation that can live in the public stream without
 /// changing its auto-trait contract. `std::io::Error` may carry an arbitrary
-/// error object, which is not necessarily unwind-safe; a deferred listing
-/// error needs only the externally observable kind and message until it is
-/// delivered as a fresh `io::Error`.
+/// error object, which is not necessarily unwind-safe; preserving raw OS error
+/// codes keeps [`std::io::Error::raw_os_error`] intact while staying
+/// unwind-safe, and non-OS errors retain their kind and message.
 #[derive(Debug)]
-struct DeferredIoError {
-    kind: std::io::ErrorKind,
-    message: String,
+pub(crate) enum DeferredIoError {
+    Os(RawOsError),
+    Custom {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
 }
 
 impl From<std::io::Error> for DeferredIoError {
     fn from(source: std::io::Error) -> Self {
-        Self {
-            kind: source.kind(),
-            message: source.to_string(),
+        match source.raw_os_error() {
+            Some(code) => Self::Os(code),
+            None => Self::Custom {
+                kind: source.kind(),
+                message: source.to_string(),
+            },
         }
     }
 }
 
 impl DeferredIoError {
-    fn into_io_error(self) -> std::io::Error {
-        std::io::Error::new(self.kind, self.message)
+    pub(crate) fn into_io_error(self) -> std::io::Error {
+        match self {
+            Self::Os(code) => std::io::Error::from_raw_os_error(code),
+            Self::Custom { kind, message } => std::io::Error::new(kind, message),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kind(&self) -> std::io::ErrorKind {
+        match self {
+            Self::Os(code) => std::io::Error::from_raw_os_error(*code).kind(),
+            Self::Custom { kind, .. } => *kind,
+        }
     }
 }
 
@@ -4750,27 +4775,21 @@ pub struct WalkStream {
 struct PendingWalkError {
     operation: WalkOperation,
     path: PathBuf,
-    kind: std::io::ErrorKind,
-    message: String,
+    source: DeferredIoError,
 }
 
 impl PendingWalkError {
     fn from_ignore(error: IgnoreReadError) -> Self {
-        let (path, source) = error.into_parts();
+        let (path, source) = error.into_deferred_parts();
         Self {
             operation: IGNORE_FILE_OPERATION,
             path,
-            kind: source.kind(),
-            message: source.to_string(),
+            source,
         }
     }
 
     fn into_walk_error(self) -> WalkError {
-        WalkError::new(
-            self.operation,
-            self.path,
-            std::io::Error::new(self.kind, self.message),
-        )
+        WalkError::new(self.operation, self.path, self.source.into_io_error())
     }
 }
 
@@ -5018,8 +5037,7 @@ impl WalkStream {
             deferred_errors.push(PendingWalkError {
                 operation: WalkOperation::ReadDir,
                 path: error.path,
-                kind: error.source.kind,
-                message: error.source.message,
+                source: error.source,
             });
         }
         self.finish_directory(frame);
@@ -6001,13 +6019,13 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let unique = format!(
-                "ferralk-test-{}-{}",
+                "ferralk-test-{}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .expect("system clock is after unix epoch")
-                    .as_nanos()
-                    + NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed) as u128
+                    .as_nanos(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
             );
             let root = std::env::temp_dir().join(unique);
             fs::create_dir_all(&root).expect("create fixture root");
@@ -10744,6 +10762,268 @@ mod tests {
                 assert_eq!(aborted.operation().as_str(), "read_ignore");
             }
         }
+    }
+
+    #[test]
+    fn ignore_and_deferred_io_errors_preserve_raw_os_error() {
+        use super::WalkOperation;
+
+        fn raw_os_code(error: &super::WalkError) -> Option<super::RawOsError> {
+            use std::error::Error as _;
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .and_then(std::io::Error::raw_os_error)
+        }
+
+        #[cfg(unix)]
+        let expected_code: super::RawOsError = libc::EACCES;
+        #[cfg(not(unix))]
+        let expected_code: super::RawOsError = 5;
+
+        let os_roundtrip =
+            super::DeferredIoError::from(std::io::Error::from_raw_os_error(expected_code))
+                .into_io_error();
+        assert_eq!(os_roundtrip.raw_os_error(), Some(expected_code));
+
+        let custom_roundtrip = super::DeferredIoError::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "synthetic budget failure",
+        ))
+        .into_io_error();
+        assert_eq!(custom_roundtrip.raw_os_error(), None);
+        assert_eq!(custom_roundtrip.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(custom_roundtrip.to_string(), "synthetic budget failure");
+
+        struct RawOsIgnoreBackend {
+            code: super::RawOsError,
+            fail_repository: bool,
+        }
+
+        impl super::DirectoryBackend for RawOsIgnoreBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                follow_symlinks: bool,
+                refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                super::StdBackend.read_directory(
+                    path,
+                    follow_symlinks,
+                    refuse_final_symlink,
+                    listing,
+                )
+            }
+
+            fn read_ignore_file(&self, path: &Path) -> std::io::Result<super::BoundedFileRead> {
+                if !self.fail_repository
+                    && path.file_name() == Some(std::ffi::OsStr::new(".gitignore"))
+                {
+                    return Err(std::io::Error::from_raw_os_error(self.code));
+                }
+                super::read_in_tree_ignore_file(path)
+            }
+
+            fn read_repository_file(&self, path: &Path) -> std::io::Result<super::BoundedFileRead> {
+                if self.fail_repository {
+                    return Err(std::io::Error::from_raw_os_error(self.code));
+                }
+                super::read_bounded_file(path)
+            }
+        }
+
+        let fixture = Fixture::new();
+        fixture.write("visible.txt");
+        fixture.write(".gitignore");
+        fixture.write(".git/info/exclude");
+
+        for fail_repository in [false, true] {
+            let backend = RawOsIgnoreBackend {
+                code: expected_code,
+                fail_repository,
+            };
+
+            for threads in [1, 4] {
+                let collected = Walker::new(&fixture.root)
+                    .threads(threads)
+                    .respect_git_ignore(true)
+                    .error_policy(ErrorPolicy::Collect)
+                    .collect_with(&backend)
+                    .expect("collect keeps walking");
+                assert_eq!(collected.errors().len(), 1);
+                assert_eq!(collected.errors()[0].operation(), WalkOperation::ReadIgnore);
+                assert_eq!(raw_os_code(&collected.errors()[0]), Some(expected_code));
+
+                let visited = Walker::new(&fixture.root)
+                    .threads(threads)
+                    .respect_git_ignore(true)
+                    .error_policy(ErrorPolicy::Collect)
+                    .walk(&backend, &|_| Verdict::Keep)
+                    .expect("visit keeps walking");
+                assert_eq!(visited.errors().len(), 1);
+                assert_eq!(visited.errors()[0].operation(), WalkOperation::ReadIgnore);
+                assert_eq!(raw_os_code(&visited.errors()[0]), Some(expected_code));
+
+                let aborted = Walker::new(&fixture.root)
+                    .threads(threads)
+                    .respect_git_ignore(true)
+                    .error_policy(ErrorPolicy::Abort)
+                    .collect_with(&backend)
+                    .expect_err("abort returns the ignore read error");
+                assert_eq!(aborted.operation(), WalkOperation::ReadIgnore);
+                assert_eq!(raw_os_code(&aborted), Some(expected_code));
+            }
+
+            for policy in [ErrorPolicy::Collect, ErrorPolicy::Abort] {
+                let mut stream = Walker::new(&fixture.root)
+                    .respect_git_ignore(true)
+                    .error_policy(policy)
+                    .stream();
+                let mut errors = Vec::new();
+                while let Some(item) = stream.next_with(&backend) {
+                    if let Err(error) = item {
+                        errors.push(error);
+                    }
+                }
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].operation(), WalkOperation::ReadIgnore);
+                assert_eq!(raw_os_code(&errors[0]), Some(expected_code));
+            }
+        }
+
+        // Deferred per-entry listing errors flowing through `WalkStream` must
+        // preserve `raw_os_error()` too.
+        struct DeferredErrorBackend {
+            root: PathBuf,
+            code: super::RawOsError,
+            deferred_path: PathBuf,
+        }
+
+        impl super::DirectoryBackend for DeferredErrorBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                follow_symlinks: bool,
+                refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                super::StdBackend.read_directory(
+                    path,
+                    follow_symlinks,
+                    refuse_final_symlink,
+                    listing,
+                )?;
+                if path == self.root {
+                    listing.defer_error(
+                        self.deferred_path.clone(),
+                        std::io::Error::from_raw_os_error(self.code),
+                    );
+                }
+                Ok(())
+            }
+        }
+
+        let deferred_backend = DeferredErrorBackend {
+            root: fixture.root.clone(),
+            code: expected_code,
+            deferred_path: fixture.root.join("broken-entry"),
+        };
+        let mut stream = Walker::new(&fixture.root)
+            .error_policy(ErrorPolicy::Collect)
+            .stream();
+        let mut deferred_errors = Vec::new();
+        while let Some(item) = stream.next_with(&deferred_backend) {
+            if let Err(error) = item {
+                deferred_errors.push(error);
+            }
+        }
+        assert_eq!(deferred_errors.len(), 1);
+        assert_eq!(deferred_errors[0].operation(), WalkOperation::ReadDir);
+        assert_eq!(raw_os_code(&deferred_errors[0]), Some(expected_code));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_ignore_file_preserves_raw_os_error_across_all_frontends() {
+        use super::WalkOperation;
+        use std::error::Error as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions(PathBuf);
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o644));
+            }
+        }
+
+        let fixture = Fixture::new();
+        fixture.write("visible.txt");
+        let gitignore = fixture.root.join(".gitignore");
+        fs::write(&gitignore, b"*.tmp\n").expect("write .gitignore");
+        let _restore = RestorePermissions(gitignore.clone());
+        fs::set_permissions(&gitignore, fs::Permissions::from_mode(0o000))
+            .expect("revoke .gitignore read permission");
+
+        // Root users bypass mode 000 permission checks; skip cleanly if the
+        // host still permits reading the file.
+        let Err(probe) = fs::read(&gitignore) else {
+            return;
+        };
+        assert_eq!(probe.raw_os_error(), Some(libc::EACCES));
+
+        let raw_os_code = |error: &super::WalkError| {
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .and_then(std::io::Error::raw_os_error)
+        };
+
+        for threads in [1, 4] {
+            let collected = Walker::new(&fixture.root)
+                .threads(threads)
+                .respect_git_ignore(true)
+                .error_policy(ErrorPolicy::Collect)
+                .collect()
+                .expect("collect keeps walking");
+            assert_eq!(collected.errors().len(), 1);
+            assert_eq!(collected.errors()[0].operation(), WalkOperation::ReadIgnore);
+            assert_eq!(raw_os_code(&collected.errors()[0]), Some(libc::EACCES));
+
+            let visited = Walker::new(&fixture.root)
+                .threads(threads)
+                .respect_git_ignore(true)
+                .error_policy(ErrorPolicy::Collect)
+                .visit(|_| Verdict::Keep)
+                .expect("visit keeps walking");
+            assert_eq!(visited.errors().len(), 1);
+            assert_eq!(visited.errors()[0].operation(), WalkOperation::ReadIgnore);
+            assert_eq!(raw_os_code(&visited.errors()[0]), Some(libc::EACCES));
+        }
+
+        let stream_errors: Vec<_> = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Collect)
+            .stream()
+            .filter_map(Result::err)
+            .collect();
+        assert_eq!(stream_errors.len(), 1);
+        assert_eq!(stream_errors[0].operation(), WalkOperation::ReadIgnore);
+        assert_eq!(raw_os_code(&stream_errors[0]), Some(libc::EACCES));
+
+        let parallel_stream_errors: Vec<_> = Walker::new(&fixture.root)
+            .threads(4)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Collect)
+            .stream_parallel()
+            .filter_map(Result::err)
+            .collect();
+        assert_eq!(parallel_stream_errors.len(), 1);
+        assert_eq!(
+            parallel_stream_errors[0].operation(),
+            WalkOperation::ReadIgnore
+        );
+        assert_eq!(raw_os_code(&parallel_stream_errors[0]), Some(libc::EACCES));
     }
 
     #[cfg(unix)]

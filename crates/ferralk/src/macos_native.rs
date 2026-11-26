@@ -1809,13 +1809,13 @@ mod tests {
     #[test]
     fn native_readers_match_the_portable_reader() {
         let root = std::env::temp_dir().join(format!(
-            "ferralk-macos-native-{}-{}",
+            "ferralk-macos-native-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock is after epoch")
-                .as_nanos()
-                + NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed) as u128
+                .as_nanos(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(root.join("nested")).expect("create native fixture");
         fs::write(root.join("file.txt"), b"fixture").expect("write native fixture");
@@ -1911,13 +1911,13 @@ mod tests {
 
     fn fixture_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "ferralk-macos-native-{label}-{}-{}",
+            "ferralk-macos-native-{label}-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock is after epoch")
-                .as_nanos()
-                + NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed) as u128
+                .as_nanos(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ))
     }
 

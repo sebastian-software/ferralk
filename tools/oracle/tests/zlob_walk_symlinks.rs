@@ -14,20 +14,24 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use zlob::walk::{WalkBuilder, WalkFlags};
 
+static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
 /// A tree holding one link of each shape next to one ordinary file.
 fn fixture() -> PathBuf {
     let root = std::env::temp_dir().join(format!(
-        "ferralk-zlob-symlinks-{}-{}",
+        "ferralk-zlob-symlinks-{}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the epoch")
-            .as_nanos()
+            .as_nanos(),
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(root.join("target-dir")).expect("create the link target directory");
     fs::write(root.join("target-file.txt"), b"target").expect("write the link target file");

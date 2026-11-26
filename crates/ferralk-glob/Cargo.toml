@@ -13,11 +13,10 @@ documentation = "https://docs.rs/ferralk-glob"
 keywords.workspace = true
 categories.workspace = true
 
-# `--cfg docsrs` turns on the `doc_cfg` annotations that name the feature a
-# gated item needs.
+# Every feature-gated item in this crate is `#[doc(hidden)]`, so `lib.rs` does
+# not enable `feature(doc_cfg)` or pass `--cfg docsrs`.
 [package.metadata.docs.rs]
 all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 # Development-only differential hooks. No item enabled by this feature is

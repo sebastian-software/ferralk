@@ -22,7 +22,7 @@ body:
     id: version
     attributes:
       label: Ferralk version or commit
-      placeholder: "0.9.4 or a commit SHA"
+      placeholder: "1.2.1 or a commit SHA"
     validations:
       required: true
 
@@ -33,7 +33,7 @@ body:
       description: Operating system, architecture, Rust version, filesystem, and enabled features.
       placeholder: |
         Linux 6.12, x86_64
-        Rust 1.96.0
+        Rust 1.98.0
         ext4, features = ["native-linux"]
     validations:
       required: true

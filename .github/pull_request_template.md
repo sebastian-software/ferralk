@@ -16,4 +16,4 @@
 - [ ] Behavior changes include a focused corpus or regression case, or this is not applicable.
 - [ ] Performance claims include same-host before/after measurements, fixture details, and limitations, or this is not applicable.
 - [ ] The PR title and every branch commit follow `<type>[(scope)][!]: <summary>`.
-- [ ] Consumer-facing pre-1.0 changes use `!` and a filled-in `BREAKING CHANGE:` footer, or this is not applicable.
+- [ ] Consumer-visible breaking changes to the [1.x stability contract](https://github.com/sebastian-software/ferralk/blob/main/docs/stability.md) use `!` and a filled-in `BREAKING CHANGE:` footer (major release), or this is not applicable.

@@ -4,8 +4,11 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
 pub const TYPESCRIPT_PATTERN: &str = "**/*.{ts,tsx}";
 pub const SCOPED_TYPESCRIPT_PATTERN: &str = "{src,packages}/**/*.{ts,tsx}";
@@ -26,15 +29,7 @@ pub struct RepositoryFixture {
 impl RepositoryFixture {
     #[must_use]
     pub fn new() -> Self {
-        let unique = format!(
-            "ferralk-repository-bench-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock is after epoch")
-                .as_nanos()
-        );
-        let root = std::env::temp_dir().join(unique);
+        let root = unique_root("ferralk-repository-bench");
         let mut files = 0;
         let mut sources = 0;
 
@@ -316,12 +311,13 @@ impl Drop for GitIgnoreFixture {
 
 fn unique_root(prefix: &str) -> PathBuf {
     let unique = format!(
-        "{prefix}-{}-{}",
+        "{prefix}-{}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after epoch")
-            .as_nanos()
+            .as_nanos(),
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
     );
     std::env::temp_dir().join(unique)
 }

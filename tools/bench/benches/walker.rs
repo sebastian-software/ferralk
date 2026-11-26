@@ -63,13 +63,13 @@ impl Fixture {
     /// directories as siblings, which fixed the effective depth at two.
     fn new(branches: usize, depth: usize, files_per_directory: usize) -> Self {
         let unique = format!(
-            "ferralk-bench-{}-{}",
+            "ferralk-bench-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock is after epoch")
-                .as_nanos()
-                + NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed) as u128
+                .as_nanos(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         );
         let root = std::env::temp_dir().join(unique);
         let mut files = 0;
@@ -97,13 +97,13 @@ impl Fixture {
     /// repeatedly resolve every ancestor.
     fn deep(depth: usize) -> Self {
         let unique = format!(
-            "ferralk-bench-deep-{}-{}",
+            "ferralk-bench-deep-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock is after epoch")
-                .as_nanos()
-                + NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed) as u128
+                .as_nanos(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         );
         let root = std::env::temp_dir().join(unique);
         fs::create_dir(&root).expect("create deep benchmark root");

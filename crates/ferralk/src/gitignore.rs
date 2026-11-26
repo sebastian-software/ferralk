@@ -80,21 +80,28 @@ struct ChainUsage {
 #[derive(Debug)]
 pub(crate) struct IgnoreReadError {
     pub(crate) path: PathBuf,
-    kind: std::io::ErrorKind,
-    message: String,
+    source: super::DeferredIoError,
 }
 
 impl IgnoreReadError {
     fn new(path: PathBuf, source: std::io::Error) -> Self {
         Self {
             path,
-            kind: source.kind(),
-            message: source.to_string(),
+            source: source.into(),
         }
     }
 
     pub(crate) fn into_parts(self) -> (PathBuf, std::io::Error) {
-        (self.path, std::io::Error::new(self.kind, self.message))
+        (self.path, self.source.into_io_error())
+    }
+
+    pub(crate) fn into_deferred_parts(self) -> (PathBuf, super::DeferredIoError) {
+        (self.path, self.source)
+    }
+
+    #[cfg(test)]
+    fn kind(&self) -> std::io::ErrorKind {
+        self.source.kind()
     }
 }
 
@@ -2032,7 +2039,7 @@ mod tests {
         );
         assert_eq!(sub_errors.len(), 1);
         assert_eq!(sub_errors[0].path, PathBuf::from("/repo/sub/.ignore"));
-        assert_eq!(sub_errors[0].kind, std::io::ErrorKind::InvalidData);
+        assert_eq!(sub_errors[0].kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(sub_rules.compiled_units(), 4);
         scope = scope.link(sub_rules);
         assert_eq!(scope.chain_usage().compiled_units, 10);
@@ -2076,7 +2083,7 @@ mod tests {
             deep_errors[0].path,
             PathBuf::from("/repo/sub/exact/deep/.gitignore")
         );
-        assert_eq!(deep_errors[0].kind, std::io::ErrorKind::InvalidData);
+        assert_eq!(deep_errors[0].kind(), std::io::ErrorKind::InvalidData);
         assert!(deep_rules.is_empty());
         scope = scope.link(deep_rules);
         assert_eq!(scope.chain_usage().compiled_units, 12);
@@ -2193,7 +2200,7 @@ mod tests {
             byte_budget,
         );
         assert_eq!(e_over.len(), 1);
-        assert_eq!(e_over[0].kind, std::io::ErrorKind::InvalidData);
+        assert_eq!(e_over[0].kind(), std::io::ErrorKind::InvalidData);
         assert!(r_over.is_empty());
         let byte_node = byte_scope.rules.as_ref().expect("ancestor rules kept");
         let a_path = format!("/bytes/sub/over/{}", "a".repeat(40));
