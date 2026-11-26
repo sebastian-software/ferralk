@@ -693,7 +693,7 @@ fn parse_rule_with_options(
                 .count()
                 >= slash_threshold);
     let pre_scanned_cost = if might_exceed_before_split {
-        let mut acc = RuleCostAccumulator::new(anchored, rule_fixed_bytes);
+        let mut acc = RuleCostAccumulator::new(anchored, rule_fixed_bytes, case_insensitive);
         let (valid, scanned_parts) =
             scan_rule_components(body, budgets.file_parsed_remaining, |part| {
                 acc.push_part(&part);
@@ -708,6 +708,7 @@ fn parse_rule_with_options(
         }
         match check_rule_budget_overflow(
             body,
+            case_insensitive,
             cost,
             max_compiled,
             compiled_budget_exceeded,
@@ -737,7 +738,7 @@ fn parse_rule_with_options(
     let cost = if let Some(cost) = pre_scanned_cost {
         cost
     } else {
-        let mut acc = RuleCostAccumulator::new(anchored, rule_fixed_bytes);
+        let mut acc = RuleCostAccumulator::new(anchored, rule_fixed_bytes, case_insensitive);
         for part in &parts {
             acc.push_part(part);
         }
@@ -748,6 +749,7 @@ fn parse_rule_with_options(
         }
         match check_rule_budget_overflow(
             body,
+            case_insensitive,
             cost,
             max_compiled,
             compiled_budget_exceeded,
@@ -763,7 +765,7 @@ fn parse_rule_with_options(
     let mut normalized = Vec::with_capacity(parts.len());
     let mut gate: Option<Vec<u8>> = None;
     for part in &parts {
-        let Some(bytes) = normalize_bracket_classes(part.bytes) else {
+        let Some(bytes) = normalize_bracket_classes(part.bytes, case_insensitive) else {
             return Ok(ParsedRuleLine::discarded(parsed_parts));
         };
         if let Some(literal) = longest_literal_run(&bytes)
@@ -834,6 +836,7 @@ struct RuleCost {
 struct RuleCostAccumulator {
     compiled_count: usize,
     retained_bytes: usize,
+    case_insensitive: bool,
     prev_any_dirs: bool,
     last_was_whole_stars: bool,
     saw_bracket: bool,
@@ -841,11 +844,12 @@ struct RuleCostAccumulator {
 }
 
 impl RuleCostAccumulator {
-    fn new(anchored: bool, rule_fixed_bytes: usize) -> Self {
+    fn new(anchored: bool, rule_fixed_bytes: usize, case_insensitive: bool) -> Self {
         let unanchored = usize::from(!anchored);
         Self {
             compiled_count: unanchored,
             retained_bytes: rule_fixed_bytes.saturating_add(unanchored * ANY_DIRS_COMPONENT_BYTES),
+            case_insensitive,
             prev_any_dirs: !anchored,
             last_was_whole_stars: false,
             saw_bracket: false,
@@ -874,7 +878,7 @@ impl RuleCostAccumulator {
             let bytes = if is_whole_stars {
                 ANY_DIRS_COMPONENT_BYTES
             } else {
-                component_cost(part.bytes)
+                component_cost(part.bytes, self.case_insensitive)
             };
             self.retained_bytes = self.retained_bytes.saturating_add(bytes);
         }
@@ -883,7 +887,7 @@ impl RuleCostAccumulator {
     fn finish(mut self) -> RuleCost {
         let trailing_whole_run = self.last_was_whole_stars;
         if trailing_whole_run {
-            let bytes = component_cost(b"*");
+            let bytes = component_cost(b"*", self.case_insensitive);
             self.compiled_count += 1;
             self.retained_bytes = self.retained_bytes.saturating_add(bytes);
         }
@@ -905,6 +909,7 @@ impl RuleCostAccumulator {
 /// component/byte budget), or `Err(Some(exceeded))` for a genuine budget breach.
 fn check_rule_budget_overflow(
     body: &[u8],
+    case_insensitive: bool,
     cost: RuleCost,
     max_compiled: usize,
     compiled_budget_exceeded: ComponentBudgetExceeded,
@@ -918,10 +923,10 @@ fn check_rule_budget_overflow(
     } else {
         return Ok(());
     };
-    if cost.saw_bracket && !validate_rule_syntax_streaming(body) {
+    if cost.saw_bracket && !validate_rule_syntax_streaming(body, case_insensitive) {
         return Err(None);
     }
-    if cost.has_large_component && !validate_large_components_ir_streaming(body) {
+    if cost.has_large_component && !validate_large_components_ir_streaming(body, case_insensitive) {
         return Err(None);
     }
     Err(Some(exceeded))
@@ -945,13 +950,250 @@ fn check_rule_budget_overflow(
 /// Every compiled `Component` counts as 1 component toward component budgets.
 /// Runs in O(part.len()) with zero heap allocations and no divergent
 /// bracket-class parser.
-fn component_cost(part: &[u8]) -> usize {
+/// Compact 256-bit byte set used to deduplicate repeated standalone literals
+/// within a single bracket class across both [`component_cost`] and
+/// [`normalize_bracket_class`].
+#[derive(Default)]
+struct ByteSet([u64; 4]);
+
+impl ByteSet {
+    fn insert(&mut self, byte: u8) -> bool {
+        let word = &mut self.0[(byte >> 6) as usize];
+        let mask = 1_u64 << (byte & 63);
+        let fresh = (*word & mask) == 0;
+        *word |= mask;
+        fresh
+    }
+
+    /// Marks every byte in `lo..=hi` and returns `true` iff at least one byte
+    /// in the range was not already present.
+    fn insert_range(&mut self, lo: u8, hi: u8) -> bool {
+        debug_assert!(lo <= hi);
+        let start_word = (lo >> 6) as usize;
+        let end_word = (hi >> 6) as usize;
+        let mut fresh = false;
+        for word_idx in start_word..=end_word {
+            let low_bit = if word_idx == start_word { lo & 63 } else { 0 };
+            let high_bit = if word_idx == end_word { hi & 63 } else { 63 };
+            let width = high_bit - low_bit + 1;
+            let mask = if width == 64 {
+                u64::MAX
+            } else {
+                ((1_u64 << width) - 1) << low_bit
+            };
+            let word = &mut self.0[word_idx];
+            if (*word & mask) != mask {
+                fresh = true;
+            }
+            *word |= mask;
+        }
+        fresh
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RawClassToken {
+    Close,
+    Range { lower: u8, upper: u8 },
+    PosixSpan { bit: Option<u16>, is_space: bool },
+    Literal(u8),
+}
+
+/// Shared raw bracket-class scanner state mirroring Git's `wildmatch.c` so
+/// [`scan_rule_components`] and [`component_cost`] always agree on class
+/// boundaries (including range-endpoint `[` consumption such as `a-[:digit:]`,
+/// escapes, leading `]`/`!]`/`^]`, and `[:...:]` spans).
+#[derive(Default)]
+struct RawClassState {
+    in_class: bool,
+    saw_member: bool,
+    previous: Option<u8>,
+}
+
+impl RawClassState {
+    fn open(&mut self, bytes: &[u8], index: usize) -> usize {
+        self.in_class = true;
+        self.saw_member = false;
+        self.previous = None;
+        let next = index + 1;
+        if matches!(bytes.get(next), Some(b'!' | b'^')) {
+            next + 1
+        } else {
+            next
+        }
+    }
+
+    fn step_in_class(
+        &mut self,
+        bytes: &[u8],
+        index: usize,
+        next_rbracket: &mut Option<usize>,
+    ) -> (usize, RawClassToken) {
+        debug_assert!(self.in_class);
+        match bytes[index] {
+            b'\\' => {
+                self.saw_member = true;
+                let literal = bytes.get(index + 1).copied().unwrap_or(b'\\');
+                self.previous = Some(literal);
+                (
+                    (index + 2).min(bytes.len()),
+                    RawClassToken::Literal(literal),
+                )
+            }
+            b'-' if let Some(lower) = self.previous
+                && let Some(&next) = bytes.get(index + 1)
+                && next != b']' =>
+            {
+                let (upper, endpoint_len) = if next == b'\\' {
+                    (bytes.get(index + 2).copied().unwrap_or(b'\\'), 2)
+                } else {
+                    (next, 1)
+                };
+                self.saw_member = true;
+                self.previous = None;
+                (
+                    (index + 1 + endpoint_len).min(bytes.len()),
+                    RawClassToken::Range { lower, upper },
+                )
+            }
+            b'[' if bytes.get(index + 1) == Some(&b':') => {
+                let name_start = index + 2;
+                if let Some(rbracket) = next_closing_bracket(bytes, name_start, next_rbracket)
+                    && rbracket > name_start
+                    && bytes[rbracket - 1] == b':'
+                {
+                    let name = &bytes[name_start..rbracket - 1];
+                    self.saw_member = true;
+                    self.previous = None;
+                    (
+                        rbracket + 1,
+                        RawClassToken::PosixSpan {
+                            bit: git_posix_class_bit(name),
+                            is_space: name == b"space",
+                        },
+                    )
+                } else {
+                    self.saw_member = true;
+                    self.previous = Some(b'[');
+                    (index + 1, RawClassToken::Literal(b'['))
+                }
+            }
+            b']' => {
+                if self.saw_member {
+                    self.in_class = false;
+                    self.previous = None;
+                    (index + 1, RawClassToken::Close)
+                } else {
+                    // The first `]` after `[` or `[!` is a literal member;
+                    // only a later one closes the class.
+                    self.saw_member = true;
+                    self.previous = Some(b']');
+                    (index + 1, RawClassToken::Literal(b']'))
+                }
+            }
+            byte => {
+                self.saw_member = true;
+                self.previous = Some(byte);
+                (index + 1, RawClassToken::Literal(byte))
+            }
+        }
+    }
+}
+
+/// Marks the exact normalized byte coverage of raw range `[lower..=upper]` in
+/// `covered_bytes`, returning `true` iff any sub-range adds a new byte.
+fn mark_normalized_range(
+    covered_bytes: &mut ByteSet,
+    lower: u8,
+    upper: u8,
+    case_insensitive: bool,
+) -> bool {
+    if lower > upper {
+        return false;
+    }
+    let mut mark_plain = |lo: u8, hi: u8| -> bool {
+        match (lo, hi) {
+            (b'/', b'/') => false,
+            (b'/', hi) => covered_bytes.insert_range(b'0', hi),
+            (lo, b'/') => covered_bytes.insert_range(lo, b'.'),
+            (lo, hi) => covered_bytes.insert_range(lo, hi),
+        }
+    };
+    if !case_insensitive {
+        return mark_plain(lower, upper);
+    }
+    let mut fresh = false;
+    if lower <= b'@' {
+        fresh |= mark_plain(lower, upper.min(b'@'));
+    }
+    if lower <= b'Z' && upper >= b'A' {
+        let lo = lower.max(b'A').to_ascii_lowercase();
+        let hi = upper.min(b'Z').to_ascii_lowercase();
+        fresh |= mark_plain(lo, hi);
+    }
+    if upper >= b'[' {
+        fresh |= mark_plain(lower.max(b'['), upper);
+    }
+    fresh
+}
+
+fn component_cost(part: &[u8], case_insensitive: bool) -> usize {
     let mut has_wildcard_or_class = false;
     let mut saw_raw_slash = false;
     let mut star_runs = 0_usize;
     let mut effective_len = 0_usize;
+    let mut class = RawClassState::default();
+    let mut covered_bytes = ByteSet::default();
+    let mut seen_posix = 0_u16;
+    let mut prev_charged = false;
+    let mut next_rbracket: Option<usize> = None;
     let mut index = 0;
     while index < part.len() {
+        if class.in_class {
+            let (next, token) = class.step_in_class(part, index, &mut next_rbracket);
+            if !saw_raw_slash && part[index..next].contains(&b'/') {
+                saw_raw_slash = true;
+            }
+            match token {
+                RawClassToken::Literal(byte) => {
+                    if is_matchable_class_literal(byte, case_insensitive)
+                        && covered_bytes.insert(byte)
+                    {
+                        effective_len += next - index;
+                        prev_charged = true;
+                    } else {
+                        prev_charged = false;
+                    }
+                }
+                RawClassToken::Range { lower, upper } => {
+                    if mark_normalized_range(&mut covered_bytes, lower, upper, case_insensitive) {
+                        effective_len += (next - index) + usize::from(!prev_charged);
+                    }
+                    prev_charged = false;
+                }
+                RawClassToken::PosixSpan { bit, is_space } => {
+                    if is_space {
+                        for &space in b" \t\n\r" {
+                            if covered_bytes.insert(space) {
+                                effective_len += 1;
+                            }
+                        }
+                    } else if let Some(posix_bit) = bit
+                        && (seen_posix & posix_bit) == 0
+                    {
+                        seen_posix |= posix_bit;
+                        effective_len += next - index;
+                    }
+                    prev_charged = false;
+                }
+                RawClassToken::Close => {
+                    effective_len += next - index;
+                    prev_charged = false;
+                }
+            }
+            index = next;
+            continue;
+        }
         match part[index] {
             b'\\' if index + 1 < part.len() => {
                 if part[index + 1] == b'/' {
@@ -973,10 +1215,19 @@ fn component_cost(part: &[u8]) -> usize {
                     index += 1;
                 }
             }
-            b'?' | b'[' => {
+            b'?' => {
                 has_wildcard_or_class = true;
                 effective_len += 1;
                 index += 1;
+            }
+            b'[' => {
+                has_wildcard_or_class = true;
+                covered_bytes = ByteSet::default();
+                seen_posix = 0;
+                prev_charged = false;
+                let next = class.open(part, index);
+                effective_len += next - index;
+                index = next;
             }
             _ => {
                 effective_len += 1;
@@ -1004,24 +1255,31 @@ fn component_cost(part: &[u8]) -> usize {
 
 const MAX_POSIX_CLASS_NAME_LEN: usize = 6;
 
-fn is_posix_class_name(name: &[u8]) -> bool {
-    matches!(
-        name,
-        b"alnum"
-            | b"alpha"
-            | b"ascii"
-            | b"blank"
-            | b"cntrl"
-            | b"digit"
-            | b"graph"
-            | b"lower"
-            | b"print"
-            | b"punct"
-            | b"space"
-            | b"upper"
-            | b"word"
-            | b"xdigit"
-    )
+/// The twelve POSIX character classes supported by Git's `wildmatch.c`,
+/// mapped to a unique bit for deduplication. Non-Git extensions such as
+/// `ascii` and `word` are deliberately excluded so ignore rules match Git's
+/// `WM_ABORT_ALL` rejection of unknown classes.
+fn git_posix_class_bit(name: &[u8]) -> Option<u16> {
+    let idx = match name {
+        b"alnum" => 0,
+        b"alpha" => 1,
+        b"blank" => 2,
+        b"cntrl" => 3,
+        b"digit" => 4,
+        b"graph" => 5,
+        b"lower" => 6,
+        b"print" => 7,
+        b"punct" => 8,
+        b"space" => 9,
+        b"upper" => 10,
+        b"xdigit" => 11,
+        _ => return None,
+    };
+    Some(1_u16 << idx)
+}
+
+fn is_git_posix_class_name(name: &[u8]) -> bool {
+    git_posix_class_bit(name).is_some()
 }
 
 /// Zero-allocation syntax validator matching `ferralk-glob::Pattern::compile`
@@ -1072,7 +1330,7 @@ fn validate_glob_class(pattern: &[u8], start: usize) -> Option<usize> {
             let name_start = index + 2;
             let search_end = pattern.len().min(name_start + MAX_POSIX_CLASS_NAME_LEN + 2);
             if let Some(posix_end) = memmem::find(&pattern[name_start..search_end], b":]")
-                && is_posix_class_name(&pattern[name_start..name_start + posix_end])
+                && is_git_posix_class_name(&pattern[name_start..name_start + posix_end])
             {
                 has_member = true;
                 index = name_start + posix_end + 2;
@@ -1098,7 +1356,7 @@ fn validate_glob_class(pattern: &[u8], start: usize) -> Option<usize> {
 /// Returns `true` when every component is syntactically valid (so the caller
 /// should report budget overflow), or `false` when any component is empty or
 /// malformed (so the caller should discard the rule cleanly).
-fn validate_rule_syntax_streaming(body: &[u8]) -> bool {
+fn validate_rule_syntax_streaming(body: &[u8], case_insensitive: bool) -> bool {
     let mut scratch = Vec::new();
     let mut valid = true;
     let scan_result = scan_rule_components(body, usize::MAX, |part| {
@@ -1106,7 +1364,7 @@ fn validate_rule_syntax_streaming(body: &[u8]) -> bool {
             return;
         }
         scratch.clear();
-        if !normalize_bracket_classes_into(part.bytes, &mut scratch) {
+        if !normalize_bracket_classes_into(part.bytes, case_insensitive, &mut scratch) {
             valid = false;
             return;
         }
@@ -1200,7 +1458,7 @@ fn parse_class_ir_members(pattern: &[u8], start: usize) -> Option<(usize, usize)
             let name_start = index + 2;
             let search_end = pattern.len().min(name_start + MAX_POSIX_CLASS_NAME_LEN + 2);
             if let Some(posix_end) = memmem::find(&pattern[name_start..search_end], b":]")
-                && is_posix_class_name(&pattern[name_start..name_start + posix_end])
+                && is_git_posix_class_name(&pattern[name_start..name_start + posix_end])
             {
                 has_any = true;
                 flush(&mut pending, &mut members);
@@ -1421,6 +1679,15 @@ fn collapse_partial_stars_in_place(bytes: &mut Vec<u8>) {
             bytes[write + 1] = bytes[read + 1];
             read += 2;
             write += 2;
+        } else if bytes[read] == b'[' {
+            // Preserve literal `*` bytes inside bracket classes verbatim so
+            // adjacent `*` range endpoints (e.g. `[#-**-0]`) are never merged.
+            let end = validate_glob_class(bytes, read).unwrap_or(bytes.len());
+            if write != read {
+                bytes.copy_within(read..end, write);
+            }
+            write += end - read;
+            read = end;
         } else if bytes[read] == b'*' {
             bytes[write] = b'*';
             write += 1;
@@ -1445,7 +1712,7 @@ fn collapse_partial_stars_in_place(bytes: &mut Vec<u8>) {
 /// should report the budget overflow), or `false` when any component would be
 /// rejected by `Pattern::compile` (so the caller should discard just this rule
 /// cleanly without rolling back the file).
-fn validate_large_components_ir_streaming(body: &[u8]) -> bool {
+fn validate_large_components_ir_streaming(body: &[u8], case_insensitive: bool) -> bool {
     let mut scratch = Vec::new();
     let mut valid = true;
     let scan_result = scan_rule_components(body, usize::MAX, |part| {
@@ -1457,7 +1724,7 @@ fn validate_large_components_ir_streaming(body: &[u8]) -> bool {
         }
         let target: &[u8] = if part.bytes.contains(&b'[') {
             scratch.clear();
-            if !normalize_bracket_classes_into(part.bytes, &mut scratch) {
+            if !normalize_bracket_classes_into(part.bytes, case_insensitive, &mut scratch) {
                 valid = false;
                 return;
             }
@@ -1486,14 +1753,41 @@ struct NormalizedPart {
 #[cfg(test)]
 std::thread_local! {
     static POSIX_CLOSER_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static POSIX_CLOSER_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PATTERN_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PART_VEC_ALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn find_posix_closer(haystack: &[u8]) -> Option<usize> {
+/// Finds the first `]` at or after `from` in `haystack`, caching the last
+/// located position (or `usize::MAX` when no `]` remains) so repeated `[:`
+/// openers inside a pattern scan every byte of `haystack` at most once.
+fn next_closing_bracket(haystack: &[u8], from: usize, cached: &mut Option<usize>) -> Option<usize> {
+    if let Some(pos) = *cached {
+        if pos == usize::MAX {
+            return None;
+        }
+        if pos >= from {
+            return Some(pos);
+        }
+    }
     #[cfg(test)]
     POSIX_CLOSER_SEARCHES.with(|count| count.set(count.get() + 1));
-    memmem::find(haystack, b":]")
+    match memchr::memchr(b']', &haystack[from..]) {
+        Some(rel) => {
+            #[cfg(test)]
+            POSIX_CLOSER_BYTES_SCANNED.with(|bytes| bytes.set(bytes.get() + rel + 1));
+            let pos = from + rel;
+            *cached = Some(pos);
+            Some(pos)
+        }
+        None => {
+            #[cfg(test)]
+            POSIX_CLOSER_BYTES_SCANNED
+                .with(|bytes| bytes.set(bytes.get() + haystack.len().saturating_sub(from)));
+            *cached = Some(usize::MAX);
+            None
+        }
+    }
 }
 
 /// Splits a rule on path separators, keeping a slash inside a bracket class in
@@ -1538,18 +1832,16 @@ fn scan_rule_components<'a>(
 ) -> Result<(bool, usize), ()> {
     let mut count = 0;
     let mut start = 0;
-    let mut in_class = false;
-    let mut class_saw_member = false;
-    // Once a `[:` opener fails to find `:]` in the remainder of `body`, no
-    // later opener (whose search slice is a suffix of that remainder) can find
-    // one either. Caching this guarantees at most one failed scan across the
-    // whole rule; every successful scan jumps `index` past `:]`, so total
-    // bytes scanned by `memmem::find` are strictly O(N).
-    let mut has_posix_closer = true;
+    let mut class = RawClassState::default();
+    let mut next_rbracket: Option<usize> = None;
     let mut index = 0;
     while index < body.len() {
+        if class.in_class {
+            index = class.step_in_class(body, index, &mut next_rbracket).0;
+            continue;
+        }
         match body[index] {
-            b'\\' if !in_class && body.get(index + 1) == Some(&b'/') => {
+            b'\\' if body.get(index + 1) == Some(&b'/') => {
                 // Git's wildmatch treats an escaped slash as the same path
                 // separator. The escape is inert here and must not remain in
                 // either component handed to the glob compiler.
@@ -1569,45 +1861,12 @@ fn scan_rule_components<'a>(
                 index += 2;
             }
             b'\\' => {
-                if in_class {
-                    class_saw_member = true;
-                }
                 index += 2;
             }
-            b'[' if in_class && has_posix_closer && body.get(index + 1) == Some(&b':') => {
-                let start = index + 2;
-                if let Some(end) = find_posix_closer(&body[start..]) {
-                    class_saw_member = true;
-                    index = start + end + 2;
-                } else {
-                    has_posix_closer = false;
-                    class_saw_member = true;
-                    index += 1;
-                }
+            b'[' => {
+                index = class.open(body, index);
             }
-            b'[' if !in_class => {
-                in_class = true;
-                class_saw_member = false;
-                index += 1;
-                if matches!(body.get(index), Some(b'!' | b'^')) {
-                    index += 1;
-                }
-            }
-            b']' if in_class => {
-                if class_saw_member {
-                    in_class = false;
-                } else {
-                    // The first `]` after `[` or `[!` is a literal member;
-                    // only a later one closes the class.
-                    class_saw_member = true;
-                }
-                index += 1;
-            }
-            b'/' if in_class => {
-                class_saw_member = true;
-                index += 1;
-            }
-            b'/' if !in_class => {
+            b'/' => {
                 let slice = &body[start..index];
                 if slice.is_empty() {
                     return Ok((false, count));
@@ -1624,9 +1883,6 @@ fn scan_rule_components<'a>(
                 index += 1;
             }
             _ => {
-                if in_class {
-                    class_saw_member = true;
-                }
                 index += 1;
             }
         }
@@ -1687,20 +1943,25 @@ fn all_stars(part: &[u8]) -> bool {
 /// neighbour `.` stands in, as the lower endpoint `0` does.
 ///
 /// A class left without a matchable member matches nothing, or any byte when
-/// negated. An unclosed class matches nothing, as in Git.
-fn normalize_bracket_classes(part: &[u8]) -> Option<Vec<u8>> {
-    // Escaping literal dashes and endpoints grows the class by at most one
-    // byte per member.
-    let mut result = Vec::with_capacity(part.len() * 2);
-    normalize_bracket_classes_into(part, &mut result).then_some(result)
+/// negated. An unclosed class or an unknown/non-Git POSIX class name matches
+/// nothing, as in Git (`WM_ABORT_ALL`).
+fn normalize_bracket_classes(part: &[u8], case_insensitive: bool) -> Option<Vec<u8>> {
+    // Escaping literal dashes and endpoints grows a small class by at most one
+    // byte per member, while huge repeated-member classes compact to O(1)
+    // bytes; capping the initial reservation avoids multi-MiB transient buffers
+    // on compacted classes.
+    let mut result = Vec::with_capacity(part.len().saturating_mul(2).min(64 * 1024));
+    normalize_bracket_classes_into(part, case_insensitive, &mut result).then_some(result)
 }
 
-fn normalize_bracket_classes_into(part: &[u8], result: &mut Vec<u8>) -> bool {
-    // Shared across all classes in `part`: once `memmem::find` reports no `:]`
-    // in the remaining suffix, no later `[:` opener in this or any subsequent
-    // class can close either. Successful matches jump `index` past `:]`, so
-    // total bytes scanned across `part` remain strictly O(N).
-    let mut has_posix_closer = true;
+fn normalize_bracket_classes_into(
+    part: &[u8],
+    case_insensitive: bool,
+    result: &mut Vec<u8>,
+) -> bool {
+    // Shared across all classes in `part`: caches the next `]` position so
+    // repeated `[:` openers scan every byte of `part` at most once.
+    let mut next_rbracket: Option<usize> = None;
     let mut index = 0;
     while index < part.len() {
         match part[index] {
@@ -1709,9 +1970,13 @@ fn normalize_bracket_classes_into(part: &[u8], result: &mut Vec<u8>) -> bool {
                 index += 2;
             }
             b'[' => {
-                let Some(next) =
-                    normalize_bracket_class(part, index, result, &mut has_posix_closer)
-                else {
+                let Some(next) = normalize_bracket_class(
+                    part,
+                    index,
+                    case_insensitive,
+                    result,
+                    &mut next_rbracket,
+                ) else {
                     return false;
                 };
                 index = next;
@@ -1730,8 +1995,9 @@ fn normalize_bracket_classes_into(part: &[u8], result: &mut Vec<u8>) -> bool {
 fn normalize_bracket_class(
     part: &[u8],
     start: usize,
+    case_insensitive: bool,
     result: &mut Vec<u8>,
-    has_posix_closer: &mut bool,
+    next_rbracket: &mut Option<usize>,
 ) -> Option<usize> {
     let class_start = result.len();
     result.push(b'[');
@@ -1741,13 +2007,24 @@ fn normalize_bracket_class(
         result.push(part[index]);
         index += 1;
     }
-    // Git's `prev_ch`: the literal byte a range operator may follow.
+    // Git's `prev_ch`: the raw literal byte a range operator may follow, plus
+    // whether that byte was actually emitted at the tail of `result` (false
+    // when dropped as `/`, dropped as uppercase under `WM_CASEFOLD`, or
+    // deduplicated as an already-emitted standalone literal).
     let mut previous: Option<u8> = None;
+    let mut prev_pushed = false;
+    // Bytes already covered by emitted literals, ranges, or `[:space:]` in this
+    // class, plus a 12-bit mask of emitted POSIX classes, so long runs of
+    // duplicate literals/ranges/POSIX classes compact strictly to O(1) members
+    // without disturbing range endpoints or changing match semantics.
+    let mut covered_bytes = ByteSet::default();
+    let mut seen_posix = 0_u16;
     // Git closes the class at a `]` only after one member, so a leading `]`
     // is a literal.
     let mut saw_member = false;
-    // Whether the compiler will find a member. Dropped slashes and reversed
-    // ranges contribute none.
+    // Whether the compiler will find a member. Dropped slashes, uppercase
+    // standalone literals under `WM_CASEFOLD`, and reversed ranges contribute
+    // none.
     let mut has_member = false;
     while index < part.len() {
         let byte = part[index];
@@ -1774,28 +2051,26 @@ fn normalize_bracket_class(
             } else {
                 (next, 1)
             };
-            // A reversed range admits only its lower endpoint, which is
-            // already in place as a literal.
-            if lower <= upper {
-                match (lower, upper) {
-                    (b'/', b'/') => {}
-                    (b'/', _) => {
-                        result.extend_from_slice(b"0-");
-                        push_range_endpoint(result, upper);
-                        has_member = true;
-                    }
-                    (_, b'/') => {
-                        result.extend_from_slice(b"-.");
-                        has_member = true;
-                    }
-                    _ => {
-                        result.push(b'-');
-                        push_range_endpoint(result, upper);
-                        has_member = true;
-                    }
-                }
+            // Git compares raw byte endpoints (`prev_ch <= upper`): a reversed
+            // range contributes nothing beyond whatever `lower` already matched
+            // as a literal. Under `WM_CASEFOLD`, Git tests both lowercased
+            // `t_ch` and `toupper(t_ch)` against the raw range `[lower..=upper]`;
+            // splitting around `b'A'..=b'Z'` lets `ferralk-glob`'s folded range
+            // matcher reproduce that exact set.
+            if lower <= upper
+                && push_normalized_range(
+                    result,
+                    lower,
+                    upper,
+                    case_insensitive,
+                    prev_pushed,
+                    &mut covered_bytes,
+                )
+            {
+                has_member = true;
             }
             previous = None;
+            prev_pushed = false;
             index += 1 + endpoint_len;
             continue;
         }
@@ -1803,45 +2078,67 @@ fn normalize_bracket_class(
         match byte {
             b'\\' => {
                 let escaped = *part.get(index + 1)?;
-                if escaped != b'/' {
-                    result.extend_from_slice(&part[index..=index + 1]);
+                prev_pushed =
+                    push_class_literal(result, escaped, case_insensitive, true, &mut covered_bytes);
+                if prev_pushed {
                     has_member = true;
                 }
                 previous = Some(escaped);
                 index += 2;
             }
-            b'[' if *has_posix_closer && part.get(index + 1) == Some(&b':') => {
+            b'[' if part.get(index + 1) == Some(&b':') => {
                 let name_start = index + 2;
-                if let Some(end) = find_posix_closer(&part[name_start..]) {
-                    let end = name_start + end + 2;
-                    result.extend_from_slice(&part[index..end]);
+                let rbracket = next_closing_bracket(part, name_start, next_rbracket)?;
+                if rbracket > name_start && part[rbracket - 1] == b':' {
+                    let name = &part[name_start..rbracket - 1];
+                    let Some(posix_bit) = git_posix_class_bit(name) else {
+                        // Git's `wildmatch.c` returns `WM_ABORT_ALL` on any
+                        // unknown or non-Git POSIX class name (such as
+                        // `[:bogus:]`, `[:ascii:]`, `[:word:]`, `[::]`, or
+                        // `[:a/b:]`), aborting the whole pattern match even
+                        // when negated or combined with valid members.
+                        return None;
+                    };
+                    if name == b"space" {
+                        // Git's `sane-ctype.h` `isspace` matches only `' '`,
+                        // `'\t'`, `'\n'`, and `'\r'`, excluding `\x0B` (VT) and
+                        // `\x0C` (FF) that general POSIX `[:space:]` admits.
+                        for &space in b" \t\n\r" {
+                            if covered_bytes.insert(space) {
+                                result.push(space);
+                            }
+                        }
+                    } else if (seen_posix & posix_bit) == 0 {
+                        seen_posix |= posix_bit;
+                        result.extend_from_slice(&part[index..=rbracket]);
+                    }
                     previous = None;
-                    index = end;
+                    prev_pushed = false;
+                    has_member = true;
+                    index = rbracket + 1;
                 } else {
-                    *has_posix_closer = false;
-                    result.push(b'[');
+                    // No `:]` before the first `]`: Git falls back to treating
+                    // `[` as a literal member and resumes at `:`. Emit it
+                    // escaped so downstream `ferralk-glob` never confuses it
+                    // with a POSIX class opener.
+                    if covered_bytes.insert(b'[') {
+                        result.extend_from_slice(b"\\[");
+                        has_member = true;
+                        prev_pushed = true;
+                    } else {
+                        prev_pushed = false;
+                    }
                     previous = Some(b'[');
                     index += 1;
                 }
-                has_member = true;
-            }
-            b'/' => {
-                previous = Some(b'/');
-                index += 1;
-            }
-            b'-' | b'!' | b'^' => {
-                // A literal dash must not group a range, and a dropped slash
-                // must not move a literal negation marker into first place.
-                result.push(b'\\');
-                result.push(byte);
-                previous = Some(byte);
-                has_member = true;
-                index += 1;
             }
             byte => {
-                result.push(byte);
+                prev_pushed =
+                    push_class_literal(result, byte, case_insensitive, false, &mut covered_bytes);
+                if prev_pushed {
+                    has_member = true;
+                }
                 previous = Some(byte);
-                has_member = true;
                 index += 1;
             }
         }
@@ -1849,12 +2146,121 @@ fn normalize_bracket_class(
     None
 }
 
-/// Writes a range's upper endpoint so the compiler cannot read it as syntax.
-fn push_range_endpoint(result: &mut Vec<u8>, upper: u8) {
-    if matches!(upper, b'\\' | b'-' | b'[' | b']') {
+/// Whether a standalone literal byte inside `[...]` can ever match in Git's
+/// `wildmatch.c`. Candidate components never contain `/`, and under
+/// `WM_CASEFOLD` Git lowercases `t_ch` before testing `t_ch == p_ch`, so a
+/// standalone uppercase ASCII byte can never match directly (though it can
+/// still open an ascending range whose upper check tests `toupper(t_ch)`).
+fn is_matchable_class_literal(byte: u8, case_insensitive: bool) -> bool {
+    byte != b'/' && !(case_insensitive && byte.is_ascii_uppercase())
+}
+
+fn push_class_literal(
+    result: &mut Vec<u8>,
+    byte: u8,
+    case_insensitive: bool,
+    was_escaped: bool,
+    covered_bytes: &mut ByteSet,
+) -> bool {
+    if !is_matchable_class_literal(byte, case_insensitive) || !covered_bytes.insert(byte) {
+        return false;
+    }
+    // A literal dash must not group a range, and dropping `/` or an uppercase
+    // literal must never promote `!`/`^` into first place or fuse `[` with a
+    // following `:...:]` into a synthetic POSIX class (e.g. `[[A:digit:]]` or
+    // `[[/:digit:]]`).
+    if was_escaped || matches!(byte, b'\\' | b'-' | b'[' | b'!' | b'^') {
+        result.push(b'\\');
+        result.push(byte);
+    } else {
+        result.push(byte);
+    }
+    true
+}
+
+/// Emits one ascending raw range `[lower..=upper]` in a form `ferralk-glob`
+/// evaluates identically to Git's `wildmatch.c`.
+fn push_normalized_range(
+    result: &mut Vec<u8>,
+    lower: u8,
+    upper: u8,
+    case_insensitive: bool,
+    lower_already_pushed: bool,
+    covered_bytes: &mut ByteSet,
+) -> bool {
+    if !case_insensitive {
+        return push_plain_range(result, lower, upper, lower_already_pushed, covered_bytes);
+    }
+    // Under `WM_CASEFOLD`, Git matches candidate `c` iff `fold(c)` is in
+    // `[lower..=upper]` OR `fold(c)` is ASCII lowercase and
+    // `fold(c).to_ascii_uppercase()` is in `[lower..=upper]`. Partition
+    // `[lower..=upper]` around `b'A'..=b'Z'` so every emitted sub-range has
+    // fold-invariant endpoints in `ferralk-glob`'s `case_insensitive(true)`.
+    let mut added = false;
+    if lower <= b'@' {
+        let hi = upper.min(b'@');
+        if push_plain_range(result, lower, hi, lower_already_pushed, covered_bytes) {
+            added = true;
+        }
+    }
+    if lower <= b'Z' && upper >= b'A' {
+        let lo = lower.max(b'A').to_ascii_lowercase();
+        let hi = upper.min(b'Z').to_ascii_lowercase();
+        if push_plain_range(result, lo, hi, false, covered_bytes) {
+            added = true;
+        }
+    }
+    if upper >= b'[' {
+        let lo = lower.max(b'[');
+        if push_plain_range(
+            result,
+            lo,
+            upper,
+            lower >= b'[' && lower_already_pushed,
+            covered_bytes,
+        ) {
+            added = true;
+        }
+    }
+    added
+}
+
+fn push_plain_range(
+    result: &mut Vec<u8>,
+    lower: u8,
+    upper: u8,
+    lower_already_pushed: bool,
+    covered_bytes: &mut ByteSet,
+) -> bool {
+    let (lo, hi, lo_pushed) = match (lower, upper) {
+        (b'/', b'/') => return false,
+        (b'/', hi) => (b'0', hi, false),
+        (lo, b'/') => (lo, b'.', lower_already_pushed),
+        (lo, hi) => (lo, hi, lower_already_pushed),
+    };
+    if !covered_bytes.insert_range(lo, hi) {
+        return false;
+    }
+    if lo == hi {
+        if !lo_pushed {
+            push_range_endpoint(result, lo);
+        }
+        return true;
+    }
+    if !lo_pushed {
+        push_range_endpoint(result, lo);
+    }
+    result.push(b'-');
+    push_range_endpoint(result, hi);
+    true
+}
+
+/// Writes a range endpoint so the compiler cannot read it as syntax.
+fn push_range_endpoint(result: &mut Vec<u8>, byte: u8) {
+    if matches!(byte, b'\\' | b'-' | b'[' | b']' | b'!' | b'^') {
         result.push(b'\\');
     }
-    result.push(upper);
+    result.push(byte);
 }
 
 /// Adapts the candidate that one ignore file sees, not its raw pattern. Mac
@@ -1919,9 +2325,9 @@ fn trailing_backslashes(text: &[u8]) -> usize {
 fn longest_literal_run(part: &[u8]) -> Option<Vec<u8>> {
     let mut longest: Vec<u8> = Vec::new();
     let mut current: Vec<u8> = Vec::new();
-    // Shared across all classes in `part`: once `find_posix_closer` reports no
-    // `:]` in the remaining suffix, no later `[:` opener can close either.
-    let mut has_posix_closer = true;
+    // Shared across all classes in `part`: caches the next `]` position so
+    // repeated `[:` openers stay linear without rescanning.
+    let mut next_rbracket: Option<usize> = None;
     let mut index = 0;
     while index < part.len() {
         match part[index] {
@@ -1951,18 +2357,17 @@ fn longest_literal_run(part: &[u8]) -> Option<Vec<u8>> {
                 while scan < part.len() && part[scan] != b']' {
                     if part[scan] == b'\\' {
                         scan = (scan + 2).min(part.len());
-                    } else if has_posix_closer
-                        && part[scan] == b'['
-                        && part.get(scan + 1) == Some(&b':')
-                    {
-                        match find_posix_closer(&part[scan + 2..]) {
-                            Some(end) => scan += 2 + end + 2,
-                            // Remember that no `:]` remains in `part` so later
-                            // `[:` openers stay linear without re-scanning.
-                            None => {
-                                has_posix_closer = false;
-                                scan += 1;
-                            }
+                    } else if part[scan] == b'[' && part.get(scan + 1) == Some(&b':') {
+                        let name_start = scan + 2;
+                        if let Some(rbracket) =
+                            next_closing_bracket(part, name_start, &mut next_rbracket)
+                            && rbracket > name_start
+                            && part[rbracket - 1] == b':'
+                            && is_git_posix_class_name(&part[name_start..rbracket - 1])
+                        {
+                            scan = rbracket + 1;
+                        } else {
+                            scan += 1;
                         }
                     } else {
                         scan += 1;
@@ -1990,12 +2395,13 @@ fn longest_literal_run(part: &[u8]) -> Option<Vec<u8>> {
     (longest.len() >= 2).then_some(longest)
 }
 
-/// Collapses a run of asterisks into a single star.
+/// Collapses a run of asterisks outside bracket classes into a single star.
 ///
 /// A `**` component has already been taken out by [`compile_component`], so
-/// every run reaching here is one ordinary star in Git, and an ordinary star
-/// never crosses a separator. An escaped asterisk is literal and not part of a
-/// run.
+/// every unbracketed run reaching here is one ordinary star in Git, and an
+/// ordinary star never crosses a separator. An escaped asterisk or an asterisk
+/// inside a bracket class is literal and must never be collapsed (otherwise
+/// adjacent `*` range endpoints such as `[#-**-0]` would lose a range).
 fn collapse_partial_stars(part: &[u8]) -> Vec<u8> {
     let mut collapsed = Vec::with_capacity(part.len());
     let mut index = 0;
@@ -2004,6 +2410,11 @@ fn collapse_partial_stars(part: &[u8]) -> Vec<u8> {
             b'\\' if index + 1 < part.len() => {
                 collapsed.extend_from_slice(&part[index..index + 2]);
                 index += 2;
+            }
+            b'[' => {
+                let end = validate_glob_class(part, index).unwrap_or(part.len());
+                collapsed.extend_from_slice(&part[index..end]);
+                index = end;
             }
             b'*' => {
                 let run = part[index..]
@@ -2562,10 +2973,17 @@ mod tests {
         (output, searches)
     }
 
+    fn count_posix_closer_bytes<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        super::POSIX_CLOSER_BYTES_SCANNED.with(|bytes| bytes.set(0));
+        let output = f();
+        let scanned = super::POSIX_CLOSER_BYTES_SCANNED.with(std::cell::Cell::get);
+        (output, scanned)
+    }
+
     #[test]
     fn large_unclosed_posix_openers_scan_at_most_once_per_pass() {
         // 262_144 * 2 bytes = 512 KiB of `[:` openers: verify deterministically
-        // that each parser pass performs at most one `:]` search rather than
+        // that each parser pass performs at most one `]` search rather than
         // rescanning the remainder at every nested opener.
         let openers = "[:".repeat(262_144);
 
@@ -2574,13 +2992,13 @@ mod tests {
         unclosed.push_str(&openers);
         let (parsed, searches) = count_posix_closer_searches(|| parse_rule(&unclosed));
         assert!(parsed.is_none());
-        // One failed search in `split_rule_components` and one in
-        // `normalize_bracket_class` (`longest_literal_run` is not reached).
-        assert_eq!(searches, 2);
+        // One failed search each in `split_rule_components`, `component_cost`,
+        // and `normalize_bracket_class` (`longest_literal_run` is not reached).
+        assert_eq!(searches, 3);
 
         // Closed with a non-colon byte before `]` so no `:]` exists anywhere
-        // in the rule, forcing all three passes (`split_rule_components`,
-        // `normalize_bracket_class`, `longest_literal_run`) to walk the class.
+        // in the rule. `normalize_bracket_class` escapes every literal `[`, so
+        // `longest_literal_run` sees no unescaped `[:` and needs 0 searches.
         let mut closed_without_posix_closer = String::with_capacity(openers.len() + 3);
         closed_without_posix_closer.push('[');
         closed_without_posix_closer.push_str(&openers);
@@ -2594,45 +3012,47 @@ mod tests {
         assert!(rule.matches(b"a", false));
         assert!(!rule.matches(b"b", false));
 
-        // Trailing `:]` without an outer `]` closes the first `[:` opener in
-        // one scan and still leaves the outer class unclosed.
+        // Trailing `:]` without an outer `]` closes the first `[:` opener with
+        // an invalid POSIX class name and aborts in one scan per pass.
         let mut trailing_posix_closer = String::with_capacity(openers.len() + 3);
         trailing_posix_closer.push('[');
         trailing_posix_closer.push_str(&openers);
         trailing_posix_closer.push_str(":]");
         let (parsed, searches) = count_posix_closer_searches(|| parse_rule(&trailing_posix_closer));
         assert!(parsed.is_none());
-        assert_eq!(searches, 2);
+        assert_eq!(searches, 3);
 
-        // Trailing `:]]` closes the first `[:` opener and then the outer class.
+        // Trailing `:]]` closes the first `[:` opener with an invalid POSIX
+        // class name (`[:[:...`), which Git aborts with `WM_ABORT_ALL` in one
+        // scan per pass.
         let mut closed_with_posix_closer = String::with_capacity(openers.len() + 4);
         closed_with_posix_closer.push('[');
         closed_with_posix_closer.push_str(&openers);
         closed_with_posix_closer.push_str(":]]");
         let (parsed, searches) =
             count_posix_closer_searches(|| parse_rule(&closed_with_posix_closer));
-        assert!(parsed.is_some());
+        assert!(parsed.is_none());
         assert_eq!(searches, 3);
 
-        // Repeated separate bracket classes each holding an unclosed `[:` with
-        // no `:]` anywhere: verifies the cached `has_posix_closer` flag carries
-        // across classes so each pass does at most one closer search.
+        // Repeated separate bracket classes each holding a non-POSIX `[:a]`:
+        // every byte is scanned at most once per pass (strictly O(N) total
+        // scanned bytes).
         let repeated_classes = "[[:a]".repeat(100_000);
-        let (parts, split_searches) =
-            count_posix_closer_searches(|| split_rule_components(repeated_classes.as_bytes()));
+        let (parts, split_bytes) =
+            count_posix_closer_bytes(|| split_rule_components(repeated_classes.as_bytes()));
         assert_eq!(parts.len(), 1);
-        assert_eq!(split_searches, 1);
+        assert!(split_bytes <= repeated_classes.len());
 
-        let (normalized, norm_searches) =
-            count_posix_closer_searches(|| normalize_bracket_classes(parts[0].bytes));
+        let (normalized, norm_bytes) =
+            count_posix_closer_bytes(|| normalize_bracket_classes(parts[0].bytes, false));
         let normalized = normalized.expect("repeated closed classes normalize");
-        assert_eq!(normalized.len(), repeated_classes.len());
-        assert_eq!(norm_searches, 1);
+        assert_eq!(normalized.len(), repeated_classes.len() + 100_000);
+        assert!(norm_bytes <= repeated_classes.len());
 
-        let (literal, literal_searches) =
-            count_posix_closer_searches(|| longest_literal_run(&normalized));
+        let (literal, literal_bytes) =
+            count_posix_closer_bytes(|| longest_literal_run(&normalized));
         assert!(literal.is_none());
-        assert_eq!(literal_searches, 1);
+        assert_eq!(literal_bytes, 0);
     }
 
     #[test]
@@ -2954,32 +3374,25 @@ mod tests {
         );
 
         // Every compiled `Component` counts as 1 component toward component
-        // budgets: both `/[a/]` (whose `/` is stripped by normalization) and
-        // `/[[:a/b:]]?` (whose `/` survives inside a `[:...:]` span) fit a
-        // 1-component budget, while `/[[:a/b:]]?` doubles retained-byte
-        // accounting compared to an equal-length pattern without a surviving
-        // `/` (`/[[:a_b:]]?`).
+        // budgets: `/[a/]` (whose `/` is stripped by normalization) fits a
+        // 1-component budget, while invalid POSIX classes like `/[[:a/b:]]?`
+        // and `/[[:a_b:]]?` are rejected cleanly (`WM_ABORT_ALL`) with 0
+        // compiled units and 0 retained bytes.
         let mut builder = RuleSetBuilder::new(root, false, false);
         let stripped_slash_usage = builder
             .add_line_within_budget("/[a/]", budgets(100, 1, 100))
             .expect("normalized slash in [a/] costs 1 compiled component");
         assert_eq!(stripped_slash_usage.compiled_units, 1);
 
-        let mut builder = RuleSetBuilder::new(root, false, false);
-        let slash_usage = builder
-            .add_line_within_budget("/[[:a/b:]]?", budgets(100, 1, 100))
-            .expect("separator-bearing pattern fits 1-component budget");
-        assert_eq!(slash_usage.compiled_units, 1);
-
-        let mut no_slash_builder = RuleSetBuilder::new(root, false, false);
-        let no_slash_usage = no_slash_builder
-            .add_line_within_budget("/[[:a_b:]]?", budgets(100, 1, 100))
-            .expect("equal-length pattern without separator fits 1-component budget");
-        assert_eq!(no_slash_usage.compiled_units, 1);
-        assert!(
-            slash_usage.retained_bytes > no_slash_usage.retained_bytes,
-            "surviving separator inside [:...:] must charge doubled pattern bytes"
-        );
+        for invalid_posix in ["/[[:a/b:]]?", "/[[:a_b:]]?"] {
+            let mut invalid_builder = RuleSetBuilder::new(root, false, false);
+            let usage = invalid_builder
+                .add_line_within_budget(invalid_posix, budgets(100, 1, 100))
+                .expect("invalid POSIX class is discarded cleanly");
+            assert_eq!(usage.parsed_parts, 1);
+            assert_eq!(usage.compiled_units, 0);
+            assert_eq!(usage.retained_bytes, 0);
+        }
 
         let slash_class_component_explosion =
             format!("/{}", "[[:a/b:]]/".repeat(MAX_IGNORE_FILE_COMPONENTS + 1));
@@ -3105,17 +3518,30 @@ mod tests {
         assert_eq!(literal_usage.compiled_units, 2);
         assert!(wildcard_usage.retained_bytes > literal_usage.retained_bytes);
 
-        // Unrecognized POSIX opener followed by wildcards still bounds retained
-        // bytes by full component length regardless of where `parse_class`
-        // closes `]`.
+        // An invalid POSIX class name (`[:bogus:]`) is discarded cleanly
+        // (`WM_ABORT_ALL`), while a valid POSIX class or non-POSIX `[:foo]`
+        // followed by wildcards bounds retained bytes by full component length.
         let bogus_posix = format!("[[:bogus:]]{}", "?".repeat(1_000));
         let mut builder = RuleSetBuilder::new(root, false, false);
         let usage = builder
             .add_line_within_budget(&bogus_posix, budgets(10, 2, 2))
-            .expect("single component fits 2 compiled components");
+            .expect("invalid POSIX class rule is discarded cleanly");
         assert_eq!(usage.parsed_parts, 1);
-        assert_eq!(usage.compiled_units, 2);
-        assert!(usage.retained_bytes >= bogus_posix.len() * super::PATTERN_BYTES_PER_BYTE);
+        assert_eq!(usage.compiled_units, 0);
+        assert_eq!(usage.retained_bytes, 0);
+
+        for valid_posix in [
+            format!("[[:alpha:]]{}", "?".repeat(1_000)),
+            format!("[[:foo]{}", "?".repeat(1_000)),
+        ] {
+            let mut builder = RuleSetBuilder::new(root, false, false);
+            let usage = builder
+                .add_line_within_budget(&valid_posix, budgets(10, 2, 2))
+                .expect("single component fits 2 compiled components");
+            assert_eq!(usage.parsed_parts, 1);
+            assert_eq!(usage.compiled_units, 2);
+            assert!(usage.retained_bytes >= valid_posix.len() * super::PATTERN_BYTES_PER_BYTE);
+        }
 
         // Dense `?` component fails fast on `FileBytes` before allocating
         // `Vec<RulePart>` or compiling any patterns.
@@ -3347,6 +3773,507 @@ mod tests {
         let mut disabled = RuleSetBuilder::new(&root, false, false);
         disabled.add_line("caf\u{e9}.txt");
         assert_eq!(disabled.build().matched(decomposed, false), None);
+    }
+
+    fn match_ignorecase(rule: &[u8], candidate: &[u8]) -> Option<bool> {
+        let mut builder = RuleSetBuilder::new(Path::new(""), true, false);
+        builder.add_line(rule);
+        builder.build().matched(candidate, false)
+    }
+
+    #[test]
+    fn case_insensitive_bracket_classes_and_ranges_match_git_wildmatch() {
+        // Specific high-value boundary cases verified against `git check-ignore`
+        // with `core.ignoreCase = true`.
+        assert_eq!(match_ignorecase(b"[a-Z]", b"a"), Some(true));
+        assert_eq!(match_ignorecase(b"[a-Z]", b"A"), Some(true));
+        assert_eq!(match_ignorecase(b"[a-Z]", b"m"), None);
+        assert_eq!(match_ignorecase(b"[a-Z]", b"Z"), None);
+
+        for matched in [
+            b"A".as_slice(),
+            b"a",
+            b"Z",
+            b"z",
+            b"[",
+            b"\\",
+            b"]",
+            b"^",
+            b"_",
+            b"`",
+        ] {
+            assert_eq!(
+                match_ignorecase(b"[Z-a]", matched),
+                if cfg!(windows) && matched == b"\\" {
+                    None
+                } else {
+                    Some(true)
+                },
+                "[Z-a] under ignoreCase for {:?}",
+                String::from_utf8_lossy(matched)
+            );
+        }
+        assert_eq!(match_ignorecase(b"[Z-a]", b"b"), None);
+        assert_eq!(match_ignorecase(b"[Z-a]", b"B"), None);
+
+        assert_eq!(match_ignorecase(b"[!Z-a]", b"b"), Some(true));
+        assert_eq!(match_ignorecase(b"[!Z-a]", b"B"), Some(true));
+        assert_eq!(match_ignorecase(b"[!Z-a]", b"Z"), None);
+        assert_eq!(match_ignorecase(b"[!Z-a]", b"z"), None);
+        assert_eq!(match_ignorecase(b"[!Z-a]", b"a"), None);
+        assert_eq!(match_ignorecase(b"[!Z-a]", b"["), None);
+
+        assert_eq!(match_ignorecase(b"[!a-Z]", b"a"), None);
+        assert_eq!(match_ignorecase(b"[!a-Z]", b"A"), None);
+        assert_eq!(match_ignorecase(b"[!a-Z]", b"Z"), Some(true));
+        assert_eq!(match_ignorecase(b"[!a-Z]", b"z"), Some(true));
+
+        // Standalone uppercase literals in `[...]` never match in Git under
+        // `WM_CASEFOLD` because Git lowercases `t_ch` before testing `t_ch == p_ch`.
+        assert_eq!(match_ignorecase(b"[Z]", b"Z"), None);
+        assert_eq!(match_ignorecase(b"[Z]", b"z"), None);
+        assert_eq!(match_ignorecase(b"[!Z]", b"Z"), Some(true));
+        assert_eq!(match_ignorecase(b"[!Z]", b"z"), Some(true));
+        assert_eq!(match_ignorecase(b"[Z-/]", b"Z"), None);
+        assert_eq!(match_ignorecase(b"[!Z-/]", b"Z"), Some(true));
+        assert_eq!(match_ignorecase(b"[Z-Z]", b"Z"), Some(true));
+        assert_eq!(match_ignorecase(b"[Z-Z]", b"z"), Some(true));
+        assert_eq!(match_ignorecase(b"[\\Z-a]", b"Z"), Some(true));
+        assert_eq!(match_ignorecase(b"[\\Z-a]", b"z"), Some(true));
+        assert_eq!(match_ignorecase(b"[\\Z-a]", b"["), Some(true));
+        assert_eq!(match_ignorecase(b"[\\Z-a]", b"b"), None);
+
+        // Dropping an unmatchable uppercase byte or `/` must not promote `!` or
+        // `^` into a negation marker, nor fuse a literal `[` with `:digit:]`
+        // into a synthetic POSIX class.
+        assert_eq!(match_ignorecase(b"[A!a]", b"!"), Some(true));
+        assert_eq!(match_ignorecase(b"[A!a]", b"A"), Some(true));
+        assert_eq!(match_ignorecase(b"[A!a]", b"b"), None);
+        assert_eq!(match_ignorecase(b"[A^a]", b"^"), Some(true));
+        assert_eq!(match_ignorecase(b"[A^a]", b"b"), None);
+        assert_eq!(match_ignorecase(b"[[A:digit:]]", b"d]"), Some(true));
+        assert_eq!(match_ignorecase(b"[[A:digit:]]", b"D]"), Some(true));
+        assert_eq!(match_ignorecase(b"[[A:digit:]]", b"[]"), Some(true));
+        assert_eq!(match_ignorecase(b"[[A:digit:]]", b"1"), None);
+        assert_eq!(match_ignorecase(b"[[A:digit:]]", b"1]"), None);
+        assert_eq!(fuzz_rule_bytes(b"[[/:digit:]]", b"d]", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"[[/:digit:]]", b"[]", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"[[/:digit:]]", b"1", false), None);
+        assert_eq!(match_ignorecase(b"[A-[:digit:]]", b"d]"), Some(true));
+        assert_eq!(match_ignorecase(b"[A-[:digit:]]", b"[]"), Some(true));
+        assert_eq!(match_ignorecase(b"[A-[:digit:]]", b"a]"), Some(true));
+        assert_eq!(match_ignorecase(b"[A-[:digit:]]", b"1"), None);
+
+        // Adjacent `*` range endpoints inside `[...]` (whether originally
+        // adjacent as in `[#-**-0]` or brought together by dropping uppercase
+        // `A` under `ignoreCase` in `[#-*A*-0]`) must never be collapsed by
+        // `collapse_partial_stars`.
+        for candidate in [b"x#y".as_slice(), b"x*y", b"x+y", b"x-y", b"x.y", b"x0y"] {
+            assert_eq!(
+                match_ignorecase(b"x[#-*A*-0]y", candidate),
+                Some(true),
+                "x[#-*A*-0]y under ignoreCase for {:?}",
+                String::from_utf8_lossy(candidate)
+            );
+            assert_eq!(
+                fuzz_rule_bytes(b"x[#-**-0]y", candidate, false),
+                Some(true),
+                "x[#-**-0]y for {:?}",
+                String::from_utf8_lossy(candidate)
+            );
+        }
+        assert_eq!(match_ignorecase(b"x[#-*A*-0]y", b"xAy"), None);
+        assert_eq!(match_ignorecase(b"x[#-*A*-0]y", b"x1y"), None);
+        assert_eq!(fuzz_rule_bytes(b"x[#-**-0]y", b"x1y", false), None);
+        assert_eq!(fuzz_rule_bytes(b"x[**-0]y", b"x+y", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"x[*-*]**y", b"x*foo y", false), Some(true));
+
+        // Deduplicating repeated standalone literals and covered ranges must
+        // never disturb later ranges that reuse the same lower endpoint or
+        // partially overlap (e.g. `[*a*-0]`, `[aZa-z]`, `[a-cb-d]`, `[b-da-c]`,
+        // `[ba-b]`, `[a-cA-C]`).
+        for candidate in [b"x*y".as_slice(), b"xay", b"x+y", b"x0y"] {
+            assert_eq!(fuzz_rule_bytes(b"x[*a*-0]y", candidate, false), Some(true));
+        }
+        assert_eq!(fuzz_rule_bytes(b"x[*a*-0]y", b"xby", false), None);
+        assert_eq!(match_ignorecase(b"x[aZa-z]y", b"xmy"), Some(true));
+        assert_eq!(match_ignorecase(b"x[aZa-z]y", b"xMy"), Some(true));
+        assert_eq!(match_ignorecase(b"x[aZa-z]y", b"x0y"), None);
+        for candidate in [b"a".as_slice(), b"b", b"c", b"d"] {
+            assert_eq!(fuzz_rule_bytes(b"[a-cb-d]", candidate, false), Some(true));
+            assert_eq!(fuzz_rule_bytes(b"[b-da-c]", candidate, false), Some(true));
+        }
+        assert_eq!(fuzz_rule_bytes(b"[a-cb-d]", b"e", false), None);
+        assert_eq!(fuzz_rule_bytes(b"[b-da-c]", b"e", false), None);
+        assert_eq!(fuzz_rule_bytes(b"[ba-b]", b"a", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"[ba-b]", b"b", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"[ba-b]", b"c", false), None);
+        assert_eq!(match_ignorecase(b"[a-cA-C]", b"B"), Some(true));
+        assert_eq!(match_ignorecase(b"[a-cA-C]", b"d"), None);
+
+        // Verify `collapse_partial_stars_in_place` agrees with
+        // `collapse_partial_stars` inside and outside bracket classes.
+        let mut in_place = b"x[#-**-0]**[[:digit:]**]***y".to_vec();
+        super::collapse_partial_stars_in_place(&mut in_place);
+        assert_eq!(in_place, b"x[#-**-0]*[[:digit:]**]*y");
+        assert_eq!(
+            super::collapse_partial_stars(b"x[#-**-0]**[[:digit:]**]***y"),
+            in_place
+        );
+
+        // Repeated literals, covered ranges, and POSIX classes compact to O(1)
+        // members in both `normalize_bracket_classes` and `component_cost`.
+        let bracketed_stars = format!("[{}]", "*".repeat(8_192));
+        assert_eq!(
+            normalize_bracket_classes(bracketed_stars.as_bytes(), false).as_deref(),
+            Some(b"[*]".as_slice())
+        );
+        assert_eq!(
+            super::component_cost(bracketed_stars.as_bytes(), false),
+            super::component_cost(b"[*]", false)
+        );
+        let bracketed_ranges = format!("[{}]", "*-*".repeat(10_000));
+        assert_eq!(
+            super::component_cost(bracketed_ranges.as_bytes(), false),
+            super::component_cost(b"[*]", false)
+        );
+        let million_az_ranges = format!("[{}]", "a-z".repeat(1_100_000));
+        assert_eq!(
+            normalize_bracket_classes(million_az_ranges.as_bytes(), false).as_deref(),
+            Some(b"[a-z]".as_slice())
+        );
+        assert_eq!(
+            super::component_cost(million_az_ranges.as_bytes(), false),
+            super::component_cost(b"[a-z]", false)
+        );
+        let repeated_digits = format!("[{}]", "[:digit:]".repeat(500_000));
+        assert_eq!(
+            normalize_bracket_classes(repeated_digits.as_bytes(), false).as_deref(),
+            Some(b"[[:digit:]]".as_slice())
+        );
+        assert_eq!(
+            super::component_cost(repeated_digits.as_bytes(), false),
+            super::component_cost(b"[[:digit:]]", false)
+        );
+
+        // Files with `keep.log` + 256 rules of `[` + 8,192 `*` + `]`, or
+        // `keep.log` + `[` + 1,100,000 `a-z` + `]` + `[` + 500,000 `[:digit:]`
+        // + `]` stay far below the 256 MiB retained-byte budget and keep
+        // `keep.log` ignored.
+        let mut star_file_builder = RuleSetBuilder::new(Path::new("/fixture"), false, false);
+        let mut remaining_units = MAX_IGNORE_FILE_COMPONENTS;
+        let mut remaining_bytes = MAX_IGNORE_FILE_RETAINED_BYTES;
+        for line in std::iter::once("keep.log")
+            .chain(std::iter::repeat_n(bracketed_stars.as_str(), 256))
+            .chain([million_az_ranges.as_str(), repeated_digits.as_str()])
+        {
+            let usage = star_file_builder
+                .add_line_within_budget(
+                    line,
+                    LineBudgets::single_file(remaining_units, remaining_bytes),
+                )
+                .expect("deduplicated bracket-class file fits comfortably within 256 MiB budget");
+            remaining_units -= usage.compiled_units;
+            remaining_bytes -= usage.retained_bytes;
+        }
+        let star_rules = star_file_builder.build();
+        assert!(star_rules.retained_bytes() < 4 * 1024 * 1024);
+        assert_eq!(star_rules.matched(b"/fixture/keep.log", false), Some(true));
+        assert_eq!(star_rules.matched(b"/fixture/*", false), Some(true));
+        assert_eq!(star_rules.matched(b"/fixture/m", false), Some(true));
+        assert_eq!(star_rules.matched(b"/fixture/5", false), Some(true));
+
+        // `[a-[:digit:][]` + 10,000 `*` + `]`, `[` + 10,000 `*-*` + `]`,
+        // `[` + 1,100,000 `a-z` + `]`, `[` + 10,923 `@-a` + `]` (which splits
+        // into 3 sub-ranges under `WM_CASEFOLD`), and repeated POSIX classes
+        // keep `retained_bytes() >= measured` under both `case_insensitive = false`
+        // and `case_insensitive = true`.
+        let range_consumed_stars = format!("[a-[:digit:][]{}]", "*".repeat(10_000));
+        let split_ranges = format!("[{}]", "@-a".repeat(10_923));
+        let repeated_spaces = format!("[{}]", "[:space:]".repeat(10_000));
+        assert_eq!(
+            normalize_bracket_classes(split_ranges.as_bytes(), true).as_deref(),
+            Some(b"[@a-z\\[-a]".as_slice())
+        );
+        assert_eq!(
+            normalize_bracket_classes(repeated_spaces.as_bytes(), false).as_deref(),
+            Some(b"[ \t\n\r]".as_slice())
+        );
+        assert_eq!(
+            super::component_cost(repeated_spaces.as_bytes(), false),
+            super::component_cost(b"[[:space:]]", false)
+        );
+        for (label, rule) in [
+            ("range_consumed_stars", range_consumed_stars.as_str()),
+            ("bracketed_ranges", bracketed_ranges.as_str()),
+            ("bracketed_stars", bracketed_stars.as_str()),
+            ("million_az_ranges", million_az_ranges.as_str()),
+            ("split_ranges", split_ranges.as_str()),
+            ("repeated_digits", repeated_digits.as_str()),
+            ("repeated_spaces", repeated_spaces.as_str()),
+        ] {
+            for case_insensitive in [false, true] {
+                let mut kept = None;
+                let info = allocation_counter::measure(|| {
+                    let mut builder =
+                        RuleSetBuilder::new(Path::new("/fixture"), case_insensitive, false);
+                    builder
+                        .add_line_within_budget(rule, LineBudgets::UNBOUNDED)
+                        .expect("memory-check rule fits unbounded budget");
+                    kept = Some(builder.build());
+                });
+                let rules = kept.expect("RuleSet built");
+                let measured = usize::try_from(info.bytes_current).expect("non-negative bytes");
+                assert!(
+                    rules.retained_bytes() >= measured,
+                    "{label} (case_insensitive={case_insensitive}): estimate ({}) fell below measured ({measured})",
+                    rules.retained_bytes()
+                );
+                drop(std::hint::black_box(rules));
+            }
+        }
+
+        // Exhaustive check against Git's `wildmatch.c` model across all 19
+        // ASCII region boundaries (positive + negated, single + range).
+        let endpoints: &[u8] = b"!./0@AMZ[\\]^_`amz{";
+        let candidates: Vec<u8> = (33_u8..127)
+            .filter(|&b| b != b'/' && !(cfg!(windows) && b == b'\\'))
+            .collect();
+        let escape_endpoint = |byte: u8| -> Vec<u8> {
+            if matches!(byte, b'\\' | b']' | b'-' | b'!' | b'^') {
+                vec![b'\\', byte]
+            } else {
+                vec![byte]
+            }
+        };
+
+        for &lo in endpoints {
+            let lo_enc = escape_endpoint(lo);
+            for negated in [false, true] {
+                let mut single = Vec::new();
+                single.extend_from_slice(b"x[");
+                if negated {
+                    single.push(b'!');
+                }
+                single.extend_from_slice(&lo_enc);
+                single.extend_from_slice(b"]y");
+                let mut builder = RuleSetBuilder::new(Path::new(""), true, false);
+                builder.add_line(&single);
+                let rules = builder.build();
+                for &c in &candidates {
+                    let t = c.to_ascii_lowercase();
+                    let expected = (t == lo) != negated;
+                    let actual = rules.matched(&[b'x', c, b'y'], false) == Some(true);
+                    assert_eq!(
+                        actual,
+                        expected,
+                        "single {} on {:?}",
+                        String::from_utf8_lossy(&single),
+                        char::from(c)
+                    );
+                }
+
+                for &hi in endpoints {
+                    let hi_enc = escape_endpoint(hi);
+                    let mut range = Vec::new();
+                    range.extend_from_slice(b"x[");
+                    if negated {
+                        range.push(b'!');
+                    }
+                    range.extend_from_slice(&lo_enc);
+                    range.push(b'-');
+                    range.extend_from_slice(&hi_enc);
+                    range.extend_from_slice(b"]y");
+                    let mut builder = RuleSetBuilder::new(Path::new(""), true, false);
+                    builder.add_line(&range);
+                    let rules = builder.build();
+                    for &c in &candidates {
+                        let t = c.to_ascii_lowercase();
+                        let mut matched = t == lo;
+                        if lo <= t && t <= hi {
+                            matched = true;
+                        } else if t.is_ascii_lowercase() {
+                            let tu = t.to_ascii_uppercase();
+                            if lo <= tu && tu <= hi {
+                                matched = true;
+                            }
+                        }
+                        let expected = matched != negated;
+                        let actual = rules.matched(&[b'x', c, b'y'], false) == Some(true);
+                        assert_eq!(
+                            actual,
+                            expected,
+                            "range {} on {:?}",
+                            String::from_utf8_lossy(&range),
+                            char::from(c)
+                        );
+                    }
+                }
+            }
+        }
+
+        // Under tight compiled budgets, an unmatchable case-folded class like
+        // `[Z]` is discarded cleanly without rolling back earlier rules.
+        let mut tight = RuleSetBuilder::new(Path::new("/fixture"), true, false);
+        let usage = tight
+            .add_line_within_budget(
+                "[Z]",
+                LineBudgets {
+                    file_parsed_remaining: 10,
+                    file_compiled_remaining: 1,
+                    file_bytes_remaining: usize::MAX,
+                    chain_compiled_remaining: 1,
+                    chain_bytes_remaining: usize::MAX,
+                },
+            )
+            .expect("empty case-folded class is discarded cleanly under tight budget");
+        assert_eq!(usage.parsed_parts, 1);
+        assert_eq!(usage.compiled_units, 0);
+    }
+
+    #[test]
+    fn posix_character_classes_enforce_git_twelve_class_set_and_abort_semantics() {
+        // Every one of Git's 12 POSIX classes works.
+        for (rule, matched, rejected) in [
+            ("[[:alnum:]]", b"a".as_slice(), b"-".as_slice()),
+            ("[[:alpha:]]", b"Z", b"0"),
+            ("[[:blank:]]", b"\t", b"a"),
+            ("[[:cntrl:]]", b"\x07", b"a"),
+            ("[[:digit:]]", b"9", b"a"),
+            ("[[:graph:]]", b"!", b" "),
+            ("[[:lower:]]", b"z", b"Z"),
+            ("[[:print:]]", b" ", b"\x07"),
+            ("[[:punct:]]", b"!", b"a"),
+            ("[[:space:]]", b" ", b"a"),
+            ("[[:upper:]]", b"A", b"a"),
+            ("[[:xdigit:]]", b"f", b"g"),
+        ] {
+            assert_eq!(fuzz_rule(rule, matched, false), Some(true), "{rule}");
+            assert_eq!(fuzz_rule(rule, rejected, false), None, "{rule}");
+        }
+        assert_eq!(match_ignorecase(b"[[:upper:]]", b"a"), Some(true));
+        assert_eq!(match_ignorecase(b"[[:lower:]]", b"A"), Some(true));
+
+        // Git's `[:space:]` uses `sane-ctype.h` (`' '`, `'\t'`, `'\n'`, `'\r'`)
+        // and excludes `\x0B` (VT) and `\x0C` (FF).
+        for byte in *b" \t\n\r" {
+            assert_eq!(
+                fuzz_rule_bytes(b"x[[:space:]]y", &[b'x', byte, b'y'], false),
+                Some(true)
+            );
+            assert_eq!(
+                fuzz_rule_bytes(b"x[![:space:]]y", &[b'x', byte, b'y'], false),
+                None
+            );
+        }
+        for byte in [0x0b_u8, 0x0c_u8] {
+            assert_eq!(
+                fuzz_rule_bytes(b"x[[:space:]]y", &[b'x', byte, b'y'], false),
+                None
+            );
+            assert_eq!(
+                fuzz_rule_bytes(b"x[![:space:]]y", &[b'x', byte, b'y'], false),
+                Some(true)
+            );
+        }
+        assert_eq!(
+            fuzz_rule_bytes(b"x[[:a]/[[:space:]]", b"x[/ ", false),
+            Some(true)
+        );
+        assert_eq!(
+            fuzz_rule_bytes(b"x[[:a]/[[:space:]]", b"x[/\x0c", false),
+            None
+        );
+        assert_eq!(
+            fuzz_rule_bytes(b"x[[:space:]-a]y", b"x-y", false),
+            Some(true)
+        );
+
+        // Unknown and non-Git POSIX classes abort the entire rule (Git's
+        // `WM_ABORT_ALL`), even when negated or paired with valid members.
+        for rule in [
+            b"[[:bogus:]]".as_slice(),
+            b"[![:bogus:]]",
+            b"[a[:bogus:]]",
+            b"[!a[:bogus:]]",
+            b"[[:bogus:]a]",
+            b"[[:ascii:]]",
+            b"[![:ascii:]]",
+            b"[[:word:]]",
+            b"[![:word:]]",
+            b"[[:a/b:]]",
+            b"[![:a/b:]]",
+            b"[[::]]",
+            b"[![::]]",
+            b"[[:DIGIT:]]",
+            b"[[:ALPHA:]]",
+            b"[[:foo[:digit:]]",
+            b"[[:alpha\\:]]",
+            b"*[[:bogus:]]*",
+            b"a/[[:bogus:]]",
+        ] {
+            assert!(
+                parse_rule(rule).is_none(),
+                "invalid/non-Git POSIX class must be rejected: {}",
+                String::from_utf8_lossy(rule)
+            );
+            assert_eq!(
+                match_ignorecase(rule, b"a"),
+                None,
+                "invalid/non-Git POSIX class must stay rejected under ignoreCase: {}",
+                String::from_utf8_lossy(rule)
+            );
+        }
+
+        // `[[:a/b:]]` must never pass an unstripped `/` into `ferralk-glob`.
+        assert!(normalize_bracket_classes(b"[[:a/b:]]", false).is_none());
+        assert!(normalize_bracket_classes(b"[[:a/b:]]", true).is_none());
+
+        // Without `:]` before the first `]`, Git falls back to treating `[` as a
+        // literal class member.
+        for candidate in [b"x[y".as_slice(), b"x:y", b"xay", b"xly"] {
+            assert_eq!(
+                fuzz_rule_bytes(b"x[[:alpha]y", candidate, false),
+                Some(true)
+            );
+        }
+        assert_eq!(fuzz_rule_bytes(b"x[[:alpha]y", b"xby", false), None);
+        assert_eq!(fuzz_rule_bytes(b"x[[:]y", b"x[y", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"x[[:]y", b"x:y", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"x[[:]y", b"x]y", false), None);
+        assert_eq!(fuzz_rule_bytes(b"x[[:alpha", b"xa", false), None);
+
+        // Escaped `]` before `:]` causes the `[:` check to stop at that `]`,
+        // see `\` != `:`, and treat `[` as literal while `\]` stays a member.
+        for candidate in [b"x[y".as_slice(), b"x:y", b"xay", b"x]y", b"xby"] {
+            assert_eq!(
+                fuzz_rule_bytes(b"x[[:a\\]b]y", candidate, false),
+                Some(true)
+            );
+        }
+
+        // Component splitting stops at the first `]` of a non-POSIX `[:foo]`
+        // and honors `[` consumed as a range upper endpoint (`a-[:digit:]`).
+        assert_eq!(
+            fuzz_rule_bytes(b"x[[:foo]/bar[[:digit:]]]y", b"x[/bar0]y", false),
+            Some(true)
+        );
+        assert_eq!(
+            fuzz_rule_bytes(b"x[[:foo]/bar[[:digit:]]]y", b"xf/bar9]y", false),
+            Some(true)
+        );
+        assert_eq!(fuzz_rule_bytes(b"x[[:a/b]c]y", b"xac]y", false), Some(true));
+        assert_eq!(fuzz_rule_bytes(b"x[[:a/b]c]y", b"x[c]y", false), Some(true));
+        for candidate in [b"xa/bar]y".as_slice(), b"xd/bar]y", b"x:/bar]y"] {
+            assert_eq!(
+                fuzz_rule_bytes(b"x[a-[:digit:]/bar]y", candidate, false),
+                Some(true)
+            );
+        }
+        assert_eq!(
+            fuzz_rule_bytes(b"x[a-[:digit:]/bar]y", b"x0/bar]y", false),
+            None
+        );
     }
 
     /// What one verdict costs, both engines, in one process.

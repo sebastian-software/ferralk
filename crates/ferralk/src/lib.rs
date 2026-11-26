@@ -9577,6 +9577,132 @@ mod tests {
     }
 
     #[test]
+    fn config_bom_chained_headers_double_signs_and_unicode_whitespace_match_git() {
+        let fixture = Fixture::new();
+        fixture.write("BUILD.log");
+        let initialized = git_command()
+            .args(["init", "--quiet"])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("initialize Git oracle");
+        assert!(initialized.success());
+        fs::write(fixture.root.join(".gitignore"), b"build.log\n").expect("write rule");
+        let config = fixture.root.join(".git/config");
+
+        for (label, contents, expected) in [
+            (
+                "UTF-8 BOM at file start",
+                b"\xEF\xBB\xBF[core]\nignorecase = true\n".as_slice(),
+                true,
+            ),
+            (
+                "chained other then core",
+                b"[other] [core]\nignorecase = true\n",
+                true,
+            ),
+            (
+                "chained core then other",
+                b"[core] ignorecase = false\n[core] [other]\nignorecase = true\n",
+                false,
+            ),
+            (
+                "quoted ] in subsection before core",
+                b"[remote \"a]\"] [core] ignorecase = true\n",
+                true,
+            ),
+            (
+                "quoted escaped quote and ] in subsection before core",
+                b"[remote \"a\\\"]\"] [core] ignorecase = true\n",
+                true,
+            ),
+            (
+                "quoted hash and semicolon in subsection with continuation",
+                b"[remote \"a#;]\"] [core] ignorecase = tru\\\ne\n",
+                true,
+            ),
+            (
+                "carriage return before quoted subsection",
+                b"[remote\r\"x\"] [core] ignorecase = true\n",
+                true,
+            ),
+            (
+                "empty section name with quoted subsection and continuation swallows [core]",
+                b"[core]\nignorecase = false\n[ \"sub\"] dummy = foo\\\n[core]\nignorecase = true\n",
+                false,
+            ),
+            (
+                "empty section name with quoted subsection followed by chained [core]",
+                b"[ \"sub\"] [core] ignorecase = true\n",
+                true,
+            ),
+            (
+                "leading vertical tab before integer via strtoimax",
+                b"[core]\nignorecase = \x0b1\n",
+                true,
+            ),
+            (
+                "comment after section header",
+                b"[core] # [other]\nignorecase = true\n",
+                true,
+            ),
+        ] {
+            fs::write(&config, contents).expect("write local config");
+            assert_eq!(
+                git_config_bool(&fixture.root, "core.ignoreCase"),
+                expected,
+                "Git oracle verdict for {label}",
+            );
+            let walked = Walker::new(&fixture.root)
+                .respect_git_ignore(true)
+                .collect()
+                .expect("walk with local config");
+            assert_eq!(
+                !relative_paths(walked.entries(), &fixture.root)
+                    .contains(&PathBuf::from("BUILD.log")),
+                expected,
+                "Ferralk must agree with Git for {label}",
+            );
+        }
+
+        // Invalid numeric signs and non-ASCII whitespace must be rejected by
+        // Git and must not flip an earlier valid setting in Ferralk.
+        for bad_value in [
+            "+-1",
+            "--1",
+            "0x-1",
+            "0-0",
+            "\x0btrue",
+            "1\x0b",
+            "\u{00A0}true",
+            "true\u{2003}",
+        ] {
+            fs::write(
+                &config,
+                format!("[core]\nignoreCase = false\nignoreCase = {bad_value}\n"),
+            )
+            .expect("write invalid boolean config");
+            let git_status = git_command()
+                .args(["config", "--get", "--type=bool", "core.ignoreCase"])
+                .current_dir(&fixture.root)
+                .output()
+                .expect("run git config on invalid value");
+            assert!(
+                !git_status.status.success(),
+                "Git must reject invalid boolean value {bad_value:?}"
+            );
+            let walked = Walker::new(&fixture.root)
+                .respect_git_ignore(true)
+                .collect()
+                .expect("walk keeps prior valid config");
+            assert!(
+                relative_paths(walked.entries(), &fixture.root)
+                    .contains(&PathBuf::from("BUILD.log")),
+                "invalid value {bad_value:?} must not override core.ignoreCase = false"
+            );
+        }
+    }
+
+    #[test]
     fn case_variant_ignore_file_follows_the_filesystem_canonical_open() {
         let fixture = Fixture::new();
         fixture.write("build.log");
