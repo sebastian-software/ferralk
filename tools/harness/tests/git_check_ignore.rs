@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -200,11 +201,14 @@ fn root_spellings_match_git_ls_files() {
     for path in [
         ".gitignore",
         "keep.txt",
+        "anchored.txt",
         "ignored.log",
         "src/keep.rs",
+        "src/anchored.txt",
         "src/ignored.log",
         "src/sub/.gitignore",
         "src/sub/keep.rs",
+        "src/sub/local_anchored.txt",
         "src/sub/local.tmp",
         "src/sub/deep/keep.md",
         "src/sub/deep/ignored.log",
@@ -214,36 +218,50 @@ fn root_spellings_match_git_ls_files() {
             .expect("create fixture directory");
         let contents = match path.file_name().and_then(|name| name.to_str()) {
             Some(".gitignore") if path.parent() == Some(repository.as_path()) => {
-                b"*.log\n".as_slice()
+                b"*.log\n/anchored.txt\nsrc/anchored.txt\n".as_slice()
             }
-            Some(".gitignore") => b"*.tmp\n".as_slice(),
+            Some(".gitignore") => b"*.tmp\n/local_anchored.txt\n".as_slice(),
             _ => b"fixture".as_slice(),
         };
         fs::write(path, contents).expect("write root-spelling fixture");
     }
 
+    let mut abs_repo_double_slash = repository.as_os_str().to_os_string();
+    abs_repo_double_slash.push("//");
+    let mut abs_src_double_slash = repository.join("src").into_os_string();
+    abs_src_double_slash.push("//");
     let cases = [
-        (".", "."),
-        (".", "./"),
-        (".", "src"),
-        (".", "src/"),
-        (".", "./src/"),
-        (".", "src//sub"),
-        (".", "src/./sub/"),
-        ("src", "."),
-        ("src", "./"),
-        ("src", "sub"),
-        ("src", "sub/"),
-        ("src", "./sub/"),
-        ("src", "../src"),
-        ("src", "../src/"),
-        ("src/sub", "."),
-        ("src/sub", "./"),
-        ("src/sub", ".."),
-        ("src/sub", "../"),
-        ("src/sub", "../sub"),
-        ("src/sub", "../../src"),
-        ("src/sub", "../../src/sub"),
+        (".", OsStr::new(".")),
+        (".", OsStr::new("./")),
+        (".", OsStr::new(".//")),
+        (".", OsStr::new("src")),
+        (".", OsStr::new("src/")),
+        (".", OsStr::new("src//")),
+        (".", OsStr::new("./src/")),
+        (".", OsStr::new("./src//")),
+        (".", OsStr::new("src//sub")),
+        (".", OsStr::new("src//sub//")),
+        (".", OsStr::new("src/./sub/")),
+        (".", abs_repo_double_slash.as_os_str()),
+        (".", abs_src_double_slash.as_os_str()),
+        ("src", OsStr::new(".")),
+        ("src", OsStr::new("./")),
+        ("src", OsStr::new(".//")),
+        ("src", OsStr::new("sub")),
+        ("src", OsStr::new("sub/")),
+        ("src", OsStr::new("sub//")),
+        ("src", OsStr::new("./sub/")),
+        ("src", OsStr::new("../src")),
+        ("src", OsStr::new("../src/")),
+        ("src", OsStr::new("../src//")),
+        ("src/sub", OsStr::new(".")),
+        ("src/sub", OsStr::new("./")),
+        ("src/sub", OsStr::new(".//")),
+        ("src/sub", OsStr::new("..")),
+        ("src/sub", OsStr::new("../")),
+        ("src/sub", OsStr::new("../sub")),
+        ("src/sub", OsStr::new("../../src")),
+        ("src/sub", OsStr::new("../../src/sub")),
     ];
     for (working_directory, spelling) in cases {
         let status = Command::new(std::env::current_exe().expect("locate test binary"))
