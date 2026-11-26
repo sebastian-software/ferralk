@@ -4997,7 +4997,9 @@ fn ensure_source_brace_compiled_ir_lower_bound(
     if provenance_upper > provenance_budget.remaining {
         return Ok(());
     }
-    let (question_marks, has_extglob) = unconditional_compiled_units(pattern, options);
+    let Some((question_marks, has_extglob)) = unconditional_compiled_units(pattern, options) else {
+        return Ok(());
+    };
     let per_alternative = question_marks.saturating_add(if has_extglob {
         summary.minimum_length
     } else {
@@ -5101,27 +5103,112 @@ fn brace_expansion_summary(
     Some(prefix.concat(group).concat(suffix))
 }
 
+/// Maximum live brace nesting tracked by [`unconditional_compiled_units`].
+///
+/// Deeper nesting while more than this many closing braces remain defers to the
+/// exact expansion and compiler budgets so the preflight stays within a fixed
+/// scratch cap.
+const MAX_UNCONDITIONAL_BRACE_DEPTH: usize = 1_024;
+
+#[cfg(test)]
+thread_local! {
+    static UNCONDITIONAL_BRACE_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static UNCONDITIONAL_BRACE_SCANNED_BYTES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn unconditional_brace_peak() -> usize {
+    UNCONDITIONAL_BRACE_PEAK.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_unconditional_brace_scanned_bytes() {
+    UNCONDITIONAL_BRACE_SCANNED_BYTES.with(|cell| cell.set(0));
+}
+
+#[cfg(test)]
+fn unconditional_brace_scanned_bytes() -> usize {
+    UNCONDITIONAL_BRACE_SCANNED_BYTES.with(std::cell::Cell::get)
+}
+
 /// Counts compiler units whose syntax is outside every matched brace group.
-fn unconditional_compiled_units(pattern: &[u8], options: PatternOptions) -> (usize, bool) {
+///
+/// Keeps scratch memory bounded by `min(remaining_closing_braces,
+/// MAX_UNCONDITIONAL_BRACE_DEPTH)`: oldest open braces beyond the remaining
+/// closing-brace count can never match and are discarded, and live nesting
+/// beyond the cap returns `None` so the caller defers to the exact compiler.
+fn unconditional_compiled_units(pattern: &[u8], options: PatternOptions) -> Option<(usize, bool)> {
+    let mut remaining_closing_braces = memchr::memchr_iter(b'}', pattern).count();
     let mut question_marks = 0_usize;
     let mut has_extglob = false;
+    let mut open_braces = std::collections::VecDeque::new();
+    #[cfg(test)]
+    let mut peak = 0_usize;
+    #[cfg(test)]
+    let mut scanned = 0_usize;
     let mut index = 0;
     while index < pattern.len() {
+        #[cfg(test)]
+        {
+            scanned += 1;
+        }
         if options.escape && pattern[index] == b'\\' {
+            if pattern.get(index + 1) == Some(&b'}') {
+                remaining_closing_braces -= 1;
+                if open_braces.len() > remaining_closing_braces {
+                    open_braces.pop_front();
+                }
+            }
             index += usize::from(index + 1 < pattern.len()) + 1;
             continue;
         }
-        if pattern[index] == b'{'
-            && let Some(close) = matching_brace(pattern, index, options.escape)
-        {
-            index = close + 1;
-            continue;
+        if remaining_closing_braces > 0 {
+            match pattern[index] {
+                b'{' => {
+                    while open_braces.len() >= remaining_closing_braces {
+                        open_braces.pop_front();
+                    }
+                    if open_braces.len() == MAX_UNCONDITIONAL_BRACE_DEPTH {
+                        #[cfg(test)]
+                        {
+                            UNCONDITIONAL_BRACE_PEAK.with(|cell| cell.set(peak));
+                            UNCONDITIONAL_BRACE_SCANNED_BYTES
+                                .with(|cell| cell.set(cell.get() + scanned));
+                        }
+                        return None;
+                    }
+                    open_braces.push_back((question_marks, has_extglob));
+                    #[cfg(test)]
+                    {
+                        peak = peak.max(open_braces.len());
+                    }
+                    index += 1;
+                    continue;
+                }
+                b'}' => {
+                    remaining_closing_braces -= 1;
+                    if let Some((saved_question_marks, saved_has_extglob)) = open_braces.pop_back()
+                    {
+                        question_marks = saved_question_marks;
+                        has_extglob = saved_has_extglob;
+                    }
+                    index += 1;
+                    continue;
+                }
+                _ => {}
+            }
         }
         question_marks += usize::from(pattern[index] == b'?');
-        has_extglob |= detect_extglob_at(pattern, index).is_some();
+        has_extglob |= options.extglob && detect_extglob_at(pattern, index).is_some();
         index += 1;
     }
-    (question_marks, options.extglob && has_extglob)
+    #[cfg(test)]
+    {
+        UNCONDITIONAL_BRACE_PEAK.with(|cell| cell.set(peak));
+        UNCONDITIONAL_BRACE_SCANNED_BYTES.with(|cell| cell.set(cell.get() + scanned));
+    }
+    Some((question_marks, has_extglob))
 }
 
 /// Rejects brace expansions whose unavoidable compiler structures exceed the
@@ -5585,6 +5672,30 @@ struct ExtglobAlternative {
     absorbed_by_separator: bool,
 }
 
+/// How [`match_extglob_task`] deduplicates arrivals at a group's start offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupEntryMemo {
+    /// Reached only through fixed-width steps from a single deduplicated task
+    /// entry (no preceding star or `through_separator` split), so the same
+    /// `(group.start, path_index)` can never be visited twice.
+    None,
+    /// Reached only from a single task arrival after one or more ordinary stars
+    /// with no crossing-to-component-local star pair and no recursive `**/`
+    /// prefix, so `path_index` arrives monotonically and a single stack slot
+    /// catches separator-stop retries without heap memo pages.
+    Monotonic,
+    /// Like [`Self::Monotonic`], except an earlier star precedes a
+    /// separator-bound star that can populate `crossing_star` under
+    /// `is_match_path`. Uses stack deduplication unless `crossing_star`
+    /// actually activates at runtime, in which case it falls back to paged
+    /// `(group.start, path_index)` memoization.
+    MonotonicOrCrossingStar,
+    /// Reached after a recursive `**/` prefix, a multi-arrival preceding group
+    /// plus a star, or a `through_separator` split, requiring paged
+    /// `(group.start, path_index)` memoization in `ExtglobFailedStates`.
+    Paged,
+}
+
 /// One `?(…)`, `*(…)`, `+(…)`, `@(…)` or `!(…)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExtglobGroup {
@@ -5614,6 +5725,8 @@ struct ExtglobGroup {
     /// a repetition. Empty for a negated group, which consumes what its
     /// alternatives reject rather than their text.
     through_separator: Vec<ExtglobAlternative>,
+    /// Deduplication strategy for arrivals at `self.start`.
+    entry_memo: GroupEntryMemo,
 }
 
 impl ExtglobGroup {
@@ -6231,10 +6344,18 @@ fn compile_extglob(
     // The step table is one entry per byte offset whatever the walk reaches, so
     // it is charged in full before it is allocated.
     budget.charge(pattern.len(), 0)?;
+    #[cfg(test)]
+    EXTGLOB_CLOSING_TABLE_LEN.with(|cell| cell.set(0));
+    let mut closing_parens = ExtglobClosingParens::Direct;
     let mut steps = vec![ExtglobStep::NoMatch; pattern.len()];
     let mut compiled = vec![false; pattern.len()];
     let mut groups = Vec::new();
     let mut pending = vec![0_usize];
+    let mut single_arrival = true;
+    let mut segment_has_star = false;
+    let mut segment_has_crossing_star = false;
+    let mut segment_needs_paged_memo = false;
+    let mut prev_was_separator = false;
     while let Some(index) = pending.pop() {
         if index >= pattern.len() || compiled[index] {
             continue;
@@ -6244,24 +6365,94 @@ fn compile_extglob(
             pattern,
             index,
             options,
+            &mut closing_parens,
             &mut groups,
             budget,
             provenance_budget,
             walker_source_provenance,
         )?;
         match &step {
-            ExtglobStep::Group(group) => pending.push(groups[*group].rest),
-            ExtglobStep::Star { next, .. } | ExtglobStep::Class { next, .. } => pending.push(*next),
+            ExtglobStep::Group(group) => {
+                let group = &mut groups[*group];
+                group.entry_memo = if !segment_has_star && !segment_needs_paged_memo {
+                    GroupEntryMemo::None
+                } else if single_arrival && !segment_needs_paged_memo {
+                    if segment_has_crossing_star {
+                        GroupEntryMemo::MonotonicOrCrossingStar
+                    } else {
+                        GroupEntryMemo::Monotonic
+                    }
+                } else {
+                    GroupEntryMemo::Paged
+                };
+                let uniform_fixed_width = group
+                    .alternatives
+                    .first()
+                    .and_then(|alternative| alternative.width)
+                    .is_some_and(|width| {
+                        group
+                            .alternatives
+                            .iter()
+                            .all(|alternative| alternative.width == Some(width))
+                    });
+                single_arrival = single_arrival
+                    && !segment_has_star
+                    && !segment_needs_paged_memo
+                    && group.kind == ExtglobKind::ExactlyOne
+                    && group.through_separator.is_empty()
+                    && uniform_fixed_width;
+                segment_has_star = false;
+                segment_has_crossing_star = false;
+                segment_needs_paged_memo = !group.through_separator.is_empty();
+                prev_was_separator = false;
+                pending.push(group.rest);
+            }
+            ExtglobStep::Star {
+                next,
+                blocks_leading_period,
+            } => {
+                if !*blocks_leading_period {
+                    segment_needs_paged_memo = true;
+                } else if segment_has_star && prev_was_separator {
+                    segment_has_crossing_star = true;
+                }
+                segment_has_star = true;
+                prev_was_separator = false;
+                pending.push(*next);
+            }
+            ExtglobStep::Class { next, .. } => {
+                prev_was_separator = false;
+                pending.push(*next);
+            }
             // The escaped byte is consumed together with its backslash; the
             // offset between them is never where a walk stands.
-            ExtglobStep::Escape { .. } => pending.push(index + 2),
-            ExtglobStep::Any | ExtglobStep::Byte(_) | ExtglobStep::UnclosedGroup { .. } => {
+            ExtglobStep::Escape { .. } => {
+                prev_was_separator = false;
+                pending.push(index + 2);
+            }
+            ExtglobStep::UnclosedGroup { byte: b'*' } => {
+                if segment_has_star && prev_was_separator {
+                    segment_has_crossing_star = true;
+                }
+                segment_has_star = true;
+                prev_was_separator = false;
+                pending.push(index + 1);
+            }
+            ExtglobStep::Byte(byte) => {
+                prev_was_separator = is_separator(*byte);
+                pending.push(index + 1);
+            }
+            ExtglobStep::Any | ExtglobStep::UnclosedGroup { .. } => {
+                prev_was_separator = false;
                 pending.push(index + 1);
             }
             // The matcher still stops at this state, but compiling the suffix
             // records the same outer path structure for embeddings that need
             // to classify every generated branch.
-            ExtglobStep::NoMatch => pending.push(index + 1),
+            ExtglobStep::NoMatch => {
+                prev_was_separator = false;
+                pending.push(index + 1);
+            }
         }
         steps[index] = step;
     }
@@ -6275,7 +6466,12 @@ fn compile_extglob(
     };
     add_memo_state(0);
     for group in &groups {
-        add_memo_state(group.start);
+        if matches!(
+            group.entry_memo,
+            GroupEntryMemo::MonotonicOrCrossingStar | GroupEntryMemo::Paged
+        ) {
+            add_memo_state(group.start);
+        }
         add_memo_state(group.rest);
         if !group.through_separator.is_empty() {
             // Alternatives that take the separator along resume behind it.
@@ -6321,10 +6517,12 @@ fn compile_extglob(
 }
 
 /// Classifies one byte offset the way the interpreter classified it.
+#[allow(clippy::too_many_arguments)]
 fn compile_extglob_step(
     pattern: &[u8],
     index: usize,
     options: PatternOptions,
+    closing_parens: &mut ExtglobClosingParens,
     groups: &mut Vec<ExtglobGroup>,
     budget: &mut IrBudget,
     provenance_budget: &mut ProvenanceBudget,
@@ -6332,7 +6530,7 @@ fn compile_extglob_step(
 ) -> Result<ExtglobStep, PatternError> {
     if let Some(kind) = detect_extglob_at(pattern, index) {
         let open = index + 1;
-        let Some(close) = closing_extglob_parenthesis(pattern, open, options.escape) else {
+        let Some(close) = closing_parens.closing(pattern, open, options.escape) else {
             return Ok(ExtglobStep::UnclosedGroup {
                 byte: pattern[index],
             });
@@ -6421,6 +6619,7 @@ fn compile_extglob_step(
             spans_components,
             root_wildcard,
             through_separator,
+            entry_memo: GroupEntryMemo::None,
         });
         return Ok(ExtglobStep::Group(groups.len() - 1));
     }
@@ -6435,7 +6634,9 @@ fn compile_extglob_step(
             // ordinary star run.
             while pattern.get(next) == Some(&b'*') {
                 let closed_group_starts_here = detect_extglob_at(pattern, next).is_some()
-                    && closing_extglob_parenthesis(pattern, next + 1, options.escape).is_some();
+                    && closing_parens
+                        .closing(pattern, next + 1, options.escape)
+                        .is_some();
                 if closed_group_starts_here {
                     break;
                 }
@@ -6630,30 +6831,229 @@ fn detect_extglob_at(pattern: &[u8], index: usize) -> Option<ExtglobKind> {
     }
 }
 
-fn closing_extglob_parenthesis(pattern: &[u8], open: usize, escapes: bool) -> Option<usize> {
-    if pattern.get(open) != Some(&b'(') {
-        return None;
+#[cfg(test)]
+thread_local! {
+    static EXTGLOB_CLOSING_TABLE_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EXTGLOB_CLOSING_SCANNED_BYTES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn extglob_closing_table_len() -> usize {
+    EXTGLOB_CLOSING_TABLE_LEN.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_extglob_closing_scanned_bytes() {
+    EXTGLOB_CLOSING_SCANNED_BYTES.with(|cell| cell.set(0));
+}
+
+#[cfg(test)]
+fn extglob_closing_scanned_bytes() -> usize {
+    EXTGLOB_CLOSING_SCANNED_BYTES.with(std::cell::Cell::get)
+}
+
+/// Result of one forward scan for an extglob opener's matching `)`.
+enum ClosingParenScan {
+    Found(usize),
+    Unclosed {
+        last_close: Option<usize>,
+        next_extglob_open: Option<usize>,
+    },
+}
+
+/// Lazily resolves matching `)` offsets for extglob `(` openers.
+///
+/// Closed groups use a direct forward scan with zero allocation. Unclosed
+/// openers collect `last_close` and `next_extglob_open` during the same forward
+/// scan (never scanning the prefix behind `open`). Only after a third unclosed
+/// opener still has another extglob opener strictly before `last_close` does it
+/// build one lookup table over `next_extglob_open..=last_close`.
+enum ExtglobClosingParens {
+    Direct,
+    NoCloseAtOrAfter(usize),
+    PendingDirect { last_close: usize },
+    ReadyToIndex { last_close: usize },
+    Table { base: usize, closes: Vec<usize> },
+}
+
+impl ExtglobClosingParens {
+    fn closing(&mut self, pattern: &[u8], open: usize, escapes: bool) -> Option<usize> {
+        match self {
+            Self::Table { base, closes } if open >= *base => closes
+                .get(open - *base)
+                .copied()
+                .filter(|&close| close != usize::MAX)
+                .map(|rel| *base + rel),
+            Self::Table { .. } => closing_extglob_parenthesis(pattern, open, escapes),
+            Self::NoCloseAtOrAfter(bound) if open >= *bound => None,
+            Self::ReadyToIndex { last_close } => {
+                if open >= *last_close {
+                    return None;
+                }
+                match scan_closing_extglob_parenthesis(pattern, open, escapes) {
+                    ClosingParenScan::Found(close) => Some(close),
+                    ClosingParenScan::Unclosed {
+                        last_close: Some(last),
+                        next_extglob_open: Some(next_open),
+                    } => {
+                        let closes = precompute_extglob_closing_parentheses(
+                            &pattern[next_open..=last],
+                            escapes,
+                        );
+                        #[cfg(test)]
+                        EXTGLOB_CLOSING_TABLE_LEN.with(|cell| cell.set(closes.len()));
+                        *self = Self::Table {
+                            base: next_open,
+                            closes,
+                        };
+                        None
+                    }
+                    ClosingParenScan::Unclosed { last_close, .. } => {
+                        *self = Self::NoCloseAtOrAfter(last_close.unwrap_or(open));
+                        None
+                    }
+                }
+            }
+            Self::PendingDirect { last_close } => {
+                if open >= *last_close {
+                    return None;
+                }
+                match scan_closing_extglob_parenthesis(pattern, open, escapes) {
+                    ClosingParenScan::Found(close) => Some(close),
+                    ClosingParenScan::Unclosed {
+                        last_close: Some(last),
+                        next_extglob_open: Some(_),
+                    } => {
+                        *self = Self::ReadyToIndex { last_close: last };
+                        None
+                    }
+                    ClosingParenScan::Unclosed { last_close, .. } => {
+                        *self = Self::NoCloseAtOrAfter(last_close.unwrap_or(open));
+                        None
+                    }
+                }
+            }
+            Self::Direct | Self::NoCloseAtOrAfter(_) => {
+                match scan_closing_extglob_parenthesis(pattern, open, escapes) {
+                    ClosingParenScan::Found(close) => Some(close),
+                    ClosingParenScan::Unclosed {
+                        last_close: Some(last),
+                        next_extglob_open: Some(_),
+                    } => {
+                        *self = Self::PendingDirect { last_close: last };
+                        None
+                    }
+                    ClosingParenScan::Unclosed { last_close, .. } => {
+                        *self = Self::NoCloseAtOrAfter(last_close.unwrap_or(open));
+                        None
+                    }
+                }
+            }
+        }
     }
-    let mut depth = 1_usize;
-    let mut index = open + 1;
-    while index < pattern.len() {
-        if escapes && pattern[index] == b'\\' {
+}
+
+/// Precomputes the matching `)` offset for every unescaped `(` in `slice`.
+fn precompute_extglob_closing_parentheses(slice: &[u8], escapes: bool) -> Vec<usize> {
+    let mut closing = vec![usize::MAX; slice.len()];
+    let mut open_stack = Vec::new();
+    #[cfg(test)]
+    let mut scanned = 0_usize;
+    let mut index = 0;
+    while index < slice.len() {
+        #[cfg(test)]
+        {
+            scanned += 1;
+        }
+        if escapes && slice[index] == b'\\' {
             index += 2;
             continue;
         }
-        match pattern[index] {
-            b'(' => depth += 1,
+        match slice[index] {
+            b'(' => open_stack.push(index),
             b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(index);
+                if let Some(open) = open_stack.pop() {
+                    closing[open] = index;
                 }
             }
             _ => {}
         }
         index += 1;
     }
-    None
+    #[cfg(test)]
+    EXTGLOB_CLOSING_SCANNED_BYTES.with(|cell| cell.set(cell.get() + scanned));
+    closing
+}
+
+fn scan_closing_extglob_parenthesis(
+    pattern: &[u8],
+    open: usize,
+    escapes: bool,
+) -> ClosingParenScan {
+    if pattern.get(open) != Some(&b'(') {
+        return ClosingParenScan::Unclosed {
+            last_close: None,
+            next_extglob_open: None,
+        };
+    }
+    let mut depth = 1_usize;
+    let mut last_close = None;
+    let mut first_extglob_open = None;
+    let mut prev_was_unescaped_extglob_op = false;
+    #[cfg(test)]
+    let mut scanned = 0_usize;
+    let mut index = open + 1;
+    while index < pattern.len() {
+        #[cfg(test)]
+        {
+            scanned += 1;
+        }
+        if escapes && pattern[index] == b'\\' {
+            prev_was_unescaped_extglob_op = false;
+            index += 2;
+            continue;
+        }
+        let byte = pattern[index];
+        match byte {
+            b'(' => {
+                if first_extglob_open.is_none() && prev_was_unescaped_extglob_op {
+                    first_extglob_open = Some(index);
+                }
+                depth += 1;
+                prev_was_unescaped_extglob_op = false;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    #[cfg(test)]
+                    EXTGLOB_CLOSING_SCANNED_BYTES.with(|cell| cell.set(cell.get() + scanned));
+                    return ClosingParenScan::Found(index);
+                }
+                last_close = Some(index);
+                prev_was_unescaped_extglob_op = false;
+            }
+            _ => {
+                prev_was_unescaped_extglob_op = matches!(byte, b'?' | b'*' | b'+' | b'@' | b'!');
+            }
+        }
+        index += 1;
+    }
+    #[cfg(test)]
+    EXTGLOB_CLOSING_SCANNED_BYTES.with(|cell| cell.set(cell.get() + scanned));
+    let next_extglob_open =
+        first_extglob_open.filter(|&pos| last_close.is_some_and(|last| pos < last));
+    ClosingParenScan::Unclosed {
+        last_close,
+        next_extglob_open,
+    }
+}
+
+fn closing_extglob_parenthesis(pattern: &[u8], open: usize, escapes: bool) -> Option<usize> {
+    match scan_closing_extglob_parenthesis(pattern, open, escapes) {
+        ClosingParenScan::Found(close) => Some(close),
+        ClosingParenScan::Unclosed { .. } => None,
+    }
 }
 
 fn split_extglob_alternatives(content: &[u8], escapes: bool) -> Vec<std::ops::Range<usize>> {
@@ -6701,6 +7101,10 @@ struct ExtglobScratch {
     /// Largest number of deferred continuations live during the previous
     /// match. This proves duplicate states never inflate the worklist.
     pending_peak: usize,
+    #[cfg(test)]
+    /// Number of group expansions executed during the previous match. This
+    /// proves star backtracking never re-expands the same `(group, path_index)`.
+    group_expansions: usize,
     /// Deferred `(program, candidate)` continuations. Extglob groups append
     /// work here instead of recursing through the native stack.
     pending: Vec<(usize, usize)>,
@@ -6725,6 +7129,8 @@ struct ExtglobMatchState<'scratch> {
     pending: &'scratch mut Vec<(usize, usize)>,
     #[cfg(test)]
     pending_peak: &'scratch mut usize,
+    #[cfg(test)]
+    group_expansions: &'scratch mut usize,
     ends: &'scratch mut Vec<usize>,
     candidate_ends: &'scratch mut Vec<usize>,
     excluded: &'scratch mut Vec<bool>,
@@ -6767,6 +7173,8 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                     failed_state_count,
                     #[cfg(test)]
                     pending_peak,
+                    #[cfg(test)]
+                    group_expansions,
                     pending,
                     ends,
                     candidate_ends,
@@ -6786,6 +7194,7 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                     *failed_page_count = 0;
                     *failed_state_count = 0;
                     *pending_peak = 0;
+                    *group_expansions = 0;
                 }
                 let mut state = ExtglobMatchState {
                     visited,
@@ -6800,6 +7209,8 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                     pending,
                     #[cfg(test)]
                     pending_peak,
+                    #[cfg(test)]
+                    group_expansions,
                     ends,
                     candidate_ends,
                     excluded,
@@ -6856,6 +7267,8 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                 failed_state_count,
                 #[cfg(test)]
                 pending_peak,
+                #[cfg(test)]
+                group_expansions,
                 pending,
                 ends,
                 candidate_ends,
@@ -6876,6 +7289,8 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                 pending,
                 #[cfg(test)]
                 pending_peak,
+                #[cfg(test)]
+                group_expansions,
                 ends,
                 candidate_ends,
                 excluded,
@@ -6926,6 +7341,11 @@ fn extglob_failed_stats() -> (usize, usize) {
 #[cfg(test)]
 fn extglob_pending_peak() -> usize {
     EXTGLOB_SCRATCH.with(|cell| cell.borrow().pending_peak)
+}
+
+#[cfg(test)]
+fn extglob_group_expansions() -> usize {
+    EXTGLOB_SCRATCH.with(|cell| cell.borrow().group_expansions)
 }
 
 /// Failure memoization for a single dense interpreter row.
@@ -7065,6 +7485,8 @@ fn match_extglob_task(
     let mut star_path_index = 0_usize;
     let mut has_star = false;
     let mut star_component_local = false;
+    let mut monotonic_range: Option<(usize, usize)> = None;
+    let mut rewound_crossing_star = false;
     // The last separator-crossing star that a later component-local star
     // replaced as the backtrack point, as `(pattern resume, path consumed)`.
     // Only the latest star is normally kept, because it can absorb whatever
@@ -7092,14 +7514,49 @@ fn match_extglob_task(
             }
             match &steps[pattern_index] {
                 ExtglobStep::Group(group) => {
-                    queue_extglob_group(
-                        program,
-                        &program.groups[*group],
-                        path,
-                        path_index,
-                        options,
-                        state,
-                    );
+                    let group = &program.groups[*group];
+                    let should_expand = match group.entry_memo {
+                        GroupEntryMemo::None => true,
+                        GroupEntryMemo::Monotonic => {
+                            if monotonic_range.is_some_and(|(_, hi)| path_index == hi) {
+                                false
+                            } else {
+                                monotonic_range = Some((
+                                    monotonic_range.map_or(path_index, |(lo, _)| lo),
+                                    path_index,
+                                ));
+                                true
+                            }
+                        }
+                        GroupEntryMemo::MonotonicOrCrossingStar if !rewound_crossing_star => {
+                            if monotonic_range.is_some_and(|(_, hi)| path_index == hi) {
+                                false
+                            } else {
+                                monotonic_range = Some((
+                                    monotonic_range.map_or(path_index, |(lo, _)| lo),
+                                    path_index,
+                                ));
+                                true
+                            }
+                        }
+                        GroupEntryMemo::MonotonicOrCrossingStar => {
+                            !monotonic_range.is_some_and(|(lo, hi)| (lo..=hi).contains(&path_index))
+                                && ((pattern_index == start && path_index == start_path_index)
+                                    || state.failed.insert(
+                                        program.memo_state_index(pattern_index),
+                                        path_index,
+                                    ))
+                        }
+                        GroupEntryMemo::Paged => {
+                            (pattern_index == start && path_index == start_path_index)
+                                || state
+                                    .failed
+                                    .insert(program.memo_state_index(pattern_index), path_index)
+                        }
+                    };
+                    if should_expand {
+                        queue_extglob_group(program, group, path, path_index, options, state);
+                    }
                     // The group's continuations are queued; this branch
                     // then backtracks through the preceding star like any
                     // failed step, below.
@@ -7238,6 +7695,7 @@ fn match_extglob_task(
             star_pattern_index = resume;
             star_path_index = consumed;
             star_component_local = false;
+            rewound_crossing_star = true;
         }
         if has_star && star_path_index < path.len() {
             if !extglob_star_can_consume(path, star_path_index, options, star_component_local) {
@@ -7377,6 +7835,10 @@ fn queue_extglob_group(
     options: PatternOptions,
     state: &mut ExtglobMatchState<'_>,
 ) {
+    #[cfg(test)]
+    {
+        *state.group_expansions += 1;
+    }
     match group.kind {
         ExtglobKind::ExactlyOne => {
             matching_extglob_group_ends(
@@ -7877,9 +8339,12 @@ mod tests {
     use super::{
         AlternativeFastPath, ComponentBounds, ExtglobStep, FailedStates, FastPath, IrBudget,
         Pattern, PatternOptions, Prefilter, ProvenanceBudget, SweepEngine, Token,
-        WalkerPathViability, extglob_failed_len, extglob_failed_stats, extglob_pending_peak,
-        extglob_scratch_capacities, positive_extglob_scratch_capacities, scratch_capacities,
-        sweep_is_deferred,
+        WalkerPathViability, extglob_closing_scanned_bytes, extglob_closing_table_len,
+        extglob_failed_len, extglob_failed_stats, extglob_group_expansions, extglob_pending_peak,
+        extglob_scratch_capacities, positive_extglob_scratch_capacities,
+        reset_extglob_closing_scanned_bytes, reset_unconditional_brace_scanned_bytes,
+        scratch_capacities, sweep_is_deferred, unconditional_brace_peak,
+        unconditional_brace_scanned_bytes,
     };
 
     fn compile(pattern: &str) -> Pattern {
@@ -9233,6 +9698,384 @@ mod tests {
             extglob_pending_peak() <= candidate.len() + 1,
             "duplicate retries must not make the worklist quadratic"
         );
+    }
+
+    #[test]
+    fn extglob_group_entry_is_memoized_across_star_backtracking() {
+        let candidate = vec![b'a'; 256];
+        let mut matching_candidate = candidate.clone();
+        matching_candidate.push(b'y');
+
+        for match_hidden in [false, true] {
+            let options = PatternOptions::default()
+                .extglob(true)
+                .recursive_double_star(true)
+                .match_hidden(match_hidden);
+
+            for source in [
+                "!(z)*!(z)y",
+                "*+(a)*+(a)y",
+                "*a*!(z)y",
+                "**/!(z)y",
+                "**/a!(z)y",
+            ] {
+                let pattern = Pattern::compile(source, options).expect("extglob compiles");
+                let program = pattern.alternatives[0]
+                    .extglob
+                    .as_ref()
+                    .expect("extglob program is present");
+                assert!(
+                    program.positive_nfa.is_none(),
+                    "{source} exercises the retained interpreter"
+                );
+                let max_group_expansions = program.groups.len() * (candidate.len() + 1);
+
+                for entry_point in ["is_match", "is_match_path", "is_match_glob_path"] {
+                    let matched = match entry_point {
+                        "is_match" => pattern.is_match(&candidate),
+                        "is_match_path" => pattern.is_match_path(&candidate),
+                        "is_match_glob_path" => pattern.is_match_glob_path(&candidate),
+                        _ => unreachable!(),
+                    };
+                    assert!(
+                        !matched,
+                        "{source} ({entry_point}) should reject non-matching candidate"
+                    );
+                    let expansions = extglob_group_expansions();
+                    assert!(
+                        expansions <= max_group_expansions,
+                        "{source} ({entry_point}) expanded groups {expansions} times for {} bytes (bound {max_group_expansions})",
+                        candidate.len()
+                    );
+                }
+                assert!(
+                    pattern.engines_agree(&candidate),
+                    "{source} engines agree on non-matching candidate (match_hidden={match_hidden})"
+                );
+                assert!(pattern.is_match(&matching_candidate));
+                assert!(
+                    pattern.engines_agree(&matching_candidate),
+                    "{source} engines agree on matching candidate (match_hidden={match_hidden})"
+                );
+            }
+
+            // Also test `**/!(z)y` and `**/a!(z)y` on a deep multi-component
+            // non-matching path so the recursive prefix queues and crosses
+            // separators into the group.
+            let deep_non_matching = "a/".repeat(64);
+            for source in ["**/!(z)y", "**/a!(z)y"] {
+                let pattern = Pattern::compile(source, options).expect("extglob compiles");
+                let program = pattern.alternatives[0]
+                    .extglob
+                    .as_ref()
+                    .expect("extglob program is present");
+                let max_group_expansions = program.groups.len() * (deep_non_matching.len() + 1);
+                assert!(!pattern.is_match(&deep_non_matching));
+                let expansions = extglob_group_expansions();
+                assert!(
+                    expansions <= max_group_expansions,
+                    "{source} expanded groups {expansions} times on deep path (bound {max_group_expansions})"
+                );
+                assert!(pattern.engines_agree(&deep_non_matching));
+            }
+
+            // Verify concrete verdicts and engine agreement when `group.start`
+            // is queued directly via adjacent groups, globstar skips, or
+            // `through_separator` resumes.
+            for (source, sample, expected) in [
+                ("!(z)!(z)y", "abcy", true),
+                ("!(z)!(z)y", "x", false),
+                ("!(z)*!(z)y", "zy", true),
+                ("!(z)*!(z)y", "z", false),
+                ("*+(a)*+(a)y", "xaay", true),
+                ("*+(a)*+(a)y", "xay", false),
+                ("file-+(a)*+(a)y", "file-aay", true),
+                ("file-+(a)*+(a)y", "file-ay", false),
+                ("**/!(z)y", "xy", true),
+                ("**/!(z)y", "a/xy", true),
+                ("**/!(z)y", "zy", false),
+                ("**/a!(z)y", "axy", true),
+                ("**/a!(z)y", "b/axy", true),
+                ("**/a!(z)y", "azy", false),
+                ("@(a/**)/!(z)y", "a/xy", true),
+                ("@(a/**)/!(z)y", "a/zy", false),
+            ] {
+                let pattern = Pattern::compile(source, options).expect("extglob compiles");
+                assert_eq!(
+                    pattern.is_match(sample),
+                    expected,
+                    "{source} verdict on {sample:?} (match_hidden={match_hidden})"
+                );
+                assert!(
+                    pattern.engines_agree(sample),
+                    "{source} engines agree on {sample:?} (match_hidden={match_hidden})"
+                );
+            }
+        }
+
+        // Mixed crossing + separator-bound component-local stars can activate
+        // `crossing_star` under `is_match_path`, so they select
+        // `MonotonicOrCrossingStar`: zero group-entry memo pages when
+        // `crossing_star` never activates (such as `is_match`), and paged
+        // deduplication whenever `crossing_star` does activate.
+        let hidden_crossing_positive = Pattern::compile(
+            "*/.hidden/*@(jpg|png)",
+            PatternOptions::default().extglob(true),
+        )
+        .expect("crossing-star positive extglob compiles");
+        assert_eq!(
+            hidden_crossing_positive.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("extglob program is present")
+                .groups[0]
+                .entry_memo,
+            super::GroupEntryMemo::MonotonicOrCrossingStar
+        );
+        let long_hidden_nonmatch = format!("a/.hidden/{}", "x".repeat(65_536));
+        assert!(!hidden_crossing_positive.is_match(&long_hidden_nonmatch));
+        assert_eq!(
+            extglob_failed_stats(),
+            (1, 1),
+            "crossing-star pattern under is_match must stay on monotonic dedup with 1 memo page"
+        );
+
+        let hidden_crossing_negated =
+            Pattern::compile("*/.hidden/*!(z)y", PatternOptions::default().extglob(true))
+                .expect("crossing-star negated extglob compiles");
+        assert!(!hidden_crossing_negated.is_match("x".repeat(65_536)));
+        assert_eq!(extglob_failed_stats(), (1, 1));
+
+        // Even under `is_match_path` where `crossing_star` is saved, staying
+        // inside one component without triggering `crossing_star.take()` must
+        // keep monotonic stack deduplication with 1 memo page / 1 memo state.
+        let foo_crossing_positive =
+            Pattern::compile("*/foo/*@(jpg|png)", PatternOptions::default().extglob(true))
+                .expect("crossing-star foo extglob compiles");
+        assert_eq!(
+            foo_crossing_positive.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("extglob program is present")
+                .groups[0]
+                .entry_memo,
+            super::GroupEntryMemo::MonotonicOrCrossingStar
+        );
+        let foo_single_component_nonmatch = format!("a/foo/{}", "x".repeat(8_192));
+        assert!(!foo_crossing_positive.is_match_path(&foo_single_component_nonmatch));
+        assert_eq!(
+            extglob_failed_stats(),
+            (1, 1),
+            "saving crossing_star without rewinding must not allocate group-entry memo pages"
+        );
+
+        for (source, match_hidden, nonmatch, match_sample) in [
+            (
+                "*/.hidden/*!(z)y",
+                false,
+                "a/b/.hidden/c/d",
+                "a/b/.hidden/xy",
+            ),
+            (
+                "*/.hidden/*!(z)y",
+                true,
+                "a/.hidden/b/.hidden/c",
+                "a/.hidden/b/.hidden/xy",
+            ),
+            ("*a/*!(z)y", false, "aa/a/aa/a/x", "aa/a/aa/a/xy"),
+        ] {
+            let pattern = Pattern::compile(
+                source,
+                PatternOptions::default()
+                    .extglob(true)
+                    .match_hidden(match_hidden),
+            )
+            .expect("crossing-star extglob compiles");
+            let program = pattern.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("extglob program is present");
+            assert_eq!(
+                program.groups[0].entry_memo,
+                super::GroupEntryMemo::MonotonicOrCrossingStar,
+                "{source} must use MonotonicOrCrossingStar when crossing_star can activate"
+            );
+            assert!(!pattern.is_match_path(nonmatch));
+            let expansions = extglob_group_expansions();
+            assert!(
+                expansions <= program.groups.len() * (nonmatch.len() + 1),
+                "{source} expanded groups {expansions} times on {nonmatch:?}"
+            );
+            assert!(pattern.is_match_path(match_sample));
+            assert!(pattern.engines_agree(nonmatch));
+            assert!(pattern.engines_agree(match_sample));
+        }
+
+        // `*/file*@(jpg|png)` has a second star behind `e` (not `/`), so both
+        // stars share locality in every mode and stay on pure `Monotonic` with
+        // 1 memo page / 1 memo state across a >4 KiB (cross-page) nonmatch in
+        // all 3 modes.
+        let same_locality_stars =
+            Pattern::compile("*/file*@(jpg|png)", PatternOptions::default().extglob(true))
+                .expect("same-locality multi-star extglob compiles");
+        assert_eq!(
+            same_locality_stars.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("extglob program is present")
+                .groups[0]
+                .entry_memo,
+            super::GroupEntryMemo::Monotonic
+        );
+        let dir_file_long = format!("dir/file{}", "x".repeat(4_097));
+        assert!(!same_locality_stars.is_match(&dir_file_long));
+        assert_eq!(extglob_failed_stats(), (1, 1));
+        assert!(!same_locality_stars.is_match_path(&dir_file_long));
+        assert_eq!(extglob_failed_stats(), (1, 1));
+        assert!(!same_locality_stars.is_match_glob_path(&dir_file_long));
+        assert_eq!(extglob_failed_stats(), (1, 1));
+        assert!(same_locality_stars.is_match("dir/file1.jpg"));
+        assert!(same_locality_stars.is_match_path("dir/file1.jpg"));
+        assert!(same_locality_stars.is_match_glob_path("dir/file1.jpg"));
+
+        // One or more ordinary leading stars before the first group (or after a
+        // single-arrival uniform fixed-width `ExactlyOne` group) deduplicate via
+        // a stack slot rather than allocating paged memo tables across long
+        // candidates.
+        for (source, nonmatch, match_sample, expected_pages, expected_states) in [
+            ("*@(jpg|png)", "a".repeat(64 * 1024), "photo.jpg", 1, 1),
+            (
+                "*foo*@(jpg|png)",
+                format!("foo{}", "x".repeat(8_192)),
+                "afoob.png",
+                1,
+                1,
+            ),
+            (
+                "@(src|lib)*@(jpg|png)",
+                format!("src{}", "x".repeat(8_192)),
+                "lib/a.jpg",
+                2,
+                2,
+            ),
+        ] {
+            let pattern = Pattern::compile(source, PatternOptions::default().extglob(true))
+                .expect("monotonic-star extglob compiles");
+            let program = pattern.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("extglob program is present");
+            assert_eq!(
+                program
+                    .groups
+                    .last()
+                    .expect("at least one group")
+                    .entry_memo,
+                super::GroupEntryMemo::Monotonic,
+                "{source} should use monotonic stack deduplication on its trailing group"
+            );
+            assert!(!pattern.is_match(&nonmatch));
+            let (pages, states) = extglob_failed_stats();
+            assert_eq!(
+                (pages, states),
+                (expected_pages, expected_states),
+                "{source} must not allocate group-entry memo pages on long nonmatch"
+            );
+            assert!(pattern.is_match(match_sample));
+        }
+
+        // A component-local `*` that clears `has_star` at `/` must keep group
+        // deduplication active on the retry so the group still expands once,
+        // without allocating any group-entry memo page.
+        let star_slash = Pattern::compile("*/!(z)y", PatternOptions::default().extglob(true))
+            .expect("component-local star before negated group compiles");
+        assert_eq!(
+            star_slash.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("extglob program is present")
+                .groups[0]
+                .entry_memo,
+            super::GroupEntryMemo::Monotonic
+        );
+        assert!(!star_slash.is_match_glob_path("a/x"));
+        assert_eq!(
+            extglob_group_expansions(),
+            1,
+            "clearing `has_star` at `/` must not re-expand the following group"
+        );
+        let (pages, _states) = extglob_failed_stats();
+        assert_eq!(
+            pages, 2,
+            "monotonic star retry should only materialize entry and rest memo pages"
+        );
+        assert!(star_slash.is_match_glob_path("a/xy"));
+        assert!(star_slash.engines_agree("a/x"));
+        assert!(star_slash.engines_agree("a/xy"));
+
+        // Verify post-group star, recursive-prefix, and `through_separator`
+        // groups select `GroupEntryMemo::Paged`.
+        let paged_options = PatternOptions::default()
+            .extglob(true)
+            .recursive_double_star(true);
+        for source in ["!(z)*!(z)y", "*+(a)*+(a)y", "**/!(z)y", "@(a/**)/!(z)y"] {
+            let pattern = Pattern::compile(source, paged_options).expect("paged extglob compiles");
+            let program = pattern.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("extglob program is present");
+            assert_eq!(
+                program
+                    .groups
+                    .last()
+                    .expect("at least one group")
+                    .entry_memo,
+                super::GroupEntryMemo::Paged,
+                "{source} should require paged entry memoization on its trailing group"
+            );
+        }
+
+        // Deterministic fixed-width segments before or between groups have only
+        // one way to reach each `group.start`, so matching them must not
+        // materialize extra group-entry memo pages.
+        for (source, matching, non_matching, expected_pages) in [
+            ("file-!(draft).txt", "file-abc.txt", "file-draft.txt", 2),
+            (
+                "file-@(foo|bar)-!(draft).txt",
+                "file-foo-main.txt",
+                "file-foo-draft.txt",
+                3,
+            ),
+            (
+                "@(foo)-@(bar)-@(xyz)-!(draft)",
+                "foo-bar-xyz-main",
+                "foo-bar-xyz-draft",
+                5,
+            ),
+        ] {
+            let pattern = Pattern::compile(source, PatternOptions::default().extglob(true))
+                .expect("deterministic-segment extglob compiles");
+            let program = pattern.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("extglob program is present");
+            assert!(
+                program
+                    .groups
+                    .iter()
+                    .all(|group| group.entry_memo == super::GroupEntryMemo::None),
+                "{source} should not mark deterministic groups for entry memoization"
+            );
+            assert!(pattern.is_match(matching));
+            let (pages, _states) = extglob_failed_stats();
+            assert_eq!(
+                pages, expected_pages,
+                "{source} should only materialize entry and group-rest memo pages"
+            );
+            assert!(!pattern.is_match(non_matching));
+            assert!(pattern.engines_agree(matching));
+            assert!(pattern.engines_agree(non_matching));
+        }
     }
 
     #[test]
@@ -11074,6 +11917,384 @@ mod tests {
         pattern.push_str("[:".repeat(32_768).as_str());
         pattern.push(']');
         assert!(Pattern::compile(&pattern, PatternOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn unclosed_braces_compile_linearly() {
+        let options = PatternOptions::default().braces(true);
+        let unclosed = "{".repeat(100_000);
+        reset_unconditional_brace_scanned_bytes();
+        let compiled = Pattern::compile(&unclosed, options).expect("unclosed braces compile");
+        assert_eq!(unconditional_brace_peak(), 0);
+        assert!(
+            unconditional_brace_scanned_bytes() <= unclosed.len(),
+            "brace preflight scanned {} bytes for {} input bytes",
+            unconditional_brace_scanned_bytes(),
+            unclosed.len()
+        );
+        assert!(compiled.is_match(&unclosed));
+        assert!(!compiled.is_match("x"));
+
+        // A single trailing `}` must keep preflight scratch memory O(1) even
+        // behind 100,000 unclosed `{` openers, and brace expansion stays O(N).
+        let with_tail = format!("{unclosed}{{a,b}}?");
+        let expanded = super::expand_braces(&with_tail, options)
+            .expect("unclosed braces with tail expand linearly");
+        assert_eq!(expanded, [with_tail.as_bytes()]);
+        reset_unconditional_brace_scanned_bytes();
+        let compiled_tail =
+            Pattern::compile(&with_tail, options).expect("unclosed braces with tail compile");
+        assert_eq!(unconditional_brace_peak(), 1);
+        assert!(
+            unconditional_brace_scanned_bytes() <= with_tail.len(),
+            "brace preflight scanned {} bytes for {} input bytes",
+            unconditional_brace_scanned_bytes(),
+            with_tail.len()
+        );
+        assert!(compiled_tail.is_match(format!("{unclosed}{{a,b}}x")));
+        assert!(!compiled_tail.is_match(format!("{unclosed}ax")));
+
+        let with_prefix = format!("{{a,b}}{unclosed}");
+        reset_unconditional_brace_scanned_bytes();
+        let compiled_prefix = Pattern::compile(&with_prefix, options)
+            .expect("prefix brace with unclosed tail compiles");
+        assert_eq!(unconditional_brace_peak(), 1);
+        assert!(
+            unconditional_brace_scanned_bytes() <= with_prefix.len(),
+            "brace preflight scanned {} bytes for {} input bytes",
+            unconditional_brace_scanned_bytes(),
+            with_prefix.len()
+        );
+        assert!(compiled_prefix.is_match(format!("a{unclosed}")));
+        assert!(compiled_prefix.is_match(format!("b{unclosed}")));
+        assert!(!compiled_prefix.is_match(format!("c{unclosed}")));
+
+        // Live nesting deeper than the cap with as many closing braces bails
+        // out of the preflight with bounded scratch instead of growing with N.
+        let deeply_nested = format!("{}{}", "{".repeat(2_000), "}".repeat(2_000));
+        reset_unconditional_brace_scanned_bytes();
+        assert_eq!(
+            super::unconditional_compiled_units(deeply_nested.as_bytes(), options),
+            None
+        );
+        assert!(unconditional_brace_peak() <= super::MAX_UNCONDITIONAL_BRACE_DEPTH);
+        assert!(unconditional_brace_scanned_bytes() <= deeply_nested.len());
+    }
+
+    #[test]
+    fn unclosed_extglob_openers_compile_linearly() {
+        let options = PatternOptions::default().extglob(true);
+
+        // Well-formed short groups followed by a large literal tail must not
+        // allocate a delimiter table.
+        for closed_with_tail in [
+            format!("@(a){}", "x".repeat(200_000)),
+            format!("!(a){}", "x".repeat(400_000)),
+        ] {
+            reset_extglob_closing_scanned_bytes();
+            let compiled_closed = Pattern::compile(&closed_with_tail, options)
+                .expect("closed group with large literal tail compiles");
+            assert_eq!(extglob_closing_table_len(), 0);
+            assert!(
+                extglob_closing_scanned_bytes() <= 16,
+                "short closed group scanned {} bytes",
+                extglob_closing_scanned_bytes()
+            );
+            assert!(!compiled_closed.is_match("x"));
+        }
+
+        // Unclosed openers without a 4th extglob opener before `last_close`
+        // (including `@(@(@(a...a)` where the 3rd opener closes directly, or
+        // unclosed openers followed only by escaped `\)`) must not allocate a
+        // delimiter table.
+        for no_table_pattern in [
+            format!("@({}()", "x".repeat(64_000)),
+            format!("@(@(a){}()", "x".repeat(8_192)),
+            format!("@(@({}()", "x".repeat(64_000)),
+            format!("@(@(@({})", "a".repeat(64_000)),
+            format!("@(@(@({}))", "a".repeat(64_000)),
+            format!(r"@(@(@({}\)", "x".repeat(64_000)),
+        ] {
+            reset_extglob_closing_scanned_bytes();
+            let compiled = Pattern::compile(&no_table_pattern, options)
+                .expect("unclosed opener with balanced or escaped tail compiles");
+            assert_eq!(extglob_closing_table_len(), 0);
+            assert!(
+                extglob_closing_scanned_bytes() <= 6 * no_table_pattern.len(),
+                "delimiter scan visited {} bytes for {} input bytes",
+                extglob_closing_scanned_bytes(),
+                no_table_pattern.len()
+            );
+            assert!(!compiled.is_match("x"));
+        }
+
+        // An unclosed opener after a long prefix of escaped `\)` must never
+        // scan backward over the prefix.
+        let escaped_close_prefix = format!("{}@(", r"\)".repeat(32_000));
+        reset_extglob_closing_scanned_bytes();
+        let compiled_escaped_prefix = Pattern::compile(&escaped_close_prefix, options)
+            .expect("escaped close prefix before unclosed opener compiles");
+        assert_eq!(extglob_closing_table_len(), 0);
+        assert!(
+            extglob_closing_scanned_bytes() <= 8,
+            "prefix of escaped `\\)` must not be rescanned, scanned {} bytes",
+            extglob_closing_scanned_bytes()
+        );
+        assert!(!compiled_escaped_prefix.is_match("x"));
+
+        // Control case: an even number of backslashes (`\\)`) leaves `)`
+        // unescaped, so after 3 unclosed openers the 4th closes against it via
+        // the table.
+        let unescaped_after_double_backslash = format!(r"@(@(@(@({}\\)", "x".repeat(64_000));
+        reset_extglob_closing_scanned_bytes();
+        let compiled_double_backslash =
+            Pattern::compile(&unescaped_after_double_backslash, options)
+                .expect("escaped backslash before closing paren compiles");
+        assert!(extglob_closing_table_len() > 0);
+        assert!(
+            extglob_closing_scanned_bytes() <= 8 * unescaped_after_double_backslash.len(),
+            "escaped backslash tail scanned {} bytes for {} input bytes",
+            extglob_closing_scanned_bytes(),
+            unescaped_after_double_backslash.len()
+        );
+        assert!(!compiled_double_backslash.is_match("x"));
+        let small_double_backslash =
+            Pattern::compile(r"@(@(@(a\\)", options).expect("small double backslash compiles");
+        assert!(small_double_backslash.is_match(r"@(@(a\"));
+        assert!(!small_double_backslash.is_match(r"@(@(@(a\)"));
+
+        let repeated_at = "@(".repeat(50_000);
+        reset_extglob_closing_scanned_bytes();
+        let compiled_at =
+            Pattern::compile(&repeated_at, options).expect("unclosed @() openers compile");
+        assert_eq!(extglob_closing_table_len(), 0);
+        assert!(
+            extglob_closing_scanned_bytes() <= 4 * repeated_at.len(),
+            "repeated @(: scanned {} bytes for {} input bytes",
+            extglob_closing_scanned_bytes(),
+            repeated_at.len()
+        );
+        assert!(!compiled_at.is_match("x"));
+
+        let repeated_at_closed_tail = format!("{repeated_at})");
+        reset_extglob_closing_scanned_bytes();
+        let compiled_at_tail = Pattern::compile(&repeated_at_closed_tail, options)
+            .expect("unclosed @() openers with one closed tail compile");
+        assert_eq!(extglob_closing_table_len(), repeated_at.len() - 6);
+        assert!(
+            extglob_closing_scanned_bytes() <= 8 * repeated_at_closed_tail.len(),
+            "repeated @( with tail: scanned {} bytes for {} input bytes",
+            extglob_closing_scanned_bytes(),
+            repeated_at_closed_tail.len()
+        );
+        assert!(!compiled_at_tail.is_match("x"));
+
+        // When a literal suffix follows the last `)`, the lazy delimiter table
+        // covers only `fourth_open..=last_close` rather than the trailing literals.
+        let repeated_at_middle_close = format!("{repeated_at}){}", "x".repeat(100_000));
+        reset_extglob_closing_scanned_bytes();
+        let compiled_at_middle = Pattern::compile(&repeated_at_middle_close, options)
+            .expect("unclosed @() openers with mid-pattern close compile");
+        assert_eq!(extglob_closing_table_len(), repeated_at.len() - 6);
+        assert!(
+            extglob_closing_scanned_bytes() <= 8 * repeated_at_middle_close.len(),
+            "repeated @( with mid-close: scanned {} bytes for {} input bytes",
+            extglob_closing_scanned_bytes(),
+            repeated_at_middle_close.len()
+        );
+        assert!(!compiled_at_middle.is_match("x"));
+
+        // When a long literal prefix precedes 3 unclosed openers and a 4th
+        // opener before `)`, the lazy table starts at the 4th opener rather
+        // than byte 0.
+        let prefix_before_unclosed = format!("{}@(@(@(@()", "x".repeat(200_000));
+        reset_extglob_closing_scanned_bytes();
+        let compiled_prefix_tail = Pattern::compile(&prefix_before_unclosed, options)
+            .expect("long literal prefix before unclosed openers compiles");
+        assert!(
+            extglob_closing_table_len() > 0 && extglob_closing_table_len() <= 8,
+            "table must start at the fourth opener, got len {}",
+            extglob_closing_table_len()
+        );
+        assert!(
+            extglob_closing_scanned_bytes() <= 64,
+            "long prefix before unclosed tail must not be scanned, got {} bytes",
+            extglob_closing_scanned_bytes()
+        );
+        assert!(!compiled_prefix_tail.is_match("x"));
+
+        // Verify matching semantics on small inputs with the same structure.
+        let small_at = Pattern::compile("@(@(@(", options).expect("small unclosed @() compiles");
+        assert!(small_at.is_match("@(@(@("));
+        assert!(!small_at.is_match("@(@("));
+        let small_at_tail =
+            Pattern::compile("@(@(@()", options).expect("small unclosed @() with tail compiles");
+        assert!(small_at_tail.is_match("@(@("));
+        assert!(!small_at_tail.is_match("@(@(@()"));
+
+        let repeated_double_star = "**(".repeat(30_000);
+        reset_extglob_closing_scanned_bytes();
+        let compiled_stars = Pattern::compile(&repeated_double_star, options)
+            .expect("unclosed **() openers compile");
+        assert_eq!(extglob_closing_table_len(), 0);
+        assert!(
+            extglob_closing_scanned_bytes() <= 4 * repeated_double_star.len(),
+            "repeated **(: scanned {} bytes for {} input bytes",
+            extglob_closing_scanned_bytes(),
+            repeated_double_star.len()
+        );
+        assert!(!compiled_stars.is_match("x"));
+
+        let repeated_double_star_tail = format!("{repeated_double_star})");
+        reset_extglob_closing_scanned_bytes();
+        let compiled_stars_tail = Pattern::compile(&repeated_double_star_tail, options)
+            .expect("unclosed **() openers with one closed tail compile");
+        assert_eq!(
+            extglob_closing_table_len(),
+            repeated_double_star_tail.len() - 11
+        );
+        assert!(
+            extglob_closing_scanned_bytes() <= 8 * repeated_double_star_tail.len(),
+            "repeated **( with tail: scanned {} bytes for {} input bytes",
+            extglob_closing_scanned_bytes(),
+            repeated_double_star_tail.len()
+        );
+        assert!(!compiled_stars_tail.is_match("x"));
+
+        let small_stars =
+            Pattern::compile("**(**(", options).expect("small unclosed **() compiles");
+        assert!(small_stars.is_match("a(b("));
+        assert!(!small_stars.is_match("a("));
+        let small_stars_tail =
+            Pattern::compile("**(**()", options).expect("small unclosed **() with tail compiles");
+        assert!(small_stars_tail.is_match("a("));
+        assert!(!small_stars_tail.is_match("a"));
+    }
+
+    #[test]
+    fn unconditional_compiled_units_matches_direct_brace_scan() {
+        fn reference(pattern: &[u8], options: PatternOptions) -> (usize, bool) {
+            let mut question_marks = 0_usize;
+            let mut has_extglob = false;
+            let mut index = 0;
+            while index < pattern.len() {
+                if options.escape && pattern[index] == b'\\' {
+                    index += usize::from(index + 1 < pattern.len()) + 1;
+                    continue;
+                }
+                if pattern[index] == b'{'
+                    && let Some(close) = super::matching_brace(pattern, index, options.escape)
+                {
+                    index = close + 1;
+                    continue;
+                }
+                question_marks += usize::from(pattern[index] == b'?');
+                has_extglob |= super::detect_extglob_at(pattern, index).is_some();
+                index += 1;
+            }
+            (question_marks, options.extglob && has_extglob)
+        }
+
+        let cases = [
+            "",
+            "?",
+            "{?}",
+            "{{?}",
+            "{{{?a}?}",
+            "{@(a)}",
+            "{{@(a}",
+            "{@(a{b}",
+            "{@({a})",
+            "@({a})",
+            "{a@}(b)",
+            "{?}(a)",
+            "a?({b})",
+            r"a\{?}",
+            r"{?a\",
+            r"{a\\}?",
+            r"{\\}}?",
+            r"{{{\}\}?{?}",
+            r"{?{?\}",
+            r"}\\{?",
+            "{{{??@(a){?}?",
+        ];
+        for escape in [false, true] {
+            for extglob in [false, true] {
+                let options = PatternOptions::default().escape(escape).extglob(extglob);
+                for case in cases {
+                    assert_eq!(
+                        super::unconditional_compiled_units(case.as_bytes(), options),
+                        Some(reference(case.as_bytes(), options)),
+                        "mismatch for {case:?} under escape={escape}, extglob={extglob}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn precomputed_extglob_closing_parentheses_match_direct_scan() {
+        let cases = [
+            "",
+            "@(",
+            "@()",
+            "@((a)",
+            "@((a))",
+            r"@(a\))",
+            r"@(a\)",
+            r"@(a\\))",
+            r"\@(a)",
+            r"@(a)\)",
+            "[(]@(a)",
+            "[)]@(a)",
+            "[(]@(a))",
+            "@([)])",
+            "**(a)**(b",
+            "**(a)**(b)",
+            r"@(a\",
+            "((())((",
+            "@(@(@(a)",
+            "@(@(@(@(a)",
+            r"@(@(@(@(a\))",
+        ];
+        for escapes in [false, true] {
+            for case in cases {
+                let bytes = case.as_bytes();
+                let precomputed = super::precompute_extglob_closing_parentheses(bytes, escapes);
+                super::EXTGLOB_CLOSING_TABLE_LEN.with(|cell| cell.set(0));
+                let mut resolver = super::ExtglobClosingParens::Direct;
+                let mut index = 0;
+                while index < bytes.len() {
+                    if escapes && bytes[index] == b'\\' {
+                        index += 2;
+                        continue;
+                    }
+                    if bytes[index] == b'(' {
+                        let expected = super::closing_extglob_parenthesis(bytes, index, escapes);
+                        assert_eq!(
+                            precomputed
+                                .get(index)
+                                .copied()
+                                .filter(|&close| close != usize::MAX),
+                            expected,
+                            "precomputed mismatch at offset {index} for {case:?} (escapes={escapes})"
+                        );
+                        assert_eq!(
+                            resolver.closing(bytes, index, escapes),
+                            expected,
+                            "resolver mismatch at offset {index} for {case:?} (escapes={escapes})"
+                        );
+                    }
+                    index += 1;
+                }
+                if case == "@(@(@(@(a)" {
+                    assert!(
+                        extglob_closing_table_len() > 0,
+                        "3 unclosed openers followed by a 4th before `)` must build the indexed table"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
