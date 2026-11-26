@@ -25,7 +25,10 @@ use std::{
 use super::glob_path_bytes;
 use super::{
     BoundedFileRead, DirectoryBackend, Listing, Walker,
-    ignore_rules::{RuleSet, RuleSetBuilder},
+    ignore_rules::{
+        ComponentBudgetExceeded, LineBudgets, MAX_IGNORE_FILE_COMPONENTS,
+        MAX_IGNORE_FILE_RETAINED_BYTES, RuleSet, RuleSetBuilder,
+    },
     read_bounded_file, read_bounded_prefix_no_follow,
 };
 
@@ -39,6 +42,40 @@ const REPOSITORY_EXCLUDE_FILE: &str = "info/exclude";
 /// limit bounds I/O; this second dimension bounds compiled matchers even for a
 /// file made entirely of one-byte rules.
 const MAX_IGNORE_RULES: usize = 100_000;
+
+/// One active ancestor chain of ignore files may retain at most this many
+/// compiled matcher units. This bounds memory across arbitrarily nested
+/// `.gitignore` and `.ignore` files without constraining realistic repositories.
+const MAX_IGNORE_CHAIN_COMPONENTS: usize = 1_000_000;
+
+/// One active ancestor chain of ignore files may retain at most this many
+/// estimated matcher bytes (2x the 256 MiB single-file retained matcher limit).
+/// This bounds memory across nested directories with large literal, dense-rule,
+/// or wildcard ignore files.
+const MAX_IGNORE_CHAIN_BYTES: usize = 512 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct IgnoreBudget {
+    max_file_components: usize,
+    max_file_bytes: usize,
+    max_chain_components: usize,
+    max_chain_bytes: usize,
+}
+
+impl IgnoreBudget {
+    const DEFAULT: Self = Self {
+        max_file_components: MAX_IGNORE_FILE_COMPONENTS,
+        max_file_bytes: MAX_IGNORE_FILE_RETAINED_BYTES,
+        max_chain_components: MAX_IGNORE_CHAIN_COMPONENTS,
+        max_chain_bytes: MAX_IGNORE_CHAIN_BYTES,
+    };
+}
+
+#[derive(Clone, Copy, Default)]
+struct ChainUsage {
+    compiled_units: usize,
+    retained_bytes: usize,
+}
 
 #[derive(Debug)]
 pub(crate) struct IgnoreReadError {
@@ -190,12 +227,25 @@ impl IgnoreScope {
         let Some((repository_root, layout)) = repository else {
             return (scope, Vec::new());
         };
-        let (rules, mut errors) =
-            read_repository_rules(backend, &repository_root, Some(&layout), adaptation);
+        let (rules, mut errors) = read_repository_rules(
+            backend,
+            &repository_root,
+            Some(&layout),
+            adaptation,
+            scope.chain_usage(),
+            IgnoreBudget::DEFAULT,
+        );
         scope = scope.link(rules);
         for directory in ancestor_directories(&repository_root, &discovery_root) {
-            let (rules, read_errors) =
-                read_rules(backend, &directory, &directory, &IGNORE_FILES, adaptation);
+            let (rules, read_errors) = read_rules(
+                backend,
+                &directory,
+                &directory,
+                &IGNORE_FILES,
+                adaptation,
+                scope.chain_usage(),
+                IgnoreBudget::DEFAULT,
+            );
             scope = scope.link(rules);
             errors.extend(read_errors);
         }
@@ -233,6 +283,8 @@ impl IgnoreScope {
             match_directory.as_ref(),
             &present,
             self.adaptation,
+            self.chain_usage(),
+            IgnoreBudget::DEFAULT,
         );
         (self.link(rules), errors)
     }
@@ -281,6 +333,15 @@ impl IgnoreScope {
         .unwrap_or(false)
     }
 
+    fn chain_usage(&self) -> ChainUsage {
+        self.rules
+            .as_ref()
+            .map_or(ChainUsage::default(), |node| ChainUsage {
+                compiled_units: node.cumulative_units,
+                retained_bytes: node.cumulative_bytes,
+            })
+    }
+
     /// Puts `rules` on the chain, unless they are empty: an empty matcher can
     /// never have an opinion, so keeping it would only lengthen the walk of
     /// every entry below it.
@@ -288,9 +349,18 @@ impl IgnoreScope {
         if rules.is_empty() {
             return self;
         }
+        let inherited = self.chain_usage();
+        let cumulative_units = inherited
+            .compiled_units
+            .saturating_add(rules.compiled_units());
+        let cumulative_bytes = inherited
+            .retained_bytes
+            .saturating_add(rules.retained_bytes());
         Self {
             rules: Some(Arc::new(IgnoreNode {
                 rules,
+                cumulative_units,
+                cumulative_bytes,
                 parent: self.rules,
             })),
             adaptation: self.adaptation,
@@ -354,6 +424,8 @@ fn ancestor_directories(repository_root: &Path, root: &Path) -> Vec<PathBuf> {
 #[derive(Debug)]
 struct IgnoreNode {
     rules: RuleSet,
+    cumulative_units: usize,
+    cumulative_bytes: usize,
     parent: Option<Arc<IgnoreNode>>,
 }
 
@@ -393,6 +465,8 @@ fn read_rules<B: DirectoryBackend + ?Sized>(
     match_directory: &Path,
     files: &[&str],
     adaptation: GitIgnoreAdaptation,
+    inherited: ChainUsage,
+    budget: IgnoreBudget,
 ) -> (RuleSet, Vec<IgnoreReadError>) {
     let mut builder = RuleSetBuilder::new(
         match_directory,
@@ -403,10 +477,30 @@ fn read_rules<B: DirectoryBackend + ?Sized>(
     for file in files {
         let path = directory.join(file);
         match backend.read_ignore_file(&path) {
-            Ok(BoundedFileRead::Contents(contents)) => match validate_rule_count(&contents) {
-                Ok(()) => add_rules(&mut builder, &contents),
-                Err(source) => errors.push(IgnoreReadError::new(path, source)),
-            },
+            Ok(BoundedFileRead::Contents(contents)) => {
+                let chain_units_remaining = budget.max_chain_components.saturating_sub(
+                    inherited
+                        .compiled_units
+                        .saturating_add(builder.compiled_units()),
+                );
+                let chain_bytes_remaining = budget.max_chain_bytes.saturating_sub(
+                    inherited
+                        .retained_bytes
+                        .saturating_add(builder.retained_bytes()),
+                );
+                if let Err(source) = validate_rule_count(&contents).and_then(|()| {
+                    add_rules_within_budget(
+                        &mut builder,
+                        &contents,
+                        budget.max_file_components,
+                        budget.max_file_bytes,
+                        chain_units_remaining,
+                        chain_bytes_remaining,
+                    )
+                }) {
+                    errors.push(IgnoreReadError::new(path, source));
+                }
+            }
             Ok(BoundedFileRead::Missing | BoundedFileRead::NotRegular) => {}
             Err(source) => errors.push(IgnoreReadError::new(path, source)),
         }
@@ -427,6 +521,8 @@ fn read_repository_rules<B: DirectoryBackend + ?Sized>(
     root: &Path,
     layout: Option<&RepositoryLayout>,
     adaptation: GitIgnoreAdaptation,
+    inherited: ChainUsage,
+    budget: IgnoreBudget,
 ) -> (RuleSet, Vec<IgnoreReadError>) {
     let mut builder = RuleSetBuilder::new(
         root,
@@ -439,10 +535,30 @@ fn read_repository_rules<B: DirectoryBackend + ?Sized>(
     let path = layout.common_directory.join(REPOSITORY_EXCLUDE_FILE);
     let mut errors = Vec::new();
     match backend.read_repository_file(&path) {
-        Ok(BoundedFileRead::Contents(contents)) => match validate_rule_count(&contents) {
-            Ok(()) => add_rules(&mut builder, &contents),
-            Err(source) => errors.push(IgnoreReadError::new(path, source)),
-        },
+        Ok(BoundedFileRead::Contents(contents)) => {
+            let chain_units_remaining = budget.max_chain_components.saturating_sub(
+                inherited
+                    .compiled_units
+                    .saturating_add(builder.compiled_units()),
+            );
+            let chain_bytes_remaining = budget.max_chain_bytes.saturating_sub(
+                inherited
+                    .retained_bytes
+                    .saturating_add(builder.retained_bytes()),
+            );
+            if let Err(source) = validate_rule_count(&contents).and_then(|()| {
+                add_rules_within_budget(
+                    &mut builder,
+                    &contents,
+                    budget.max_file_components,
+                    budget.max_file_bytes,
+                    chain_units_remaining,
+                    chain_bytes_remaining,
+                )
+            }) {
+                errors.push(IgnoreReadError::new(path, source));
+            }
+        }
         Ok(BoundedFileRead::Missing | BoundedFileRead::NotRegular) => {}
         Err(source) => errors.push(IgnoreReadError::new(path, source)),
     }
@@ -669,24 +785,24 @@ fn read_repository_config(layout: &RepositoryLayout) -> GitConfig {
 /// config forms leave the repository-local default intact rather than guessing.
 fn apply_config(config: &mut GitConfig, contents: &[u8]) {
     let mut section = None;
-    for line in logical_config_lines(contents) {
-        let mut line = trim_ascii(strip_config_comment(&line));
+    for_each_logical_config_line(contents, |line| {
+        let mut line = trim_ascii(strip_config_comment(line));
         if line.is_empty() {
-            continue;
+            return;
         }
         if line.starts_with(b"[") {
             let Some((parsed_section, remainder)) = parse_config_header(line) else {
                 section = None;
-                continue;
+                return;
             };
             section = parsed_section;
             line = trim_ascii(remainder);
             if line.is_empty() {
-                continue;
+                return;
             }
         }
         let Some(section) = section else {
-            continue;
+            return;
         };
         let (key, value) =
             line.iter()
@@ -697,22 +813,22 @@ fn apply_config(config: &mut GitConfig, contents: &[u8]) {
                         Some(trim_ascii(&line[index + 1..])),
                     )
                 });
-        let Some(value) = parse_git_bool(value.unwrap_or(b"true")) else {
-            continue;
-        };
-        match section {
+        let target = match section {
             GitConfigSection::Core if key.eq_ignore_ascii_case(b"ignorecase") => {
-                config.ignore_case = Some(value);
+                &mut config.ignore_case
             }
             GitConfigSection::Core if key.eq_ignore_ascii_case(b"precomposeunicode") => {
-                config.precompose_unicode = Some(value);
+                &mut config.precompose_unicode
             }
             GitConfigSection::Extensions if key.eq_ignore_ascii_case(b"worktreeconfig") => {
-                config.worktree_config = Some(value);
+                &mut config.worktree_config
             }
-            _ => {}
+            _ => return,
+        };
+        if let Some(value) = parse_git_bool(value.unwrap_or(b"true")) {
+            *target = Some(value);
         }
-    }
+    });
 }
 
 /// Splits a section header from a variable written on the same physical line.
@@ -723,32 +839,48 @@ fn parse_config_header(line: &[u8]) -> Option<(Option<GitConfigSection>, &[u8])>
     Some((parse_top_level_section(&line[..=end]), &line[end + 1..]))
 }
 
-/// Produces the logical config lines that Git's value parser sees. A terminal
+/// Streams the logical config lines that Git's value parser sees. A terminal
 /// backslash in an assignment value consumes the following physical newline,
 /// then parsing resumes with the next line's bytes (including indentation).
 /// It works inside and outside quotes, but a backslash in a comment is ignored.
 /// A terminal backslash at EOF is consumed with Git's synthetic final newline.
 /// Every other quote and escape is retained for `parse_git_bool`.
-fn logical_config_lines(contents: &[u8]) -> Vec<Vec<u8>> {
+///
+/// Uncontinued lines are passed straight to `f` as borrowed slices into
+/// `contents` without allocating. Continued lines reuse a single scratch buffer
+/// cleared between logical lines.
+fn for_each_logical_config_line(contents: &[u8], mut f: impl FnMut(&[u8])) {
     let mut physical = contents.split_inclusive(|byte| *byte == b'\n').map(|line| {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
         line.strip_suffix(b"\r").unwrap_or(line)
     });
-    let mut logical = Vec::new();
+    let mut buffer = Vec::new();
     while let Some(line) = physical.next() {
-        let mut line = line.to_vec();
-        let mut continuation = config_value_continuation(&line);
-        while let Some(state) = continuation {
-            line.pop();
-            let Some(next) = physical.next() else {
+        let Some(mut state) = config_value_continuation(line) else {
+            f(line);
+            continue;
+        };
+        let prefix = line.strip_suffix(b"\\").unwrap_or(line);
+        let Some(mut next) = physical.next() else {
+            f(prefix);
+            continue;
+        };
+        buffer.clear();
+        buffer.extend_from_slice(prefix);
+        loop {
+            buffer.extend_from_slice(next);
+            let Some(next_state) = config_value_suffix_continuation(next, state) else {
                 break;
             };
-            line.extend_from_slice(next);
-            continuation = config_value_suffix_continuation(next, state);
+            buffer.pop();
+            let Some(following) = physical.next() else {
+                break;
+            };
+            state = next_state;
+            next = following;
         }
-        logical.push(line);
+        f(&buffer);
     }
-    logical
 }
 
 /// Quote state at the end of a continued config-value fragment.
@@ -977,18 +1109,79 @@ fn resolve_metadata_path(base: &Path, path: PathBuf) -> Option<PathBuf> {
     }
 }
 
-/// Feeds one ignore file's lines to the builder.
+/// Feeds one ignore file's lines to the builder within both the per-file and
+/// remaining chain component budgets.
 ///
 /// Ignore files are byte streams. Git strips one BOM at the file start, treats
 /// NUL as the end of a rule line, and otherwise keeps parsing after invalid
-/// UTF-8 bytes.
-fn add_rules(builder: &mut RuleSetBuilder, contents: &[u8]) {
+/// UTF-8 bytes. When any line breaches a budget, every rule contributed by this
+/// file is rolled back so an offending file is never partially applied.
+fn add_rules_within_budget(
+    builder: &mut RuleSetBuilder,
+    contents: &[u8],
+    max_file_components: usize,
+    max_file_bytes: usize,
+    max_chain_remaining: usize,
+    max_chain_bytes_remaining: usize,
+) -> std::io::Result<()> {
+    let checkpoint = builder.checkpoint();
     let contents = contents.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(contents);
+    let mut file_parsed_parts = 0_usize;
+    let mut file_compiled_units = 0_usize;
+    let mut file_retained_bytes = 0_usize;
     for line in contents.split(|byte| *byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         let line = line.split(|byte| *byte == b'\0').next().unwrap_or(line);
-        builder.add_line(line);
+        let budgets = LineBudgets {
+            file_parsed_remaining: max_file_components.saturating_sub(file_parsed_parts),
+            file_compiled_remaining: max_file_components.saturating_sub(file_compiled_units),
+            file_bytes_remaining: max_file_bytes.saturating_sub(file_retained_bytes),
+            chain_compiled_remaining: max_chain_remaining.saturating_sub(file_compiled_units),
+            chain_bytes_remaining: max_chain_bytes_remaining.saturating_sub(file_retained_bytes),
+        };
+        match builder.add_line_within_budget(line, budgets) {
+            Ok(usage) => {
+                file_parsed_parts += usage.parsed_parts;
+                file_compiled_units += usage.compiled_units;
+                file_retained_bytes += usage.retained_bytes;
+            }
+            Err(exceeded) => {
+                builder.restore(checkpoint);
+                let message = match exceeded {
+                    ComponentBudgetExceeded::File => {
+                        "ignore file exceeds the 250,000-component safety limit"
+                    }
+                    ComponentBudgetExceeded::FileBytes => {
+                        "ignore file exceeds the 256 MiB retained matcher safety limit"
+                    }
+                    ComponentBudgetExceeded::Chain => {
+                        "ignore rule chain exceeds the 1,000,000-component safety limit"
+                    }
+                    ComponentBudgetExceeded::ChainBytes => {
+                        "ignore rule chain exceeds the 512 MiB retained matcher safety limit"
+                    }
+                };
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    message,
+                ));
+            }
+        }
     }
+    Ok(())
+}
+
+#[cfg(test)]
+fn add_rules(builder: &mut RuleSetBuilder, contents: &[u8]) {
+    add_rules_within_budget(
+        builder,
+        contents,
+        MAX_IGNORE_FILE_COMPONENTS,
+        MAX_IGNORE_FILE_RETAINED_BYTES,
+        MAX_IGNORE_CHAIN_COMPONENTS,
+        MAX_IGNORE_CHAIN_BYTES,
+    )
+    .expect("test ignore rules fit within safety budget");
 }
 
 #[cfg(test)]
@@ -996,8 +1189,10 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        CandidateRoot, GitConfig, MAX_IGNORE_RULES, RuleSetBuilder, add_rules, apply_config,
-        is_valid_git_head_contents, logical_config_lines, parse_git_bool, validate_rule_count,
+        BoundedFileRead, CandidateRoot, GitConfig, GitIgnoreAdaptation, IGNORE_FILES, IgnoreBudget,
+        IgnoreScope, MAX_IGNORE_FILE_COMPONENTS, MAX_IGNORE_RULES, RuleSetBuilder, add_rules,
+        add_rules_within_budget, apply_config, for_each_logical_config_line,
+        is_valid_git_head_contents, parse_git_bool, read_rules, validate_rule_count,
     };
 
     #[test]
@@ -1330,10 +1525,19 @@ mod tests {
         }
         contents.extend_from_slice(b"true\n");
 
-        let lines = logical_config_lines(&contents);
-        assert_eq!(lines.len(), 2);
-        assert!(lines[1].ends_with(b"true"));
-        assert_eq!(lines[1].len(), 2 + CONTINUATION_LINES * 2 + 4);
+        let mut count = 0;
+        let mut second_len = 0;
+        let mut second_ends_with_true = false;
+        for_each_logical_config_line(&contents, |line| {
+            if count == 1 {
+                second_len = line.len();
+                second_ends_with_true = line.ends_with(b"true");
+            }
+            count += 1;
+        });
+        assert_eq!(count, 2);
+        assert!(second_ends_with_true);
+        assert_eq!(second_len, 2 + CONTINUATION_LINES * 2 + 4);
     }
 
     #[test]
@@ -1381,8 +1585,13 @@ mod tests {
                     builder.build()
                 };
 
+                let root_rules = build_rules(b"*.log\n");
+                let mut cumulative_units = root_rules.compiled_units();
+                let mut cumulative_bytes = root_rules.retained_bytes();
                 let shared_root = Arc::new(super::IgnoreNode {
-                    rules: build_rules(b"*.log\n"),
+                    rules: root_rules,
+                    cumulative_units,
+                    cumulative_bytes,
                     parent: None,
                 });
 
@@ -1395,8 +1604,12 @@ mod tests {
                     } else {
                         build_rules(b"")
                     };
+                    cumulative_units += rules.compiled_units();
+                    cumulative_bytes += rules.retained_bytes();
                     head = Arc::new(super::IgnoreNode {
                         rules,
+                        cumulative_units,
+                        cumulative_bytes,
                         parent: Some(head),
                     });
                 }
@@ -1419,5 +1632,614 @@ mod tests {
         handle
             .join()
             .expect("deep IgnoreNode verdict and drop succeed on a 256 KiB stack");
+    }
+
+    #[test]
+    fn ignore_file_component_budget_rolls_back_offending_file_atomically() {
+        let root = Path::new("/fixture");
+        let mut builder = RuleSetBuilder::new(root, false, false);
+
+        // First file adds valid rules (`*.log` = `AnyDirs` + `*.log` = 2 components).
+        add_rules_within_budget(&mut builder, b"*.log\n", 10, usize::MAX, 100, usize::MAX)
+            .expect("small valid ignore file succeeds");
+        assert_eq!(builder.compiled_units(), 2);
+
+        // Second file adds many valid rules (growing `rules`'s backing buffer)
+        // before breaching the per-file component budget on its final line.
+        // Rollback must drop those rules AND release the excess vector capacity
+        // while preserving the first file's rules.
+        let mut offending = String::new();
+        for index in 0..32 {
+            offending.push_str(&format!("keep-{index}.txt\n"));
+        }
+        offending.push_str("a/b/c/d/e/f/g/h/i\n");
+        let error = add_rules_within_budget(
+            &mut builder,
+            offending.as_bytes(),
+            70,
+            usize::MAX,
+            200,
+            usize::MAX,
+        )
+        .expect_err("over-budget file is rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(builder.compiled_units(), 2);
+        assert_eq!(
+            builder.rules_capacity(),
+            1,
+            "rollback must release excess backing capacity from rejected rules"
+        );
+
+        let rules = builder.build();
+        assert_eq!(rules.matched(b"/fixture/app.log", false), Some(true));
+        assert_eq!(rules.matched(b"/fixture/keep-0.txt", false), None);
+
+        // Parsed-part and compiled-unit totals are tracked independently:
+        // 5 pairs of `**/**/**/x` (4 parsed, 2 compiled) + `y` (1 parsed, 2
+        // compiled) total 25 parsed parts and 20 compiled units — both within
+        // a 25-unit file budget even though summing per-line maxima would be
+        // 5 * (4 + 2) = 30 > 25.
+        let mut paired = RuleSetBuilder::new(root, false, false);
+        let paired_contents = "**/**/**/x\ny\n".repeat(5);
+        add_rules_within_budget(
+            &mut paired,
+            paired_contents.as_bytes(),
+            25,
+            usize::MAX,
+            100,
+            usize::MAX,
+        )
+        .expect("independent parsed and compiled totals stay within budget");
+        assert_eq!(paired.compiled_units(), 20);
+        let paired_rules = paired.build();
+        assert_eq!(paired_rules.matched(b"/fixture/a/b/x", false), Some(true));
+        assert_eq!(paired_rules.matched(b"/fixture/y", false), Some(true));
+
+        // With only 1 compiled slot remaining, an unanchored malformed rule
+        // (`[[:x][:][]`, 1 parsed part) is discarded cleanly without rolling
+        // back earlier valid rules.
+        let mut tight_compiled = RuleSetBuilder::new(root, false, false);
+        add_rules_within_budget(
+            &mut tight_compiled,
+            b"*.log\n[[:x][:][]\n",
+            10,
+            usize::MAX,
+            3,
+            usize::MAX,
+        )
+        .expect("malformed rule at tight compiled budget is discarded cleanly");
+        assert_eq!(tight_compiled.compiled_units(), 2);
+        assert_eq!(
+            tight_compiled.build().matched(b"/fixture/app.log", false),
+            Some(true)
+        );
+
+        // Repeated malformed multi-component lines charge `parsed_parts` so they
+        // cannot bypass the per-file budget, while malformed lines within the
+        // budget remain ignored without dropping subsequent valid rules.
+        let mut under_budget = RuleSetBuilder::new(root, false, false);
+        add_rules_within_budget(
+            &mut under_budget,
+            b"a/b/c/[\n*.log\n",
+            10,
+            usize::MAX,
+            10,
+            usize::MAX,
+        )
+        .expect("malformed line plus valid rule under budget succeeds");
+        assert_eq!(under_budget.compiled_units(), 2);
+        assert_eq!(
+            under_budget.build().matched(b"/fixture/app.log", false),
+            Some(true)
+        );
+
+        let mut malformed_flood = RuleSetBuilder::new(root, false, false);
+        let error = add_rules_within_budget(
+            &mut malformed_flood,
+            b"a/b/c/[\na/b/c/[\na/b/c/[\n",
+            10,
+            usize::MAX,
+            100,
+            usize::MAX,
+        )
+        .expect_err("repeated malformed multi-component lines hit file budget");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(malformed_flood.compiled_units(), 0);
+        assert_eq!(malformed_flood.rules_capacity(), 0);
+
+        // Repeated 60,000-`?` lines breach the 256 MiB retained-byte ceiling
+        // and roll back atomically.
+        let mut wildcard_flood = RuleSetBuilder::new(root, false, false);
+        let qline = format!("{}\n", "?".repeat(60_000));
+        let mut qfile = String::from("keep.txt\n");
+        for _ in 0..40 {
+            qfile.push_str(&qline);
+        }
+        let error = add_rules_within_budget(
+            &mut wildcard_flood,
+            qfile.as_bytes(),
+            MAX_IGNORE_FILE_COMPONENTS,
+            super::MAX_IGNORE_FILE_RETAINED_BYTES,
+            super::MAX_IGNORE_CHAIN_COMPONENTS,
+            super::MAX_IGNORE_CHAIN_BYTES,
+        )
+        .expect_err("repeated wildcard-heavy lines exceed per-file retained-byte budget");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("256 MiB"),
+            "expected FileBytes diagnostic, got: {error}"
+        );
+        assert_eq!(wildcard_flood.compiled_units(), 0);
+        assert_eq!(wildcard_flood.rules_capacity(), 0);
+
+        // Ordinary large literal ignore files (e.g. 40,000 simple literal
+        // rules = 80,000 components) and realistic large glob ignore files
+        // (e.g. 12,000 `*.generated-00001.json` rules = 24,000 components)
+        // remain accepted under the default 100,000-line / 250,000-component /
+        // 256 MiB safety ceilings.
+        let mut ordinary_large = RuleSetBuilder::new(root, false, false);
+        let forty_k_literals = "a\n".repeat(40_000);
+        add_rules_within_budget(
+            &mut ordinary_large,
+            forty_k_literals.as_bytes(),
+            MAX_IGNORE_FILE_COMPONENTS,
+            super::MAX_IGNORE_FILE_RETAINED_BYTES,
+            super::MAX_IGNORE_CHAIN_COMPONENTS,
+            super::MAX_IGNORE_CHAIN_BYTES,
+        )
+        .expect("40,000 simple literal rules remain accepted under default budgets");
+        assert_eq!(ordinary_large.compiled_units(), 80_000);
+        let ordinary_rules = ordinary_large.build();
+        assert_eq!(ordinary_rules.matched(b"/fixture/a", false), Some(true));
+
+        let mut twelve_k_globs = RuleSetBuilder::new(root, false, false);
+        let mut generated_globs = String::with_capacity(12_000 * 24);
+        for index in 0..12_000 {
+            use std::fmt::Write as _;
+            writeln!(generated_globs, "*.generated-{index:05}.json").expect("write glob line");
+        }
+        add_rules_within_budget(
+            &mut twelve_k_globs,
+            generated_globs.as_bytes(),
+            MAX_IGNORE_FILE_COMPONENTS,
+            super::MAX_IGNORE_FILE_RETAINED_BYTES,
+            super::MAX_IGNORE_CHAIN_COMPONENTS,
+            super::MAX_IGNORE_CHAIN_BYTES,
+        )
+        .expect("12,000 realistic glob suffix rules remain accepted under default budgets");
+        assert_eq!(twelve_k_globs.compiled_units(), 24_000);
+        let glob_rules = twelve_k_globs.build();
+        assert_eq!(
+            glob_rules.matched(b"/fixture/pkg/app.generated-11999.json", false),
+            Some(true)
+        );
+
+        // A single rule that exceeds `ferralk-glob`'s per-pattern IR budget
+        // skips only that uncompiled rule without rolling back the rest of the
+        // file — regardless of line order, even when its estimated retained
+        // bytes exceed the remaining file byte budget (`100 MiB < ~134 MiB`),
+        // AND even when only 1 compiled component slot remains.
+        let mut ir_after_valid = Vec::with_capacity(1_048_577 + 32);
+        ir_after_valid.extend_from_slice(b"*.log\nkeep.tmp\n");
+        ir_after_valid.resize(ir_after_valid.len() + 1_048_577, b'?');
+        ir_after_valid.push(b'\n');
+
+        let mut ir_before_valid = Vec::with_capacity(1_048_577 + 32);
+        ir_before_valid.resize(1_048_577, b'?');
+        ir_before_valid.extend_from_slice(b"\n*.log\nkeep.tmp\n");
+
+        for (label, contents) in [
+            ("valid-before-ir-limit", ir_after_valid),
+            ("ir-limit-before-valid", ir_before_valid),
+        ] {
+            for (max_comp, file_byte_budget) in [
+                (
+                    MAX_IGNORE_FILE_COMPONENTS,
+                    super::MAX_IGNORE_FILE_RETAINED_BYTES,
+                ),
+                (MAX_IGNORE_FILE_COMPONENTS, 100 * 1024 * 1024),
+                // `*.log` (2) + `keep.tmp` (2) = 4 compiled components; budget
+                // of 5 leaves only 1 compiled component slot for the unanchored
+                // IR-limit line (which wants 2), exercising the compiled-budget
+                // overflow discard path as well.
+                (5, super::MAX_IGNORE_FILE_RETAINED_BYTES),
+            ] {
+                let mut ir_limit_builder = RuleSetBuilder::new(root, false, false);
+                add_rules_within_budget(
+                    &mut ir_limit_builder,
+                    &contents,
+                    max_comp,
+                    file_byte_budget,
+                    max_comp,
+                    super::MAX_IGNORE_CHAIN_BYTES,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{label} under ({max_comp} components, {file_byte_budget} bytes) must skip only the IR-limit rule, got: {error}"
+                    )
+                });
+                assert_eq!(ir_limit_builder.compiled_units(), 4, "{label}");
+                let ir_rules = ir_limit_builder.build();
+                assert_eq!(ir_rules.matched(b"/fixture/app.log", false), Some(true));
+                assert_eq!(ir_rules.matched(b"/fixture/keep.tmp", false), Some(true));
+            }
+        }
+
+        // Pathological multi-star rules (`/*a*\n` repeated 80,000 times =
+        // 80,000 components, strictly below `MAX_IGNORE_FILE_COMPONENTS = 250,000`)
+        // hit the 256 MiB per-file retained-byte ceiling FIRST and roll back
+        // atomically.
+        let mut dense_wide_builder = RuleSetBuilder::new(root, false, false);
+        let dense_wide_rules = "/*a*\n".repeat(80_000);
+        let error = add_rules_within_budget(
+            &mut dense_wide_builder,
+            dense_wide_rules.as_bytes(),
+            MAX_IGNORE_FILE_COMPONENTS,
+            super::MAX_IGNORE_FILE_RETAINED_BYTES,
+            super::MAX_IGNORE_CHAIN_COMPONENTS,
+            super::MAX_IGNORE_CHAIN_BYTES,
+        )
+        .expect_err(
+            "80,000 multi-star rules exceed 256 MiB retained matcher safety limit before component limit",
+        );
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("256 MiB"),
+            "expected FileBytes diagnostic, got: {error}"
+        );
+        assert_eq!(dense_wide_builder.compiled_units(), 0);
+        assert_eq!(dense_wide_builder.rules_capacity(), 0);
+
+        // Multi-star `WideSweepEngine` lines (`*` + 40 KiB + `*`) breach the
+        // 256 MiB retained-byte budget and roll back atomically.
+        let mut wide_sweep_flood = RuleSetBuilder::new(root, false, false);
+        let wide_line = format!("*{}*\n", "a".repeat(40_000));
+        let mut wide_file = String::from("keep.txt\n");
+        for _ in 0..60 {
+            wide_file.push_str(&wide_line);
+        }
+        let error = add_rules_within_budget(
+            &mut wide_sweep_flood,
+            wide_file.as_bytes(),
+            MAX_IGNORE_FILE_COMPONENTS,
+            super::MAX_IGNORE_FILE_RETAINED_BYTES,
+            super::MAX_IGNORE_CHAIN_COMPONENTS,
+            super::MAX_IGNORE_CHAIN_BYTES,
+        )
+        .expect_err("multi-star WideSweepEngine lines exceed per-file safety limit");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("256 MiB"),
+            "expected FileBytes diagnostic, got: {error}"
+        );
+        assert_eq!(wide_sweep_flood.compiled_units(), 0);
+        assert_eq!(wide_sweep_flood.rules_capacity(), 0);
+
+        // A single 500,000-component line fails fast against the real ceiling.
+        let mut huge_builder = RuleSetBuilder::new(root, false, false);
+        let huge_line = format!("first.txt\n{}", "a/".repeat(MAX_IGNORE_FILE_COMPONENTS + 1));
+        let error = add_rules_within_budget(
+            &mut huge_builder,
+            huge_line.as_bytes(),
+            MAX_IGNORE_FILE_COMPONENTS,
+            super::MAX_IGNORE_FILE_RETAINED_BYTES,
+            super::MAX_IGNORE_CHAIN_COMPONENTS,
+            super::MAX_IGNORE_CHAIN_BYTES,
+        )
+        .expect_err("single-line component explosion is rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(huge_builder.compiled_units(), 0);
+        assert_eq!(huge_builder.rules_capacity(), 0);
+        assert!(huge_builder.build().is_empty());
+    }
+
+    #[test]
+    fn ignore_chain_cumulative_budget_preserves_ancestors_and_siblings() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        struct MapBackend {
+            files: HashMap<PathBuf, Vec<u8>>,
+        }
+
+        impl crate::DirectoryBackend for MapBackend {
+            fn read_directory(
+                &self,
+                _path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                _listing: &mut crate::Listing,
+            ) -> std::io::Result<()> {
+                unreachable!("only ignore-file reads are exercised")
+            }
+
+            fn read_ignore_file(&self, path: &Path) -> std::io::Result<BoundedFileRead> {
+                Ok(self
+                    .files
+                    .get(path)
+                    .cloned()
+                    .map_or(BoundedFileRead::Missing, BoundedFileRead::Contents))
+            }
+        }
+
+        let budget = IgnoreBudget {
+            max_file_components: 10,
+            max_file_bytes: 16 * 1024,
+            max_chain_components: 12,
+            max_chain_bytes: 32 * 1024,
+        };
+        let adaptation = GitIgnoreAdaptation::default();
+        let backend = MapBackend {
+            files: HashMap::from([
+                // 6 units (3 unanchored literal rules, 2 units each)
+                (
+                    PathBuf::from("/repo/.gitignore"),
+                    b"app.log\napp.tmp\napp.bak\n".to_vec(),
+                ),
+                // 4 units -> cumulative 10
+                (
+                    PathBuf::from("/repo/sub/.gitignore"),
+                    b"main.o\nmain.a\n".to_vec(),
+                ),
+                // 4 units -> would reach 14 > 12; rejected atomically while
+                // `/repo/sub/.gitignore` remains applied.
+                (
+                    PathBuf::from("/repo/sub/.ignore"),
+                    b"keep.txt\nsecret.txt\n".to_vec(),
+                ),
+                // Empty/comment-only file still succeeds at 10/12.
+                (
+                    PathBuf::from("/repo/sub/empty/.gitignore"),
+                    b"# just a comment\n\n".to_vec(),
+                ),
+                // 3 parsed parts collapsing to 2 compiled units -> reaches
+                // exact ceiling 12/12 despite only 2 chain slots remaining.
+                (
+                    PathBuf::from("/repo/sub/exact/.gitignore"),
+                    b"**/**/exact.txt\n".to_vec(),
+                ),
+                // 2 more units after 12/12 -> rejected while ancestors stay.
+                (
+                    PathBuf::from("/repo/sub/exact/deep/.gitignore"),
+                    b"deep.txt\n".to_vec(),
+                ),
+            ]),
+        };
+
+        let mut scope = IgnoreScope::default();
+        let (root_rules, root_errors) = read_rules(
+            &backend,
+            Path::new("/repo"),
+            Path::new("/repo"),
+            &IGNORE_FILES,
+            adaptation,
+            scope.chain_usage(),
+            budget,
+        );
+        assert!(root_errors.is_empty());
+        assert_eq!(root_rules.compiled_units(), 6);
+        scope = scope.link(root_rules);
+        assert_eq!(scope.chain_usage().compiled_units, 6);
+
+        let (sub_rules, sub_errors) = read_rules(
+            &backend,
+            Path::new("/repo/sub"),
+            Path::new("/repo/sub"),
+            &IGNORE_FILES,
+            adaptation,
+            scope.chain_usage(),
+            budget,
+        );
+        assert_eq!(sub_errors.len(), 1);
+        assert_eq!(sub_errors[0].path, PathBuf::from("/repo/sub/.ignore"));
+        assert_eq!(sub_errors[0].kind, std::io::ErrorKind::InvalidData);
+        assert_eq!(sub_rules.compiled_units(), 4);
+        scope = scope.link(sub_rules);
+        assert_eq!(scope.chain_usage().compiled_units, 10);
+
+        let (empty_rules, empty_errors) = read_rules(
+            &backend,
+            Path::new("/repo/sub/empty"),
+            Path::new("/repo/sub/empty"),
+            &IGNORE_FILES,
+            adaptation,
+            scope.chain_usage(),
+            budget,
+        );
+        assert!(empty_errors.is_empty());
+        assert!(empty_rules.is_empty());
+
+        let (exact_rules, exact_errors) = read_rules(
+            &backend,
+            Path::new("/repo/sub/exact"),
+            Path::new("/repo/sub/exact"),
+            &IGNORE_FILES,
+            adaptation,
+            scope.chain_usage(),
+            budget,
+        );
+        assert!(exact_errors.is_empty());
+        scope = scope.link(exact_rules);
+        assert_eq!(scope.chain_usage().compiled_units, 12);
+
+        let (deep_rules, deep_errors) = read_rules(
+            &backend,
+            Path::new("/repo/sub/exact/deep"),
+            Path::new("/repo/sub/exact/deep"),
+            &IGNORE_FILES,
+            adaptation,
+            scope.chain_usage(),
+            budget,
+        );
+        assert_eq!(deep_errors.len(), 1);
+        assert_eq!(
+            deep_errors[0].path,
+            PathBuf::from("/repo/sub/exact/deep/.gitignore")
+        );
+        assert_eq!(deep_errors[0].kind, std::io::ErrorKind::InvalidData);
+        assert!(deep_rules.is_empty());
+        scope = scope.link(deep_rules);
+        assert_eq!(scope.chain_usage().compiled_units, 12);
+
+        // Ancestor rules remain in force, while rolled-back files do not apply.
+        let node = scope.rules.as_ref().expect("chain has ancestor rules");
+        assert_eq!(
+            node.verdict(b"/repo/sub/exact/deep/app.log", false),
+            Some(true)
+        );
+        assert_eq!(
+            node.verdict(b"/repo/sub/exact/deep/main.o", false),
+            Some(true)
+        );
+        assert_eq!(
+            node.verdict(b"/repo/sub/exact/deep/exact.txt", false),
+            Some(true)
+        );
+        assert_eq!(node.verdict(b"/repo/sub/exact/deep/keep.txt", false), None);
+        assert_eq!(node.verdict(b"/repo/sub/exact/deep/deep.txt", false), None);
+
+        // Active-chain retained-byte cap rejects large literal chains cleanly
+        // while preserving ancestors and still allowing comment-only files.
+        // Compute exact budgets from the production `RuleSetBuilder` estimator
+        // so this boundary stays exact on every target architecture.
+        let line_a = format!("{}\n", "a".repeat(40)).into_bytes();
+        let line_b = format!("{}\n", "b".repeat(24)).into_bytes();
+        let expected_a_bytes = {
+            let mut b = RuleSetBuilder::new(Path::new("/bytes"), false, false);
+            b.add_line_within_budget(
+                &line_a[..line_a.len() - 1],
+                crate::ignore_rules::LineBudgets::UNBOUNDED,
+            )
+            .expect("measure rule a")
+            .retained_bytes
+        };
+        let expected_b_bytes = {
+            let mut b = RuleSetBuilder::new(Path::new("/bytes/sub"), false, false);
+            b.add_line_within_budget(
+                &line_b[..line_b.len() - 1],
+                crate::ignore_rules::LineBudgets::UNBOUNDED,
+            )
+            .expect("measure rule b")
+            .retained_bytes
+        };
+        let expected_total_bytes = expected_a_bytes + expected_b_bytes;
+        let byte_budget = IgnoreBudget {
+            max_file_components: 100,
+            max_file_bytes: expected_total_bytes,
+            max_chain_components: 1_000,
+            max_chain_bytes: expected_total_bytes,
+        };
+        let byte_backend = MapBackend {
+            files: HashMap::from([
+                (PathBuf::from("/bytes/.gitignore"), line_a),
+                (PathBuf::from("/bytes/sub/.gitignore"), line_b),
+                (
+                    PathBuf::from("/bytes/sub/comment/.gitignore"),
+                    b"# comments retain zero bytes\n".to_vec(),
+                ),
+                (PathBuf::from("/bytes/sub/over/.gitignore"), b"c\n".to_vec()),
+            ]),
+        };
+
+        let mut byte_scope = IgnoreScope::default();
+        let (r1, e1) = read_rules(
+            &byte_backend,
+            Path::new("/bytes"),
+            Path::new("/bytes"),
+            &IGNORE_FILES,
+            adaptation,
+            byte_scope.chain_usage(),
+            byte_budget,
+        );
+        assert!(e1.is_empty());
+        byte_scope = byte_scope.link(r1);
+        assert_eq!(byte_scope.chain_usage().retained_bytes, expected_a_bytes);
+
+        let (r2, e2) = read_rules(
+            &byte_backend,
+            Path::new("/bytes/sub"),
+            Path::new("/bytes/sub"),
+            &IGNORE_FILES,
+            adaptation,
+            byte_scope.chain_usage(),
+            byte_budget,
+        );
+        assert!(e2.is_empty());
+        byte_scope = byte_scope.link(r2);
+        assert_eq!(
+            byte_scope.chain_usage().retained_bytes,
+            expected_total_bytes
+        );
+
+        let (r_comment, e_comment) = read_rules(
+            &byte_backend,
+            Path::new("/bytes/sub/comment"),
+            Path::new("/bytes/sub/comment"),
+            &IGNORE_FILES,
+            adaptation,
+            byte_scope.chain_usage(),
+            byte_budget,
+        );
+        assert!(e_comment.is_empty());
+        assert!(r_comment.is_empty());
+
+        let (r_over, e_over) = read_rules(
+            &byte_backend,
+            Path::new("/bytes/sub/over"),
+            Path::new("/bytes/sub/over"),
+            &IGNORE_FILES,
+            adaptation,
+            byte_scope.chain_usage(),
+            byte_budget,
+        );
+        assert_eq!(e_over.len(), 1);
+        assert_eq!(e_over[0].kind, std::io::ErrorKind::InvalidData);
+        assert!(r_over.is_empty());
+        let byte_node = byte_scope.rules.as_ref().expect("ancestor rules kept");
+        let a_path = format!("/bytes/sub/over/{}", "a".repeat(40));
+        assert_eq!(byte_node.verdict(a_path.as_bytes(), false), Some(true));
+        assert_eq!(byte_node.verdict(b"/bytes/sub/over/c", false), None);
+    }
+
+    #[test]
+    fn streaming_config_lines_preserve_crlf_escapes_and_reuse_scratch() {
+        let mut config = GitConfig::default();
+        apply_config(
+            &mut config,
+            b"[core]\r\n\
+              # comment \\\r\n\
+              ignorecase = tru\\\r\n\
+              e\r\n\
+              other = foo\\\\\r\n\
+              precomposeunicode = \"fa\\\r\n\
+              lse\" # trailing \\\r\n\
+              [extensions]\r\n\
+              worktreeconfig = \\\r\n\
+              \\\r\n\
+              yes\r\n",
+        );
+        assert_eq!(config.ignore_case, Some(true));
+        assert_eq!(config.precompose_unicode, Some(false));
+        assert_eq!(config.worktree_config, Some(true));
+
+        // Uncontinued lines borrow directly from `contents` with no copy.
+        let plain = b"[core]\nignorecase = true\nprecomposeunicode = false\n";
+        let range = plain.as_ptr_range();
+        let mut seen = 0;
+        for_each_logical_config_line(plain, |line| {
+            assert!(range.contains(&line.as_ptr()));
+            seen += 1;
+        });
+        assert_eq!(seen, 3);
+
+        // Trailing EOF backslash on an uncontinued line also borrows directly.
+        let eof_slash = b"k = v\\";
+        let eof_range = eof_slash.as_ptr_range();
+        let mut yielded = Vec::new();
+        for_each_logical_config_line(eof_slash, |line| {
+            assert!(eof_range.contains(&line.as_ptr()));
+            yielded.push(line.to_vec());
+        });
+        assert_eq!(yielded, vec![b"k = v".to_vec()]);
     }
 }

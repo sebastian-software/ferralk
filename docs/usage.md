@@ -336,10 +336,13 @@ Important defaults:
   `.git` pointer files are resolved (including one `commondir`). In-tree
   `.gitignore` and `.ignore` symlinks are ignored rather than followed;
   `.git/info/exclude` keeps Git's link-following behavior.
-  Each ignore or repository-metadata file is capped at 8 MiB, and each rule
-  file at 100,000 lines. A rule file that exceeds either limit, or otherwise
-  cannot be read, contributes no rules and is reported as a `read_ignore`
-  failure through the configured `ErrorPolicy`.
+  Each ignore or repository-metadata file is capped at 8 MiB, each rule file at
+  100,000 lines, 250,000 parsed parts or compiled components (including parts
+  from collapsed `**/` runs or malformed lines), and 256 MiB of estimated
+  retained matcher storage, and each active ancestor chain at 1,000,000 compiled
+  components and 512 MiB of estimated retained matcher storage. A rule file that exceeds any of these limits, or otherwise cannot be
+  read, contributes no rules, is reported as a `read_ignore` failure through
+  the configured `ErrorPolicy`, and leaves previously accepted rules in force.
 
   Ferralk reads `core.ignoreCase` and `core.precomposeUnicode` from the
   repository-local `.git/config`; a linked worktree also reads its private

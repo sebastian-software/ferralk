@@ -615,6 +615,9 @@ pub use ignore_rules::fuzz_rule as fuzz_ignore_rule;
 #[doc(hidden)]
 #[cfg(feature = "unstable-test-hooks")]
 pub use ignore_rules::fuzz_rule_bytes as fuzz_ignore_rule_bytes;
+#[doc(hidden)]
+#[cfg(feature = "unstable-test-hooks")]
+pub use ignore_rules::{MemoryTestRuleSet, build_ignore_rule_set_for_memory_test};
 mod parallel;
 mod parallel_stream;
 mod scheduler;
@@ -11054,6 +11057,164 @@ mod tests {
             item.as_ref()
                 .is_ok_and(|entry| entry.path().ends_with("visible.txt"))
         }));
+    }
+
+    #[test]
+    fn component_exploding_ignore_file_follows_the_configured_error_policy() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.root.join(".git")).expect("create git dir");
+        fixture.write("visible.txt");
+        fixture.write("kept.log");
+        let ignore_path = fixture.root.join(".gitignore");
+        let mut contents = Vec::from(&b"*.log\n"[..]);
+        for _ in 0..500_000 {
+            contents.extend_from_slice(b"a/");
+        }
+        contents.push(b'\n');
+        fs::write(&ignore_path, contents).expect("write component-exploding ignore file");
+
+        for threads in [1, 4] {
+            let result = Walker::new(&fixture.root)
+                .respect_git_ignore(true)
+                .threads(threads)
+                .error_policy(ErrorPolicy::Collect)
+                .collect()
+                .expect("collect policy keeps walking");
+            assert_eq!(result.errors().len(), 1);
+            assert_eq!(result.errors()[0].operation().as_str(), "read_ignore");
+            assert_eq!(result.errors()[0].path(), ignore_path);
+            assert_eq!(
+                result.errors()[0].io_kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            let paths = relative_paths(result.entries(), &fixture.root);
+            assert!(paths.contains(&PathBuf::from("visible.txt")));
+            assert!(
+                paths.contains(&PathBuf::from("kept.log")),
+                "an offending ignore file must be rolled back atomically, never partially applied"
+            );
+        }
+
+        let skipped = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .threads(1)
+            .error_policy(ErrorPolicy::Skip)
+            .collect()
+            .expect("skip policy keeps walking");
+        assert!(skipped.errors().is_empty());
+        assert!(
+            relative_paths(skipped.entries(), &fixture.root).contains(&PathBuf::from("kept.log"))
+        );
+
+        let aborted = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .threads(1)
+            .error_policy(ErrorPolicy::Abort)
+            .collect()
+            .expect_err("abort policy reports the ignore failure immediately");
+        assert_eq!(aborted.operation().as_str(), "read_ignore");
+        assert_eq!(aborted.path(), ignore_path);
+        assert_eq!(aborted.io_kind(), std::io::ErrorKind::InvalidData);
+
+        let streamed = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Collect)
+            .stream()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            streamed.iter().filter(|item| item.is_err()).count(),
+            1,
+            "the stream yields the ignore failure exactly once"
+        );
+        assert!(streamed.iter().any(|item| {
+            item.as_ref()
+                .is_ok_and(|entry| entry.path().ends_with("kept.log"))
+        }));
+    }
+
+    #[test]
+    fn cumulative_ignore_chain_budget_reports_read_ignore_and_keeps_ancestor_rules() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.root.join(".git")).expect("create git dir");
+        fixture.write("a/b/c/d/ignored.log");
+        fixture.write("a/b/c/d/keep.txt");
+        fixture.write("a/b/c/d/e/sub_ignored.log");
+        fixture.write("a/b/c/d/e/sub_keep.txt");
+
+        // Each ancestor `.gitignore` uses 240,000 `**\/` (`AnyDirsNonEmpty`)
+        // components, staying under the 250,000-unit and 256 MiB per-file
+        // ceilings so four ancestors occupy ~960,000 units of the 1,000,000-unit
+        // active-chain budget on every architecture.
+        let ancestor_parts = 240_000;
+        let overflow_parts = 50_000;
+
+        let mut heavy = Vec::with_capacity(6 + ancestor_parts * 4 + 2);
+        heavy.extend_from_slice(b"*.log\n");
+        for _ in 0..ancestor_parts {
+            heavy.extend_from_slice(b"**\\/");
+        }
+        heavy.extend_from_slice(b"x\n");
+
+        for dir in ["", "a", "a/b", "a/b/c"] {
+            let path = if dir.is_empty() {
+                fixture.root.join(".gitignore")
+            } else {
+                fixture.root.join(dir).join(".gitignore")
+            };
+            fs::write(path, &heavy).expect("write ancestor ignore file");
+        }
+
+        // The fifth directory in the chain breaches the 1,000,000-unit
+        // cumulative chain ceiling on its third line; its earlier lines
+        // (`keep.txt`, `sub_keep.txt`) must be rolled back while ancestor
+        // `*.log` rules stay active.
+        let overflow_path = fixture.root.join("a/b/c/d/.gitignore");
+        let mut overflow = Vec::from(&b"keep.txt\nsub_keep.txt\n"[..]);
+        for _ in 0..overflow_parts {
+            overflow.extend_from_slice(b"**\\/");
+        }
+        overflow.extend_from_slice(b"y\n");
+        fs::write(&overflow_path, overflow).expect("write chain-overflow ignore file");
+
+        for threads in [1, 4] {
+            let result = Walker::new(&fixture.root)
+                .respect_git_ignore(true)
+                .threads(threads)
+                .error_policy(ErrorPolicy::Collect)
+                .collect()
+                .expect("collect policy keeps walking");
+            assert_eq!(result.errors().len(), 1);
+            assert_eq!(result.errors()[0].operation().as_str(), "read_ignore");
+            assert_eq!(result.errors()[0].path(), overflow_path);
+            assert_eq!(
+                result.errors()[0].io_kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            let paths = relative_paths(result.entries(), &fixture.root);
+            assert!(!paths.contains(&PathBuf::from("a/b/c/d/ignored.log")));
+            assert!(paths.contains(&PathBuf::from("a/b/c/d/keep.txt")));
+            assert!(!paths.contains(&PathBuf::from("a/b/c/d/e/sub_ignored.log")));
+            assert!(paths.contains(&PathBuf::from("a/b/c/d/e/sub_keep.txt")));
+        }
+
+        // Walking a subtree rooted below the overflow exercises
+        // `IgnoreScope::for_root`'s ancestor-loading loop as well.
+        let subtree_root = fixture.root.join("a/b/c/d/e");
+        let subtree = Walker::new(&subtree_root)
+            .respect_git_ignore(true)
+            .threads(1)
+            .error_policy(ErrorPolicy::Collect)
+            .collect()
+            .expect("subtree collect keeps walking");
+        assert_eq!(subtree.errors().len(), 1);
+        assert_eq!(subtree.errors()[0].operation().as_str(), "read_ignore");
+        assert_eq!(
+            subtree.errors()[0].io_kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let subtree_paths = relative_paths(subtree.entries(), &subtree_root);
+        assert!(!subtree_paths.contains(&PathBuf::from("sub_ignored.log")));
+        assert!(subtree_paths.contains(&PathBuf::from("sub_keep.txt")));
     }
 
     /// The chain is rebuilt per directory now, so a rule at the root still has
