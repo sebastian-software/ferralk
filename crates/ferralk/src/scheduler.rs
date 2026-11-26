@@ -49,6 +49,7 @@ impl<T> Scheduler<T> {
         self.injector.push(task);
     }
 
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn worker(&self) -> Worker<T> {
         Worker::new_fifo()
     }
@@ -85,7 +86,11 @@ pub(crate) struct Coordinator {
     /// Publication epoch in the high bits and registered sleepers in the low
     /// bits. Keeping them in one atomic makes the producer's epoch bump and
     /// sleeper observation indivisible.
-    wake_state: AtomicUsize,
+    ///
+    /// Padded onto its own cache line because every `schedule()` writes it
+    /// with a `SeqCst` RMW, which would otherwise false-share with `lone`,
+    /// `wake_lock`, and `wake`.
+    wake_state: CacheLine<AtomicUsize>,
     /// Whether the caller is still the only worker. This state belongs beside
     /// the parking protocol because it decides whether producing work must
     /// notify a waiter.
@@ -126,7 +131,7 @@ impl Coordinator {
         Self {
             pending: CacheLine(AtomicUsize::new(0)),
             active_workers: CacheLine(AtomicUsize::new(0)),
-            wake_state: AtomicUsize::new(0),
+            wake_state: CacheLine(AtomicUsize::new(0)),
             lone: AtomicBool::new(true),
             wake_lock: Mutex::new(()),
             wake: Condvar::new(),
@@ -326,7 +331,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
-    use super::Scheduler;
+    use std::mem::{align_of, offset_of};
+
+    use super::{CacheLine, Coordinator, Scheduler};
 
     #[test]
     fn injector_distributes_tasks_to_worker_local_queues() {
@@ -343,6 +350,31 @@ mod tests {
         });
         assert_ne!(first, second);
         assert!(scheduler.steal_into(&worker).is_none());
+    }
+
+    #[test]
+    fn coordinator_pads_wake_state_on_its_own_cache_line() {
+        let line = align_of::<CacheLine<super::AtomicUsize>>();
+        let expected_min = if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
+            128
+        } else {
+            64
+        };
+        assert!(line >= expected_min);
+
+        let wake_state = offset_of!(Coordinator, wake_state);
+        for other in [
+            offset_of!(Coordinator, pending),
+            offset_of!(Coordinator, active_workers),
+            offset_of!(Coordinator, lone),
+            offset_of!(Coordinator, wake_lock),
+            offset_of!(Coordinator, wake),
+        ] {
+            assert!(
+                wake_state.abs_diff(other) >= line,
+                "wake_state (offset {wake_state}) must not share a {line}-byte cache line with field at offset {other}"
+            );
+        }
     }
 }
 

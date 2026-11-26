@@ -105,8 +105,17 @@ pub(crate) struct DirectoryTask {
     /// every entry's path.
     pub(crate) depth: usize,
     pub(crate) ignores: IgnoreScope,
-    /// Repository-level ignore errors are discovered while the root task is
-    /// built and consumed exactly once by the frontend that opens it.
+}
+
+/// An initial root directory together with any repository-level ignore errors
+/// discovered while preparing its root [`IgnoreScope`].
+///
+/// Kept separate from [`DirectoryTask`] so every queued subdirectory does not
+/// carry an empty `Vec<IgnoreReadError>` (24 bytes) inline in the work-stealing
+/// deques.
+#[derive(Debug)]
+pub(crate) struct RootTask {
+    pub(crate) task: DirectoryTask,
     pub(crate) ignore_errors: Vec<IgnoreReadError>,
 }
 
@@ -423,7 +432,6 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         root: context.root,
         ancestors: context.ancestors.clone(),
         ignores: ignores.clone(),
-        ignore_errors: Vec::new(),
     };
     if !emit {
         if descend {
@@ -460,5 +468,61 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         EntryAction::DescendAndEmit(emitted, task())
     } else {
         EntryAction::Emit(emitted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::{align_of, size_of};
+
+    use super::{DirectoryTask, RootTask};
+    use crate::{
+        AncestorChain, DirectoryOpen,
+        gitignore::{IgnoreReadError, IgnoreScope},
+    };
+
+    #[test]
+    fn directory_task_omits_root_only_ignore_errors_vec() {
+        // Independent field-sum pin (rounded to struct alignment so 32-bit
+        // targets with 8-byte-aligned `DirectoryOpen::Suspended((u64, u64))`
+        // account for trailing padding): re-adding `Vec<IgnoreReadError>`
+        // (3 words) or another unexpected field fails this check.
+        let kept_fields = size_of::<std::path::PathBuf>()
+            + size_of::<DirectoryOpen>()
+            + size_of::<usize>()
+            + size_of::<AncestorChain>()
+            + size_of::<usize>()
+            + size_of::<IgnoreScope>();
+        let expected_size = kept_fields.next_multiple_of(align_of::<DirectoryTask>());
+        assert_eq!(
+            size_of::<DirectoryTask>(),
+            expected_size,
+            "DirectoryTask ({}) must hold only its kept traversal fields rounded to alignment ({expected_size})",
+            size_of::<DirectoryTask>()
+        );
+        // Independent word-count ceiling on the portable build: PathBuf plus
+        // root + depth (2 words), AncestorChain (1 word), and IgnoreScope (3
+        // words) — 72 bytes on 64-bit Unix and 80 bytes on 64-bit Windows where
+        // PathBuf is 4 words. Re-adding a 3-word Vec<IgnoreReadError> fails
+        // this bound on every target.
+        #[cfg(not(any(
+            all(feature = "native-macos", target_os = "macos"),
+            all(feature = "native-linux", target_os = "linux"),
+        )))]
+        {
+            let budget = size_of::<std::path::PathBuf>() + 6 * size_of::<usize>();
+            assert!(
+                size_of::<DirectoryTask>() <= budget,
+                "portable DirectoryTask ({}) exceeded PathBuf + 6-word budget ({budget})",
+                size_of::<DirectoryTask>(),
+            );
+        }
+        assert!(
+            size_of::<RootTask>() - size_of::<DirectoryTask>() >= size_of::<Vec<IgnoreReadError>>(),
+            "DirectoryTask ({}) must stay at least one Vec ({}) smaller than RootTask ({})",
+            size_of::<DirectoryTask>(),
+            size_of::<Vec<IgnoreReadError>>(),
+            size_of::<RootTask>(),
+        );
     }
 }

@@ -26,10 +26,12 @@
 //! ended where the other goes on, and the ended one sorts first.
 //!
 //! Where that argument does not hold the sort keeps `Path::cmp`: across
-//! several roots, whose spellings share no prefix, and off Unix, where `/` and
-//! `\` both separate and a prefix such as `C:` has rules of its own.
+//! distinct roots, whose spellings share no prefix, and off Unix, where `/`
+//! and `\` both separate and a prefix such as `C:` has rules of its own. On
+//! Unix, pairs within a multi-root walk that came from the same root still
+//! dispatch directly via `compare_below_root`.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc};
 
 use crate::{WalkEntry, Walker};
 
@@ -39,7 +41,26 @@ pub(crate) fn sort_entries(walker: &Walker, entries: &mut [WalkEntry]) {
         Some(start) => entries.sort_by(|left, right| {
             compare_below_root(left.path_bytes(), right.path_bytes(), start)
         }),
+        None if cfg!(unix) => entries.sort_by(compare_multi_root_unix),
         None => entries.sort_by(|left, right| left.path.cmp(&right.path)),
+    }
+}
+
+/// Compares two Unix entries from a multi-root walk in `Path::cmp` order.
+///
+/// Entries that share the same [`SharedRoot`](crate::SharedRoot) allocation
+/// share an identical root prefix up to `relative_start`, so comparing below
+/// that offset agrees with `Path::cmp` without re-parsing path components.
+/// Cross-root pairs fall back to `Path::cmp`.
+fn compare_multi_root_unix(left: &WalkEntry, right: &WalkEntry) -> Ordering {
+    if Arc::ptr_eq(&left.root, &right.root) {
+        compare_below_root(
+            left.path_bytes(),
+            right.path_bytes(),
+            left.root.relative_start,
+        )
+    } else {
+        left.path.cmp(&right.path)
     }
 }
 
@@ -353,5 +374,84 @@ mod tests {
         let mut expected = sorted.clone();
         expected.sort();
         assert_eq!(sorted, expected);
+    }
+
+    #[test]
+    fn multi_root_unix_comparator_agrees_with_path_cmp() {
+        use std::sync::Arc;
+
+        use crate::SharedRoot;
+
+        let mut random = SplitMix(0x5017);
+        // Include identical root spellings with distinct `Arc<SharedRoot>`
+        // pointers, nested roots, awkward spellings, and non-UTF-8 bytes.
+        let root_specs: &[&[u8]] = &[
+            b"a",
+            b"a",
+            b"a/",
+            b"a/b",
+            b"a-b",
+            b"./a",
+            b"./x//y/",
+            b"x/./y/",
+            b"..//x",
+            b"/",
+            b"//",
+            b"\xff/.\xa0/",
+        ];
+        let shared_roots: Vec<Arc<SharedRoot>> = root_specs
+            .iter()
+            .map(|&bytes| {
+                let path = PathBuf::from(OsStr::from_bytes(bytes));
+                let start = RootPlan::new(path.clone()).relative_start;
+                Arc::new(SharedRoot::new(path, start))
+            })
+            .collect();
+
+        let mut entries = Vec::new();
+        for (root_index, &root_bytes) in root_specs.iter().enumerate() {
+            for _ in 0..16 {
+                entries.push(WalkEntry {
+                    path: walked_path(&mut random, root_bytes),
+                    root: Arc::clone(&shared_roots[root_index]),
+                    is_dir: false,
+                    is_symlink: false,
+                    depth: 1,
+                    metadata: None,
+                });
+            }
+        }
+
+        // Verify both same-root (`Arc::ptr_eq`) and cross-root pairs agree with
+        // `Path::cmp` on every pair.
+        let mut saw_same_root = false;
+        let mut saw_cross_root = false;
+        for left in &entries {
+            for right in &entries {
+                if Arc::ptr_eq(&left.root, &right.root) {
+                    saw_same_root = true;
+                } else {
+                    saw_cross_root = true;
+                }
+                assert_eq!(
+                    compare_multi_root_unix(left, right),
+                    left.path.cmp(&right.path),
+                    "multi-root mismatch: {:?} vs {:?}",
+                    left.path,
+                    right.path
+                );
+            }
+        }
+        assert!(saw_same_root && saw_cross_root);
+
+        // Also verify `sort_entries` over a multi-root walker produces exact
+        // `Path::cmp` order.
+        let mut walker = Walker::new("a");
+        walker = walker.add_root("a-b").expect("add root");
+        let mut expected: Vec<PathBuf> = entries.iter().map(|entry| entry.path.clone()).collect();
+        expected.sort();
+        sort_entries(&walker, &mut entries);
+        let actual: Vec<PathBuf> = entries.into_iter().map(|entry| entry.path).collect();
+        assert_eq!(actual, expected);
     }
 }

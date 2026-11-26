@@ -381,6 +381,7 @@
 
 use std::{
     borrow::Cow,
+    collections::VecDeque,
     error::Error,
     ffi::{OsStr, OsString},
     fmt, fs,
@@ -625,7 +626,9 @@ mod sort_order;
 
 pub use parallel_stream::ParallelWalkStream;
 
-use classify::{DirectoryTask, EmittedEntry, EntryAction, TraversalContext, classify_entry};
+use classify::{
+    DirectoryTask, EmittedEntry, EntryAction, RootTask, TraversalContext, classify_entry,
+};
 use gitignore::{IgnoreReadError, IgnoreScope};
 
 /// Controls what a walk does after a recoverable filesystem error.
@@ -2725,27 +2728,19 @@ impl Walker {
         if self.threads > 1 {
             return parallel::collect(self, backend, visitor);
         }
-        let Some(root_tasks) = self.root_tasks(backend) else {
-            return Ok(WalkResult {
-                entries: Vec::new(),
-                errors: Vec::new(),
-                cancelled: true,
-            });
-        };
         let mut state = WalkState::new(&self, visitor);
-        // Use the same injector-to-worker transfer as the parallel backend. The
-        // serial baseline owns one local queue and deliberately drains it
-        // before returning.
-        let scheduler = scheduler::Scheduler::new();
-        for task in root_tasks {
-            scheduler.push(task);
-        }
-        let worker = scheduler.worker();
-        while let Some(task) = scheduler.steal_into(&worker).or_else(|| worker.pop()) {
+        for index in 0..self.roots.len() {
             if state.check_cancellation() {
                 break;
             }
-            state.walk_directory(backend, task)?;
+            let Some(task) = self.build_root_task(backend, index) else {
+                state.cancelled = true;
+                break;
+            };
+            state.walk_root(backend, task)?;
+            if state.cancelled {
+                break;
+            }
         }
         if self.options.sort {
             sort_order::sort_entries(&self, &mut state.entries);
@@ -2913,32 +2908,36 @@ impl Walker {
             .is_some_and(CancellationToken::is_cancelled)
     }
 
-    /// The tasks a walk starts from: one per root, in order.
+    /// Builds the initial [`RootTask`] for root `index`, lazily discovering
+    /// its ignore scope without staging all roots in a `Vec<RootTask>`.
     ///
-    /// Returns `None` if cancellation was observed before or while building
-    /// root tasks so callers never mistake an abbreviated task list for a
+    /// Returns `None` if cancellation was observed before or after building
+    /// this root task so callers never mistake an abbreviated root set for a
     /// completed walk.
-    fn root_tasks<B: DirectoryBackend + ?Sized>(&self, backend: &B) -> Option<Vec<DirectoryTask>> {
-        let mut tasks = Vec::with_capacity(self.roots.len());
-        for (index, plan) in self.roots.iter().enumerate() {
-            if self.is_cancelled() {
-                return None;
-            }
-            let (ignores, ignore_errors) = IgnoreScope::for_root(self, backend, &plan.path);
-            tasks.push(DirectoryTask {
+    fn build_root_task<B: DirectoryBackend + ?Sized>(
+        &self,
+        backend: &B,
+        index: usize,
+    ) -> Option<RootTask> {
+        if self.is_cancelled() {
+            return None;
+        }
+        let plan = &self.roots[index];
+        let (ignores, ignore_errors) = IgnoreScope::for_root(self, backend, &plan.path);
+        if self.is_cancelled() {
+            return None;
+        }
+        Some(RootTask {
+            task: DirectoryTask {
                 path: plan.path.clone(),
                 open: DirectoryOpen::default(),
                 depth: 0,
                 root: index,
                 ancestors: AncestorChain::default(),
                 ignores,
-                ignore_errors,
-            });
-        }
-        if self.is_cancelled() {
-            return None;
-        }
-        Some(tasks)
+            },
+            ignore_errors,
+        })
     }
 }
 
@@ -3806,6 +3805,20 @@ trait DirectoryBackend {
             self.canonicalize(path)
         }
     }
+
+    /// Returns both the filesystem identity (`st_dev`) and the follow-symlinks
+    /// cycle key (`(st_dev, st_ino)`) from one `metadata` call on Unix.
+    ///
+    /// Used when both `same_file_system` and `follow_symlinks` are enabled so
+    /// each directory pays one `stat` syscall rather than two back-to-back.
+    #[cfg(unix)]
+    fn filesystem_id_and_cycle_key(&self, path: &Path) -> std::io::Result<(u64, CycleKey)> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = self.metadata(path)?;
+        let dev = metadata.dev();
+        Ok((dev, (dev, metadata.ino())))
+    }
 }
 
 /// Ignore and repository-metadata files are configuration, not bulk input.
@@ -4085,14 +4098,12 @@ impl AncestorChain {
     }
 }
 
-/// Checks a scheduled directory before reading it; the root establishes its own boundary.
-fn enter_filesystem(
-    backend: &(impl DirectoryBackend + ?Sized),
-    path: &Path,
+/// Checks a filesystem id against the root's boundary; the root records its own.
+fn check_filesystem_id(
+    current: u64,
     root: &std::sync::OnceLock<u64>,
     is_root: bool,
 ) -> std::io::Result<bool> {
-    let current = backend.filesystem_id(path)?;
     if is_root {
         let _ = root.set(current);
         Ok(true)
@@ -4102,6 +4113,72 @@ fn enter_filesystem(
             .ok_or_else(|| std::io::Error::other("root filesystem identity is unavailable"))?;
         Ok(*expected == current)
     }
+}
+
+/// Checks a scheduled directory before reading it; the root establishes its own boundary.
+fn enter_filesystem(
+    backend: &(impl DirectoryBackend + ?Sized),
+    path: &Path,
+    root: &std::sync::OnceLock<u64>,
+    is_root: bool,
+) -> std::io::Result<bool> {
+    check_filesystem_id(backend.filesystem_id(path)?, root, is_root)
+}
+
+/// Outcome of the per-directory `same_file_system` and `follow_symlinks`
+/// checks run before reading a directory.
+pub(crate) enum DirectoryEntryCheck {
+    Enter(AncestorChain),
+    Skip,
+    Failed(WalkOperation, std::io::Error),
+}
+
+/// Runs `same_file_system` and `follow_symlinks` entry checks for a directory.
+///
+/// On Unix, when both switches are enabled, this issues a single `metadata`
+/// syscall via [`DirectoryBackend::filesystem_id_and_cycle_key`] instead of
+/// separate `filesystem_id` and `cycle_key` calls.
+pub(crate) fn check_directory_entry(
+    walker: &Walker,
+    backend: &(impl DirectoryBackend + ?Sized),
+    path: &Path,
+    root: usize,
+    ancestors: AncestorChain,
+    is_root: bool,
+) -> DirectoryEntryCheck {
+    #[cfg(unix)]
+    if walker.options.same_file_system && walker.options.follow_symlinks {
+        return match backend.filesystem_id_and_cycle_key(path) {
+            Ok((dev, key)) => {
+                match check_filesystem_id(dev, &walker.roots[root].filesystem, is_root) {
+                    Ok(true) => match ancestors.enter(key) {
+                        Some(ancestors) => DirectoryEntryCheck::Enter(ancestors),
+                        None => DirectoryEntryCheck::Skip,
+                    },
+                    Ok(false) => DirectoryEntryCheck::Skip,
+                    Err(source) => DirectoryEntryCheck::Failed(WalkOperation::Metadata, source),
+                }
+            }
+            Err(source) => DirectoryEntryCheck::Failed(WalkOperation::Metadata, source),
+        };
+    }
+    if walker.options.same_file_system {
+        match enter_filesystem(backend, path, &walker.roots[root].filesystem, is_root) {
+            Ok(true) => {}
+            Ok(false) => return DirectoryEntryCheck::Skip,
+            Err(source) => return DirectoryEntryCheck::Failed(WalkOperation::Metadata, source),
+        }
+    }
+    if walker.options.follow_symlinks {
+        return match backend.cycle_key(path) {
+            Ok(key) => match ancestors.enter(key) {
+                Some(ancestors) => DirectoryEntryCheck::Enter(ancestors),
+                None => DirectoryEntryCheck::Skip,
+            },
+            Err(source) => DirectoryEntryCheck::Failed(CYCLE_KEY_OPERATION, source),
+        };
+    }
+    DirectoryEntryCheck::Enter(ancestors)
 }
 
 /// Names the call whose failure ends a directory in follow mode, so the
@@ -4125,6 +4202,25 @@ const IGNORE_FILE_OPERATION: WalkOperation = WalkOperation::ReadIgnore;
 /// listing that has been used once names further entries without allocating.
 /// It holds no more than the `Vec<PathBuf>` it replaced: a name is a suffix of
 /// the path that used to be stored whole.
+/// Maximum entry buffers a [`Listing`] retains across directories.
+///
+/// Ordinary directories stay below this cap and reuse their buffers with zero
+/// reallocations, while a one-time wide directory (for example 100k entries)
+/// releases its peak capacity as soon as the listing is cleared.
+const MAX_RETAINED_LISTING_ENTRIES: usize = 4_096;
+
+/// Maximum deferred-error slots a [`Listing`] retains across directories.
+const MAX_RETAINED_DEFERRED_ERRORS: usize = 64;
+
+/// Maximum finished [`DirectoryScratch`] frames pooled by `WalkStream` /
+/// `WalkState`. Covers ordinary directory depths without retaining peak depth
+/// memory from pathological deep chains.
+const MAX_RETAINED_SCRATCH_FRAMES: usize = 32;
+
+/// Maximum byte capacity retained in reusable path / normalization buffers of a
+/// pooled [`DirectoryScratch`].
+const MAX_RETAINED_SCRATCH_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Default)]
 pub(crate) struct Listing {
     entries: Vec<ListedEntry>,
@@ -4136,9 +4232,10 @@ pub(crate) struct Listing {
     /// the next directory.
     len: usize,
     /// Per-entry failures discovered while a backend was completing an
-    /// otherwise usable listing. They are delivered after its siblings, so a
-    /// persistent stat failure cannot make those siblings disappear.
-    deferred_errors: Vec<DeferredListingError>,
+    /// otherwise usable listing. They are delivered after its siblings in FIFO
+    /// order, so a persistent stat failure cannot make those siblings
+    /// disappear.
+    deferred_errors: VecDeque<DeferredListingError>,
 }
 
 #[derive(Debug)]
@@ -4196,7 +4293,8 @@ impl ListedEntry {
 }
 
 impl Listing {
-    /// Drops the previous directory's entries, keeping their buffers.
+    /// Drops the previous directory's entries, keeping reusable buffers up to
+    /// [`MAX_RETAINED_LISTING_ENTRIES`].
     pub(crate) fn clear(&mut self) {
         self.len = 0;
         #[cfg(any(
@@ -4207,6 +4305,26 @@ impl Listing {
             self.native_directory = None;
         }
         self.deferred_errors.clear();
+        self.shrink_if_oversized();
+    }
+
+    /// Releases peak buffers left behind by an unusually wide directory while
+    /// leaving ordinary directories untouched.
+    pub(crate) fn shrink_if_oversized(&mut self) {
+        if self.entries.len() > MAX_RETAINED_LISTING_ENTRIES {
+            self.entries.truncate(MAX_RETAINED_LISTING_ENTRIES);
+            if self.len > MAX_RETAINED_LISTING_ENTRIES {
+                self.len = MAX_RETAINED_LISTING_ENTRIES;
+            }
+        }
+        if self.entries.capacity() > MAX_RETAINED_LISTING_ENTRIES {
+            self.entries.shrink_to(MAX_RETAINED_LISTING_ENTRIES);
+        }
+        if self.deferred_errors.capacity() > MAX_RETAINED_DEFERRED_ERRORS
+            && self.deferred_errors.len() <= MAX_RETAINED_DEFERRED_ERRORS
+        {
+            self.deferred_errors.shrink_to(MAX_RETAINED_DEFERRED_ERRORS);
+        }
     }
 
     /// Adds one entry, reusing the buffer left by the directory before.
@@ -4229,14 +4347,14 @@ impl Listing {
     /// Records a failure for one entry without throwing away the successfully
     /// read siblings. Consumers report these after the listing is consumed.
     pub(crate) fn defer_error(&mut self, path: PathBuf, source: std::io::Error) {
-        self.deferred_errors.push(DeferredListingError {
+        self.deferred_errors.push_back(DeferredListingError {
             path,
             source: source.into(),
         });
     }
 
     pub(crate) fn take_deferred_error(&mut self) -> Option<DeferredListingError> {
-        (!self.deferred_errors.is_empty()).then(|| self.deferred_errors.remove(0))
+        self.deferred_errors.pop_front()
     }
 
     /// Whether the directory holds an entry of this name, which is how the
@@ -4718,15 +4836,26 @@ impl WalkStream {
     fn start(&mut self, backend: &impl DirectoryBackend) -> bool {
         self.started = true;
         backend.begin_walk();
-        let Some(root_tasks) = self.walker.root_tasks(backend) else {
-            self.cancelled = true;
-            self.stopped = true;
-            return false;
-        };
-        // Reversed, because the stream pops from the back and the roots are
-        // walked in the order the caller added them.
-        self.pending
-            .extend(root_tasks.into_iter().rev().map(SerialTask::Directory));
+        // Reserve exact slots up front — one per root, with rare ancestor
+        // ignore errors boxed inside `SerialTask::RootWithIgnoreErrors` — so
+        // multi-root streams avoid both staging vectors and geometric doubling.
+        // Build in forward root order, then reverse in place because the stream
+        // pops from the back.
+        self.pending.reserve_exact(self.walker.roots.len());
+        for index in 0..self.walker.roots.len() {
+            let Some(root) = self.walker.build_root_task(backend, index) else {
+                self.pending = Vec::new();
+                self.cancelled = true;
+                self.stopped = true;
+                return false;
+            };
+            self.pending.push(if root.ignore_errors.is_empty() {
+                SerialTask::Directory(root.task)
+            } else {
+                SerialTask::RootWithIgnoreErrors(Box::new(root))
+            });
+        }
+        self.pending.reverse();
         true
     }
 
@@ -4735,38 +4864,21 @@ impl WalkStream {
         backend: &impl DirectoryBackend,
         mut task: DirectoryTask,
     ) -> Option<Result<WalkEntry, WalkError>> {
-        let root_ignore_errors = std::mem::take(&mut task.ignore_errors);
-        if !root_ignore_errors.is_empty()
-            && let Some(error) = self.queue_ignore_errors(root_ignore_errors)
-        {
-            if !self.stopped {
-                self.pending.push(SerialTask::Directory(task));
-            }
-            return Some(error);
-        }
         let is_root = task.depth == 0;
-        if self.walker.options.same_file_system {
-            match enter_filesystem(
-                backend,
-                &task.path,
-                &self.walker.roots[task.root].filesystem,
-                is_root,
-            ) {
-                Ok(true) => {}
-                Ok(false) => return None,
-                Err(source) => {
-                    return self.error(WalkOperation::Metadata, task.path, source, is_root);
-                }
+        task.ancestors = match check_directory_entry(
+            &self.walker,
+            backend,
+            &task.path,
+            task.root,
+            std::mem::take(&mut task.ancestors),
+            is_root,
+        ) {
+            DirectoryEntryCheck::Enter(ancestors) => ancestors,
+            DirectoryEntryCheck::Skip => return None,
+            DirectoryEntryCheck::Failed(operation, source) => {
+                return self.error(operation, task.path, source, is_root);
             }
-        }
-        if self.walker.options.follow_symlinks {
-            task.ancestors = match backend.cycle_key(&task.path) {
-                Ok(key) => task.ancestors.enter(key)?,
-                Err(source) => {
-                    return self.error(CYCLE_KEY_OPERATION, task.path, source, is_root);
-                }
-            };
-        }
+        };
         let mut scratch = self.scratch.pop().unwrap_or_default();
         let read_result = backend.read_scheduled_directory(
             &task.path,
@@ -4779,8 +4891,7 @@ impl WalkStream {
         if let Err(source) = read_result {
             // A backend can fail after appending entries. They belong to the
             // failed directory and must never survive in reusable scratch.
-            scratch.listing.clear();
-            self.scratch.push(scratch);
+            recycle_scratch(&mut self.scratch, scratch);
             return self.error(WalkOperation::ReadDir, task.path, source, is_root);
         }
         let (ignores, entered_errors) = std::mem::take(&mut task.ignores).enter(
@@ -4929,9 +5040,8 @@ impl WalkStream {
         }
     }
 
-    fn finish_directory(&mut self, mut frame: DirectoryFrame) {
-        frame.scratch.listing.clear();
-        self.scratch.push(frame.scratch);
+    fn finish_directory(&mut self, frame: DirectoryFrame) {
+        recycle_scratch(&mut self.scratch, frame.scratch);
     }
 
     fn next_with(
@@ -4958,6 +5068,21 @@ impl WalkStream {
             };
             let result = match task {
                 SerialTask::Directory(task) => self.prepare_directory(backend, task),
+                SerialTask::RootWithIgnoreErrors(root) => {
+                    let RootTask {
+                        task,
+                        ignore_errors,
+                    } = *root;
+                    match self.queue_ignore_errors(ignore_errors) {
+                        Some(error) => {
+                            if !self.stopped {
+                                self.pending.push(SerialTask::Directory(task));
+                            }
+                            Some(error)
+                        }
+                        None => self.prepare_directory(backend, task),
+                    }
+                }
                 SerialTask::Resume(frame) => self.resume_directory(backend, frame),
                 SerialTask::Record(entry) => Some(Ok(entry)),
             };
@@ -5001,6 +5126,35 @@ struct DirectoryScratch {
     ignore_bytes: Vec<u8>,
 }
 
+impl DirectoryScratch {
+    fn reset_for_reuse(&mut self) {
+        self.listing.clear();
+        self.path.clear();
+        if self.path.capacity() > MAX_RETAINED_SCRATCH_BYTES {
+            self.path.shrink_to(MAX_RETAINED_SCRATCH_BYTES);
+        }
+        self.glob_bytes.clear();
+        if self.glob_bytes.capacity() > MAX_RETAINED_SCRATCH_BYTES {
+            self.glob_bytes.shrink_to(MAX_RETAINED_SCRATCH_BYTES);
+        }
+        self.ignore_bytes.clear();
+        if self.ignore_bytes.capacity() > MAX_RETAINED_SCRATCH_BYTES {
+            self.ignore_bytes.shrink_to(MAX_RETAINED_SCRATCH_BYTES);
+        }
+    }
+}
+
+/// Returns a finished scratch frame to the bounded pool, dropping excess
+/// frames and shrinking oversized buffers so peak memory from deep or wide
+/// directories is not retained for the rest of the walk.
+fn recycle_scratch(pool: &mut Vec<DirectoryScratch>, mut scratch: DirectoryScratch) {
+    if pool.len() >= MAX_RETAINED_SCRATCH_FRAMES {
+        return;
+    }
+    scratch.reset_for_reuse();
+    pool.push(scratch);
+}
+
 /// One suspended serial-directory listing. A child directory is scheduled
 /// separately, then this frame resumes at the next entry, which retains the
 /// serial walk's depth-first order without borrowing a call-stack frame. The
@@ -5030,6 +5184,10 @@ impl DirectoryFrame {
 #[derive(Debug)]
 enum SerialTask {
     Directory(DirectoryTask),
+    /// A root directory carrying repository-level ignore errors discovered
+    /// while building its root [`IgnoreScope`]. Boxed so multi-root streams
+    /// keep one pending slot per root.
+    RootWithIgnoreErrors(Box<RootTask>),
     Resume(DirectoryFrame),
     /// A directory entry the visitor has already kept, recorded once its
     /// subtree has been walked.
@@ -5168,6 +5326,21 @@ impl<'walker> WalkState<'walker> {
         }
     }
 
+    fn walk_root(
+        &mut self,
+        backend: &impl DirectoryBackend,
+        root: RootTask,
+    ) -> Result<(), WalkError> {
+        if self.check_cancellation() {
+            return Ok(());
+        }
+        for error in root.ignore_errors {
+            let (path, source) = error.into_parts();
+            self.handle_error(IGNORE_FILE_OPERATION, path, source, false)?;
+        }
+        self.walk_directory(backend, root.task)
+    }
+
     fn walk_directory(
         &mut self,
         backend: &impl DirectoryBackend,
@@ -5177,6 +5350,17 @@ impl<'walker> WalkState<'walker> {
         while let Some(task) = pending.pop() {
             match task {
                 SerialTask::Directory(task) => self.start_directory(backend, task, &mut pending)?,
+                SerialTask::RootWithIgnoreErrors(root) => {
+                    let RootTask {
+                        task,
+                        ignore_errors,
+                    } = *root;
+                    for error in ignore_errors {
+                        let (path, source) = error.into_parts();
+                        self.handle_error(IGNORE_FILE_OPERATION, path, source, false)?;
+                    }
+                    self.start_directory(backend, task, &mut pending)?;
+                }
                 SerialTask::Resume(frame) => self.resume_directory(backend, frame, &mut pending)?,
                 SerialTask::Record(entry) => self.entries.push(entry),
             }
@@ -5196,32 +5380,20 @@ impl<'walker> WalkState<'walker> {
             return Ok(());
         }
         let is_root = task.depth == 0;
-        for error in std::mem::take(&mut task.ignore_errors) {
-            let (path, source) = error.into_parts();
-            self.handle_error(IGNORE_FILE_OPERATION, path, source, false)?;
-        }
-        if self.walker.options.same_file_system {
-            match enter_filesystem(
-                backend,
-                &task.path,
-                &self.walker.roots[task.root].filesystem,
-                is_root,
-            ) {
-                Ok(true) => {}
-                Ok(false) => return Ok(()),
-                Err(source) => {
-                    return self.handle_error(WalkOperation::Metadata, task.path, source, is_root);
-                }
+        task.ancestors = match check_directory_entry(
+            self.walker,
+            backend,
+            &task.path,
+            task.root,
+            std::mem::take(&mut task.ancestors),
+            is_root,
+        ) {
+            DirectoryEntryCheck::Enter(ancestors) => ancestors,
+            DirectoryEntryCheck::Skip => return Ok(()),
+            DirectoryEntryCheck::Failed(operation, source) => {
+                return self.handle_error(operation, task.path, source, is_root);
             }
-        }
-        if self.walker.options.follow_symlinks {
-            let Some(ancestors) =
-                self.enter_directory(backend, &task.ancestors, &task.path, is_root)?
-            else {
-                return Ok(());
-            };
-            task.ancestors = ancestors;
-        }
+        };
         let mut scratch = self.scratch.pop().unwrap_or_default();
         let path = task.path.as_path();
         let depth = task.depth;
@@ -5240,8 +5412,7 @@ impl<'walker> WalkState<'walker> {
         if let Err(source) = read_result {
             let result =
                 self.handle_error(WalkOperation::ReadDir, path.to_path_buf(), source, is_root);
-            scratch.listing.clear();
-            self.scratch.push(scratch);
+            recycle_scratch(&mut self.scratch, scratch);
             return result;
         }
         // The directory's own ignore files join the chain here, once,
@@ -5251,8 +5422,7 @@ impl<'walker> WalkState<'walker> {
         for error in ignore_errors {
             let (path, source) = error.into_parts();
             if let Err(error) = self.handle_error(IGNORE_FILE_OPERATION, path, source, false) {
-                scratch.listing.clear();
-                self.scratch.push(scratch);
+                recycle_scratch(&mut self.scratch, scratch);
                 return Err(error);
             }
         }
@@ -5407,31 +5577,9 @@ impl<'walker> WalkState<'walker> {
         self.finish_directory(frame)
     }
 
-    fn finish_directory(&mut self, mut frame: DirectoryFrame) -> Result<(), WalkError> {
-        frame.scratch.listing.clear();
-        self.scratch.push(frame.scratch);
+    fn finish_directory(&mut self, frame: DirectoryFrame) -> Result<(), WalkError> {
+        recycle_scratch(&mut self.scratch, frame.scratch);
         Ok(())
-    }
-
-    fn enter_directory(
-        &mut self,
-        backend: &impl DirectoryBackend,
-        ancestors: &AncestorChain,
-        directory: &Path,
-        is_root: bool,
-    ) -> Result<Option<AncestorChain>, WalkError> {
-        match backend.cycle_key(directory) {
-            Ok(key) => Ok(ancestors.enter(key)),
-            Err(source) => {
-                self.handle_error(
-                    CYCLE_KEY_OPERATION,
-                    directory.to_path_buf(),
-                    source,
-                    is_root,
-                )?;
-                Ok(None)
-            }
-        }
     }
 
     fn handle_error(
@@ -5929,6 +6077,15 @@ mod tests {
                 Ok(1)
             }
         }
+        #[cfg(unix)]
+        fn filesystem_id_and_cycle_key(
+            &self,
+            path: &Path,
+        ) -> std::io::Result<(u64, super::CycleKey)> {
+            let dev = self.filesystem_id(path)?;
+            let (_, ino) = self.cycle_key(path)?;
+            Ok((dev, (dev, ino)))
+        }
     }
 
     #[test]
@@ -5964,6 +6121,7 @@ mod tests {
                 "the default must not query identity"
             );
             let restricted = walker
+                .clone()
                 .options(WalkOptions::default().same_file_system(true))
                 .collect_with(&backend)
                 .unwrap();
@@ -5984,6 +6142,35 @@ mod tests {
             );
             assert!(
                 restricted
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.path().ends_with("nested/two"))
+            );
+            let fused = walker
+                .options(
+                    WalkOptions::default()
+                        .same_file_system(true)
+                        .follow_symlinks(true),
+                )
+                .collect_with(&backend)
+                .unwrap();
+            assert!(fused.errors().is_empty());
+            assert_eq!(
+                fused
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.path() == first.root.join("boundary"))
+                    .count(),
+                2
+            );
+            assert!(
+                !fused
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.path().ends_with("boundary/hidden"))
+            );
+            assert!(
+                fused
                     .entries()
                     .iter()
                     .any(|entry| entry.path().ends_with("nested/two"))
@@ -6301,15 +6488,17 @@ mod tests {
         walker: &Walker,
         backend: &impl super::DirectoryBackend,
         path: PathBuf,
-    ) -> super::DirectoryTask {
+    ) -> super::RootTask {
         let (ignores, ignore_errors) = super::IgnoreScope::for_root(walker, backend, &path);
-        super::DirectoryTask {
-            path: path.clone(),
-            open: super::DirectoryOpen::default(),
-            depth: 0,
-            root: 0,
-            ancestors: super::AncestorChain::default(),
-            ignores,
+        super::RootTask {
+            task: super::DirectoryTask {
+                path: path.clone(),
+                open: super::DirectoryOpen::default(),
+                depth: 0,
+                root: 0,
+                ancestors: super::AncestorChain::default(),
+                ignores,
+            },
             ignore_errors,
         }
     }
@@ -13788,7 +13977,7 @@ mod tests {
             .error_policy(ErrorPolicy::Collect);
         let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
         state
-            .walk_directory(
+            .walk_root(
                 &permission,
                 directory_task(&walker, &permission, fixture.root.clone()),
             )
@@ -13831,7 +14020,7 @@ mod tests {
             };
             let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
             state
-                .walk_directory(
+                .walk_root(
                     &backend,
                     directory_task(&walker, &backend, fixture.root.clone()),
                 )
@@ -13953,7 +14142,7 @@ mod tests {
         let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
 
         state
-            .walk_directory(&backend, directory_task(&walker, &backend, root.clone()))
+            .walk_root(&backend, directory_task(&walker, &backend, root.clone()))
             .expect("backend walk succeeds");
 
         assert_eq!(backend.reads.into_inner(), vec![root, source]);
@@ -14000,7 +14189,7 @@ mod tests {
         let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
 
         state
-            .walk_directory(
+            .walk_root(
                 &backend,
                 directory_task(&walker, &backend, fixture.root.clone()),
             )
@@ -14064,7 +14253,7 @@ mod tests {
             };
             let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
             state
-                .walk_directory(
+                .walk_root(
                     &backend,
                     directory_task(&walker, &backend, fixture.root.clone()),
                 )
@@ -14088,7 +14277,7 @@ mod tests {
         };
         let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
         state
-            .walk_directory(
+            .walk_root(
                 &backend,
                 directory_task(&walker, &backend, fixture.root.clone()),
             )
@@ -14139,7 +14328,7 @@ mod tests {
             };
             let mut state = super::WalkState::new(&walker, &super::keep_every_entry);
             state
-                .walk_directory(
+                .walk_root(
                     &backend,
                     directory_task(&walker, &backend, fixture.root.clone()),
                 )
@@ -14431,7 +14620,7 @@ mod tests {
     fn collect_with_portable_backend(walker: &Walker) -> (Vec<WalkEntry>, Vec<super::WalkError>) {
         let mut state = super::WalkState::new(walker, &super::keep_every_entry);
         state
-            .walk_directory(
+            .walk_root(
                 &super::StdBackend,
                 directory_task(
                     walker,
@@ -15710,5 +15899,414 @@ mod tests {
         handle
             .join()
             .expect("deep AncestorChain drop succeeds on a 256 KiB stack");
+    }
+
+    #[test]
+    fn listing_deferred_errors_drain_in_fifo_order_and_shrink_oversized_capacity() {
+        let mut listing = super::Listing::default();
+        let count = super::MAX_RETAINED_DEFERRED_ERRORS * 4;
+        for index in 0..count {
+            listing.defer_error(
+                PathBuf::from(format!("entry-{index:04}")),
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("err-{index}")),
+            );
+        }
+        assert!(listing.deferred_errors.capacity() >= count);
+
+        let mut drained = Vec::with_capacity(count);
+        while let Some(error) = listing.take_deferred_error() {
+            drained.push(error.path);
+        }
+        let expected: Vec<PathBuf> = (0..count)
+            .map(|index| PathBuf::from(format!("entry-{index:04}")))
+            .collect();
+        assert_eq!(drained, expected);
+        assert!(listing.take_deferred_error().is_none());
+
+        listing.clear();
+        assert!(
+            listing.deferred_errors.capacity() <= super::MAX_RETAINED_DEFERRED_ERRORS,
+            "clear() must shrink oversized deferred_errors capacity ({})",
+            listing.deferred_errors.capacity()
+        );
+    }
+
+    #[test]
+    fn listing_and_scratch_pool_release_peak_capacity_after_wide_and_deep_directories() {
+        // 1. Direct Listing shrink after a one-time wide directory.
+        let mut listing = super::Listing::default();
+        let wide_count = super::MAX_RETAINED_LISTING_ENTRIES + 4_000;
+        for index in 0..wide_count {
+            let name = format!("file-{index:05}.txt");
+            listing.push(std::ffi::OsStr::new(&name), false, false);
+        }
+        assert!(listing.entries.capacity() >= wide_count);
+        listing.clear();
+        assert!(listing.entries().is_empty());
+        assert!(listing.entries.len() <= super::MAX_RETAINED_LISTING_ENTRIES);
+        assert!(
+            listing.entries.capacity() <= super::MAX_RETAINED_LISTING_ENTRIES,
+            "Listing::clear() must release peak capacity after a wide directory: {}",
+            listing.entries.capacity()
+        );
+
+        // 2. Bounded scratch pool and oversized path/normalization buffers.
+        let mut pool = Vec::new();
+        for _ in 0..(super::MAX_RETAINED_SCRATCH_FRAMES * 2) {
+            let mut scratch = DirectoryScratch::default();
+            scratch
+                .path
+                .push("a".repeat(super::MAX_RETAINED_SCRATCH_BYTES * 2));
+            scratch
+                .glob_bytes
+                .resize(super::MAX_RETAINED_SCRATCH_BYTES * 2, b'b');
+            scratch
+                .ignore_bytes
+                .resize(super::MAX_RETAINED_SCRATCH_BYTES * 2, b'c');
+            super::recycle_scratch(&mut pool, scratch);
+        }
+        assert_eq!(pool.len(), super::MAX_RETAINED_SCRATCH_FRAMES);
+        for scratch in &pool {
+            assert!(scratch.path.capacity() <= super::MAX_RETAINED_SCRATCH_BYTES);
+            assert!(scratch.glob_bytes.capacity() <= super::MAX_RETAINED_SCRATCH_BYTES);
+            assert!(scratch.ignore_bytes.capacity() <= super::MAX_RETAINED_SCRATCH_BYTES);
+        }
+
+        // 3. WalkStream releases peak listing capacity after finishing a wide
+        // directory while continuing to walk subsequent small directories.
+        struct WideThenSmallBackend {
+            root: PathBuf,
+            wide_entries: usize,
+        }
+
+        impl super::DirectoryBackend for WideThenSmallBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                listing.clear();
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .expect("walk stays under root");
+                match relative.to_str().expect("UTF-8 mock path") {
+                    "" => {
+                        listing.push(std::ffi::OsStr::new("wide"), true, false);
+                        listing.push(std::ffi::OsStr::new("small"), true, false);
+                    }
+                    "wide" => {
+                        for index in 0..self.wide_entries {
+                            let name = format!("f-{index:05}");
+                            listing.push(std::ffi::OsStr::new(&name), false, false);
+                        }
+                    }
+                    "small" => {
+                        listing.push(std::ffi::OsStr::new("leaf.txt"), false, false);
+                    }
+                    other => panic!("unexpected mock read: {other}"),
+                }
+                Ok(())
+            }
+        }
+
+        let wide_entries = super::MAX_RETAINED_LISTING_ENTRIES + 2_000;
+        let backend = WideThenSmallBackend {
+            root: PathBuf::from("/wide-then-small"),
+            wide_entries,
+        };
+        let mut stream = Walker::new(&backend.root).stream();
+        let mut yielded = 0;
+        while let Some(item) = stream.next_with(&backend) {
+            item.expect("mock stream succeeds");
+            yielded += 1;
+        }
+        assert_eq!(yielded, 2 + wide_entries + 1);
+        assert!(stream.scratch.len() <= super::MAX_RETAINED_SCRATCH_FRAMES);
+        for scratch in &stream.scratch {
+            assert!(
+                scratch.listing.entries.capacity() <= super::MAX_RETAINED_LISTING_ENTRIES,
+                "WalkStream must not retain peak listing capacity after wide directory finishes: {}",
+                scratch.listing.entries.capacity()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_file_system_and_follow_symlinks_fuse_directory_metadata_calls() {
+        use std::{
+            collections::HashMap,
+            os::unix::fs::symlink,
+            sync::{Mutex, atomic::AtomicUsize},
+        };
+
+        struct MetadataCountingBackend {
+            counts: Mutex<HashMap<PathBuf, usize>>,
+            fail_path: Option<PathBuf>,
+            total_metadata: AtomicUsize,
+        }
+
+        impl MetadataCountingBackend {
+            fn new(fail_path: Option<PathBuf>) -> Self {
+                Self {
+                    counts: Mutex::new(HashMap::new()),
+                    fail_path,
+                    total_metadata: AtomicUsize::new(0),
+                }
+            }
+
+            fn count_for(&self, path: &Path) -> usize {
+                *self
+                    .counts
+                    .lock()
+                    .expect("counts lock")
+                    .get(path)
+                    .unwrap_or(&0)
+            }
+        }
+
+        impl super::DirectoryBackend for MetadataCountingBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                follow_symlinks: bool,
+                refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                super::SystemBackend.read_directory(
+                    path,
+                    follow_symlinks,
+                    refuse_final_symlink,
+                    listing,
+                )
+            }
+
+            fn metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+                self.total_metadata.fetch_add(1, Ordering::Relaxed);
+                *self
+                    .counts
+                    .lock()
+                    .expect("counts lock")
+                    .entry(path.to_path_buf())
+                    .or_insert(0) += 1;
+                if self.fail_path.as_deref() == Some(path) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected directory metadata failure",
+                    ));
+                }
+                super::SystemBackend.metadata(path)
+            }
+        }
+
+        let fixture = Fixture::new();
+        fixture.write("alpha/file.txt");
+        fixture.write("alpha/nested/leaf.txt");
+        fixture.write("beta/item.txt");
+        // Include a symlink cycle back to root so loop detection is exercised
+        // through the fused `(st_dev, st_ino)` path.
+        let loop_link = fixture.root.join("alpha/loop_root");
+        symlink(&fixture.root, &loop_link).expect("create directory cycle symlink");
+
+        let normal_dirs = [
+            fixture.root.clone(),
+            fixture.root.join("alpha"),
+            fixture.root.join("alpha/nested"),
+            fixture.root.join("beta"),
+        ];
+        let options = WalkOptions::default()
+            .same_file_system(true)
+            .follow_symlinks(true)
+            .sort(true);
+
+        // Verify serial collect, parallel collect, and stream each issue
+        // exactly ONE `metadata()` call per entered normal directory.
+        let mut expected_paths = None;
+        for threads in [1, 4] {
+            let backend = MetadataCountingBackend::new(None);
+            let result = Walker::new(&fixture.root)
+                .threads(threads)
+                .options(options)
+                .collect_with(&backend)
+                .expect("walk succeeds");
+            assert!(result.errors().is_empty());
+            for dir in &normal_dirs {
+                assert_eq!(
+                    backend.count_for(dir),
+                    1,
+                    "threads={threads}: expected fused single metadata() call for {}",
+                    dir.display()
+                );
+            }
+            let paths = relative_paths(result.entries(), &fixture.root);
+            if let Some(expected) = &expected_paths {
+                assert_eq!(&paths, expected);
+            } else {
+                expected_paths = Some(paths);
+            }
+        }
+
+        // Stream frontend with the same counting backend.
+        let stream_backend = MetadataCountingBackend::new(None);
+        let mut stream = Walker::new(&fixture.root).options(options).stream();
+        let mut streamed = Vec::new();
+        while let Some(item) = stream.next_with(&stream_backend) {
+            streamed.push(
+                item.expect("stream entry succeeds")
+                    .relative_path()
+                    .to_path_buf(),
+            );
+        }
+        streamed.sort();
+        assert_eq!(Some(streamed), expected_paths);
+        for dir in &normal_dirs {
+            assert_eq!(
+                stream_backend.count_for(dir),
+                1,
+                "stream: expected fused single metadata() call for {}",
+                dir.display()
+            );
+        }
+
+        // Verify error attribution stays `WalkOperation::Metadata` under both
+        // `Collect` and `Abort` when the fused metadata call fails.
+        let failing_dir = fixture.root.join("beta");
+        for threads in [1, 4] {
+            let collect_backend = MetadataCountingBackend::new(Some(failing_dir.clone()));
+            let collected = Walker::new(&fixture.root)
+                .threads(threads)
+                .options(options)
+                .error_policy(ErrorPolicy::Collect)
+                .collect_with(&collect_backend)
+                .expect("Collect returns Ok");
+            assert_eq!(collected.errors().len(), 1);
+            assert_eq!(
+                collected.errors()[0].operation(),
+                super::WalkOperation::Metadata
+            );
+            assert_eq!(collected.errors()[0].path(), failing_dir);
+            assert_eq!(collect_backend.count_for(&failing_dir), 1);
+
+            let abort_backend = MetadataCountingBackend::new(Some(failing_dir.clone()));
+            let aborted = Walker::new(&fixture.root)
+                .threads(threads)
+                .options(options)
+                .error_policy(ErrorPolicy::Abort)
+                .collect_with(&abort_backend)
+                .expect_err("Abort returns Err");
+            assert_eq!(aborted.operation(), super::WalkOperation::Metadata);
+            assert_eq!(aborted.path(), failing_dir);
+        }
+    }
+
+    #[test]
+    fn stream_start_reserves_exact_pending_slots_for_many_roots() {
+        let root_count = 33; // power of two + 1: geometric growth would double to 64
+        let mut walker = Walker::new("root-00");
+        for index in 1..root_count {
+            walker = walker
+                .add_root(format!("root-{index:02}"))
+                .expect("add root");
+        }
+        let mut stream = walker.clone().stream();
+        assert!(stream.start(&super::SystemBackend));
+        assert_eq!(stream.pending.len(), root_count);
+        assert_eq!(
+            stream.pending.capacity(),
+            root_count,
+            "WalkStream::start must reserve exact root slots without geometric doubling"
+        );
+
+        // If cancellation arrives while `start()` is preparing roots, release
+        // the reserved `pending` buffer instead of retaining it on a stopped
+        // stream.
+        let token = CancellationToken::default();
+        token.cancel();
+        let mut cancelled_stream = walker.cancellation(token).stream();
+        assert!(!cancelled_stream.start(&super::SystemBackend));
+        assert!(cancelled_stream.was_cancelled());
+        assert_eq!(
+            cancelled_stream.pending.capacity(),
+            0,
+            "cancelled WalkStream::start must release reserved pending storage"
+        );
+
+        // Even when every root carries multiple unreadable ancestor `.gitignore`
+        // files, `SerialTask::RootWithIgnoreErrors` keeps exactly one pending
+        // slot per root and preserves exact FIFO ignore-error delivery before
+        // each root's own directory entries/errors under every `ErrorPolicy`.
+        let fixture = Fixture::new();
+        let base = fs::canonicalize(&fixture.root).unwrap_or_else(|_| fixture.root.clone());
+        let over_rule_limit = vec![b'\n'; 100_001];
+        let mut roots = Vec::with_capacity(5);
+        let mut expected_ignore_pairs = Vec::with_capacity(5);
+        for index in 0..5 {
+            let repo = base.join(format!("repo-{index:02}"));
+            let sub = repo.join("sub");
+            let walk_root = sub.join("leaf-root");
+            fs::create_dir_all(repo.join(".git")).expect("create .git");
+            fs::create_dir_all(&walk_root).expect("create walk root");
+            let outer_ignore = repo.join(".gitignore");
+            let inner_ignore = sub.join(".gitignore");
+            fs::write(&outer_ignore, &over_rule_limit).expect("write outer .gitignore");
+            fs::write(&inner_ignore, &over_rule_limit).expect("write inner .gitignore");
+            fs::write(walk_root.join("file.txt"), b"ok").expect("write root file");
+            roots.push(walk_root);
+            expected_ignore_pairs.push((outer_ignore, inner_ignore));
+        }
+
+        let make_stream = |policy| {
+            let mut walker = Walker::new(&roots[0])
+                .respect_git_ignore(true)
+                .error_policy(policy);
+            for root in &roots[1..] {
+                walker = walker.add_root(root).expect("add repo root");
+            }
+            walker.stream()
+        };
+
+        let mut collect_stream = make_stream(ErrorPolicy::Collect);
+        assert!(collect_stream.start(&super::SystemBackend));
+        assert_eq!(collect_stream.pending.len(), roots.len());
+        assert_eq!(
+            collect_stream.pending.capacity(),
+            roots.len(),
+            "roots with ignore errors must still occupy exactly one SerialTask slot each"
+        );
+        let mut observed_collect = Vec::new();
+        for item in collect_stream {
+            match item {
+                Ok(entry) => observed_collect.push(("entry", entry.path().to_path_buf())),
+                Err(error) => {
+                    observed_collect.push((error.operation().as_str(), error.path().to_path_buf()));
+                }
+            }
+        }
+        let mut expected_collect = Vec::new();
+        for (root, (outer, inner)) in roots.iter().zip(&expected_ignore_pairs) {
+            expected_collect.push(("read_ignore", outer.clone()));
+            expected_collect.push(("read_ignore", inner.clone()));
+            expected_collect.push(("entry", root.join("file.txt")));
+        }
+        assert_eq!(observed_collect, expected_collect);
+
+        let skip_items: Vec<PathBuf> = make_stream(ErrorPolicy::Skip)
+            .map(|item| {
+                item.expect("Skip drops non-root read_ignore errors")
+                    .into_path()
+            })
+            .collect();
+        let expected_skip: Vec<PathBuf> = roots.iter().map(|root| root.join("file.txt")).collect();
+        assert_eq!(skip_items, expected_skip);
+
+        let abort_items: Vec<_> = make_stream(ErrorPolicy::Abort).collect();
+        assert_eq!(abort_items.len(), 1);
+        let abort_err = abort_items[0]
+            .as_ref()
+            .expect_err("Abort stops on first root's first ignore error");
+        assert_eq!(abort_err.operation(), super::WalkOperation::ReadIgnore);
+        assert_eq!(abort_err.path(), expected_ignore_pairs[0].0);
     }
 }

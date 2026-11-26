@@ -18,9 +18,12 @@ use std::collections::HashSet;
 use crossbeam_deque::{Steal, Stealer, Worker};
 
 use super::{
-    AncestorChain, CANCELLATION_STRIDE, CYCLE_KEY_OPERATION, DirectoryBackend, EntryVisitor,
+    AncestorChain, CANCELLATION_STRIDE, DirectoryBackend, DirectoryEntryCheck, EntryVisitor,
     ErrorPolicy, Listing, Verdict, WalkEntry, WalkError, WalkOperation, WalkResult, Walker,
-    classify::{DirectoryTask, EmittedEntry, EntryAction, TraversalContext, classify_entry},
+    check_directory_entry,
+    classify::{
+        DirectoryTask, EmittedEntry, EntryAction, RootTask, TraversalContext, classify_entry,
+    },
     own_path,
     parallel_stream::{StreamControl, StreamMessage, StreamSink},
     push_entry_name, reset_to_directory,
@@ -85,23 +88,39 @@ fn run<B: DirectoryBackend + Sync>(
     let mut caller = WorkerScratch::new(0);
     let caller_slot = shared.coordinator.claim_caller_slot();
 
-    // The caller starts alone. Helpers are created only after the roots made
-    // parallel directory work available, as required by ADR-0009. Several roots
-    // are several initial tasks and nothing more: the caller reads them in
-    // order, and whatever they uncover is ordinary work for the same pool.
-    let Some(roots) = walker.root_tasks(backend) else {
+    // The caller starts alone. Helpers are created only after the walk makes
+    // parallel directory work available, as required by ADR-0009. Build the
+    // first root for the caller and stream remaining roots directly into the
+    // shared scheduler one at a time (without staging a `Vec<RootTask>`) so
+    // multi-root walks keep startup memory low and widen as soon as
+    // `tree_is_worth_helpers()` is met.
+    if walker.roots.is_empty() {
+        drop(caller_slot);
+        return finish(shared, Vec::new());
+    }
+    let Some(first_root) = walker.build_root_task(backend, 0) else {
         shared.stop();
         drop(caller_slot);
         return finish(shared, Vec::new());
     };
+    if !enqueue_remaining_roots(
+        &shared,
+        (1..walker.roots.len()).map(|index| walker.build_root_task(backend, index)),
+    ) {
+        shared.stop();
+        drop(caller_slot);
+        return finish(shared, Vec::new());
+    }
     catch_worker_panic(&shared, || {
-        for root in roots {
-            if shared.should_stop() {
-                break;
-            }
+        if !shared.should_stop() {
             shared.coordinator.begin_task();
             let _root_task = shared.coordinator.claim_task();
-            process_directory(&shared, &mut caller, ParallelTask::Directory(root), None);
+            process_directory(
+                &shared,
+                &mut caller,
+                ParallelTask::from_root(first_root),
+                None,
+            );
         }
     });
 
@@ -118,9 +137,10 @@ fn run<B: DirectoryBackend + Sync>(
     //
     caller.flush_into(&shared.scheduler);
 
-    // Every root has been read by the time this starts, so the queue it drains
-    // holds whatever all of them uncovered — a walk that never widens still
-    // finishes every root, in the order the eager route read them.
+    // Remaining roots sit in the shared scheduler alongside anything the first
+    // root uncovered — a walk that never widens drains every root on the caller
+    // thread, while one that crosses the floor widens immediately so helpers
+    // share remaining roots as well as subdirectories.
     //
     // Panics are caught here the way `run_worker` catches them, because this
     // stands in for `run_worker` on the route that never widens.
@@ -133,15 +153,19 @@ fn run<B: DirectoryBackend + Sync>(
     shared.coordinator.widen();
 
     // Every helper slot is built here so the stealer list is complete and stays
-    // lock-free once the walk runs. Only the threads are lazy: a slot stays
-    // unused until the backlog outgrows the workers that are already running,
-    // which is what lets a tree that only fans out below the root widen too.
-    let spare = (1..walker.threads.max(1))
+    // lock-free once the walk runs. Reversing `spare` makes `idle.pop()` hand
+    // out indices 1, 2, ..., threads - 1 in ascending order so all spawned
+    // stealers live in `&stealers[..spawned_workers]`. Only the threads are
+    // lazy: a slot stays unused until the backlog outgrows the workers that are
+    // already running, which is what lets a tree that only fans out below the
+    // root widen too.
+    let mut spare = (1..walker.threads.max(1))
         .map(WorkerScratch::new)
         .collect::<Vec<_>>();
     let mut stealers = Vec::with_capacity(spare.len() + 1);
     stealers.push(caller.queue.stealer());
     stealers.extend(spare.iter().map(|worker| worker.queue.stealer()));
+    spare.reverse();
     let idle = Mutex::new(spare);
     let shards = Mutex::new(Vec::new());
 
@@ -301,10 +325,13 @@ impl<'scope, 'env> HelperPool<'scope, 'env> {
     /// instance, a refused spawn under `ErrorPolicy::Abort` or a closed stream
     /// sink).
     fn grow(self) -> bool {
+        // Fast path: once every helper slot has been spawned (or the operating
+        // system refused to start one), no further growth is possible and we
+        // skip polling `work_seen` / `active_workers`.
+        if self.shared.helpers_capped.load(Ordering::Acquire) {
+            return true;
+        }
         while !self.shared.should_stop() {
-            // A helper the operating system refused to start capped the pool
-            // for this walk: the workers that exist finish it, and no
-            // directory boundary retries the refused spawn.
             if self.shared.helpers_capped.load(Ordering::Acquire) {
                 return true;
             }
@@ -319,11 +346,20 @@ impl<'scope, 'env> HelperPool<'scope, 'env> {
                 return true;
             };
             // Dropping the slot here releases it again for a later attempt.
-            let Some(scratch) = lock(self.idle).pop() else {
-                return true;
+            let (scratch, became_empty) = {
+                let mut idle = lock(self.idle);
+                let Some(scratch) = idle.pop() else {
+                    self.shared.helpers_capped.store(true, Ordering::Release);
+                    return true;
+                };
+                (scratch, idle.is_empty())
             };
             if !self.spawn(slot, scratch) {
                 return !self.shared.should_stop();
+            }
+            if became_empty {
+                self.shared.helpers_capped.store(true, Ordering::Release);
+                return true;
             }
         }
         false
@@ -347,6 +383,13 @@ impl<'scope, 'env> HelperPool<'scope, 'env> {
                 // however it ends.
                 let _slot = slot;
                 let mut scratch = scratch;
+                // Publish this helper's stealer slot once the thread is running
+                // and before it can push any task into its local deque, so a
+                // refused OS spawn never leaves an unspawned deque in the
+                // active steal prefix.
+                self.shared
+                    .spawned_workers
+                    .fetch_max(scratch.index + 1, Ordering::Release);
                 run_worker_catching_panics(self, &mut scratch);
                 lock(self.shards).push(std::mem::take(&mut scratch.entries));
             });
@@ -418,10 +461,14 @@ struct Shared<'backend> {
     cancellation: Option<super::CancellationToken>,
     errors: Mutex<Vec<WalkError>>,
     abort_error: Mutex<Option<WalkError>>,
-    /// Set once a helper could not be started. Helpers are an optimization
-    /// (ADR-0009), so the walk goes on with the workers it has; this stops
-    /// every later directory boundary from asking the operating system again.
+    /// Set once every helper slot has been spawned or a helper could not be
+    /// started. Helpers are an optimization (ADR-0009), so the walk goes on
+    /// with the workers it has; this stops later directory boundaries from
+    /// polling `work_seen` / `active_workers` or retrying refused spawns.
     helpers_capped: AtomicBool,
+    /// Number of workers whose stealers occupy the active prefix of
+    /// `HelperPool::stealers` (starts at 1 for the caller at index 0).
+    spawned_workers: AtomicUsize,
     panic: Mutex<Option<Box<dyn Any + Send + 'static>>>,
     /// Where a streaming walk sends its entries and kept errors. `None` for
     /// `collect()` and `visit()`, which retain them for the `WalkResult`.
@@ -447,6 +494,7 @@ impl<'backend> Shared<'backend> {
             errors: Mutex::new(Vec::new()),
             abort_error: Mutex::new(None),
             helpers_capped: AtomicBool::new(false),
+            spawned_workers: AtomicUsize::new(1),
             panic: Mutex::new(None),
             sink: None,
         }
@@ -650,15 +698,53 @@ struct WorkerScratch {
     spare: PathBuf,
 }
 
+/// Streams remaining roots into `shared.scheduler` in a single
+/// cancellation-aware pass without staging a `Vec<RootTask>`. Returns `false`
+/// if the walk stopped or root construction observed cancellation before every
+/// remaining root was scheduled.
+fn enqueue_remaining_roots(
+    shared: &Shared,
+    roots: impl IntoIterator<Item = Option<RootTask>>,
+) -> bool {
+    let mut roots = roots.into_iter();
+    loop {
+        if shared.should_stop() {
+            return false;
+        }
+        let Some(next_root) = roots.next() else {
+            return true;
+        };
+        let Some(root) = next_root else {
+            return false;
+        };
+        if shared.should_stop() {
+            return false;
+        }
+        shared.schedule_shared(ParallelTask::from_root(root));
+    }
+}
+
 /// Work local to the parallel frontend.
 ///
 /// A task sits inline in the work-stealing deques, which double up to 65,536
 /// slots on a wide listing, so its size is paid once per queued directory.
-/// The continuation carries a whole `Listing` and is rare, one per widening
-/// listing rather than one per directory, so it lives behind a pointer.
+/// Rare variants — a root carrying ancestor ignore-read errors and a wide
+/// listing's continuation — live behind a pointer so error-free roots and
+/// subdirectories pay zero extra bytes or locking.
 enum ParallelTask {
     Directory(DirectoryTask),
+    RootWithIgnoreErrors(Box<RootTask>),
     Continuation(Box<Continuation>),
+}
+
+impl ParallelTask {
+    fn from_root(root: RootTask) -> Self {
+        if root.ignore_errors.is_empty() {
+            Self::Directory(root.task)
+        } else {
+            Self::RootWithIgnoreErrors(Box::new(root))
+        }
+    }
 }
 
 /// The unvisited tail of a wide directory listing. It lets the serial route
@@ -796,10 +882,16 @@ fn try_take(
             task
         })
         .or_else(|| {
-            // Start next door and leave the own queue out: stealing from
-            // itself can only come up empty, and the offset keeps idle workers
-            // from all probing the same victim first.
-            let (head, tail) = stealers.split_at((worker.index + 1).min(stealers.len()));
+            // Only probe stealers belonging to workers that have actually been
+            // spawned. Start next door and leave the own queue out: stealing
+            // from itself can only come up empty, and the offset keeps idle
+            // workers from all probing the same victim first.
+            let active_len = shared
+                .spawned_workers
+                .load(Ordering::Acquire)
+                .min(stealers.len());
+            let active = &stealers[..active_len];
+            let (head, tail) = active.split_at((worker.index + 1).min(active.len()));
             tail.iter()
                 .chain(head.iter().take(worker.index))
                 .find_map(|stealer| {
@@ -839,100 +931,117 @@ fn process_directory(
     }
 }
 
+struct PreparedListing {
+    path: PathBuf,
+    depth: usize,
+    root: usize,
+    ancestors: AncestorChain,
+    ignores: super::gitignore::IgnoreScope,
+    start_index: usize,
+}
+
+fn prepare_directory(
+    shared: &Shared,
+    worker: &mut WorkerScratch,
+    task: DirectoryTask,
+    root_ignore_errors: Vec<super::gitignore::IgnoreReadError>,
+) -> Option<PreparedListing> {
+    let DirectoryTask {
+        path,
+        open,
+        depth,
+        root,
+        ancestors,
+        ignores,
+    } = task;
+    #[cfg(test)]
+    if should_panic_in_directory(&path) {
+        panic!("injected directory panic");
+    }
+    if shared.should_stop() {
+        return None;
+    }
+    let is_root = depth == 0;
+    for error in root_ignore_errors {
+        let (path, source) = error.into_parts();
+        if !shared.record_error(super::IGNORE_FILE_OPERATION, path, source, false)
+            || shared.should_stop()
+        {
+            return None;
+        }
+    }
+    let ancestors = match check_directory_entry(
+        &shared.walker,
+        shared.backend,
+        &path,
+        root,
+        ancestors,
+        is_root,
+    ) {
+        DirectoryEntryCheck::Enter(ancestors) => ancestors,
+        DirectoryEntryCheck::Skip => return None,
+        DirectoryEntryCheck::Failed(operation, source) => {
+            let _ = shared.record_error(operation, path, source, is_root);
+            return None;
+        }
+    };
+    if let Err(source) = shared.backend.read_scheduled_directory(
+        &path,
+        &open,
+        shared.walker.options.follow_symlinks,
+        !shared.walker.options.follow_symlinks && depth > 0,
+        &mut worker.listing,
+    ) {
+        let _ = shared.record_error(WalkOperation::ReadDir, path, source, is_root);
+        return None;
+    }
+    // One add for the whole listing: the entries it returned, and the listing
+    // itself, which cost a syscall to get them. Once the helper pool is full or
+    // capped, nothing reads `work_seen` anymore, so skip the atomic RMW to
+    // avoid cross-core contention.
+    if !shared.helpers_capped.load(Ordering::Relaxed) {
+        shared.work_seen.fetch_add(
+            worker.listing.entries().len() + DIRECTORY_WEIGHT,
+            Ordering::AcqRel,
+        );
+    }
+    // The directory's own ignore files join the chain here. Every directory is
+    // processed once, so every ignore file is read once, whatever the worker
+    // count.
+    let (ignores, ignore_errors) =
+        ignores.enter(&shared.walker, shared.backend, &path, &worker.listing);
+    for error in ignore_errors {
+        let (path, source) = error.into_parts();
+        if !shared.record_error(super::IGNORE_FILE_OPERATION, path, source, false)
+            || shared.should_stop()
+        {
+            return None;
+        }
+    }
+    Some(PreparedListing {
+        path,
+        depth,
+        root,
+        ancestors,
+        ignores,
+        start_index: 0,
+    })
+}
+
 fn walk_directory(
     shared: &Shared,
     worker: &mut WorkerScratch,
     task: ParallelTask,
     pool: Option<HelperPool<'_, '_>>,
 ) {
-    let (path, depth, root, ancestors, ignores, start_index) = match task {
-        ParallelTask::Directory(DirectoryTask {
-            path,
-            open,
-            depth,
-            root,
-            ancestors,
-            ignores,
-            ignore_errors,
-        }) => {
-            #[cfg(test)]
-            if should_panic_in_directory(&path) {
-                panic!("injected directory panic");
-            }
-            if shared.should_stop() {
-                return;
-            }
-            let is_root = depth == 0;
-            for error in ignore_errors {
-                let (path, source) = error.into_parts();
-                if !shared.record_error(super::IGNORE_FILE_OPERATION, path, source, false)
-                    || shared.should_stop()
-                {
-                    return;
-                }
-            }
-            if shared.walker.options.same_file_system {
-                match super::enter_filesystem(
-                    shared.backend,
-                    &path,
-                    &shared.walker.roots[root].filesystem,
-                    is_root,
-                ) {
-                    Ok(true) => {}
-                    Ok(false) => return,
-                    Err(source) => {
-                        let _ = shared.record_error(WalkOperation::Metadata, path, source, is_root);
-                        return;
-                    }
-                }
-            }
-            let ancestors = if shared.walker.options.follow_symlinks {
-                match shared.backend.cycle_key(&path) {
-                    Ok(key) => {
-                        let Some(ancestors) = ancestors.enter(key) else {
-                            return;
-                        };
-                        ancestors
-                    }
-                    Err(source) => {
-                        let _ = shared.record_error(CYCLE_KEY_OPERATION, path, source, is_root);
-                        return;
-                    }
-                }
-            } else {
-                ancestors
-            };
-            if let Err(source) = shared.backend.read_scheduled_directory(
-                &path,
-                &open,
-                shared.walker.options.follow_symlinks,
-                !shared.walker.options.follow_symlinks && depth > 0,
-                &mut worker.listing,
-            ) {
-                let _ = shared.record_error(WalkOperation::ReadDir, path, source, is_root);
-                return;
-            }
-            // One add for the whole listing: the entries it returned, and the listing
-            // itself, which cost a syscall to get them.
-            shared.work_seen.fetch_add(
-                worker.listing.entries().len() + DIRECTORY_WEIGHT,
-                Ordering::AcqRel,
-            );
-            // The directory's own ignore files join the chain here. Every directory is
-            // processed once, so every ignore file is read once, whatever the worker
-            // count.
-            let (ignores, ignore_errors) =
-                ignores.enter(&shared.walker, shared.backend, &path, &worker.listing);
-            for error in ignore_errors {
-                let (path, source) = error.into_parts();
-                if !shared.record_error(super::IGNORE_FILE_OPERATION, path, source, false)
-                    || shared.should_stop()
-                {
-                    return;
-                }
-            }
-            (path, depth, root, ancestors, ignores, 0)
-        }
+    let PreparedListing {
+        path,
+        depth,
+        root,
+        ancestors,
+        ignores,
+        start_index,
+    } = match task {
         ParallelTask::Continuation(continuation) => {
             let Continuation {
                 path,
@@ -944,7 +1053,30 @@ fn walk_directory(
                 next_entry,
             } = *continuation;
             worker.listing = listing;
-            (path, depth, root, ancestors, ignores, next_entry)
+            PreparedListing {
+                path,
+                depth,
+                root,
+                ancestors,
+                ignores,
+                start_index: next_entry,
+            }
+        }
+        ParallelTask::Directory(task) => {
+            let Some(prepared) = prepare_directory(shared, worker, task, Vec::new()) else {
+                return;
+            };
+            prepared
+        }
+        ParallelTask::RootWithIgnoreErrors(root_task) => {
+            let RootTask {
+                task,
+                ignore_errors,
+            } = *root_task;
+            let Some(prepared) = prepare_directory(shared, worker, task, ignore_errors) else {
+                return;
+            };
+            prepared
         }
     };
     worker.path.clear();
@@ -1012,6 +1144,7 @@ fn walk_directory(
     }
     while let Some(error) = worker.listing.take_deferred_error() {
         if shared.should_stop() {
+            worker.listing.shrink_if_oversized();
             return;
         }
         if !shared.record_error(
@@ -1020,9 +1153,11 @@ fn walk_directory(
             error.source.into_io_error(),
             false,
         ) {
+            worker.listing.shrink_if_oversized();
             return;
         }
     }
+    worker.listing.shrink_if_oversized();
 }
 
 /// Carries out what classification decided about one entry. The entry's path
@@ -1188,7 +1323,7 @@ fn join_worker_rendezvous(shared: &Shared) {
     // there would block the one worker that still has to read its way past the
     // floor. Standing aside on exactly the production condition keeps the
     // harness measuring the pool rather than the floor.
-    if !shared.tree_is_worth_helpers() {
+    if !shared.helpers_capped.load(Ordering::Acquire) && !shared.tree_is_worth_helpers() {
         return;
     }
     let mut state = lock(&WORKER_RENDEZVOUS);
@@ -2299,7 +2434,6 @@ mod tests {
                 root: 0,
                 ancestors: AncestorChain::default(),
                 ignores: IgnoreScope::default(),
-                ignore_errors: Vec::new(),
             }),
         };
 
@@ -2374,5 +2508,467 @@ mod tests {
         assert_eq!(shared.coordinator.pending(), 1);
         assert!(worker.queue.pop().is_some());
         assert_eq!(lock(&shared.errors).len(), 1);
+    }
+
+    /// Many flat roots (each with zero subdirectories) must still widen and
+    /// parallelize across roots once the combined work and waiting roots clear
+    /// the helper floor, rather than walking every root serially on the caller.
+    #[test]
+    fn many_flat_roots_widen_and_parallelize_across_roots() {
+        let _rendezvous = lock(&WORKER_RENDEZVOUS_GUARD);
+        let base = unique_root("many-flat-roots");
+        let roots: Vec<PathBuf> = (0..32)
+            .map(|index| {
+                let dir = base.join(format!("root-{index:02}"));
+                fs::create_dir_all(&dir).expect("create flat root");
+                for file in 0..12 {
+                    fs::write(dir.join(format!("file-{file:02}.txt")), b"flat")
+                        .expect("write flat file");
+                }
+                dir
+            })
+            .collect();
+
+        let build_walker = |threads| {
+            let mut walker = Walker::new(&roots[0])
+                .threads(threads)
+                .options(WalkOptions::default().sort(true));
+            for root in &roots[1..] {
+                walker = walker.add_root(root).expect("add flat root");
+            }
+            walker
+        };
+
+        let serial = build_walker(1).collect().expect("serial walk succeeds");
+        expect_worker_threads(roots[0].clone(), 4);
+        let parallel = build_walker(4).collect().expect("parallel walk succeeds");
+        let observed = observed_worker_threads();
+        let _ = fs::remove_dir_all(&base);
+
+        assert_eq!(
+            observed, 4,
+            "many flat roots must widen and distribute remaining roots across helpers"
+        );
+        assert_eq!(walked_paths(&parallel), walked_paths(&serial));
+        assert_eq!(parallel.entries().len(), 32 * 12);
+        assert!(parallel.errors().is_empty());
+    }
+
+    /// Verifies multi-root parallel walks across `collect`, `visit`, `stream`,
+    /// `stream_parallel`, `ErrorPolicy::{Collect, Skip, Abort}`, `Verdict::Stop`,
+    /// `same_file_system`, and pre-cancellation.
+    #[test]
+    fn multi_root_parallel_preserves_semantics_across_frontends_and_error_policies() {
+        let base = unique_root("multi-root-semantics");
+        let roots: Vec<PathBuf> = (0..16)
+            .map(|index| {
+                let dir = base.join(format!("r-{index:02}"));
+                fs::create_dir_all(dir.join("sub")).expect("create root subdir");
+                for file in 0..10 {
+                    fs::write(dir.join(format!("top-{file:02}.rs")), b"top")
+                        .expect("write top file");
+                    fs::write(dir.join("sub").join(format!("leaf-{file:02}.rs")), b"leaf")
+                        .expect("write leaf file");
+                }
+                dir
+            })
+            .collect();
+        let missing = base.join("missing-root");
+
+        let make_valid_walker = |threads| {
+            let mut walker = Walker::new(&roots[0]).threads(threads);
+            for root in &roots[1..] {
+                walker = walker.add_root(root).expect("add root");
+            }
+            walker
+        };
+
+        // 1. collect (sorted + same_file_system), visit, stream, stream_parallel
+        // all agree on the exact entry set.
+        let serial = make_valid_walker(1)
+            .options(WalkOptions::default().sort(true).same_file_system(true))
+            .collect()
+            .expect("serial multi-root collect succeeds");
+        let parallel = make_valid_walker(4)
+            .options(WalkOptions::default().sort(true).same_file_system(true))
+            .collect()
+            .expect("parallel multi-root collect succeeds");
+        assert_eq!(walked_paths(&parallel), walked_paths(&serial));
+        assert!(parallel.errors().is_empty());
+
+        let visited = make_valid_walker(4)
+            .options(WalkOptions::default().sort(true))
+            .visit(|entry| {
+                if entry.path().extension().and_then(|e| e.to_str()) == Some("rs") {
+                    crate::Verdict::Keep
+                } else {
+                    crate::Verdict::Skip
+                }
+            })
+            .expect("parallel multi-root visit succeeds");
+        assert_eq!(visited.entries().len(), 16 * 20);
+
+        // Verdict::Stop stops early and marks the walk cancelled.
+        let stopped = make_valid_walker(4)
+            .visit(|_| crate::Verdict::Stop)
+            .expect("Verdict::Stop returns Ok");
+        assert!(stopped.was_cancelled());
+        assert!(stopped.entries().is_empty());
+
+        let mut streamed: Vec<PathBuf> = make_valid_walker(1)
+            .stream()
+            .map(|item| item.expect("stream item").path().to_path_buf())
+            .collect();
+        streamed.sort();
+        let mut parallel_streamed: Vec<PathBuf> = make_valid_walker(4)
+            .stream_parallel()
+            .map(|item| item.expect("parallel stream item").path().to_path_buf())
+            .collect();
+        parallel_streamed.sort();
+        assert_eq!(streamed, walked_paths(&serial));
+        assert_eq!(parallel_streamed, walked_paths(&serial));
+
+        // 2. ErrorPolicy::{Collect, Skip, Abort} with a missing root queued
+        // among valid roots.
+        let make_failing_walker = |threads, policy| {
+            let mut walker = Walker::new(&roots[0]).threads(threads).error_policy(policy);
+            for root in &roots[1..8] {
+                walker = walker.add_root(root).expect("add root");
+            }
+            walker = walker.add_root(&missing).expect("add missing root");
+            for root in &roots[8..] {
+                walker = walker.add_root(root).expect("add root");
+            }
+            walker
+        };
+
+        for policy in [ErrorPolicy::Collect, ErrorPolicy::Skip] {
+            let collected = make_failing_walker(4, policy)
+                .options(WalkOptions::default().sort(true))
+                .collect()
+                .expect("Collect/Skip returns Ok");
+            assert_eq!(walked_paths(&collected), walked_paths(&serial));
+            assert_eq!(
+                collected.errors().len(),
+                1,
+                "{policy:?} must keep the missing root error"
+            );
+            assert_eq!(collected.errors()[0].path(), missing);
+
+            let mut ps_entries = Vec::new();
+            let mut ps_errors = Vec::new();
+            for item in make_failing_walker(4, policy).stream_parallel() {
+                match item {
+                    Ok(entry) => ps_entries.push(entry.path().to_path_buf()),
+                    Err(error) => ps_errors.push(error.path().to_path_buf()),
+                }
+            }
+            ps_entries.sort();
+            assert_eq!(ps_entries, walked_paths(&serial));
+            assert_eq!(ps_errors, vec![missing.clone()]);
+        }
+
+        let aborted = make_failing_walker(4, ErrorPolicy::Abort)
+            .collect()
+            .expect_err("Abort must return the missing root error");
+        assert_eq!(aborted.path(), missing);
+
+        let stream_abort_errors: Vec<PathBuf> = make_failing_walker(4, ErrorPolicy::Abort)
+            .stream_parallel()
+            .filter_map(Result::err)
+            .map(|error| error.path().to_path_buf())
+            .collect();
+        assert_eq!(stream_abort_errors, vec![missing.clone()]);
+
+        // 3. Pre-cancelled multi-root walk performs no work and marks cancelled.
+        let token = CancellationToken::default();
+        token.cancel();
+        let cancelled = make_failing_walker(4, ErrorPolicy::Abort)
+            .cancellation(token)
+            .collect()
+            .expect("pre-cancelled walk returns Ok without hitting missing root");
+        assert!(cancelled.was_cancelled());
+        assert!(cancelled.entries().is_empty());
+        assert!(cancelled.errors().is_empty());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Once every helper slot has been spawned, `helpers_capped` is set,
+    /// `spawned_workers` tracks the spawned prefix, and `work_seen` stops
+    /// updating on subsequent directories. Also verifies `try_take` skips
+    /// stealers beyond `spawned_workers`.
+    #[test]
+    fn helpers_capped_and_spawned_workers_bound_contention_and_steal_probes() {
+        let root = unique_root("helpers-capped");
+        create_wide_fixture(&root);
+
+        let walker = Arc::new(Walker::new(&root).threads(4));
+        let shared = Arc::new(Shared::new(
+            Arc::clone(&walker),
+            &crate::SystemBackend,
+            &crate::keep_every_entry,
+        ));
+        let result = super::run(&walker, &crate::SystemBackend, Arc::clone(&shared))
+            .expect("wide parallel walk succeeds");
+        assert!(result.errors().is_empty());
+        assert!(
+            shared.helpers_capped.load(Ordering::Acquire),
+            "a full pool must set helpers_capped once all helper slots are spawned"
+        );
+        assert_eq!(shared.spawned_workers.load(Ordering::Acquire), 4);
+
+        // Once capped, processing another directory must not touch `work_seen`.
+        let frozen_work = shared.work_seen.load(Ordering::Acquire);
+        let mut scratch = super::WorkerScratch::new(0);
+        let root_task = walker
+            .build_root_task(&crate::SystemBackend, 0)
+            .expect("root task")
+            .task;
+        super::walk_directory(
+            &shared,
+            &mut scratch,
+            super::ParallelTask::Directory(root_task),
+            None,
+        );
+        assert_eq!(
+            shared.work_seen.load(Ordering::Acquire),
+            frozen_work,
+            "work_seen must not be incremented after helpers_capped is set"
+        );
+
+        // Verify `try_take` only probes `&stealers[..spawned_workers]`.
+        let walker = Arc::new(Walker::new(&root).threads(4));
+        let shared = Shared::new(walker, &crate::SystemBackend, &crate::keep_every_entry);
+        let w0 = super::WorkerScratch::new(0);
+        let w1 = super::WorkerScratch::new(1);
+        let w2 = super::WorkerScratch::new(2);
+        let w3 = super::WorkerScratch::new(3);
+        let stealers = [
+            w0.queue.stealer(),
+            w1.queue.stealer(),
+            w2.queue.stealer(),
+            w3.queue.stealer(),
+        ];
+        // Push a task only into unspawned worker 3's queue while
+        // `spawned_workers` is 2 (workers 0 and 1 active).
+        let dummy_task = || {
+            super::ParallelTask::Directory(crate::classify::DirectoryTask {
+                path: root.clone(),
+                open: crate::DirectoryOpen::default(),
+                depth: 1,
+                root: 0,
+                ancestors: crate::AncestorChain::default(),
+                ignores: crate::gitignore::IgnoreScope::default(),
+            })
+        };
+        shared.spawned_workers.store(2, Ordering::Release);
+        w3.queue.push(dummy_task());
+        assert!(
+            super::try_take(&shared, &w0, &stealers).is_none(),
+            "try_take must not probe stealers beyond spawned_workers"
+        );
+        // Once worker 1 has a task, worker 0 steals it immediately.
+        w1.queue.push(dummy_task());
+        assert!(
+            super::try_take(&shared, &w0, &stealers).is_some(),
+            "try_take must probe active stealers within spawned_workers"
+        );
+        // Raising spawned_workers to 4 makes worker 3's queue visible.
+        shared.spawned_workers.store(4, Ordering::Release);
+        assert!(super::try_take(&shared, &w0, &stealers).is_some());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parallel_task_keeps_sparse_variants_boxed_within_directory_task_budget() {
+        use std::mem::size_of;
+
+        use crate::classify::DirectoryTask;
+
+        assert_eq!(
+            size_of::<super::ParallelTask>(),
+            size_of::<DirectoryTask>(),
+            "ParallelTask ({}) must share DirectoryTask's size ({}) via niche optimization",
+            size_of::<super::ParallelTask>(),
+            size_of::<DirectoryTask>()
+        );
+        #[cfg(not(any(
+            all(feature = "native-macos", target_os = "macos"),
+            all(feature = "native-linux", target_os = "linux"),
+        )))]
+        {
+            let budget = size_of::<PathBuf>() + 6 * size_of::<usize>();
+            assert!(
+                size_of::<super::ParallelTask>() <= budget,
+                "portable ParallelTask ({}) exceeded PathBuf + 6-word budget ({budget})",
+                size_of::<super::ParallelTask>(),
+            );
+        }
+    }
+
+    #[test]
+    fn multi_root_enqueue_stops_promptly_on_cancellation() {
+        let token = CancellationToken::default();
+        let walker = Arc::new(Walker::new(".").threads(4).cancellation(token.clone()));
+        let shared = Shared::new(walker, &crate::SystemBackend, &crate::keep_every_entry);
+        let produced = AtomicUsize::new(0);
+        let make_task = |index| crate::classify::RootTask {
+            task: crate::classify::DirectoryTask {
+                path: PathBuf::from(format!("root-{index}")),
+                open: crate::DirectoryOpen::default(),
+                depth: 0,
+                root: index,
+                ancestors: crate::AncestorChain::default(),
+                ignores: crate::gitignore::IgnoreScope::default(),
+            },
+            ignore_errors: Vec::new(),
+        };
+        let roots = (0..1_000).map(|index| {
+            let count = produced.fetch_add(1, Ordering::Relaxed);
+            if count == 4 {
+                token.cancel();
+            }
+            Some(make_task(index))
+        });
+
+        assert!(
+            !super::enqueue_remaining_roots(&shared, roots),
+            "cancellation during lazy multi-root enqueue must return false promptly"
+        );
+        assert_eq!(
+            shared.coordinator.pending(),
+            4,
+            "the root whose build observed cancellation and all later roots must not be scheduled"
+        );
+        assert_eq!(
+            produced.load(Ordering::Relaxed),
+            5,
+            "lazy iterator must stop without constructing the remaining 995 roots"
+        );
+
+        // Also verify `None` returned by `build_root_task` stops immediately.
+        let walker = Arc::new(Walker::new(".").threads(4));
+        let shared = Shared::new(walker, &crate::SystemBackend, &crate::keep_every_entry);
+        let built = AtomicUsize::new(0);
+        let roots = (0..1_000).map(|index| {
+            let count = built.fetch_add(1, Ordering::Relaxed);
+            if count == 3 {
+                None
+            } else {
+                Some(make_task(index))
+            }
+        });
+        assert!(!super::enqueue_remaining_roots(&shared, roots));
+        assert_eq!(shared.coordinator.pending(), 3);
+        assert_eq!(built.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn multi_root_sparse_root_ignore_errors_preserve_error_policies() {
+        let base = unique_root("multi-root-ignore-errors");
+        fs::create_dir_all(&base).expect("create multi-root base");
+        let base = fs::canonicalize(&base).unwrap_or(base);
+        let ok_roots: Vec<PathBuf> = (0..10)
+            .map(|index| {
+                let dir = base.join(format!("ok-{index:02}"));
+                fs::create_dir_all(&dir).expect("create ok root");
+                fs::write(dir.join("file.txt"), b"ok").expect("write ok file");
+                dir
+            })
+            .collect();
+
+        // One root inside a repository whose ancestor `.gitignore` exceeds the
+        // 100,000-rule safety limit (portable failure across all OSes/users).
+        let bad_repo = base.join("bad-repo");
+        let bad_walk_root = bad_repo.join("sub").join("walk-root");
+        fs::create_dir_all(bad_repo.join(".git")).expect("create .git dir");
+        fs::create_dir_all(&bad_walk_root).expect("create bad walk root");
+        let bad_gitignore = bad_repo.join(".gitignore");
+        fs::write(&bad_gitignore, vec![b'\n'; 100_001]).expect("write oversized .gitignore");
+        fs::write(bad_walk_root.join("kept.txt"), b"kept").expect("write kept file");
+
+        // Verify sparse boxing: error-free roots stay unboxed `Directory`,
+        // while the root with an ancestor ignore error uses
+        // `RootWithIgnoreErrors`.
+        let probe_walker = Walker::new(&ok_roots[0])
+            .add_root(&bad_walk_root)
+            .expect("add bad root")
+            .respect_git_ignore(true);
+        assert!(matches!(
+            super::ParallelTask::from_root(
+                probe_walker
+                    .build_root_task(&crate::SystemBackend, 0)
+                    .expect("first root")
+            ),
+            super::ParallelTask::Directory(_)
+        ));
+        assert!(matches!(
+            super::ParallelTask::from_root(
+                probe_walker
+                    .build_root_task(&crate::SystemBackend, 1)
+                    .expect("second root")
+            ),
+            super::ParallelTask::RootWithIgnoreErrors(_)
+        ));
+
+        // Test both placements: bad root enqueued as a remaining root AND as
+        // the first root.
+        for bad_first in [false, true] {
+            let make_walker = |policy| {
+                let mut walker = if bad_first {
+                    let mut w = Walker::new(&bad_walk_root);
+                    for ok in &ok_roots {
+                        w = w.add_root(ok).expect("add ok root");
+                    }
+                    w
+                } else {
+                    let mut w = Walker::new(&ok_roots[0]);
+                    for ok in &ok_roots[1..5] {
+                        w = w.add_root(ok).expect("add ok root");
+                    }
+                    w = w.add_root(&bad_walk_root).expect("add bad root");
+                    for ok in &ok_roots[5..] {
+                        w = w.add_root(ok).expect("add ok root");
+                    }
+                    w
+                };
+                walker = walker
+                    .threads(4)
+                    .respect_git_ignore(true)
+                    .error_policy(policy)
+                    .options(WalkOptions::default().sort(true));
+                walker
+            };
+
+            let collected = make_walker(ErrorPolicy::Collect)
+                .collect()
+                .expect("Collect returns Ok");
+            assert_eq!(collected.entries().len(), ok_roots.len() + 1);
+            assert_eq!(collected.errors().len(), 1);
+            assert_eq!(
+                collected.errors()[0].operation(),
+                crate::WalkOperation::ReadIgnore
+            );
+            assert_eq!(collected.errors()[0].path(), bad_gitignore);
+
+            let skipped = make_walker(ErrorPolicy::Skip)
+                .collect()
+                .expect("Skip returns Ok");
+            assert_eq!(skipped.entries().len(), ok_roots.len() + 1);
+            assert!(
+                skipped.errors().is_empty(),
+                "Skip must drop non-root read_ignore errors"
+            );
+
+            let aborted = make_walker(ErrorPolicy::Abort)
+                .collect()
+                .expect_err("Abort returns the root ignore error");
+            assert_eq!(aborted.operation(), crate::WalkOperation::ReadIgnore);
+            assert_eq!(aborted.path(), bad_gitignore);
+        }
+
+        let _ = fs::remove_dir_all(&base);
     }
 }
