@@ -189,6 +189,16 @@ enum State {
     Done,
 }
 
+#[cfg(test)]
+struct BeforeRecv(Option<Box<dyn FnOnce() + Send>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for BeforeRecv {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BeforeRecv")
+    }
+}
+
 /// The iterating thread's end of a threaded walk.
 #[derive(Debug)]
 struct Threaded {
@@ -203,11 +213,20 @@ struct Threaded {
     cancellation: Option<CancellationToken>,
     #[cfg(test)]
     produced: Arc<AtomicUsize>,
+    /// Test-only hook invoked right before `receiver.recv()` (strictly after
+    /// `step()`'s initial cancellation check) so cancellation races during
+    /// `recv()` can be driven deterministically.
+    #[cfg(test)]
+    before_recv: BeforeRecv,
 }
 
 /// What one step of a threaded walk produced.
 enum Step {
     Item(Result<WalkEntry, WalkError>),
+    /// The walk ended with an abort error; yield it and transition to
+    /// [`State::Done`] so later `next()` calls cannot observe a cancellation
+    /// token that fired afterwards.
+    Abort(WalkError),
     /// The walk is over; `cancelled` says whether a cancellation request ended
     /// it.
     End {
@@ -341,6 +360,8 @@ impl ParallelWalkStream {
             cancellation,
             #[cfg(test)]
             produced,
+            #[cfg(test)]
+            before_recv: BeforeRecv(None),
         });
         None
     }
@@ -422,6 +443,10 @@ impl Iterator for ParallelWalkStream {
                 }
                 State::Threaded(threaded) => match threaded.step() {
                     Step::Item(item) => return Some(item),
+                    Step::Abort(error) => {
+                        self.state = State::Done;
+                        return Some(Err(error));
+                    }
                     Step::End { cancelled } => {
                         self.cancelled = cancelled;
                         self.state = State::Done;
@@ -452,11 +477,22 @@ impl Threaded {
         if let Some(entry) = self.batch.next() {
             return Step::Item(Ok(entry));
         }
-        let Some(receiver) = &self.receiver else {
-            return Step::End { cancelled: false };
-        };
         loop {
-            match receiver.recv() {
+            #[cfg(test)]
+            if let Some(hook) = self.before_recv.0.take() {
+                hook();
+            }
+            let Some(receiver) = self.receiver.as_ref() else {
+                return Step::End { cancelled: false };
+            };
+            let message = receiver.recv();
+            // Re-check after blocking in `recv()`: if the token fired while
+            // waiting, drop whatever arrived and end as cancelled.
+            if self.is_cancelled() {
+                let _ = self.finish();
+                return Step::End { cancelled: true };
+            }
+            match message {
                 Ok(StreamMessage::Entries(batch)) => {
                     self.batch = batch.into_iter();
                     if let Some(entry) = self.batch.next() {
@@ -467,11 +503,13 @@ impl Threaded {
                 // Every sender is gone, so the walk is over and its threads
                 // are ending. The driver says how it ended.
                 Err(_) => {
-                    return match self.finish() {
-                        Err(error) => Step::Item(Err(error)),
-                        Ok(()) => Step::End {
-                            cancelled: self.is_cancelled(),
-                        },
+                    let result = self.finish();
+                    if self.is_cancelled() {
+                        return Step::End { cancelled: true };
+                    }
+                    return match result {
+                        Err(error) => Step::Abort(error),
+                        Ok(()) => Step::End { cancelled: false },
                     };
                 }
             }
@@ -988,5 +1026,196 @@ mod tests {
             )
         });
         assert_eq!(actual, expected);
+    }
+
+    /// Once a stream ends — whether by `ErrorPolicy::Abort` or by exhausting
+    /// the tree — it must transition to `Done` so cancelling the caller's token
+    /// afterwards and polling `next()` again never flips `was_cancelled()`.
+    #[test]
+    fn abort_and_exhaustion_transition_to_done_without_corrupting_was_cancelled() {
+        let tree = Tree::new("abort-done");
+        let missing = tree.0.join("missing");
+
+        for threads in [1, 4] {
+            let token = CancellationToken::default();
+            let mut stream = Walker::new(&missing)
+                .threads(threads)
+                .error_policy(ErrorPolicy::Abort)
+                .cancellation(token.clone())
+                .stream_parallel();
+            let error = stream
+                .next()
+                .expect("missing root yields an abort error")
+                .expect_err("missing root fails");
+            assert_eq!(error.operation().as_str(), "read_dir");
+            assert!(!stream.was_cancelled(), "{threads} threads");
+
+            token.cancel();
+            assert!(stream.next().is_none(), "{threads} threads");
+            assert!(
+                !stream.was_cancelled(),
+                "{threads} threads: cancelling after an abort error must not flip was_cancelled()"
+            );
+
+            // Same guarantee after normal exhaustion.
+            let token = CancellationToken::default();
+            let mut stream = Walker::new(&tree.0)
+                .threads(threads)
+                .cancellation(token.clone())
+                .stream_parallel();
+            assert!(stream.next().is_none(), "{threads} threads: empty root");
+            assert!(!stream.was_cancelled(), "{threads} threads");
+            token.cancel();
+            assert!(stream.next().is_none(), "{threads} threads");
+            assert!(
+                !stream.was_cancelled(),
+                "{threads} threads: cancelling after completion must not flip was_cancelled()"
+            );
+        }
+    }
+
+    /// If the cancellation token fires strictly after `step()`'s initial
+    /// cancellation check — while waiting in `recv()` or joining the driver —
+    /// every possible `recv()` outcome (`Entries`, `Error`, or disconnect with
+    /// an `ErrorPolicy::Abort` error) must be dropped and the stream must end
+    /// as cancelled.
+    #[test]
+    fn cancellation_observed_after_recv_drops_arriving_items_and_abort_error() {
+        use std::sync::{Arc, mpsc::sync_channel};
+
+        use super::{BeforeRecv, Step, StreamControl, StreamMessage, Threaded};
+        use crate::{WalkError, WalkOperation};
+
+        let sample_tree = Tree::new("post-recv-cancel");
+        fs::write(sample_tree.0.join("entry.txt"), b"fixture").expect("write fixture file");
+        let sample_entry = Walker::new(&sample_tree.0)
+            .stream()
+            .next()
+            .expect("fixture yields an entry")
+            .expect("fixture walk succeeds");
+
+        // Case 1: token fires between the initial check and `recv()` returning
+        // `Ok(StreamMessage::Entries(..))`. The arriving batch must be dropped.
+        let token = CancellationToken::default();
+        let (sender, receiver) = sync_channel::<StreamMessage>(1);
+        let cancel_before_recv = token.clone();
+        let mut threaded = Threaded {
+            receiver: Some(receiver),
+            control: Arc::new(StreamControl::default()),
+            driver: Some(thread::spawn(|| Ok(()))),
+            batch: Vec::new().into_iter(),
+            cancellation: Some(token),
+            produced: Arc::new(AtomicUsize::new(0)),
+            before_recv: BeforeRecv(Some(Box::new(move || {
+                cancel_before_recv.cancel();
+                sender
+                    .send(StreamMessage::Entries(vec![sample_entry]))
+                    .expect("buffered channel accepts batch");
+            }))),
+        };
+        assert!(
+            matches!(threaded.step(), Step::End { cancelled: true }),
+            "cancellation observed after recv() must drop arriving entries"
+        );
+        assert!(
+            threaded.before_recv.0.is_none(),
+            "hook must have executed strictly after the initial cancellation check"
+        );
+
+        // Case 2: token fires between the initial check and `recv()` returning
+        // `Ok(StreamMessage::Error(..))`. The arriving error must be dropped.
+        let token = CancellationToken::default();
+        let (sender, receiver) = sync_channel::<StreamMessage>(1);
+        let cancel_before_recv = token.clone();
+        let mut threaded = Threaded {
+            receiver: Some(receiver),
+            control: Arc::new(StreamControl::default()),
+            driver: Some(thread::spawn(|| Ok(()))),
+            batch: Vec::new().into_iter(),
+            cancellation: Some(token),
+            produced: Arc::new(AtomicUsize::new(0)),
+            before_recv: BeforeRecv(Some(Box::new(move || {
+                cancel_before_recv.cancel();
+                sender
+                    .send(StreamMessage::Error(WalkError::new(
+                        WalkOperation::ReadDir,
+                        PathBuf::from("/in-band"),
+                        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "in-band"),
+                    )))
+                    .expect("buffered channel accepts error");
+            }))),
+        };
+        assert!(
+            matches!(threaded.step(), Step::End { cancelled: true }),
+            "cancellation observed after recv() must drop arriving in-band errors"
+        );
+        assert!(
+            threaded.before_recv.0.is_none(),
+            "hook must have executed strictly after the initial cancellation check"
+        );
+
+        // Case 3: token fires between the initial check and `recv()` returning
+        // `Err(_)` (disconnect) while the driver returns an `ErrorPolicy::Abort`
+        // error. The abort error must be suppressed.
+        let token = CancellationToken::default();
+        let (sender, receiver) = sync_channel::<StreamMessage>(1);
+        let cancel_before_recv = token.clone();
+        let driver = thread::spawn(|| {
+            Err(WalkError::new(
+                WalkOperation::ReadDir,
+                PathBuf::from("/aborted-before-finish"),
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "aborted"),
+            ))
+        });
+        let mut threaded = Threaded {
+            receiver: Some(receiver),
+            control: Arc::new(StreamControl::default()),
+            driver: Some(driver),
+            batch: Vec::new().into_iter(),
+            cancellation: Some(token),
+            produced: Arc::new(AtomicUsize::new(0)),
+            before_recv: BeforeRecv(Some(Box::new(move || {
+                cancel_before_recv.cancel();
+                drop(sender);
+            }))),
+        };
+        assert!(
+            matches!(threaded.step(), Step::End { cancelled: true }),
+            "cancellation observed after recv() disconnect must suppress the abort error"
+        );
+        assert!(
+            threaded.before_recv.0.is_none(),
+            "hook must have executed strictly after the initial cancellation check"
+        );
+
+        // Case 4: token fires during `finish()` (triggered deterministically by
+        // `control.close()`) after `recv()` returned `Err(_)` with the token
+        // still unset, while the driver returns an `ErrorPolicy::Abort` error.
+        let token = CancellationToken::default();
+        let control = Arc::new(StreamControl::default());
+        let cancel_on_close = token.clone();
+        control.attach(Box::new(move || cancel_on_close.cancel()));
+        let (sender, receiver) = sync_channel::<StreamMessage>(1);
+        drop(sender);
+        let driver = thread::spawn(|| {
+            Err(WalkError::new(
+                WalkOperation::ReadDir,
+                PathBuf::from("/aborted-during-finish"),
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "aborted"),
+            ))
+        });
+        let mut threaded = Threaded {
+            receiver: Some(receiver),
+            control,
+            driver: Some(driver),
+            batch: Vec::new().into_iter(),
+            cancellation: Some(token),
+            produced: Arc::new(AtomicUsize::new(0)),
+            before_recv: BeforeRecv(None),
+        };
+        assert!(
+            matches!(threaded.step(), Step::End { cancelled: true }),
+            "cancellation observed during finish() must suppress the abort error"
+        );
     }
 }
