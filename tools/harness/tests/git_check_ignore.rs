@@ -82,8 +82,7 @@ fn ignore_corpus_replays_against_git_check_ignore() {
                 continue;
             }
             let candidate_bytes = decode_bytes(&case.path).expect("decode candidate path");
-            let candidate = std::str::from_utf8(&candidate_bytes)
-                .expect("Git oracle corpus paths must be valid UTF-8");
+            let candidate = decoded_corpus_path(&candidate_bytes);
             let nested: Vec<(&str, &[String])> = case
                 .nested_ignore_rules
                 .iter()
@@ -100,7 +99,7 @@ fn ignore_corpus_replays_against_git_check_ignore() {
                     &case.ignore_rules,
                     &nested,
                     &case.exclude_rules,
-                    candidate,
+                    &candidate,
                     case.candidate_is_dir,
                     case.candidate_is_symlink,
                     case.git_ignorecase,
@@ -296,6 +295,22 @@ struct Cleanup(PathBuf);
 impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn decoded_corpus_path(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        PathBuf::from(OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(
+            std::str::from_utf8(bytes)
+                .expect("non-POSIX Git oracle corpus paths must be valid UTF-8"),
+        )
     }
 }
 

@@ -786,33 +786,28 @@ fn read_repository_config(layout: &RepositoryLayout) -> GitConfig {
 fn apply_config(config: &mut GitConfig, contents: &[u8]) {
     let mut section = None;
     for_each_logical_config_line(contents, |line| {
-        let mut line = trim_ascii(strip_config_comment(line));
-        if line.is_empty() {
-            return;
-        }
-        if line.starts_with(b"[") {
+        let mut line = trim_git_space_start(line);
+        while line.starts_with(b"[") {
             let Some((parsed_section, remainder)) = parse_config_header(line) else {
                 section = None;
                 return;
             };
             section = parsed_section;
-            line = trim_ascii(remainder);
-            if line.is_empty() {
-                return;
-            }
+            line = trim_git_space_start(remainder);
+        }
+        if line.is_empty() || matches!(line[0], b'#' | b';') {
+            return;
         }
         let Some(section) = section else {
             return;
         };
-        let (key, value) =
-            line.iter()
-                .position(|byte| *byte == b'=')
-                .map_or((trim_ascii(line), None), |index| {
-                    (
-                        trim_ascii(&line[..index]),
-                        Some(trim_ascii(&line[index + 1..])),
-                    )
-                });
+        let (key, value) = match line.iter().position(|byte| *byte == b'=') {
+            Some(index) => (
+                trim_git_space(&line[..index]),
+                Some(trim_git_space(strip_config_comment(&line[index + 1..]))),
+            ),
+            None => (trim_git_space(line), None),
+        };
         let target = match section {
             GitConfigSection::Core if key.eq_ignore_ascii_case(b"ignorecase") => {
                 &mut config.ignore_case
@@ -831,25 +826,72 @@ fn apply_config(config: &mut GitConfig, contents: &[u8]) {
     });
 }
 
-/// Splits a section header from a variable written on the same physical line.
+/// Splits one Git config section header (`[section]` or `[section "sub"]`)
+/// from the remainder of the line.
+///
 /// Git resumes its character-based parser immediately after the closing `]`,
-/// so both `[core] key = value` and `[core]key = value` leave `core` active.
+/// so chained headers (`[other] [core]`, `[remote "a]"] [core]`) and same-line
+/// assignments (`[core] key = value`, `[core]key = value`) leave the last
+/// parsed section active. Quoted subsections never alias their top-level
+/// section and may contain `]`, `#`, `;`, and backslash escapes (`\"`, `\\`).
 fn parse_config_header(line: &[u8]) -> Option<(Option<GitConfigSection>, &[u8])> {
-    let end = line.iter().position(|byte| *byte == b']')?;
-    Some((parse_top_level_section(&line[..=end]), &line[end + 1..]))
+    let rest = line.strip_prefix(b"[")?;
+    let name_len = rest
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(**byte, b'-' | b'.'))
+        .count();
+    let name = &rest[..name_len];
+    let after_name = &rest[name_len..];
+    match *after_name.first()? {
+        b']' if name_len > 0 => {
+            let section = if name.eq_ignore_ascii_case(b"core") {
+                Some(GitConfigSection::Core)
+            } else if name.eq_ignore_ascii_case(b"extensions") {
+                Some(GitConfigSection::Extensions)
+            } else {
+                None
+            };
+            Some((section, &after_name[1..]))
+        }
+        byte if is_git_space(byte) => {
+            let after_space = trim_git_space_start(after_name);
+            let quoted = after_space.strip_prefix(b"\"")?;
+            let mut index = 0;
+            while index < quoted.len() {
+                match quoted[index] {
+                    b'\\' => {
+                        if index + 1 >= quoted.len() {
+                            return None;
+                        }
+                        index += 2;
+                    }
+                    b'"' => {
+                        let remainder = quoted[index + 1..].strip_prefix(b"]")?;
+                        return Some((None, remainder));
+                    }
+                    _ => index += 1,
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
-/// Streams the logical config lines that Git's value parser sees. A terminal
-/// backslash in an assignment value consumes the following physical newline,
-/// then parsing resumes with the next line's bytes (including indentation).
-/// It works inside and outside quotes, but a backslash in a comment is ignored.
-/// A terminal backslash at EOF is consumed with Git's synthetic final newline.
-/// Every other quote and escape is retained for `parse_git_bool`.
+/// Streams the logical config lines that Git's value parser sees. A single
+/// leading UTF-8 BOM at the start of the file is stripped as in Git's
+/// `config.c`. A terminal backslash in an assignment value consumes the
+/// following physical newline, then parsing resumes with the next line's bytes
+/// (including indentation). It works inside and outside quotes, but a backslash
+/// in a comment is ignored. A terminal backslash at EOF is consumed with Git's
+/// synthetic final newline. Every other quote and escape is retained for
+/// `parse_git_bool`.
 ///
 /// Uncontinued lines are passed straight to `f` as borrowed slices into
 /// `contents` without allocating. Continued lines reuse a single scratch buffer
 /// cleared between logical lines.
 fn for_each_logical_config_line(contents: &[u8], mut f: impl FnMut(&[u8])) {
+    let contents = contents.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(contents);
     let mut physical = contents.split_inclusive(|byte| *byte == b'\n').map(|line| {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
         line.strip_suffix(b"\r").unwrap_or(line)
@@ -892,12 +934,10 @@ struct ConfigValueState {
 /// Finds an initial assignment value and carries its quote state over a
 /// backslash continuation. Subsequent physical lines are scanned only once.
 fn config_value_continuation(line: &[u8]) -> Option<ConfigValueState> {
-    let line = trim_ascii_start(line);
-    let line = if line.starts_with(b"[") {
-        trim_ascii_start(parse_config_header(line)?.1)
-    } else {
-        line
-    };
+    let mut line = trim_git_space_start(line);
+    while line.starts_with(b"[") {
+        line = trim_git_space_start(parse_config_header(line)?.1);
+    }
     let first = line.first()?;
     if matches!(first, b'#' | b';') || !first.is_ascii_alphabetic() {
         return None;
@@ -906,7 +946,7 @@ fn config_value_continuation(line: &[u8]) -> Option<ConfigValueState> {
         .iter()
         .position(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'-'))
         .unwrap_or(line.len());
-    let value = trim_ascii_start(&line[key_end..]).strip_prefix(b"=")?;
+    let value = trim_git_space_start(&line[key_end..]).strip_prefix(b"=")?;
     config_value_suffix_continuation(value, ConfigValueState { quoted: false })
 }
 
@@ -932,20 +972,6 @@ fn config_value_suffix_continuation(
     None
 }
 
-/// Returns only the top-level sections whose variables this adapter consumes.
-/// Git gives a quoted subsection a dotted key prefix, so it must never alias
-/// that subsection with its parent section.
-fn parse_top_level_section(line: &[u8]) -> Option<GitConfigSection> {
-    let name = line.strip_prefix(b"[")?.strip_suffix(b"]")?;
-    if name.eq_ignore_ascii_case(b"core") {
-        Some(GitConfigSection::Core)
-    } else if name.eq_ignore_ascii_case(b"extensions") {
-        Some(GitConfigSection::Extensions)
-    } else {
-        None
-    }
-}
-
 fn strip_config_comment(line: &[u8]) -> &[u8] {
     let mut quoted = false;
     let mut escaped = false;
@@ -964,8 +990,8 @@ fn strip_config_comment(line: &[u8]) -> &[u8] {
 }
 
 fn parse_git_bool(value: &[u8]) -> Option<bool> {
-    let value = std::str::from_utf8(value).ok()?;
-    let value = decode_git_config_value(value.trim())?;
+    let value = std::str::from_utf8(trim_git_space(value)).ok()?;
+    let value = decode_git_config_value(value)?;
     if value.is_empty() {
         Some(false)
     } else if value.eq_ignore_ascii_case("true")
@@ -983,19 +1009,25 @@ fn parse_git_bool(value: &[u8]) -> Option<bool> {
     }
 }
 
-fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
+/// Matches Git's `sane-ctype.h` `isspace` (`' '`, `'\t'`, `'\r'`, `'\n'`),
+/// excluding `\x0b`, `\x0c`, and non-ASCII Unicode whitespace.
+const fn is_git_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+fn trim_git_space_start(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
+        .position(|byte| !is_git_space(*byte))
         .unwrap_or(bytes.len());
     &bytes[start..]
 }
 
-fn trim_ascii(bytes: &[u8]) -> &[u8] {
-    let bytes = trim_ascii_start(bytes);
+fn trim_git_space(bytes: &[u8]) -> &[u8] {
+    let bytes = trim_git_space_start(bytes);
     let end = bytes
         .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
+        .rposition(|byte| !is_git_space(*byte))
         .map_or(0, |index| index + 1);
     &bytes[..end]
 }
@@ -1003,7 +1035,9 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
 /// Decodes the quoted escapes that Git's config parser resolves before it
 /// hands a value to its boolean parser. Whitespace outside quotes is already
 /// trimmed by the caller; whitespace inside quotes deliberately remains part
-/// of the value and therefore makes a boolean invalid, as it does in Git.
+/// of the value (making named booleans and trailing-whitespace integers
+/// invalid, while leading C `isspace` is still skipped by Git's numeric
+/// `strtoimax` fallback).
 fn decode_git_config_value(value: &str) -> Option<String> {
     let mut decoded = String::with_capacity(value.len());
     let mut quoted = false;
@@ -1030,9 +1064,11 @@ fn decode_git_config_value(value: &str) -> Option<String> {
 }
 
 /// Git parses a numeric boolean through its signed `int` config grammar:
-/// optional sign, C base-zero notation, and K/M/G binary scaling. Values that
-/// overflow that `int` are invalid rather than silently changing the setting.
+/// optional leading C `isspace` (via `strtoimax`), optional sign, C base-zero
+/// notation, and K/M/G binary scaling. Values that overflow that `int` are
+/// invalid rather than silently changing the setting.
 fn parse_git_config_int(value: &str) -> Option<i32> {
+    let value = value.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
     let (negative, value) = match value.as_bytes().first() {
         Some(b'+') => (false, &value[1..]),
         Some(b'-') => (true, &value[1..]),
@@ -1054,6 +1090,11 @@ fn parse_git_config_int(value: &str) -> Option<i32> {
     } else {
         (10, digits)
     };
+    // `i64::from_str_radix` accepts a leading `+` or `-`, so reject any inner
+    // sign left after stripping the optional outer sign and base prefix.
+    if digits.starts_with(['+', '-']) {
+        return None;
+    }
     let magnitude = i64::from_str_radix(digits, radix)
         .ok()?
         .checked_mul(scale)?;
@@ -2241,5 +2282,294 @@ mod tests {
             yielded.push(line.to_vec());
         });
         assert_eq!(yielded, vec![b"k = v".to_vec()]);
+    }
+
+    #[test]
+    fn config_strips_one_leading_utf8_bom_at_file_start_only() {
+        let mut bom_section = GitConfig::default();
+        apply_config(&mut bom_section, b"\xEF\xBB\xBF[core]\nignorecase = true\n");
+        assert_eq!(bom_section.ignore_case, Some(true));
+
+        let mut bom_comment = GitConfig::default();
+        apply_config(
+            &mut bom_comment,
+            b"\xEF\xBB\xBF# comment\n[core]\nignorecase = true\n",
+        );
+        assert_eq!(bom_comment.ignore_case, Some(true));
+
+        let mut bom_continuation = GitConfig::default();
+        apply_config(
+            &mut bom_continuation,
+            b"\xEF\xBB\xBF[core] ignorecase = tru\\\ne\n",
+        );
+        assert_eq!(bom_continuation.ignore_case, Some(true));
+
+        // Only one initial BOM is stripped; a second BOM or a BOM on a later
+        // line leaves the header unparsed just as Git rejects it.
+        let mut double_bom = GitConfig::default();
+        apply_config(
+            &mut double_bom,
+            b"\xEF\xBB\xBF\xEF\xBB\xBF[core]\nignorecase = true\n",
+        );
+        assert_eq!(double_bom.ignore_case, None);
+
+        let mut line_two_bom = GitConfig::default();
+        apply_config(
+            &mut line_two_bom,
+            b"\n\xEF\xBB\xBF[core]\nignorecase = true\n",
+        );
+        assert_eq!(line_two_bom.ignore_case, None);
+
+        // BOM-stripped uncontinued lines still borrow directly from `contents`.
+        let bom_plain = b"\xEF\xBB\xBF[core]\nignorecase = true\n";
+        let range = bom_plain.as_ptr_range();
+        let mut first = Vec::new();
+        for_each_logical_config_line(bom_plain, |line| {
+            assert!(range.contains(&line.as_ptr()));
+            if first.is_empty() {
+                first = line.to_vec();
+            }
+        });
+        assert_eq!(first, b"[core]");
+    }
+
+    #[test]
+    fn config_chained_headers_quoted_subsections_and_comments_match_git() {
+        for (label, contents, expected) in [
+            (
+                "chained other then core",
+                b"[other] [core]\nignorecase = true\n".as_slice(),
+                Some(true),
+            ),
+            (
+                "chained core then other",
+                b"[core] [other]\nignorecase = true\n",
+                None,
+            ),
+            (
+                "chained without spaces",
+                b"[other][core]ignorecase = true\n",
+                Some(true),
+            ),
+            (
+                "quoted ] in subsection",
+                b"[remote \"a]\"] [core] ignorecase = true\n",
+                Some(true),
+            ),
+            (
+                "quoted escaped quote and ] in subsection",
+                b"[remote \"a\\\"]\"] [core] ignorecase = true\n",
+                Some(true),
+            ),
+            (
+                "quoted escaped backslash before quote in subsection",
+                b"[remote \"a\\\\\"] [core] ignorecase = true\n",
+                Some(true),
+            ),
+            (
+                "quoted hash and semicolon in subsection",
+                b"[remote \"a#b;c\"] [core] ignorecase = true\n",
+                Some(true),
+            ),
+            (
+                "carriage return before quoted subsection",
+                b"[remote\r\"x\"] [core] ignorecase = true\n",
+                Some(true),
+            ),
+            (
+                "carriage return without subsection is still invalid",
+                b"[core\r] ignorecase = true\n",
+                None,
+            ),
+            (
+                "empty section name with quoted subsection and continuation swallows [core]",
+                b"[ \"sub\"] dummy = foo\\\n[core]\nignorecase = true\n",
+                None,
+            ),
+            (
+                "empty section name with quoted subsection followed by chained [core]",
+                b"[ \"sub\"] [core] ignorecase = true\n",
+                Some(true),
+            ),
+            (
+                "empty section name without space before quote is invalid",
+                b"[\"sub\"] [core] ignorecase = true\n",
+                None,
+            ),
+            (
+                "empty brackets [] are invalid",
+                b"[] [core] ignorecase = true\n",
+                None,
+            ),
+            (
+                "whitespace-only brackets [ ] are invalid",
+                b"[ ] [core] ignorecase = true\n",
+                None,
+            ),
+            (
+                "core subsection then top-level core",
+                b"[core \"sub\"] [core] ignorecase = true\n",
+                Some(true),
+            ),
+            (
+                "top-level core then core subsection",
+                b"[core] [core \"sub\"] ignorecase = true\n",
+                None,
+            ),
+            (
+                "empty quoted subsection does not alias core",
+                b"[core \"\"] ignorecase = true\n",
+                None,
+            ),
+            (
+                "deprecated dot subsection does not alias core",
+                b"[core.sub] ignorecase = true\n",
+                None,
+            ),
+            (
+                "chained quoted subsection with backslash continuation",
+                b"[remote \"a#]\"] [core] ignorecase = tru\\\ne\n",
+                Some(true),
+            ),
+            (
+                "comment after header does not switch section",
+                b"[core] # [other]\nignorecase = true\n",
+                Some(true),
+            ),
+            (
+                "semicolon comment after header does not switch section",
+                b"[core] ; [other]\nignorecase = true\n",
+                Some(true),
+            ),
+            (
+                "empty value before comment parses as false",
+                b"[core]\nignorecase = # comment\n",
+                Some(false),
+            ),
+            (
+                "bare key followed by comment is rejected",
+                b"[core]\nignorecase # comment\n",
+                None,
+            ),
+            (
+                "trailing space inside header brackets is invalid",
+                b"[core ] ignorecase = true\n",
+                None,
+            ),
+            (
+                "leading space inside header brackets is invalid",
+                b"[ core] ignorecase = true\n",
+                None,
+            ),
+            (
+                "space between subsection quote and bracket is invalid",
+                b"[remote \"a\" ] [core] ignorecase = true\n",
+                None,
+            ),
+            (
+                "invalid second chained header clears section",
+                b"[core] [bad section]\nignorecase = true\n",
+                None,
+            ),
+            (
+                "tab before header is accepted",
+                b"\t[core]\nignorecase = true\n",
+                Some(true),
+            ),
+            (
+                "vertical tab before header is rejected",
+                b"\x0b[core]\nignorecase = true\n",
+                None,
+            ),
+            (
+                "form feed before header is rejected",
+                b"\x0c[core]\nignorecase = true\n",
+                None,
+            ),
+        ] {
+            let mut config = GitConfig::default();
+            apply_config(&mut config, contents);
+            assert_eq!(config.ignore_case, expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn config_bool_rejects_double_signs_empty_prefixes_and_non_git_whitespace() {
+        for (value, expected) in [
+            // Double/inner signs must be rejected rather than forwarded to
+            // `i64::from_str_radix`.
+            ("+-1", None),
+            ("--1", None),
+            ("++1", None),
+            ("-+1", None),
+            ("0x-1", None),
+            ("0x+1", None),
+            ("+0x-1", None),
+            ("-0x+1", None),
+            ("0-0", None),
+            ("0+0", None),
+            ("0-1", None),
+            ("0+1", None),
+            ("+0-0", None),
+            ("-0+0", None),
+            // Empty prefixes and bare suffixes.
+            ("0x", None),
+            ("-0x", None),
+            ("+0x", None),
+            ("0xk", None),
+            ("-0xk", None),
+            ("+0xk", None),
+            ("k", None),
+            ("+k", None),
+            ("-k", None),
+            // Valid bases, suffixes, and i32 bounds.
+            ("0k", Some(false)),
+            ("-0k", Some(false)),
+            ("0x0k", Some(false)),
+            ("+0x0k", Some(false)),
+            ("-0x0k", Some(false)),
+            ("0x1k", Some(true)),
+            ("+0x1k", Some(true)),
+            ("-0x1k", Some(true)),
+            ("00", Some(false)),
+            ("-010", Some(true)),
+            ("2147483647", Some(true)),
+            ("-2147483648", Some(true)),
+            ("2147483648", None),
+            ("-2147483649", None),
+            ("0x7fffffff", Some(true)),
+            ("-0x80000000", Some(true)),
+            ("0x80000000", None),
+            ("-2G", Some(true)),
+            ("2G", None),
+            ("1t", None),
+            // Git ASCII whitespace (`' '`, `'\t'`, `'\r'`) vs rejected
+            // `\x0b`, `\x0c`, and Unicode whitespace on named booleans and
+            // trailing numeric values, plus leading C `isspace` accepted by
+            // Git's `strtoimax` numeric parser.
+            (" true ", Some(true)),
+            ("\ttrue\t", Some(true)),
+            ("\rtrue\r", Some(true)),
+            ("\x0btrue", None),
+            ("true\x0b", None),
+            ("\x0ctrue", None),
+            ("true\x0c", None),
+            ("\x0b1", Some(true)),
+            ("\x0c1", Some(true)),
+            ("\x0b0", Some(false)),
+            ("\x0c-1", Some(true)),
+            ("\" 1\"", Some(true)),
+            ("1\x0b", None),
+            ("1\x0c", None),
+            ("\x0b", None),
+            ("\" \"", None),
+            ("\u{00A0}1", None),
+            ("\u{00A0}true", None),
+            ("true\u{00A0}", None),
+            ("\u{2003}true", None),
+            ("true\u{2003}", None),
+        ] {
+            assert_eq!(parse_git_bool(value.as_bytes()), expected, "{value:?}");
+        }
     }
 }

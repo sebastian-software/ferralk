@@ -154,11 +154,12 @@ pub fn git_check_ignore_layered_with_options(
     rules: &[String],
     nested: &[(&str, &[String])],
     excludes: &[String],
-    candidate: &str,
+    candidate: impl AsRef<Path>,
     candidate_is_dir: bool,
     candidate_is_symlink: bool,
     git_ignorecase: bool,
 ) -> io::Result<bool> {
+    let candidate = candidate.as_ref();
     if candidate_is_dir && candidate_is_symlink {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,

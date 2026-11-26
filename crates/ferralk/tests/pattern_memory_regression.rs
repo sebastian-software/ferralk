@@ -424,6 +424,92 @@ fn ignore_and_git_config_safety_budgets_bound_peak_memory() {
         "rejecting 22 x 100 KiB valid components peaked at {} bytes",
         large_valid_allocs.bytes_max
     );
+
+    // 7. A ~2 MiB `.gitignore` with `keep.log` + 256 rules of `[` + 8,192 `*`
+    //    + `]` must deduplicate repeated standalone class literals, fit well
+    //    within the 256 MiB budget without rolling back, and still ignore
+    //    `keep.log`.
+    let dup_stars_fixture = TempFixture::new("ignore-dup-class-stars");
+    let star_rule = format!("[{}]\n", "*".repeat(8_192));
+    let mut dup_stars_ignore = String::with_capacity(16 + 256 * star_rule.len());
+    dup_stars_ignore.push_str("keep.log\n");
+    for _ in 0..256 {
+        dup_stars_ignore.push_str(&star_rule);
+    }
+    fs::write(dup_stars_fixture.root.join(".gitignore"), dup_stars_ignore)
+        .expect("write dup-stars ignore");
+    fs::write(dup_stars_fixture.root.join("keep.log"), b"x").expect("write keep.log");
+    fs::write(dup_stars_fixture.root.join("visible.txt"), b"x").expect("write visible.txt");
+
+    let dup_stars_result = Walker::new(&dup_stars_fixture.root)
+        .respect_git_ignore(true)
+        .threads(1)
+        .error_policy(ErrorPolicy::Collect)
+        .collect()
+        .expect("walk with deduplicated star-class rules succeeds");
+    assert!(dup_stars_result.errors().is_empty());
+    assert!(
+        dup_stars_result
+            .entries()
+            .iter()
+            .any(|entry| entry.path().ends_with("visible.txt"))
+    );
+    assert!(
+        !dup_stars_result
+            .entries()
+            .iter()
+            .any(|entry| entry.path().ends_with("keep.log")),
+        "keep.log must remain ignored when 256 repeated-star bracket classes are deduplicated"
+    );
+
+    // 8. A `.gitignore` with `keep.log` + `[` + 1,100,000 `a-z` + `]` +
+    //    `[` + 500,000 `[:digit:]` + `]` must deduplicate repeated ranges and
+    //    POSIX classes in both `component_cost` and `normalize_bracket_class`,
+    //    fit comfortably within the 256 MiB budget with zero errors, and keep
+    //    `keep.log` ignored.
+    let dup_ranges_fixture = TempFixture::new("ignore-dup-class-ranges");
+    let mut dup_ranges_ignore = String::with_capacity(16 + 3_300_003 + 4_500_003);
+    dup_ranges_ignore.push_str("keep.log\n[");
+    for _ in 0..1_100_000 {
+        dup_ranges_ignore.push_str("a-z");
+    }
+    dup_ranges_ignore.push_str("]\n[");
+    for _ in 0..500_000 {
+        dup_ranges_ignore.push_str("[:digit:]");
+    }
+    dup_ranges_ignore.push_str("]\n");
+    fs::write(
+        dup_ranges_fixture.root.join(".gitignore"),
+        dup_ranges_ignore,
+    )
+    .expect("write dup-ranges ignore");
+    fs::write(dup_ranges_fixture.root.join("keep.log"), b"x").expect("write keep.log");
+    fs::write(dup_ranges_fixture.root.join("m"), b"x").expect("write m");
+    fs::write(dup_ranges_fixture.root.join("5"), b"x").expect("write 5");
+    fs::write(dup_ranges_fixture.root.join("visible.txt"), b"x").expect("write visible.txt");
+
+    let dup_ranges_result = Walker::new(&dup_ranges_fixture.root)
+        .respect_git_ignore(true)
+        .threads(1)
+        .error_policy(ErrorPolicy::Collect)
+        .collect()
+        .expect("walk with deduplicated range/POSIX-class rules succeeds");
+    assert!(dup_ranges_result.errors().is_empty());
+    assert!(
+        dup_ranges_result
+            .entries()
+            .iter()
+            .any(|entry| entry.path().ends_with("visible.txt"))
+    );
+    for ignored in ["keep.log", "m", "5"] {
+        assert!(
+            !dup_ranges_result
+                .entries()
+                .iter()
+                .any(|entry| entry.path().ends_with(ignored)),
+            "{ignored} must remain ignored when repeated ranges/POSIX classes are deduplicated"
+        );
+    }
 }
 
 #[cfg(feature = "unstable-test-hooks")]
@@ -438,17 +524,22 @@ fn ignore_retained_byte_estimates_upper_bound_measured_rule_set_storage() {
     let classes_513 = "[a]".repeat(513);
     let classes_1025 = "[a]".repeat(1_025);
     let astar_513 = "a*".repeat(513);
-    let posix_slash_513 = format!("[[:a/b:]]{}", "?".repeat(513));
-    let posix_slash_1025 = format!("[[:a/b:]]{}", "?".repeat(1_025));
+    let posix_alpha_513 = format!("[[:alpha:]]{}", "?".repeat(513));
+    let posix_alpha_1025 = format!("[[:alpha:]]{}", "?".repeat(1_025));
     let range_posix_slash_513 = format!("[a-[:a/b:]]{}", "?".repeat(513));
-    let range_bracket_posix_slash_513 = format!("[a-b[:a/b:]]{}", "?".repeat(513));
+    let range_bracket_posix_513 = format!("[a-b[:digit:]]{}", "?".repeat(513));
+    let range_consumed_bracket_stars_10k = format!("[a-[:digit:][]{}]", "*".repeat(10_000));
+    let bracket_stars_8k = format!("[{}]", "*".repeat(8_192));
+    let bracket_star_ranges_10k = format!("[{}]", "*-*".repeat(10_000));
+    let bracket_az_ranges_1m = format!("[{}]", "a-z".repeat(1_100_000));
+    let bracket_posix_digits_500k = format!("[{}]", "[:digit:]".repeat(500_000));
     let lit_1025 = "a".repeat(1_025);
     let lit_10k = "a".repeat(10_000);
     let multi_5 = "a\n".repeat(5);
     let multi_1025 = "a\n".repeat(1_025);
     let multi_glob_513 = "*.log\n".repeat(513);
 
-    let cases: [(&str, &str); 26] = [
+    let cases: [(&str, &str); 31] = [
         ("a", "a"),
         ("**", "**"),
         ("**/a", "**/a"),
@@ -466,10 +557,18 @@ fn ignore_retained_byte_estimates_upper_bound_measured_rule_set_storage() {
         ("[a]*513", classes_513.as_str()),
         ("[a]*1025", classes_1025.as_str()),
         ("a**513", astar_513.as_str()),
-        ("[[:a/b:]]+?*513", posix_slash_513.as_str()),
-        ("[[:a/b:]]+?*1025", posix_slash_1025.as_str()),
+        ("[[:alpha:]]+?*513", posix_alpha_513.as_str()),
+        ("[[:alpha:]]+?*1025", posix_alpha_1025.as_str()),
         ("[a-[:a/b:]]+?*513", range_posix_slash_513.as_str()),
-        ("[a-b[:a/b:]]+?*513", range_bracket_posix_slash_513.as_str()),
+        ("[a-b[:digit:]]+?*513", range_bracket_posix_513.as_str()),
+        (
+            "[a-[:digit:][]*10k]",
+            range_consumed_bracket_stars_10k.as_str(),
+        ),
+        ("[*8192]", bracket_stars_8k.as_str()),
+        ("[*-**10k]", bracket_star_ranges_10k.as_str()),
+        ("[a-z*1.1m]", bracket_az_ranges_1m.as_str()),
+        ("[[:digit:]*500k]", bracket_posix_digits_500k.as_str()),
         ("lit_1025", lit_1025.as_str()),
         ("lit_10k", lit_10k.as_str()),
         ("multi_a_5", multi_5.as_str()),

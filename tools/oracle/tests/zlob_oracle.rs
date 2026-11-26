@@ -14,8 +14,9 @@ use zlob::{
 /// cannot bypass the oracle through a broadened skip condition.
 const EXPECTED_REPLAYED: usize = 633;
 // The #447 and #499 fast-glob regressions belong to the secondary oracle, and
-// the fourteen #488 escaped-bracket ignore cases belong to the Git oracle.
-const EXPECTED_SKIPPED: usize = 408;
+// the fourteen #488 escaped-bracket and thirty-eight #494 casefolded/POSIX
+// ignore cases belong to the Git oracle.
+const EXPECTED_SKIPPED: usize = 446;
 
 /// Cases the zlob 1.6.3 Rust API cannot express, counted by reason.
 #[derive(Default)]
