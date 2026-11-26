@@ -3766,13 +3766,14 @@ trait DirectoryBackend {
         fs::canonicalize(path)
     }
 
-    /// Reads an in-tree ignore file. Missing files are the common case and
-    /// are reported as an error rather than probed for beforehand.
+    /// Reads an in-tree ignore file. Missing and non-regular paths (including
+    /// refused symlinks) return `Ok(BoundedFileRead::Missing | NotRegular)` so
+    /// genuine read errors from confirmed regular files are never masked.
     ///
     /// On Unix this refuses symlinks atomically. Git likewise refuses an
     /// in-tree `.gitignore` that resolves through a link, so its rules cannot
     /// redirect a walk to an arbitrary file outside the tree.
-    fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+    fn read_ignore_file(&self, path: &Path) -> std::io::Result<BoundedFileRead> {
         read_in_tree_ignore_file(path)
     }
 
@@ -3781,7 +3782,7 @@ trait DirectoryBackend {
     /// Unlike in-tree rule files, Git permits this file to be a link. Keeping
     /// this separate prevents a repository-wide exclude from weakening the
     /// in-tree no-follow rule above.
-    fn read_repository_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+    fn read_repository_file(&self, path: &Path) -> std::io::Result<BoundedFileRead> {
         read_bounded_file(path)
     }
 
@@ -3810,11 +3811,190 @@ trait DirectoryBackend {
 /// expansion ceiling.
 pub(crate) const MAX_IGNORE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
-pub(crate) fn read_bounded_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    read_bounded(fs::File::open(path)?)
+/// Outcome of reading a bounded ignore or repository metadata file.
+///
+/// Separating missing and non-regular paths from `Err(io::Error)` ensures that
+/// genuine read errors from a confirmed regular file (such as `EINVAL`,
+/// `EOPNOTSUPP`, or `PermissionDenied`) are never masked as skipped entries.
+#[derive(Debug)]
+pub(crate) enum BoundedFileRead {
+    Contents(Vec<u8>),
+    Missing,
+    NotRegular,
 }
 
-fn read_bounded(file: fs::File) -> std::io::Result<Vec<u8>> {
+/// Reads a bounded repository metadata or ignore file, following symlinks.
+///
+/// Unix opens with `O_NONBLOCK` so a FIFO cannot stall the walk before
+/// [`is_regular_disk_file`] checks that the opened descriptor is a regular
+/// file; Windows opens once and checks handle type before metadata. Other
+/// platforms check metadata before opening.
+pub(crate) fn read_bounded_file(path: &Path) -> std::io::Result<BoundedFileRead> {
+    read_file_following_links(path, read_bounded_contents)
+}
+
+/// Reads up to `max_bytes` from a regular file without following a final
+/// symlink or reparse point and without rejecting files larger than
+/// `max_bytes`. Used for fixed-prefix probes such as Git's 255-byte `HEAD`
+/// validation.
+pub(crate) fn read_bounded_prefix_no_follow(
+    path: &Path,
+    max_bytes: u64,
+) -> std::io::Result<BoundedFileRead> {
+    read_file_no_follow(path, |file| read_prefix_contents(file, max_bytes))
+}
+
+#[cfg(unix)]
+fn read_file_following_links(
+    path: &Path,
+    read: impl FnOnce(fs::File) -> std::io::Result<BoundedFileRead>,
+) -> std::io::Result<BoundedFileRead> {
+    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
+
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) => return classify_open_error(path, true, error),
+    };
+    if !is_regular_disk_file(&file)? {
+        return Ok(BoundedFileRead::NotRegular);
+    }
+    read(file)
+}
+
+#[cfg(windows)]
+fn read_file_following_links(
+    path: &Path,
+    read: impl FnOnce(fs::File) -> std::io::Result<BoundedFileRead>,
+) -> std::io::Result<BoundedFileRead> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return classify_open_error(path, true, error),
+    };
+    if !is_regular_disk_file(&file)? {
+        return Ok(BoundedFileRead::NotRegular);
+    }
+    read(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_file_following_links(
+    path: &Path,
+    read: impl FnOnce(fs::File) -> std::io::Result<BoundedFileRead>,
+) -> std::io::Result<BoundedFileRead> {
+    match fs::metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => return Ok(BoundedFileRead::NotRegular),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BoundedFileRead::Missing);
+        }
+        Err(error) => return Err(error),
+    }
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BoundedFileRead::Missing);
+        }
+        Err(error) => return Err(error),
+    };
+    if !is_regular_disk_file(&file)? {
+        return Ok(BoundedFileRead::NotRegular);
+    }
+    read(file)
+}
+
+#[cfg(unix)]
+fn read_file_no_follow(
+    path: &Path,
+    read: impl FnOnce(fs::File) -> std::io::Result<BoundedFileRead>,
+) -> std::io::Result<BoundedFileRead> {
+    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
+
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) => return classify_open_error(path, false, error),
+    };
+    if !is_regular_disk_file(&file)? {
+        return Ok(BoundedFileRead::NotRegular);
+    }
+    read(file)
+}
+
+#[cfg(not(unix))]
+fn read_file_no_follow(
+    path: &Path,
+    read: impl FnOnce(fs::File) -> std::io::Result<BoundedFileRead>,
+) -> std::io::Result<BoundedFileRead> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => return Ok(BoundedFileRead::NotRegular),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BoundedFileRead::Missing);
+        }
+        Err(error) => return Err(error),
+    }
+    read_file_following_links(path, read)
+}
+
+fn is_regular_disk_file(file: &fs::File) -> std::io::Result<bool> {
+    #[cfg(windows)]
+    if !winapi_util::file::typ(file)?.is_disk() {
+        return Ok(false);
+    }
+    Ok(file.metadata()?.file_type().is_file())
+}
+
+fn read_prefix_contents(file: fs::File, max_bytes: u64) -> std::io::Result<BoundedFileRead> {
+    use std::io::Read;
+
+    let mut contents = Vec::new();
+    file.take(max_bytes).read_to_end(&mut contents)?;
+    Ok(BoundedFileRead::Contents(contents))
+}
+
+#[cfg(any(unix, windows))]
+fn classify_open_error(
+    path: &Path,
+    follow_symlinks: bool,
+    error: std::io::Error,
+) -> std::io::Result<BoundedFileRead> {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return Ok(BoundedFileRead::Missing);
+    }
+    #[cfg(unix)]
+    if !follow_symlinks && error.raw_os_error() == Some(libc::ELOOP) {
+        return Ok(BoundedFileRead::NotRegular);
+    }
+    let metadata = if follow_symlinks {
+        fs::metadata(path)
+    } else {
+        fs::symlink_metadata(path)
+    };
+    match metadata {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            let is_regular = file_type.is_file() && (follow_symlinks || !file_type.is_symlink());
+            if is_regular {
+                Err(error)
+            } else {
+                Ok(BoundedFileRead::NotRegular)
+            }
+        }
+        Err(meta_error) if meta_error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(BoundedFileRead::Missing)
+        }
+        Err(_) => Err(error),
+    }
+}
+
+fn read_bounded_contents(file: fs::File) -> std::io::Result<BoundedFileRead> {
     use std::io::Read;
 
     let mut contents = Vec::new();
@@ -3826,34 +4006,23 @@ fn read_bounded(file: fs::File) -> std::io::Result<Vec<u8>> {
             "configuration file exceeds the 8 MiB safety limit",
         ));
     }
-    Ok(contents)
+    Ok(BoundedFileRead::Contents(contents))
 }
 
 /// Reads a rule file found in the tree being walked.
 ///
-/// Unix opens the final path component with `O_NOFOLLOW`, so exchanging a
-/// regular rule file for a symlink between a metadata check and an open cannot
-/// make a walk read a target outside the tree. Other supported platforms do
-/// not expose an equivalent through `std`, so they reject a symlink before the
-/// regular `fs::read`; Windows will receive an atomic implementation once its
-/// stable standard-library API exposes one.
-#[cfg(unix)]
-fn read_in_tree_ignore_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
-
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    read_bounded(file)
-}
-
-#[cfg(not(unix))]
-fn read_in_tree_ignore_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    if fs::symlink_metadata(path)?.file_type().is_symlink() {
-        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
-    }
-    read_bounded_file(path)
+/// Unix opens the final path component atomically with `O_NOFOLLOW | O_NONBLOCK`
+/// so exchanging a regular rule file for a symlink or FIFO between a metadata
+/// check and an open cannot redirect a walk outside the tree or stall on a pipe
+/// with no writer. Windows and other platforms reject symlinks, junctions, and
+/// non-regular files via `symlink_metadata` before a regular `File::open` (plus
+/// a `GetFileType` disk-handle check via `winapi-util` on Windows): opening
+/// with `FILE_FLAG_OPEN_REPARSE_POINT` would bypass logical-data filter drivers
+/// such as Windows Data Deduplication and cloud placeholders, and safe `std`
+/// does not expose raw `ReparseTag` or `ReOpenFile` without `unsafe`; Windows
+/// will receive an atomic implementation once a stable safe API exposes one.
+fn read_in_tree_ignore_file(path: &Path) -> std::io::Result<BoundedFileRead> {
+    read_file_no_follow(path, read_bounded_contents)
 }
 
 /// What identifies a directory for the follow-symlinks ancestor-chain guard.
@@ -6409,14 +6578,17 @@ mod tests {
     #[test]
     fn stream_preserves_root_ignore_errors_when_root_fails() {
         let fixture = Fixture::new();
-        // Mark the fixture as a Git repository and place directories where
-        // ancestor `.gitignore` files live so reading them fails portably on
-        // every OS (including when running as root).
+        // Mark the fixture as a Git repository and write regular ancestor
+        // `.gitignore` files that exceed the 100,000-rule safety limit so
+        // reading them fails portably on every OS (including when running as
+        // root).
         fs::create_dir_all(fixture.root.join(".git")).expect("create .git dir");
+        fs::create_dir_all(fixture.root.join("sub")).expect("create sub dir");
         let root_gitignore = fixture.root.join(".gitignore");
         let sub_gitignore = fixture.root.join("sub").join(".gitignore");
-        fs::create_dir_all(&root_gitignore).expect("create unreadable root .gitignore");
-        fs::create_dir_all(&sub_gitignore).expect("create unreadable sub .gitignore");
+        let over_rule_limit = vec![b'\n'; 100_001];
+        fs::write(&root_gitignore, &over_rule_limit).expect("write oversized root .gitignore");
+        fs::write(&sub_gitignore, &over_rule_limit).expect("write oversized sub .gitignore");
         let missing_root = fixture.root.join("sub").join("missing-root");
 
         let describe_errors = |errors: &[super::WalkError]| {
@@ -6725,14 +6897,14 @@ mod tests {
             super::StdBackend.read_directory(path, follow_symlinks, refuse_final_symlink, listing)
         }
 
-        fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        fn read_ignore_file(&self, path: &Path) -> std::io::Result<super::BoundedFileRead> {
             *self
                 .ignore_reads
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .entry(path.to_path_buf())
                 .or_default() += 1;
-            fs::read(path)
+            super::read_in_tree_ignore_file(path)
         }
     }
 
@@ -9499,6 +9671,18 @@ mod tests {
         );
     }
 
+    fn init_git_common_dir(dir: &Path) {
+        fs::create_dir_all(dir.join("objects")).expect("create git objects directory");
+        fs::create_dir_all(dir.join("refs")).expect("create git refs directory");
+        fs::write(dir.join("HEAD"), b"ref: refs/heads/main\n").expect("write git HEAD");
+    }
+
+    fn init_git_worktree_dir(dir: &Path) {
+        fs::create_dir_all(dir).expect("create git worktree directory");
+        fs::write(dir.join("HEAD"), b"ref: refs/heads/worktree\n")
+            .expect("write git worktree HEAD");
+    }
+
     #[test]
     fn linked_worktree_and_submodule_gitdir_pointers_read_the_right_info_exclude() {
         let fixture = Fixture::new();
@@ -9509,6 +9693,8 @@ mod tests {
         let worktree = fixture.root.join("linked-worktree");
         let common_git = fixture.root.join("main/.git");
         let private_git = common_git.join("worktrees/linked-worktree");
+        init_git_common_dir(&common_git);
+        init_git_worktree_dir(&private_git);
         fs::create_dir_all(private_git.join("refs")).expect("create private git directory");
         fs::create_dir_all(common_git.join("info")).expect("create common git info");
         fs::write(common_git.join("info/exclude"), b"worktree-secret.txt\n")
@@ -9537,6 +9723,7 @@ mod tests {
         // directly at `.git/modules/<name>` with no `commondir` file.
         let submodule = fixture.root.join("super/dependency");
         let submodule_git = fixture.root.join("super/.git/modules/dependency");
+        init_git_common_dir(&submodule_git);
         fs::create_dir_all(submodule_git.join("info")).expect("create submodule git info");
         fs::write(
             submodule_git.join("info/exclude"),
@@ -9570,9 +9757,9 @@ mod tests {
         let common_git = fixture.root.join("main/.git");
         let private_git = common_git.join("worktrees/linked-worktree");
         fs::create_dir_all(&checkout).expect("create linked checkout");
-        fs::create_dir_all(&private_git).expect("create private Git directory");
+        init_git_common_dir(&common_git);
+        init_git_worktree_dir(&private_git);
         fs::write(private_git.join("commondir"), b"../..\n").expect("write commondir");
-        fs::create_dir_all(&common_git).expect("create common Git directory");
         fs::write(
             common_git.join("config"),
             b"[extensions]\nworktreeConfig = f\\\nalse\nWORKTREECONFIG = t\\\nr\\\nue\n\
@@ -9614,6 +9801,7 @@ mod tests {
         let fixture = Fixture::new();
         let checkout = fixture.root.join("absolute-worktree");
         let git_directory = fixture.root.join("separate-git-directory");
+        init_git_common_dir(&git_directory);
         fs::create_dir_all(git_directory.join("info")).expect("create separate git info");
         fs::write(git_directory.join("info/exclude"), b"absolute-secret.txt\n")
             .expect("write absolute exclude");
@@ -9691,6 +9879,902 @@ mod tests {
                 .contains(&PathBuf::from("not-excluded.txt")),
             "an unreadable pointer must add no repository rules"
         );
+    }
+
+    #[test]
+    fn directory_named_like_ignore_file_is_skipped_without_aborting() {
+        for ignore_name in [".gitignore", ".ignore"] {
+            let fixture = Fixture::new();
+            fixture.write("visible.txt");
+            fixture.write(format!("{ignore_name}/nested.txt"));
+
+            for threads in [1, 4] {
+                let result = Walker::new(&fixture.root)
+                    .respect_git_ignore(true)
+                    .threads(threads)
+                    .error_policy(ErrorPolicy::Abort)
+                    .collect()
+                    .expect("a directory named like an ignore file must not abort the walk");
+                assert!(result.errors().is_empty());
+                let paths = relative_paths(result.entries(), &fixture.root);
+                assert!(paths.contains(&PathBuf::from("visible.txt")));
+                assert!(paths.contains(&PathBuf::from(format!("{ignore_name}/nested.txt"))));
+            }
+        }
+
+        let fixture = Fixture::new();
+        fixture.write("visible.txt");
+        fs::create_dir_all(fixture.root.join(".git/info/exclude"))
+            .expect("create directory where repository exclude lives");
+        let result = Walker::new(&fixture.root)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Abort)
+            .collect()
+            .expect("a directory at .git/info/exclude must not abort the walk");
+        assert!(result.errors().is_empty());
+        assert!(
+            relative_paths(result.entries(), &fixture.root).contains(&PathBuf::from("visible.txt"))
+        );
+    }
+
+    #[test]
+    fn gitdir_and_commondir_pointers_targeting_non_directories_are_ignored() {
+        let fixture = Fixture::new();
+
+        // `.git` pointer targeting a regular file.
+        let file_target_checkout = fixture.root.join("file-target");
+        fs::create_dir_all(&file_target_checkout).expect("create checkout");
+        fs::write(fixture.root.join("not-a-dir"), b"plain file").expect("write target file");
+        fs::write(file_target_checkout.join(".git"), b"gitdir: ../not-a-dir\n")
+            .expect("write gitdir pointer to file");
+        fs::write(file_target_checkout.join("visible.txt"), b"fixture").expect("write entry");
+        let result = Walker::new(&file_target_checkout)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Abort)
+            .collect()
+            .expect("gitdir pointing at a file is ignored without error");
+        assert!(result.errors().is_empty());
+        assert!(
+            relative_paths(result.entries(), &file_target_checkout)
+                .contains(&PathBuf::from("visible.txt"))
+        );
+
+        // `.git` pointer targeting a missing path.
+        let missing_target_checkout = fixture.root.join("missing-target");
+        fs::create_dir_all(&missing_target_checkout).expect("create checkout");
+        fs::write(
+            missing_target_checkout.join(".git"),
+            b"gitdir: ../does-not-exist\n",
+        )
+        .expect("write gitdir pointer to missing path");
+        fs::write(missing_target_checkout.join("visible.txt"), b"fixture").expect("write entry");
+        let result = Walker::new(&missing_target_checkout)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Abort)
+            .collect()
+            .expect("gitdir pointing at a missing path is ignored without error");
+        assert!(result.errors().is_empty());
+        assert!(
+            relative_paths(result.entries(), &missing_target_checkout)
+                .contains(&PathBuf::from("visible.txt"))
+        );
+
+        // `.git` pointer targeting a directory whose `commondir` points at a regular file.
+        let bad_commondir_checkout = fixture.root.join("bad-commondir");
+        let private_git = fixture.root.join("private-git");
+        fs::create_dir_all(&bad_commondir_checkout).expect("create checkout");
+        init_git_worktree_dir(&private_git);
+        fs::write(private_git.join("commondir"), b"../not-a-dir\n").expect("write commondir");
+        fs::write(
+            bad_commondir_checkout.join(".git"),
+            b"gitdir: ../private-git\n",
+        )
+        .expect("write gitdir pointer");
+        fs::write(bad_commondir_checkout.join("visible.txt"), b"fixture").expect("write entry");
+        let result = Walker::new(&bad_commondir_checkout)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Abort)
+            .collect()
+            .expect("commondir pointing at a non-directory is ignored without error");
+        assert!(result.errors().is_empty());
+        assert!(
+            relative_paths(result.entries(), &bad_commondir_checkout)
+                .contains(&PathBuf::from("visible.txt"))
+        );
+    }
+
+    #[test]
+    fn gitdir_pointer_to_non_git_directory_ignores_its_exclude_and_config() {
+        let fixture = Fixture::new();
+
+        // An existing directory that has `info/exclude` and `config`, but lacks
+        // Git directory markers (`HEAD`, `objects/`, `refs/`).
+        let unrelated_dir = fixture.root.join("unrelated");
+        fs::create_dir_all(unrelated_dir.join("info")).expect("create unrelated info dir");
+        fs::write(unrelated_dir.join("info/exclude"), b"secret.txt\n")
+            .expect("write unrelated exclude");
+        fs::write(unrelated_dir.join("config"), b"[core]\nignorecase = true\n")
+            .expect("write unrelated config");
+
+        let checkout = fixture.root.join("checkout");
+        fs::create_dir_all(&checkout).expect("create checkout");
+        fs::write(checkout.join(".git"), b"gitdir: ../unrelated\n")
+            .expect("write pointer to unrelated dir");
+        fs::write(checkout.join(".gitignore"), b"build.log\n").expect("write gitignore");
+        fs::write(checkout.join("secret.txt"), b"fixture").expect("write secret");
+        fs::write(checkout.join("BUILD.log"), b"fixture").expect("write mixed-case log");
+
+        let result = Walker::new(&checkout)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Abort)
+            .collect()
+            .expect("non-Git pointer target is skipped without error");
+        assert!(result.errors().is_empty());
+        let paths = relative_paths(result.entries(), &checkout);
+        assert!(
+            paths.contains(&PathBuf::from("secret.txt")),
+            "info/exclude from a non-Git directory must not be loaded"
+        );
+        assert!(
+            paths.contains(&PathBuf::from("BUILD.log")),
+            "core.ignorecase from a non-Git directory's config must not be loaded"
+        );
+
+        // Same check through `commondir`: valid private dir with `HEAD`, but
+        // `commondir` points at an unrelated non-Git directory.
+        let commondir_checkout = fixture.root.join("commondir-checkout");
+        let private_git = fixture.root.join("worktree-private");
+        fs::create_dir_all(&commondir_checkout).expect("create checkout");
+        init_git_worktree_dir(&private_git);
+        fs::write(private_git.join("commondir"), b"../unrelated\n")
+            .expect("write commondir to unrelated dir");
+        fs::write(
+            commondir_checkout.join(".git"),
+            b"gitdir: ../worktree-private\n",
+        )
+        .expect("write gitdir pointer");
+        fs::write(commondir_checkout.join(".gitignore"), b"build.log\n").expect("write gitignore");
+        fs::write(commondir_checkout.join("secret.txt"), b"fixture").expect("write secret");
+        fs::write(commondir_checkout.join("BUILD.log"), b"fixture").expect("write mixed-case log");
+
+        let result = Walker::new(&commondir_checkout)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Abort)
+            .collect()
+            .expect("non-Git commondir target is skipped without error");
+        assert!(result.errors().is_empty());
+        let paths = relative_paths(result.entries(), &commondir_checkout);
+        assert!(paths.contains(&PathBuf::from("secret.txt")));
+        assert!(paths.contains(&PathBuf::from("BUILD.log")));
+    }
+
+    #[test]
+    fn linked_worktree_does_not_require_head_in_common_directory() {
+        let fixture = Fixture::new();
+        let checkout = fixture.root.join("linked-worktree");
+        let common_git = fixture.root.join("main/.git");
+        let private_git = common_git.join("worktrees/linked-worktree");
+
+        // Common directory has `objects/`, `refs/`, and `info/exclude`, but no `HEAD`.
+        fs::create_dir_all(common_git.join("objects")).expect("create common objects dir");
+        fs::create_dir_all(common_git.join("refs")).expect("create common refs dir");
+        fs::create_dir_all(common_git.join("info")).expect("create common info dir");
+        fs::write(common_git.join("info/exclude"), b"worktree-secret.txt\n")
+            .expect("write common exclude");
+
+        init_git_worktree_dir(&private_git);
+        fs::write(private_git.join("commondir"), b"../..\n").expect("write commondir");
+
+        fs::create_dir_all(&checkout).expect("create linked worktree checkout");
+        fs::write(
+            checkout.join(".git"),
+            b"gitdir: ../main/.git/worktrees/linked-worktree\n",
+        )
+        .expect("write worktree pointer");
+        fs::write(checkout.join("worktree-secret.txt"), b"fixture").expect("write secret");
+        fs::write(checkout.join("visible.txt"), b"fixture").expect("write visible");
+
+        let result = Walker::new(&checkout)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Abort)
+            .collect()
+            .expect("linked worktree without common HEAD walks cleanly");
+        assert!(result.errors().is_empty());
+        let paths = relative_paths(result.entries(), &checkout);
+        assert!(
+            !paths.contains(&PathBuf::from("worktree-secret.txt")),
+            "shared info/exclude must apply even when common HEAD is absent"
+        );
+        assert!(paths.contains(&PathBuf::from("visible.txt")));
+    }
+
+    fn isolated_git_check_ignore(root: &Path, candidate: &str) -> bool {
+        let mut command = git_command();
+        command.env("LC_ALL", "C");
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_INDEX_FILE",
+            "GIT_CEILING_DIRECTORIES",
+        ] {
+            command.env_remove(var);
+        }
+        let output = command
+            .args(["check-ignore", "--no-index", "--quiet", "--", candidate])
+            .current_dir(root)
+            .output()
+            .expect("run Git check-ignore oracle");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match output.status.code() {
+            Some(0) => true,
+            Some(1) => false,
+            Some(128)
+                if stderr.contains("not a git repository")
+                    || stderr.contains("gitfile does not point to a valid repository") =>
+            {
+                false
+            }
+            _ => panic!(
+                "unexpected git check-ignore failure: status={:?}, stderr={stderr}",
+                output.status
+            ),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_head_on_unborn_branch_is_accepted_for_gitdir_pointers() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let checkout = fixture.root.join("unborn-checkout");
+        let git_dir = fixture.root.join("separate-git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create objects dir");
+        fs::create_dir_all(git_dir.join("refs")).expect("create refs dir");
+        fs::create_dir_all(git_dir.join("info")).expect("create info dir");
+        fs::write(git_dir.join("info/exclude"), b"unborn-secret.txt\n").expect("write exclude");
+        // Dangling symlink matching `core.preferSymlinkRefs=true` on an unborn branch.
+        symlink("refs/heads/main", git_dir.join("HEAD")).expect("create symlink HEAD");
+
+        fs::create_dir_all(&checkout).expect("create checkout");
+        fs::write(checkout.join(".git"), b"gitdir: ../separate-git\n").expect("write pointer");
+        fs::write(checkout.join("unborn-secret.txt"), b"fixture").expect("write secret");
+        fs::write(checkout.join("visible.txt"), b"fixture").expect("write visible");
+
+        let result = Walker::new(&checkout)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Abort)
+            .collect()
+            .expect("gitdir with dangling refs/ HEAD symlink walks cleanly");
+        assert!(result.errors().is_empty());
+        let paths = relative_paths(result.entries(), &checkout);
+        assert!(
+            !paths.contains(&PathBuf::from("unborn-secret.txt")),
+            "info/exclude must be honored when HEAD is a dangling refs/ symlink"
+        );
+        assert!(paths.contains(&PathBuf::from("visible.txt")));
+
+        // A `HEAD` symlink whose target does NOT start with `refs/` is rejected
+        // by Git without following it, even when the target contains a valid
+        // `ref: refs/heads/main` line.
+        fs::remove_file(git_dir.join("HEAD")).expect("remove refs/ HEAD symlink");
+        fs::write(git_dir.join("target"), b"ref: refs/heads/main\n")
+            .expect("write non-refs target file");
+        symlink("target", git_dir.join("HEAD")).expect("create non-refs HEAD symlink");
+
+        let rejected = Walker::new(&checkout)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Abort)
+            .collect()
+            .expect("non-refs HEAD symlink is rejected cleanly");
+        assert!(rejected.errors().is_empty());
+        let walker_ignored = !relative_paths(rejected.entries(), &checkout)
+            .contains(&PathBuf::from("unborn-secret.txt"));
+        let git_ignored = isolated_git_check_ignore(&checkout, "unborn-secret.txt");
+        assert!(
+            !walker_ignored,
+            "HEAD symlink not targeting refs/ must be rejected"
+        );
+        assert_eq!(walker_ignored, git_ignored);
+    }
+
+    #[test]
+    fn gitdir_pointer_rejects_empty_or_invalid_head_and_accepts_detached_head() {
+        let fixture = Fixture::new();
+        let checkout = fixture.root.join("checkout");
+        let git_dir = fixture.root.join("candidate-git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create objects dir");
+        fs::create_dir_all(git_dir.join("refs")).expect("create refs dir");
+        fs::create_dir_all(git_dir.join("info")).expect("create info dir");
+        fs::write(git_dir.join("info/exclude"), b"secret.txt\n").expect("write exclude");
+        fs::write(git_dir.join("config"), b"[core]\nignorecase = true\n").expect("write config");
+
+        fs::create_dir_all(&checkout).expect("create checkout");
+        fs::write(checkout.join(".git"), b"gitdir: ../candidate-git\n").expect("write pointer");
+        fs::write(checkout.join(".gitignore"), b"build.log\n").expect("write gitignore");
+        fs::write(checkout.join("secret.txt"), b"fixture").expect("write secret");
+        fs::write(checkout.join("BUILD.log"), b"fixture").expect("write mixed-case log");
+
+        // Symbolic refs (with Git's whitespace and 255-byte prefix limit),
+        // detached SHA-1/SHA-256 HEADs (including trailing text), and
+        // empty/invalid HEADs must match `git check-ignore`.
+        let mut spaces_246 = b"ref:".to_vec();
+        spaces_246.extend(std::iter::repeat_n(b' ', 246));
+        spaces_246.extend_from_slice(b"refs/heads/main\n");
+
+        let mut spaces_247 = b"ref:".to_vec();
+        spaces_247.extend(std::iter::repeat_n(b' ', 247));
+        spaces_247.extend_from_slice(b"refs/heads/main\n");
+
+        let mut long_branch_300 = b"ref: refs/heads/".to_vec();
+        long_branch_300.extend(std::iter::repeat_n(b'a', 300));
+        long_branch_300.push(b'\n');
+
+        for (head_contents, expected_ignored) in [
+            (b"ref:\nrefs/heads/main\n".as_slice(), true),
+            (b"ref:\r\nrefs/heads/main\n".as_slice(), true),
+            (spaces_246.as_slice(), true),
+            (spaces_247.as_slice(), false),
+            (long_branch_300.as_slice(), true),
+            (
+                b"0123456789abcdef0123456789abcdef01234567\n".as_slice(),
+                true,
+            ),
+            (
+                b"0123456789abcdef0123456789abcdef01234567 trailing\n".as_slice(),
+                true,
+            ),
+            (
+                b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n".as_slice(),
+                true,
+            ),
+            (b"".as_slice(), false),
+            (b"ref:\x0brefs/heads/main\n".as_slice(), false),
+            (b"ref: ../escape\n".as_slice(), false),
+            (b"not-a-valid-head\n".as_slice(), false),
+        ] {
+            fs::write(git_dir.join("HEAD"), head_contents).expect("write HEAD case");
+            let result = Walker::new(&checkout)
+                .respect_git_ignore(true)
+                .error_policy(ErrorPolicy::Abort)
+                .collect()
+                .expect("walk with candidate HEAD completes cleanly");
+            assert!(result.errors().is_empty());
+            let paths = relative_paths(result.entries(), &checkout);
+            let walker_ignored_exclude = !paths.contains(&PathBuf::from("secret.txt"));
+            let walker_applied_config = !paths.contains(&PathBuf::from("BUILD.log"));
+            assert_eq!(
+                walker_ignored_exclude,
+                expected_ignored,
+                "exclude verdict for HEAD len={}",
+                head_contents.len()
+            );
+            assert_eq!(
+                walker_applied_config,
+                expected_ignored,
+                "config verdict for HEAD len={}",
+                head_contents.len()
+            );
+
+            let git_ignored = isolated_git_check_ignore(&checkout, "secret.txt");
+            assert_eq!(
+                walker_ignored_exclude,
+                git_ignored,
+                "ferralk and git check-ignore must agree on HEAD len={}",
+                head_contents.len()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitdir_pointer_requires_searchable_objects_and_refs_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        let checkout = fixture.root.join("checkout");
+        let git_dir = fixture.root.join("candidate-git");
+        init_git_common_dir(&git_dir);
+        fs::create_dir_all(git_dir.join("info")).expect("create info dir");
+        fs::write(git_dir.join("info/exclude"), b"secret.txt\n").expect("write exclude");
+        fs::create_dir_all(&checkout).expect("create checkout");
+        fs::write(checkout.join(".git"), b"gitdir: ../candidate-git\n").expect("write pointer");
+        fs::write(checkout.join("secret.txt"), b"fixture").expect("write secret");
+        fs::write(checkout.join("visible.txt"), b"fixture").expect("write visible");
+
+        for marker in ["objects", "refs"] {
+            let marker_dir = git_dir.join(marker);
+
+            // `0o600` (non-searchable): both Git and ferralk reject the gitdir.
+            fs::set_permissions(&marker_dir, fs::Permissions::from_mode(0o600))
+                .expect("chmod marker 0600");
+            if fs::metadata(marker_dir.join(".")).is_ok() {
+                // Privileged test process bypasses directory search bits.
+                fs::set_permissions(&marker_dir, fs::Permissions::from_mode(0o755))
+                    .expect("restore marker permissions");
+                return;
+            }
+            let walk_0600 = Walker::new(&checkout)
+                .respect_git_ignore(true)
+                .error_policy(ErrorPolicy::Abort)
+                .collect();
+            let git_ignored_0600 = isolated_git_check_ignore(&checkout, "secret.txt");
+
+            // `0o111` (execute-only searchable): both Git and ferralk accept the gitdir.
+            fs::set_permissions(&marker_dir, fs::Permissions::from_mode(0o111))
+                .expect("chmod marker 0111");
+            let walk_0111 = Walker::new(&checkout)
+                .respect_git_ignore(true)
+                .error_policy(ErrorPolicy::Abort)
+                .collect();
+            let git_ignored_0111 = isolated_git_check_ignore(&checkout, "secret.txt");
+
+            fs::set_permissions(&marker_dir, fs::Permissions::from_mode(0o755))
+                .expect("restore marker permissions");
+
+            let result_0600 = walk_0600.expect("non-searchable marker skips gitdir cleanly");
+            assert!(result_0600.errors().is_empty());
+            let walker_ignored_0600 = !relative_paths(result_0600.entries(), &checkout)
+                .contains(&PathBuf::from("secret.txt"));
+            assert!(
+                !walker_ignored_0600,
+                "0o600 {marker}/ must reject gitdir pointer"
+            );
+            assert_eq!(walker_ignored_0600, git_ignored_0600);
+
+            let result_0111 = walk_0111.expect("0o111 searchable marker walks cleanly");
+            assert!(result_0111.errors().is_empty());
+            let walker_ignored_0111 = !relative_paths(result_0111.entries(), &checkout)
+                .contains(&PathBuf::from("secret.txt"));
+            assert!(
+                walker_ignored_0111,
+                "0o111 searchable {marker}/ must accept gitdir pointer"
+            );
+            assert_eq!(walker_ignored_0111, git_ignored_0111);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_open_error_uses_file_type_for_arbitrary_errnos() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let regular = fixture.root.join("regular.txt");
+        let dir = fixture.root.join("dir");
+        let fifo = fixture.root.join("pipe.fifo");
+        let link_to_regular = fixture.root.join("link-to-regular");
+        let missing = fixture.root.join("missing");
+
+        fs::write(&regular, b"rules\n").expect("write regular file");
+        fs::create_dir(&dir).expect("create directory");
+        create_fifo(&fifo);
+        symlink(&regular, &link_to_regular).expect("create symlink to regular file");
+
+        let busy = || std::io::Error::from_raw_os_error(libc::EBUSY);
+
+        assert!(matches!(
+            super::classify_open_error(&fifo, false, busy()),
+            Ok(super::BoundedFileRead::NotRegular)
+        ));
+        assert!(matches!(
+            super::classify_open_error(&fifo, true, busy()),
+            Ok(super::BoundedFileRead::NotRegular)
+        ));
+        assert!(matches!(
+            super::classify_open_error(&dir, false, busy()),
+            Ok(super::BoundedFileRead::NotRegular)
+        ));
+        assert!(matches!(
+            super::classify_open_error(&link_to_regular, false, busy()),
+            Ok(super::BoundedFileRead::NotRegular)
+        ));
+        assert!(matches!(
+            super::classify_open_error(&missing, false, busy()),
+            Ok(super::BoundedFileRead::Missing)
+        ));
+
+        let regular_err = super::classify_open_error(&regular, false, busy())
+            .expect_err("EBUSY on a regular file must be propagated");
+        assert_eq!(regular_err.raw_os_error(), Some(libc::EBUSY));
+
+        let followed_regular_err = super::classify_open_error(&link_to_regular, true, busy())
+            .expect_err("EBUSY on a followed link to a regular file must be propagated");
+        assert_eq!(followed_regular_err.raw_os_error(), Some(libc::EBUSY));
+    }
+
+    #[test]
+    fn regular_file_read_errors_are_not_masked_as_skipped_ignore_files() {
+        struct FailingIgnoreReadBackend {
+            make_error: fn() -> std::io::Error,
+            fail_repository: bool,
+        }
+
+        impl super::DirectoryBackend for FailingIgnoreReadBackend {
+            fn read_directory(
+                &self,
+                path: &Path,
+                follow_symlinks: bool,
+                refuse_final_symlink: bool,
+                listing: &mut super::Listing,
+            ) -> std::io::Result<()> {
+                super::StdBackend.read_directory(
+                    path,
+                    follow_symlinks,
+                    refuse_final_symlink,
+                    listing,
+                )
+            }
+
+            fn read_ignore_file(&self, path: &Path) -> std::io::Result<super::BoundedFileRead> {
+                if !self.fail_repository
+                    && path.file_name() == Some(std::ffi::OsStr::new(".gitignore"))
+                {
+                    return Err((self.make_error)());
+                }
+                super::read_in_tree_ignore_file(path)
+            }
+
+            fn read_repository_file(&self, path: &Path) -> std::io::Result<super::BoundedFileRead> {
+                if self.fail_repository {
+                    return Err((self.make_error)());
+                }
+                super::read_bounded_file(path)
+            }
+        }
+
+        let fixture = Fixture::new();
+        fixture.write("visible.txt");
+        fixture.write(".gitignore");
+        fixture.write(".git/info/exclude");
+
+        let error_factories: Vec<fn() -> std::io::Error> = vec![
+            || std::io::Error::from(std::io::ErrorKind::InvalidInput),
+            #[cfg(unix)]
+            || std::io::Error::from_raw_os_error(libc::EOPNOTSUPP),
+            #[cfg(unix)]
+            || std::io::Error::from_raw_os_error(libc::ENXIO),
+        ];
+
+        for make_error in error_factories {
+            for fail_repository in [false, true] {
+                let backend = FailingIgnoreReadBackend {
+                    make_error,
+                    fail_repository,
+                };
+                let collected = Walker::new(&fixture.root)
+                    .respect_git_ignore(true)
+                    .error_policy(ErrorPolicy::Collect)
+                    .collect_with(&backend)
+                    .expect("collect policy keeps walking");
+                assert_eq!(
+                    collected.errors().len(),
+                    1,
+                    "regular-file read error must be reported (fail_repository={fail_repository})"
+                );
+                assert_eq!(collected.errors()[0].operation().as_str(), "read_ignore");
+
+                let aborted = Walker::new(&fixture.root)
+                    .respect_git_ignore(true)
+                    .error_policy(ErrorPolicy::Abort)
+                    .collect_with(&backend)
+                    .expect_err("abort policy must fail on regular-file read error");
+                assert_eq!(aborted.operation().as_str(), "read_ignore");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_fifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(
+            status.success(),
+            "mkfifo {} failed: {status}",
+            path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    fn run_with_fifo_deadline<F>(description: &str, fifos: &[PathBuf], action: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, sync::mpsc, time::Duration};
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action));
+            let _ = done_tx.send(outcome);
+        });
+
+        match done_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(())) => {
+                let _ = handle.join();
+            }
+            Ok(Err(payload)) => {
+                let _ = handle.join();
+                std::panic::resume_unwind(payload);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Best-effort unblock of any worker stuck in a blocking
+                // open(O_RDONLY) on a test FIFO before failing fast.
+                for fifo in fifos {
+                    let _ = OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(fifo);
+                }
+                panic!("{description} timed out after 10s (likely blocked on a FIFO)");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = handle.join();
+                panic!("{description} worker thread exited unexpectedly");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_in_tree_ignore_files_do_not_hang_or_abort() {
+        for ignore_name in [".gitignore", ".ignore"] {
+            let fixture = Fixture::new();
+            fixture.write("visible.txt");
+            fixture.write("sub/nested.txt");
+            let root_fifo = fixture.root.join(ignore_name);
+            let nested_fifo = fixture.root.join("sub").join(ignore_name);
+            create_fifo(&root_fifo);
+            create_fifo(&nested_fifo);
+
+            for threads in [1, 4] {
+                let root = fixture.root.clone();
+                run_with_fifo_deadline(
+                    "in-tree FIFO ignore walk",
+                    &[root_fifo.clone(), nested_fifo.clone()],
+                    move || {
+                        let result = Walker::new(&root)
+                            .respect_git_ignore(true)
+                            .threads(threads)
+                            .error_policy(ErrorPolicy::Abort)
+                            .collect()
+                            .expect("a FIFO named like an ignore file must not hang or abort");
+                        assert!(result.errors().is_empty());
+                        let paths = relative_paths(result.entries(), &root);
+                        assert!(paths.contains(&PathBuf::from("visible.txt")));
+                        assert!(paths.contains(&PathBuf::from("sub/nested.txt")));
+                    },
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_git_metadata_and_gitdir_pointers_do_not_hang_or_abort() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+
+        // 1. `.git` itself is a FIFO.
+        let dot_git_fifo = fixture.root.join("dot-git-fifo");
+        fs::create_dir_all(&dot_git_fifo).expect("create checkout");
+        let fifo_dot_git = dot_git_fifo.join(".git");
+        create_fifo(&fifo_dot_git);
+        fs::write(dot_git_fifo.join("visible.txt"), b"fixture").expect("write entry");
+
+        // 2. `.git` pointer targeting a FIFO.
+        let pointer_to_fifo = fixture.root.join("pointer-to-fifo");
+        let external_fifo = fixture.root.join("external.fifo");
+        fs::create_dir_all(&pointer_to_fifo).expect("create checkout");
+        create_fifo(&external_fifo);
+        fs::write(pointer_to_fifo.join(".git"), b"gitdir: ../external.fifo\n")
+            .expect("write pointer to FIFO");
+        fs::write(pointer_to_fifo.join("visible.txt"), b"fixture").expect("write entry");
+
+        // 3. `commondir` itself is a FIFO inside a valid private git dir.
+        let fifo_commondir_checkout = fixture.root.join("fifo-commondir");
+        let private_git_1 = fixture.root.join("private-git-fifo-commondir");
+        fs::create_dir_all(&fifo_commondir_checkout).expect("create checkout");
+        init_git_worktree_dir(&private_git_1);
+        let fifo_commondir = private_git_1.join("commondir");
+        create_fifo(&fifo_commondir);
+        fs::write(
+            fifo_commondir_checkout.join(".git"),
+            b"gitdir: ../private-git-fifo-commondir\n",
+        )
+        .expect("write pointer");
+        fs::write(fifo_commondir_checkout.join("visible.txt"), b"fixture").expect("write entry");
+
+        // 4. `commondir` points at a FIFO.
+        let commondir_to_fifo_checkout = fixture.root.join("commondir-to-fifo");
+        let private_git_2 = fixture.root.join("private-git-commondir-to-fifo");
+        fs::create_dir_all(&commondir_to_fifo_checkout).expect("create checkout");
+        init_git_worktree_dir(&private_git_2);
+        fs::write(private_git_2.join("commondir"), b"../external.fifo\n")
+            .expect("write commondir pointing at FIFO");
+        fs::write(
+            commondir_to_fifo_checkout.join(".git"),
+            b"gitdir: ../private-git-commondir-to-fifo\n",
+        )
+        .expect("write pointer");
+        fs::write(commondir_to_fifo_checkout.join("visible.txt"), b"fixture").expect("write entry");
+
+        // 5. `.git/config` and `.git/info/exclude` are FIFOs.
+        let repo_fifo_files = fixture.root.join("repo-fifo-files");
+        fs::create_dir_all(repo_fifo_files.join(".git/info")).expect("create .git/info");
+        let fifo_config = repo_fifo_files.join(".git/config");
+        let fifo_exclude = repo_fifo_files.join(".git/info/exclude");
+        create_fifo(&fifo_config);
+        create_fifo(&fifo_exclude);
+        fs::write(repo_fifo_files.join("visible.txt"), b"fixture").expect("write entry");
+
+        // 6. `.git/info/exclude` is a symlink to a FIFO.
+        let symlink_to_fifo = fixture.root.join("symlink-to-fifo");
+        fs::create_dir_all(symlink_to_fifo.join(".git/info")).expect("create .git/info");
+        symlink(&external_fifo, symlink_to_fifo.join(".git/info/exclude"))
+            .expect("symlink info/exclude to FIFO");
+        fs::write(symlink_to_fifo.join("visible.txt"), b"fixture").expect("write entry");
+
+        let fifos = vec![
+            fifo_dot_git,
+            external_fifo,
+            fifo_commondir,
+            fifo_config,
+            fifo_exclude,
+        ];
+        let checkouts = [
+            ("FIFO .git", dot_git_fifo),
+            (".git pointer to FIFO", pointer_to_fifo),
+            ("FIFO commondir", fifo_commondir_checkout),
+            ("commondir pointer to FIFO", commondir_to_fifo_checkout),
+            ("FIFO config and info/exclude", repo_fifo_files),
+            ("symlinked FIFO info/exclude", symlink_to_fifo),
+        ];
+        for (label, checkout) in checkouts {
+            run_with_fifo_deadline(label, &fifos, move || {
+                let result = Walker::new(&checkout)
+                    .respect_git_ignore(true)
+                    .error_policy(ErrorPolicy::Abort)
+                    .collect()
+                    .unwrap_or_else(|error| panic!("{label} must not hang or abort: {error}"));
+                assert!(result.errors().is_empty(), "{label} reported errors");
+                assert!(
+                    relative_paths(result.entries(), &checkout)
+                        .contains(&PathBuf::from("visible.txt")),
+                    "{label} lost visible.txt"
+                );
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_fifo_ignore_and_exclude_files_are_skipped_without_masking_regular_file_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Unreadable (`0o000`) FIFOs named `.gitignore`, `.ignore`, and
+        // `.git/info/exclude` must be skipped rather than aborting the walk.
+        for ignore_name in [".gitignore", ".ignore"] {
+            let fixture = Fixture::new();
+            fixture.write("visible.txt");
+            let fifo_path = fixture.root.join(ignore_name);
+            create_fifo(&fifo_path);
+            let original_permissions = fs::symlink_metadata(&fifo_path)
+                .expect("read fifo metadata")
+                .permissions();
+            fs::set_permissions(&fifo_path, fs::Permissions::from_mode(0o000))
+                .expect("make fifo unreadable");
+
+            let root = fixture.root.clone();
+            let fifo_clone = fifo_path.clone();
+            let outcome = std::panic::catch_unwind(move || {
+                run_with_fifo_deadline("unreadable FIFO ignore file", &[fifo_clone], move || {
+                    let result = Walker::new(&root)
+                        .respect_git_ignore(true)
+                        .error_policy(ErrorPolicy::Abort)
+                        .collect()
+                        .expect("unreadable FIFO ignore file must not abort the walk");
+                    assert!(result.errors().is_empty());
+                    assert!(
+                        relative_paths(result.entries(), &root)
+                            .contains(&PathBuf::from("visible.txt"))
+                    );
+                });
+            });
+            let _ = fs::set_permissions(&fifo_path, original_permissions);
+            if let Err(payload) = outcome {
+                std::panic::resume_unwind(payload);
+            }
+        }
+
+        let exclude_fixture = Fixture::new();
+        exclude_fixture.write("visible.txt");
+        fs::create_dir_all(exclude_fixture.root.join(".git/info")).expect("create .git/info");
+        let exclude_fifo = exclude_fixture.root.join(".git/info/exclude");
+        create_fifo(&exclude_fifo);
+        let original_permissions = fs::symlink_metadata(&exclude_fifo)
+            .expect("read exclude fifo metadata")
+            .permissions();
+        fs::set_permissions(&exclude_fifo, fs::Permissions::from_mode(0o000))
+            .expect("make exclude fifo unreadable");
+        let root = exclude_fixture.root.clone();
+        let fifo_clone = exclude_fifo.clone();
+        let outcome = std::panic::catch_unwind(move || {
+            run_with_fifo_deadline("unreadable FIFO info/exclude", &[fifo_clone], move || {
+                let result = Walker::new(&root)
+                    .respect_git_ignore(true)
+                    .error_policy(ErrorPolicy::Abort)
+                    .collect()
+                    .expect("unreadable FIFO info/exclude must not abort the walk");
+                assert!(result.errors().is_empty());
+                assert!(
+                    relative_paths(result.entries(), &root).contains(&PathBuf::from("visible.txt"))
+                );
+            });
+        });
+        let _ = fs::set_permissions(&exclude_fifo, original_permissions);
+        if let Err(payload) = outcome {
+            std::panic::resume_unwind(payload);
+        }
+
+        // Unreadable (`0o000`) regular `.gitignore` and `.git/info/exclude`
+        // must still report `read_ignore` errors (and abort under Abort).
+        for relative_path in [".gitignore", ".git/info/exclude"] {
+            let fixture = Fixture::new();
+            fixture.write("visible.txt");
+            let file_path = fixture.root.join(relative_path);
+            if let Some(parent) = file_path.parent() {
+                fs::create_dir_all(parent).expect("create parent dir");
+            }
+            fs::write(&file_path, b"visible.txt\n").expect("write regular rule file");
+
+            let original_permissions = fs::metadata(&file_path)
+                .expect("read rule file metadata")
+                .permissions();
+            fs::set_permissions(&file_path, fs::Permissions::from_mode(0o000))
+                .expect("make rule file unreadable");
+            if fs::read(&file_path).is_ok() {
+                fs::set_permissions(&file_path, original_permissions)
+                    .expect("restore rule file permissions");
+                continue;
+            }
+
+            let collected = Walker::new(&fixture.root)
+                .respect_git_ignore(true)
+                .error_policy(ErrorPolicy::Collect)
+                .collect()
+                .expect("collect policy keeps walking");
+            let aborted = Walker::new(&fixture.root)
+                .respect_git_ignore(true)
+                .error_policy(ErrorPolicy::Abort)
+                .collect()
+                .expect_err("abort policy fails on unreadable regular rule file");
+            fs::set_permissions(&file_path, original_permissions)
+                .expect("restore rule file permissions");
+
+            let expected_canonical =
+                fs::canonicalize(&file_path).expect("canonicalize rule file path");
+            assert_eq!(collected.errors().len(), 1);
+            assert_eq!(collected.errors()[0].operation().as_str(), "read_ignore");
+            assert_eq!(
+                fs::canonicalize(collected.errors()[0].path()).expect("canonicalize error path"),
+                expected_canonical
+            );
+            assert_eq!(aborted.operation().as_str(), "read_ignore");
+            assert_eq!(
+                fs::canonicalize(aborted.path()).expect("canonicalize aborted path"),
+                expected_canonical
+            );
+            assert!(
+                relative_paths(collected.entries(), &fixture.root)
+                    .contains(&PathBuf::from("visible.txt"))
+            );
+        }
     }
 
     #[test]
