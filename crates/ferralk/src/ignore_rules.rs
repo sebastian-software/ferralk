@@ -31,6 +31,119 @@ use memchr::memmem;
 
 use super::glob_path_bytes;
 
+/// A single ignore file may contribute at most this many parsed path parts or
+/// compiled components. The byte and line limits bound I/O and rule count,
+/// while this dimension prevents one long line of tiny components (such as
+/// `"a/"` repeated millions of times) from amplifying an 8 MiB file into
+/// gigabytes of compiled matchers.
+///
+/// 250,000 components fits 100,000 unanchored single-component rules (whether
+/// literal or wildcard, each costing `AnyDirs` plus one component = 200,000
+/// components total), while long wildcard and multi-star memory bombs are
+/// bounded separately by `MAX_IGNORE_FILE_RETAINED_BYTES`.
+pub(crate) const MAX_IGNORE_FILE_COMPONENTS: usize = 250_000;
+
+/// Conservative estimated retained matcher storage cap for one ignore file.
+/// Accommodates up to the full 100,000-line / 8 MiB ceiling of ordinary literal
+/// rules on every architecture while rejecting pathological wildcard and
+/// multi-star `WideSweepEngine` memory bombs before retaining unbounded heap
+/// state.
+pub(crate) const MAX_IGNORE_FILE_RETAINED_BYTES: usize = 256 * 1024 * 1024;
+
+/// Calibrated conservative bounds for retained inline and heap storage owned by
+/// a compiled ignore `Rule` and its `Component` entries, derived from target
+/// struct sizes so `Vec` initial/doubled capacities stay upper-bounded on every
+/// architecture (arm64, x86_64, etc.) and verified against `allocation-counter`
+/// measurements in `pattern_memory_regression`.
+///
+/// The initial 4-element `Vec<Rule>` backing allocation is charged once on the
+/// first rule (`RULE_FIRST_EXTRA_BYTES`), and `2 * size_of::<Rule>() + 128` per
+/// rule thereafter so `sum_{i=1..=N} >= cap(N) * size_of::<Rule>()` for every
+/// `N >= 1` without penalizing large legitimate rule files by 2x.
+const RULE_FIXED_RETAINED_BYTES: usize = std::mem::size_of::<Rule>() * 2 + 128;
+const RULE_FIRST_EXTRA_BYTES: usize = std::mem::size_of::<Rule>() * 2 + 128;
+const ANY_DIRS_COMPONENT_BYTES: usize = std::mem::size_of::<Component>() * 2;
+const LITERAL_COMPONENT_FIXED_BYTES: usize = std::mem::size_of::<Component>() * 4 + 256;
+const PATTERN_COMPONENT_FIXED_BYTES: usize =
+    std::mem::size_of::<Component>() * 4 + std::mem::size_of::<memmem::Finder<'static>>() + 768;
+const WIDE_SWEEP_EXTRA_BYTES: usize = 2_048;
+const MAX_COMPONENT_FIXED_BYTES: usize =
+    (PATTERN_COMPONENT_FIXED_BYTES + WIDE_SWEEP_EXTRA_BYTES) * 2;
+const LITERAL_BYTES_PER_BYTE: usize = 10;
+const PATTERN_BYTES_PER_BYTE: usize = 128;
+const MAX_BYTES_PER_BYTE: usize = PATTERN_BYTES_PER_BYTE * 2;
+/// Under `component_options` (`braces: false`, `extglob: false`,
+/// `recursive_double_star: false`), `ferralk-glob`'s `IrBudget` (1,048,576 IR
+/// units) cannot be exhausted by any single component shorter than 64 KiB.
+const MIN_IR_LIMIT_COMPONENT_BYTES: usize = 65_536;
+
+/// Returned when a rule line would exceed a component or byte budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComponentBudgetExceeded {
+    /// Per-file parsed-part or compiled-matcher-unit limit.
+    File,
+    /// Per-file estimated retained matcher byte limit.
+    FileBytes,
+    /// Active ancestor-chain retained compiled-matcher-unit limit.
+    Chain,
+    /// Active ancestor-chain estimated retained matcher byte limit.
+    ChainBytes,
+}
+
+/// Remaining budgets passed to one ignore-rule line parse.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LineBudgets {
+    pub(crate) file_parsed_remaining: usize,
+    pub(crate) file_compiled_remaining: usize,
+    pub(crate) file_bytes_remaining: usize,
+    pub(crate) chain_compiled_remaining: usize,
+    pub(crate) chain_bytes_remaining: usize,
+}
+
+impl LineBudgets {
+    #[cfg(any(test, feature = "unstable-test-hooks"))]
+    pub(crate) const UNBOUNDED: Self = Self {
+        file_parsed_remaining: usize::MAX,
+        file_compiled_remaining: usize::MAX,
+        file_bytes_remaining: usize::MAX,
+        chain_compiled_remaining: usize::MAX,
+        chain_bytes_remaining: usize::MAX,
+    };
+
+    #[cfg(any(test, feature = "unstable-test-hooks"))]
+    pub(crate) const fn single_file(remaining_units: usize, remaining_bytes: usize) -> Self {
+        Self {
+            file_parsed_remaining: remaining_units,
+            file_compiled_remaining: remaining_units,
+            file_bytes_remaining: remaining_bytes,
+            chain_compiled_remaining: remaining_units,
+            chain_bytes_remaining: remaining_bytes,
+        }
+    }
+}
+
+/// Budget units charged by one parsed ignore-rule line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LineBudgetUsage {
+    /// Non-empty path parts scanned/parsed from the line, including lines
+    /// discarded as malformed.
+    pub(crate) parsed_parts: usize,
+    /// Retained compiled matcher units stored in the resulting [`RuleSet`].
+    pub(crate) compiled_units: usize,
+    /// Conservative estimated retained matcher bytes stored in the resulting
+    /// [`RuleSet`].
+    pub(crate) retained_bytes: usize,
+}
+
+/// Snapshot of [`RuleSetBuilder`] state used to roll back a file atomically
+/// when a later line in that file breaches a safety budget.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RuleSetCheckpoint {
+    rules_len: usize,
+    compiled_units: usize,
+    retained_bytes: usize,
+}
+
 /// How ferralk-glob reads one rule component.
 ///
 /// Braces stay literal because Git does not expand them in ignore files, and
@@ -72,11 +185,21 @@ pub(crate) struct RuleSet {
     root_prefix: Vec<u8>,
     precompose_unicode: bool,
     rules: Vec<Rule>,
+    compiled_units: usize,
+    retained_bytes: usize,
 }
 
 impl RuleSet {
     pub(crate) fn is_empty(&self) -> bool {
         self.rules.is_empty()
+    }
+
+    pub(crate) fn compiled_units(&self) -> usize {
+        self.compiled_units
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 
     /// The verdict of the last rule that matches, or `None` when none does.
@@ -237,6 +360,8 @@ pub(crate) struct RuleSetBuilder {
     case_insensitive: bool,
     precompose_unicode: bool,
     rules: Vec<Rule>,
+    compiled_units: usize,
+    retained_bytes: usize,
 }
 
 impl RuleSetBuilder {
@@ -259,15 +384,85 @@ impl RuleSetBuilder {
             case_insensitive,
             precompose_unicode,
             rules: Vec::new(),
+            compiled_units: 0,
+            retained_bytes: 0,
         }
     }
 
-    /// Adds one line. A line that is blank, a comment, or malformed adds
-    /// nothing, which is what Git does with it.
-    pub(crate) fn add_line(&mut self, line: impl AsRef<[u8]>) {
-        if let Some(rule) = parse_rule_with_options(line, self.case_insensitive) {
-            self.rules.push(rule);
+    pub(crate) fn compiled_units(&self) -> usize {
+        self.compiled_units
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    pub(crate) fn checkpoint(&self) -> RuleSetCheckpoint {
+        RuleSetCheckpoint {
+            rules_len: self.rules.len(),
+            compiled_units: self.compiled_units,
+            retained_bytes: self.retained_bytes,
         }
+    }
+
+    pub(crate) fn restore(&mut self, checkpoint: RuleSetCheckpoint) {
+        self.rules.truncate(checkpoint.rules_len);
+        self.rules.shrink_to_fit();
+        self.compiled_units = checkpoint.compiled_units;
+        self.retained_bytes = checkpoint.retained_bytes;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rules_capacity(&self) -> usize {
+        self.rules.capacity()
+    }
+
+    /// Adds one line within the given remaining per-file and active-chain
+    /// budgets. A line that is blank, a comment, or malformed adds no rule,
+    /// while any path parts already parsed still charge `parsed_parts`.
+    pub(crate) fn add_line_within_budget(
+        &mut self,
+        line: impl AsRef<[u8]>,
+        budgets: LineBudgets,
+    ) -> Result<LineBudgetUsage, ComponentBudgetExceeded> {
+        let first_rule_overhead = if self.rules.is_empty() {
+            RULE_FIRST_EXTRA_BYTES.saturating_add(self.root_prefix.capacity())
+        } else {
+            0
+        };
+        let ParsedRuleLine {
+            rule,
+            parsed_parts,
+            compiled_units,
+            retained_bytes,
+        } = parse_rule_with_options(line, self.case_insensitive, first_rule_overhead, budgets)?;
+        let Some(rule) = rule else {
+            return Ok(LineBudgetUsage {
+                parsed_parts,
+                compiled_units: 0,
+                retained_bytes: 0,
+            });
+        };
+        self.compiled_units += compiled_units;
+        self.retained_bytes += retained_bytes;
+        self.rules.push(rule);
+        Ok(LineBudgetUsage {
+            parsed_parts,
+            compiled_units,
+            retained_bytes,
+        })
+    }
+
+    /// Adds one line under the single-file safety ceilings. A line that is
+    /// blank, a comment, malformed, or over budget adds nothing.
+    #[cfg(any(test, feature = "unstable-test-hooks"))]
+    pub(crate) fn add_line(&mut self, line: impl AsRef<[u8]>) {
+        let remaining_units = MAX_IGNORE_FILE_COMPONENTS.saturating_sub(self.compiled_units);
+        let remaining_bytes = MAX_IGNORE_FILE_RETAINED_BYTES.saturating_sub(self.retained_bytes);
+        let _ = self.add_line_within_budget(
+            line,
+            LineBudgets::single_file(remaining_units, remaining_bytes),
+        );
     }
 
     pub(crate) fn build(self) -> RuleSet {
@@ -275,6 +470,8 @@ impl RuleSetBuilder {
             root_prefix: self.root_prefix,
             precompose_unicode: self.precompose_unicode,
             rules: self.rules,
+            compiled_units: self.compiled_units,
+            retained_bytes: self.retained_bytes,
         }
     }
 }
@@ -312,6 +509,52 @@ pub fn fuzz_rule(line: &str, candidate: &[u8], is_dir: bool) -> Option<bool> {
     fuzz_rule_bytes(line.as_bytes(), candidate, is_dir)
 }
 
+/// Opaque handle returned by [`build_ignore_rule_set_for_memory_test`] so
+/// `pattern_memory_regression` measures `RuleSet`'s exact heap allocations
+/// without extra boxing.
+#[doc(hidden)]
+#[cfg(feature = "unstable-test-hooks")]
+#[derive(Debug)]
+pub struct MemoryTestRuleSet(RuleSet);
+
+#[doc(hidden)]
+#[cfg(feature = "unstable-test-hooks")]
+impl MemoryTestRuleSet {
+    pub fn estimated_retained_bytes(&self) -> usize {
+        self.0.retained_bytes()
+    }
+}
+
+/// Development-only hook for `pattern_memory_regression` to measure actual
+/// retained heap bytes of one compiled `RuleSet` (single-line or multi-line)
+/// against its production estimator without duplicating the budget formula in
+/// the test.
+#[doc(hidden)]
+#[cfg(feature = "unstable-test-hooks")]
+pub fn build_ignore_rule_set_for_memory_test(contents: &[u8]) -> MemoryTestRuleSet {
+    let mut builder = RuleSetBuilder::new(Path::new("/fixture"), false, false);
+    for line in contents.split(|&byte| byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let usage = builder
+            .add_line_within_budget(line, LineBudgets::UNBOUNDED)
+            .expect("unbounded memory-test rule line must fit budget");
+        assert!(
+            usage.compiled_units > 0,
+            "memory-test fixture {:?} compiled zero units",
+            String::from_utf8_lossy(line)
+        );
+    }
+    let rules = builder.build();
+    assert!(
+        !rules.is_empty(),
+        "memory-test fixture {:?} produced an empty RuleSet",
+        String::from_utf8_lossy(contents)
+    );
+    MemoryTestRuleSet(rules)
+}
+
 /// Byte-oriented fuzz entry point for the rule layer.
 ///
 /// Ignore files are bytes, so this also reaches patterns that are not valid
@@ -324,20 +567,45 @@ pub fn fuzz_rule_bytes(line: &[u8], candidate: &[u8], is_dir: bool) -> Option<bo
     builder.build().matched(candidate, is_dir)
 }
 
+struct ParsedRuleLine {
+    rule: Option<Rule>,
+    parsed_parts: usize,
+    compiled_units: usize,
+    retained_bytes: usize,
+}
+
+impl ParsedRuleLine {
+    const fn discarded(parsed_parts: usize) -> Self {
+        Self {
+            rule: None,
+            parsed_parts,
+            compiled_units: 0,
+            retained_bytes: 0,
+        }
+    }
+}
+
 /// Reads one `gitignore(5)` line into a rule, or nothing.
 #[cfg(test)]
 fn parse_rule(line: impl AsRef<[u8]>) -> Option<Rule> {
-    parse_rule_with_options(line, false)
+    parse_rule_with_options(line, false, RULE_FIRST_EXTRA_BYTES, LineBudgets::UNBOUNDED)
+        .ok()
+        .and_then(|parsed| parsed.rule)
 }
 
-fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Option<Rule> {
+fn parse_rule_with_options(
+    line: impl AsRef<[u8]>,
+    case_insensitive: bool,
+    first_rule_overhead: usize,
+    budgets: LineBudgets,
+) -> Result<ParsedRuleLine, ComponentBudgetExceeded> {
     let line = line.as_ref();
     if line.is_empty() || line.starts_with(b"#") {
-        return None;
+        return Ok(ParsedRuleLine::discarded(0));
     }
     let body = strip_trailing_spaces(line);
     if body.is_empty() {
-        return None;
+        return Ok(ParsedRuleLine::discarded(0));
     }
 
     let (negated, body) = match body.strip_prefix(b"!") {
@@ -347,7 +615,7 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
     // A rule ending in an unpaired backslash escapes nothing and matches
     // nothing; Git drops it rather than guessing.
     if trailing_backslashes(body) % 2 == 1 {
-        return None;
+        return Ok(ParsedRuleLine::discarded(0));
     }
 
     let plain_trailing_separator = body
@@ -363,19 +631,141 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
     let anchored = body.contains(&b'/');
     let body = body.strip_prefix(b"/").unwrap_or(body);
     if body.is_empty() {
-        return None;
+        return Ok(ParsedRuleLine::discarded(0));
     }
+
+    let max_compiled = budgets
+        .file_compiled_remaining
+        .min(budgets.chain_compiled_remaining);
+    let compiled_budget_exceeded =
+        if budgets.file_compiled_remaining <= budgets.chain_compiled_remaining {
+            ComponentBudgetExceeded::File
+        } else {
+            ComponentBudgetExceeded::Chain
+        };
+    let max_bytes = budgets
+        .file_bytes_remaining
+        .min(budgets.chain_bytes_remaining);
+    let bytes_budget_exceeded = if budgets.file_bytes_remaining <= budgets.chain_bytes_remaining {
+        ComponentBudgetExceeded::FileBytes
+    } else {
+        ComponentBudgetExceeded::ChainBytes
+    };
+
+    let rule_fixed_bytes = RULE_FIXED_RETAINED_BYTES.saturating_add(first_rule_overhead);
+
+    // Every non-empty component before the last consumes at least one slash
+    // (so compiled components <= raw_slashes + 2), each component pays up to
+    // `MAX_COMPONENT_FIXED_BYTES` fixed overhead, and each byte pays up to
+    // `MAX_BYTES_PER_BYTE` retained bytes. When the line could breach any
+    // component or retained-byte budget, run a zero-allocation scan first so
+    // crafted inputs fail fast before allocating `Vec<RulePart>`,
+    // `Vec<NormalizedPart>`, or `Pattern`, and reuse the computed `RuleCost`
+    // when the line passes.
+    let min_unit_remaining = budgets.file_parsed_remaining.min(max_compiled);
+    let slash_threshold = min_unit_remaining.saturating_sub(1);
+    let max_possible_bytes_from_len = rule_fixed_bytes
+        .saturating_add(
+            (body.len() / 2)
+                .saturating_add(2)
+                .saturating_mul(MAX_COMPONENT_FIXED_BYTES),
+        )
+        .saturating_add(body.len().saturating_mul(MAX_BYTES_PER_BYTE));
+    let might_exceed_bytes =
+        max_bytes < usize::MAX && max_possible_bytes_from_len >= max_bytes && {
+            let raw_slashes = body.iter().filter(|&&byte| byte == b'/').count();
+            let refined_max_bytes = rule_fixed_bytes
+                .saturating_add(
+                    raw_slashes
+                        .saturating_add(2)
+                        .saturating_mul(MAX_COMPONENT_FIXED_BYTES),
+                )
+                .saturating_add(body.len().saturating_mul(MAX_BYTES_PER_BYTE));
+            refined_max_bytes >= max_bytes
+        };
+    let might_exceed_before_split = min_unit_remaining <= 1
+        || might_exceed_bytes
+        || (body.len() >= slash_threshold
+            && body
+                .iter()
+                .filter(|&&byte| byte == b'/')
+                .take(slash_threshold)
+                .count()
+                >= slash_threshold);
+    let pre_scanned_cost = if might_exceed_before_split {
+        let mut acc = RuleCostAccumulator::new(anchored, rule_fixed_bytes);
+        let (valid, scanned_parts) =
+            scan_rule_components(body, budgets.file_parsed_remaining, |part| {
+                acc.push_part(&part);
+            })
+            .map_err(|()| ComponentBudgetExceeded::File)?;
+        if !valid {
+            return Ok(ParsedRuleLine::discarded(scanned_parts));
+        }
+        let cost = acc.finish();
+        if cost.compiled_count == usize::from(!anchored) {
+            return Ok(ParsedRuleLine::discarded(scanned_parts));
+        }
+        match check_rule_budget_overflow(
+            body,
+            cost,
+            max_compiled,
+            compiled_budget_exceeded,
+            max_bytes,
+            bytes_budget_exceeded,
+        ) {
+            Ok(()) => Some(cost),
+            Err(None) => return Ok(ParsedRuleLine::discarded(scanned_parts)),
+            Err(Some(exceeded)) => return Err(exceeded),
+        }
+    } else {
+        None
+    };
+
     // A single leading separator is the anchor. Any other empty component is
     // unmatchable in Git, rather than an alternate spelling of a valid rule.
-    let parts = split_rule_components(body);
-    if parts.iter().any(|part| part.bytes.is_empty()) {
-        return None;
-    }
+    let (parts, parsed_parts) = split_rule_components_bounded(body, budgets.file_parsed_remaining)
+        .map_err(|()| ComponentBudgetExceeded::File)?;
+    let Some(parts) = parts else {
+        return Ok(ParsedRuleLine::discarded(parsed_parts));
+    };
+
+    // Reuse the pre-scan totals when available; otherwise compute compiled
+    // components and retained bytes once before normalizing or compiling so
+    // over-budget lines fail fast without allocating `NormalizedPart` or
+    // `Pattern`.
+    let cost = if let Some(cost) = pre_scanned_cost {
+        cost
+    } else {
+        let mut acc = RuleCostAccumulator::new(anchored, rule_fixed_bytes);
+        for part in &parts {
+            acc.push_part(part);
+        }
+        let cost = acc.finish();
+        // A body of nothing but separators is not a rule.
+        if cost.compiled_count == usize::from(!anchored) {
+            return Ok(ParsedRuleLine::discarded(parsed_parts));
+        }
+        match check_rule_budget_overflow(
+            body,
+            cost,
+            max_compiled,
+            compiled_budget_exceeded,
+            max_bytes,
+            bytes_budget_exceeded,
+        ) {
+            Ok(()) => cost,
+            Err(None) => return Ok(ParsedRuleLine::discarded(parsed_parts)),
+            Err(Some(exceeded)) => return Err(exceeded),
+        }
+    };
 
     let mut normalized = Vec::with_capacity(parts.len());
     let mut gate: Option<Vec<u8>> = None;
     for part in &parts {
-        let bytes = normalize_bracket_classes(part.bytes)?;
+        let Some(bytes) = normalize_bracket_classes(part.bytes) else {
+            return Ok(ParsedRuleLine::discarded(parsed_parts));
+        };
         if let Some(literal) = longest_literal_run(&bytes)
             && gate.as_ref().is_none_or(|best| best.len() < literal.len())
         {
@@ -387,42 +777,700 @@ fn parse_rule_with_options(line: impl AsRef<[u8]>, case_insensitive: bool) -> Op
         });
     }
 
-    let mut components = Vec::with_capacity(normalized.len() + 2);
+    let mut components = Vec::with_capacity(cost.compiled_count);
     if !anchored {
         components.push(Component::AnyDirs);
     }
     for part in &normalized {
-        let component =
-            compile_component(&part.bytes, case_insensitive, part.escaped_separator_after)?;
-        if matches!(component, Component::AnyDirs)
+        let is_whole_stars = all_stars(&part.bytes) && part.bytes.len() >= 2;
+        if is_whole_stars
+            && !part.escaped_separator_after
             && matches!(components.last(), Some(Component::AnyDirs))
         {
             continue;
         }
+        let Some(component) =
+            compile_component(&part.bytes, case_insensitive, part.escaped_separator_after)
+        else {
+            return Ok(ParsedRuleLine::discarded(parsed_parts));
+        };
         components.push(component);
     }
-    let trailing_whole_run = normalized
-        .last()
-        .is_some_and(|part| all_stars(&part.bytes) && part.bytes.len() >= 2);
-    if trailing_whole_run {
+    if cost.trailing_whole_run {
         // `abc/**` is what is inside `abc`, so one component has to follow.
-        components.push(compile_component(b"*", case_insensitive, false)?);
+        let Some(component) = compile_component(b"*", case_insensitive, false) else {
+            return Ok(ParsedRuleLine::discarded(parsed_parts));
+        };
+        components.push(component);
     }
-    // A body of nothing but separators is not a rule.
-    if components.len() == usize::from(!anchored) {
-        return None;
+    debug_assert_eq!(components.len(), cost.compiled_count);
+
+    Ok(ParsedRuleLine {
+        rule: Some(Rule {
+            components,
+            // This prefilter is byte-exact, so it would reject a case-folded
+            // candidate before the rule matcher can evaluate it.
+            gate: (!case_insensitive)
+                .then(|| gate.map(|literal| memmem::Finder::new(&literal).into_owned()))
+                .flatten(),
+            negated,
+            directory_only,
+        }),
+        parsed_parts,
+        compiled_units: cost.compiled_count,
+        retained_bytes: cost.retained_bytes,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct RuleCost {
+    compiled_count: usize,
+    retained_bytes: usize,
+    trailing_whole_run: bool,
+    saw_bracket: bool,
+    has_large_component: bool,
+}
+
+struct RuleCostAccumulator {
+    compiled_count: usize,
+    retained_bytes: usize,
+    prev_any_dirs: bool,
+    last_was_whole_stars: bool,
+    saw_bracket: bool,
+    has_large_component: bool,
+}
+
+impl RuleCostAccumulator {
+    fn new(anchored: bool, rule_fixed_bytes: usize) -> Self {
+        let unanchored = usize::from(!anchored);
+        Self {
+            compiled_count: unanchored,
+            retained_bytes: rule_fixed_bytes.saturating_add(unanchored * ANY_DIRS_COMPONENT_BYTES),
+            prev_any_dirs: !anchored,
+            last_was_whole_stars: false,
+            saw_bracket: false,
+            has_large_component: false,
+        }
     }
 
-    Some(Rule {
-        components,
-        // This prefilter is byte-exact, so it would reject a case-folded
-        // candidate before the rule matcher can evaluate it.
-        gate: (!case_insensitive)
-            .then(|| gate.map(|literal| memmem::Finder::new(&literal).into_owned()))
-            .flatten(),
-        negated,
-        directory_only,
-    })
+    fn push_part(&mut self, part: &RulePart<'_>) {
+        if part.bytes.contains(&b'[') {
+            self.saw_bracket = true;
+        }
+        let is_whole_stars = all_stars(part.bytes) && part.bytes.len() >= 2;
+        if !is_whole_stars && part.bytes.len() >= MIN_IR_LIMIT_COMPONENT_BYTES {
+            self.has_large_component = true;
+        }
+        self.last_was_whole_stars = is_whole_stars;
+        if is_whole_stars && !part.escaped_separator_after {
+            if !self.prev_any_dirs {
+                self.prev_any_dirs = true;
+                self.compiled_count += 1;
+                self.retained_bytes = self.retained_bytes.saturating_add(ANY_DIRS_COMPONENT_BYTES);
+            }
+        } else {
+            self.prev_any_dirs = false;
+            self.compiled_count += 1;
+            let bytes = if is_whole_stars {
+                ANY_DIRS_COMPONENT_BYTES
+            } else {
+                component_cost(part.bytes)
+            };
+            self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        }
+    }
+
+    fn finish(mut self) -> RuleCost {
+        let trailing_whole_run = self.last_was_whole_stars;
+        if trailing_whole_run {
+            let bytes = component_cost(b"*");
+            self.compiled_count += 1;
+            self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        }
+        RuleCost {
+            compiled_count: self.compiled_count,
+            retained_bytes: self.retained_bytes,
+            trailing_whole_run,
+            saw_bracket: self.saw_bracket,
+            has_large_component: self.has_large_component,
+        }
+    }
+}
+
+/// Verifies whether `cost` fits within the component and retained-byte budgets.
+///
+/// Returns `Ok(())` when within budget, `Err(None)` when an over-budget rule is
+/// actually malformed or rejected by `ferralk-glob`'s per-pattern IR limit (and
+/// therefore must be discarded cleanly regardless of line order or remaining
+/// component/byte budget), or `Err(Some(exceeded))` for a genuine budget breach.
+fn check_rule_budget_overflow(
+    body: &[u8],
+    cost: RuleCost,
+    max_compiled: usize,
+    compiled_budget_exceeded: ComponentBudgetExceeded,
+    max_bytes: usize,
+    bytes_budget_exceeded: ComponentBudgetExceeded,
+) -> Result<(), Option<ComponentBudgetExceeded>> {
+    let exceeded = if cost.compiled_count > max_compiled {
+        compiled_budget_exceeded
+    } else if cost.retained_bytes > max_bytes {
+        bytes_budget_exceeded
+    } else {
+        return Ok(());
+    };
+    if cost.saw_bracket && !validate_rule_syntax_streaming(body) {
+        return Err(None);
+    }
+    if cost.has_large_component && !validate_large_components_ir_streaming(body) {
+        return Err(None);
+    }
+    Err(Some(exceeded))
+}
+
+/// Conservative upper-bound retained matcher bytes for one non-`**` component:
+/// - Plain literal components (no unescaped `*`, `?`, `[`) cost
+///   `LITERAL_COMPONENT_FIXED_BYTES + LITERAL_BYTES_PER_BYTE * part.len()`
+///   retained bytes (covering `Component`, `CompiledAlternative`, literal/raw/
+///   fast-path copies with `Vec` capacity doubling, and a rule-level
+///   `memmem::Finder` gate).
+/// - Non-literal components (containing unescaped `*`, `?`, or `[`) cost
+///   `PATTERN_COMPONENT_FIXED_BYTES + [WIDE_SWEEP_EXTRA_BYTES] + PATTERN_BYTES_PER_BYTE * part.len()`
+///   bytes (covering `Vec` power-of-two capacity doubling in `tokens` plus
+///   `FastPath::DeterministicTokens` copies, single-star sweep state, `Class`
+///   members, and `WideSweepEngine`'s 256-row bitmask table plus 64-bit word
+///   rounding), doubled whenever a separator `/` appears inside the component
+///   (e.g., an unrecognized POSIX class like `[[:a/b:]]`) because `PathFilter`
+///   may retain a second compiled alternative.
+///
+/// Every compiled `Component` counts as 1 component toward component budgets.
+/// Runs in O(part.len()) with zero heap allocations and no divergent
+/// bracket-class parser.
+fn component_cost(part: &[u8]) -> usize {
+    let mut has_wildcard_or_class = false;
+    let mut saw_raw_slash = false;
+    let mut star_runs = 0_usize;
+    let mut effective_len = 0_usize;
+    let mut index = 0;
+    while index < part.len() {
+        match part[index] {
+            b'\\' if index + 1 < part.len() => {
+                if part[index + 1] == b'/' {
+                    saw_raw_slash = true;
+                }
+                effective_len += 2;
+                index += 2;
+            }
+            b'/' => {
+                saw_raw_slash = true;
+                effective_len += 1;
+                index += 1;
+            }
+            b'*' => {
+                has_wildcard_or_class = true;
+                star_runs += 1;
+                effective_len += 1;
+                while index < part.len() && part[index] == b'*' {
+                    index += 1;
+                }
+            }
+            b'?' | b'[' => {
+                has_wildcard_or_class = true;
+                effective_len += 1;
+                index += 1;
+            }
+            _ => {
+                effective_len += 1;
+                index += 1;
+            }
+        }
+    }
+    if !has_wildcard_or_class {
+        LITERAL_COMPONENT_FIXED_BYTES
+            .saturating_add(effective_len.saturating_mul(LITERAL_BYTES_PER_BYTE))
+    } else {
+        let base = if star_runs >= 2 {
+            PATTERN_COMPONENT_FIXED_BYTES + WIDE_SWEEP_EXTRA_BYTES
+        } else {
+            PATTERN_COMPONENT_FIXED_BYTES
+        };
+        let bytes = base.saturating_add(effective_len.saturating_mul(PATTERN_BYTES_PER_BYTE));
+        if saw_raw_slash {
+            bytes.saturating_mul(2)
+        } else {
+            bytes
+        }
+    }
+}
+
+const MAX_POSIX_CLASS_NAME_LEN: usize = 6;
+
+fn is_posix_class_name(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"alnum"
+            | b"alpha"
+            | b"ascii"
+            | b"blank"
+            | b"cntrl"
+            | b"digit"
+            | b"graph"
+            | b"lower"
+            | b"print"
+            | b"punct"
+            | b"space"
+            | b"upper"
+            | b"word"
+            | b"xdigit"
+    )
+}
+
+/// Zero-allocation syntax validator matching `ferralk-glob::Pattern::compile`
+/// under `component_options` (`braces: false`, `extglob: false`,
+/// `recursive_double_star: false`, `escape: true`).
+///
+/// Under those options the only syntax errors `ferralk-glob` can report are
+/// empty, trailing-escape, or unclosed bracket expressions (`parse_class`).
+fn is_valid_ignore_component_syntax(pattern: &[u8]) -> bool {
+    let mut index = 0;
+    while index < pattern.len() {
+        match pattern[index] {
+            b'\\' => {
+                index += usize::from(index + 1 < pattern.len()) + 1;
+            }
+            b'[' => {
+                let Some(next) = validate_glob_class(pattern, index) else {
+                    return false;
+                };
+                index = next;
+            }
+            _ => index += 1,
+        }
+    }
+    true
+}
+
+/// Mirrors `ferralk-glob::parse_class(pattern, start, true)` without allocating
+/// `Class` or `ClassMember` vectors.
+fn validate_glob_class(pattern: &[u8], start: usize) -> Option<usize> {
+    let mut index = start + 1;
+    if pattern
+        .get(index)
+        .is_some_and(|byte| matches!(byte, b'!' | b'^'))
+    {
+        index += 1;
+    }
+    let mut has_member = false;
+    if pattern.get(index) == Some(&b']') {
+        has_member = true;
+        index += 1;
+    }
+    while let Some(&byte) = pattern.get(index) {
+        if byte == b']' {
+            return has_member.then_some(index + 1);
+        }
+        if byte == b'[' && pattern.get(index + 1) == Some(&b':') {
+            let name_start = index + 2;
+            let search_end = pattern.len().min(name_start + MAX_POSIX_CLASS_NAME_LEN + 2);
+            if let Some(posix_end) = memmem::find(&pattern[name_start..search_end], b":]")
+                && is_posix_class_name(&pattern[name_start..name_start + posix_end])
+            {
+                has_member = true;
+                index = name_start + posix_end + 2;
+                continue;
+            }
+        }
+        if byte == b'\\' {
+            pattern.get(index + 1)?;
+            has_member = true;
+            index += 2;
+        } else {
+            has_member = true;
+            index += 1;
+        }
+    }
+    None
+}
+
+/// Streams through `body`'s components using a single reusable scratch buffer,
+/// checking only components that contain `[` for bracket-class syntax validity
+/// without ever invoking `Pattern::compile`.
+///
+/// Returns `true` when every component is syntactically valid (so the caller
+/// should report budget overflow), or `false` when any component is empty or
+/// malformed (so the caller should discard the rule cleanly).
+fn validate_rule_syntax_streaming(body: &[u8]) -> bool {
+    let mut scratch = Vec::new();
+    let mut valid = true;
+    let scan_result = scan_rule_components(body, usize::MAX, |part| {
+        if !valid || !part.bytes.contains(&b'[') {
+            return;
+        }
+        scratch.clear();
+        if !normalize_bracket_classes_into(part.bytes, &mut scratch) {
+            valid = false;
+            return;
+        }
+        if !(all_stars(&scratch) && scratch.len() >= 2)
+            && !is_valid_ignore_component_syntax(&scratch)
+        {
+            valid = false;
+        }
+    });
+    matches!(scan_result, Ok((true, _))) && valid
+}
+
+/// Mirrors `ferralk-glob`'s `IrBudget` constants under `component_options`
+/// (`braces: false`, `extglob: false`, `recursive_double_star: false`,
+/// `escape: true`, `match_hidden: true`) so large over-budget components can be
+/// checked against `IrBudget` without materializing a `Pattern`.
+const GLOB_MAX_COMPILED_IR_UNITS: usize = 1 << 20;
+const GLOB_TOKEN_SIZE: usize = std::mem::size_of::<usize>() * 4;
+const GLOB_NARROW_IR_UNITS: usize = 2_128_usize.div_ceil(GLOB_TOKEN_SIZE);
+const GLOB_MAX_NARROW_POSITIONS: usize = 63;
+const GLOB_WIDE_WORD_ROWS_AT_COMPILE: usize = 256 + 9 + 3;
+
+fn glob_sweep_ir_units(position_count: usize) -> Option<usize> {
+    if position_count > GLOB_MAX_NARROW_POSITIONS {
+        let word_count = position_count.checked_add(1)?.div_ceil(u64::BITS as usize);
+        let peak_words = word_count.checked_mul(GLOB_WIDE_WORD_ROWS_AT_COMPILE)?;
+        let peak_bytes = peak_words.checked_mul(std::mem::size_of::<u64>())?;
+        Some(peak_bytes.div_ceil(GLOB_TOKEN_SIZE))
+    } else {
+        Some(GLOB_NARROW_IR_UNITS)
+    }
+}
+
+/// Zero-allocation parser mirroring `ferralk-glob::parse_class` + `class_members`
+/// to count exact `ClassMember` IR units and locate the closing `]`.
+fn parse_class_ir_members(pattern: &[u8], start: usize) -> Option<(usize, usize)> {
+    #[derive(Clone, Copy)]
+    enum Pending {
+        Empty,
+        One,
+        OneThenDash,
+    }
+    let push_value =
+        |pending: &mut Pending, members: &mut usize, is_unescaped_dash: bool| match *pending {
+            Pending::Empty => *pending = Pending::One,
+            Pending::One => {
+                if is_unescaped_dash {
+                    *pending = Pending::OneThenDash;
+                } else {
+                    *members += 1;
+                }
+            }
+            Pending::OneThenDash => {
+                *members += 1;
+                *pending = Pending::Empty;
+            }
+        };
+    let flush = |pending: &mut Pending, members: &mut usize| {
+        match *pending {
+            Pending::Empty => {}
+            Pending::One => *members += 1,
+            Pending::OneThenDash => *members += 2,
+        }
+        *pending = Pending::Empty;
+    };
+
+    let mut index = start + 1;
+    if pattern
+        .get(index)
+        .is_some_and(|byte| matches!(byte, b'!' | b'^'))
+    {
+        index += 1;
+    }
+    let mut pending = Pending::Empty;
+    let mut members = 0_usize;
+    let mut has_any = false;
+    if pattern.get(index) == Some(&b']') {
+        has_any = true;
+        push_value(&mut pending, &mut members, false);
+        index += 1;
+    }
+    while let Some(&byte) = pattern.get(index) {
+        if byte == b']' {
+            if !has_any {
+                return None;
+            }
+            flush(&mut pending, &mut members);
+            return Some((members, index + 1));
+        }
+        if byte == b'[' && pattern.get(index + 1) == Some(&b':') {
+            let name_start = index + 2;
+            let search_end = pattern.len().min(name_start + MAX_POSIX_CLASS_NAME_LEN + 2);
+            if let Some(posix_end) = memmem::find(&pattern[name_start..search_end], b":]")
+                && is_posix_class_name(&pattern[name_start..name_start + posix_end])
+            {
+                has_any = true;
+                flush(&mut pending, &mut members);
+                members += 1;
+                index = name_start + posix_end + 2;
+                continue;
+            }
+        }
+        if byte == b'\\' {
+            pattern.get(index + 1)?;
+            has_any = true;
+            push_value(&mut pending, &mut members, false);
+            index += 2;
+        } else {
+            has_any = true;
+            push_value(&mut pending, &mut members, byte == b'-');
+            index += 1;
+        }
+    }
+    None
+}
+
+/// Zero-allocation exact check for whether `Pattern::compile` (under
+/// `component_options`) would reject `pattern` for syntax or `IrBudget`,
+/// assuming consecutive unescaped `*` runs have already been collapsed (or
+/// collapsing them on the fly outside bracket classes).
+fn component_exceeds_glob_ir_budget(pattern: &[u8]) -> bool {
+    let mut token_count = 0_usize;
+    let mut class_member_units = 0_usize;
+    let mut position_count = 0_usize;
+    let mut has_star = false;
+    let mut prev_was_separator = false;
+    let mut needs_path_filter_copy = pattern.starts_with(b"./");
+    let mut first_token_is_single_dot = false;
+    let mut second_token_is_separator = false;
+    let mut in_literal_run = false;
+    let mut literal_run_len = 0_usize;
+    let mut first_literal_byte = 0_u8;
+
+    let flush_literal = |in_literal_run: &mut bool,
+                         literal_run_len: &mut usize,
+                         first_literal_byte: u8,
+                         token_count: &mut usize,
+                         first_token_is_single_dot: &mut bool,
+                         prev_was_separator: &mut bool| {
+        if *in_literal_run {
+            *token_count += 1;
+            if *token_count == 1 && *literal_run_len == 1 && first_literal_byte == b'.' {
+                *first_token_is_single_dot = true;
+            }
+            *in_literal_run = false;
+            *literal_run_len = 0;
+            *prev_was_separator = false;
+        }
+    };
+
+    let mut index = 0;
+    while index < pattern.len() {
+        match pattern[index] {
+            b'/' => {
+                flush_literal(
+                    &mut in_literal_run,
+                    &mut literal_run_len,
+                    first_literal_byte,
+                    &mut token_count,
+                    &mut first_token_is_single_dot,
+                    &mut prev_was_separator,
+                );
+                token_count += 1;
+                position_count += 1;
+                if token_count == 2 && first_token_is_single_dot {
+                    second_token_is_separator = true;
+                }
+                prev_was_separator = true;
+                index += 1;
+            }
+            b'*' => {
+                flush_literal(
+                    &mut in_literal_run,
+                    &mut literal_run_len,
+                    first_literal_byte,
+                    &mut token_count,
+                    &mut first_token_is_single_dot,
+                    &mut prev_was_separator,
+                );
+                if prev_was_separator {
+                    needs_path_filter_copy = true;
+                }
+                token_count += 1;
+                position_count += 1;
+                has_star = true;
+                prev_was_separator = false;
+                while index < pattern.len() && pattern[index] == b'*' {
+                    index += 1;
+                }
+            }
+            b'?' => {
+                flush_literal(
+                    &mut in_literal_run,
+                    &mut literal_run_len,
+                    first_literal_byte,
+                    &mut token_count,
+                    &mut first_token_is_single_dot,
+                    &mut prev_was_separator,
+                );
+                if prev_was_separator {
+                    needs_path_filter_copy = true;
+                }
+                token_count += 1;
+                position_count += 1;
+                prev_was_separator = false;
+                index += 1;
+            }
+            b'[' => {
+                flush_literal(
+                    &mut in_literal_run,
+                    &mut literal_run_len,
+                    first_literal_byte,
+                    &mut token_count,
+                    &mut first_token_is_single_dot,
+                    &mut prev_was_separator,
+                );
+                let Some((members, next)) = parse_class_ir_members(pattern, index) else {
+                    return true;
+                };
+                if prev_was_separator {
+                    needs_path_filter_copy = true;
+                }
+                class_member_units = class_member_units.saturating_add(members);
+                token_count += 1;
+                position_count += 1;
+                prev_was_separator = false;
+                index = next;
+            }
+            b'\\' => {
+                let byte = if let Some(&escaped) = pattern.get(index + 1) {
+                    index += 2;
+                    escaped
+                } else {
+                    index += 1;
+                    b'\\'
+                };
+                if !in_literal_run {
+                    in_literal_run = true;
+                    literal_run_len = 0;
+                    first_literal_byte = byte;
+                }
+                literal_run_len += 1;
+                position_count += 1;
+            }
+            byte => {
+                if !in_literal_run {
+                    in_literal_run = true;
+                    literal_run_len = 0;
+                    first_literal_byte = byte;
+                }
+                literal_run_len += 1;
+                position_count += 1;
+                index += 1;
+            }
+        }
+    }
+    flush_literal(
+        &mut in_literal_run,
+        &mut literal_run_len,
+        first_literal_byte,
+        &mut token_count,
+        &mut first_token_is_single_dot,
+        &mut prev_was_separator,
+    );
+
+    let mut total_ir = token_count.saturating_add(class_member_units);
+    if total_ir > GLOB_MAX_COMPILED_IR_UNITS {
+        return true;
+    }
+    if has_star {
+        let Some(sweep) = glob_sweep_ir_units(position_count) else {
+            return true;
+        };
+        total_ir = total_ir.saturating_add(sweep);
+        if total_ir > GLOB_MAX_COMPILED_IR_UNITS {
+            return true;
+        }
+    }
+    let leading_dot_slash =
+        pattern.starts_with(b"./") && first_token_is_single_dot && second_token_is_separator;
+    if needs_path_filter_copy {
+        let copy_tokens = if leading_dot_slash {
+            token_count - 2
+        } else {
+            token_count
+        };
+        let copy_positions = if leading_dot_slash {
+            position_count - 2
+        } else {
+            position_count
+        };
+        total_ir = total_ir.saturating_add(copy_tokens);
+        if has_star {
+            let Some(sweep) = glob_sweep_ir_units(copy_positions) else {
+                return true;
+            };
+            total_ir = total_ir.saturating_add(sweep);
+        }
+        if total_ir > GLOB_MAX_COMPILED_IR_UNITS {
+            return true;
+        }
+    }
+    false
+}
+
+fn collapse_partial_stars_in_place(bytes: &mut Vec<u8>) {
+    let mut read = 0;
+    let mut write = 0;
+    while read < bytes.len() {
+        if bytes[read] == b'\\' && read + 1 < bytes.len() {
+            bytes[write] = bytes[read];
+            bytes[write + 1] = bytes[read + 1];
+            read += 2;
+            write += 2;
+        } else if bytes[read] == b'*' {
+            bytes[write] = b'*';
+            write += 1;
+            while read < bytes.len() && bytes[read] == b'*' {
+                read += 1;
+            }
+        } else {
+            bytes[write] = bytes[read];
+            read += 1;
+            write += 1;
+        }
+    }
+    bytes.truncate(write);
+}
+
+/// Streams through `body`'s components using a zero-materialization `IrBudget`
+/// check on components large enough to possibly trip `ferralk-glob`'s
+/// per-pattern `IrBudget`, allocating a single reusable normalization buffer
+/// only when a large component contains `[`.
+///
+/// Returns `true` when every large component fits `IrBudget` (so the caller
+/// should report the budget overflow), or `false` when any component would be
+/// rejected by `Pattern::compile` (so the caller should discard just this rule
+/// cleanly without rolling back the file).
+fn validate_large_components_ir_streaming(body: &[u8]) -> bool {
+    let mut scratch = Vec::new();
+    let mut valid = true;
+    let scan_result = scan_rule_components(body, usize::MAX, |part| {
+        if !valid
+            || part.bytes.len() < MIN_IR_LIMIT_COMPONENT_BYTES
+            || (all_stars(part.bytes) && part.bytes.len() >= 2)
+        {
+            return;
+        }
+        let target: &[u8] = if part.bytes.contains(&b'[') {
+            scratch.clear();
+            if !normalize_bracket_classes_into(part.bytes, &mut scratch) {
+                valid = false;
+                return;
+            }
+            collapse_partial_stars_in_place(&mut scratch);
+            &scratch
+        } else {
+            part.bytes
+        };
+        if component_exceeds_glob_ir_budget(target) {
+            valid = false;
+        }
+    });
+    matches!(scan_result, Ok((true, _))) && valid
 }
 
 struct RulePart<'a> {
@@ -438,6 +1486,8 @@ struct NormalizedPart {
 #[cfg(test)]
 std::thread_local! {
     static POSIX_CLOSER_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PATTERN_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PART_VEC_ALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn find_posix_closer(haystack: &[u8]) -> Option<usize> {
@@ -450,8 +1500,43 @@ fn find_posix_closer(haystack: &[u8]) -> Option<usize> {
 /// its component. Escaped brackets do not open a class, matching the glob
 /// parser's byte-oriented escape handling. The separator spelling is retained
 /// because Git does not let an escaped slash activate `**`'s zero-width case.
-fn split_rule_components(body: &[u8]) -> Vec<RulePart<'_>> {
+///
+/// Returns `Ok((None, scanned_parts))` immediately when any component is empty,
+/// and `Err(())` as soon as the non-empty component count would exceed
+/// `max_parts`.
+fn split_rule_components_bounded(
+    body: &[u8],
+    max_parts: usize,
+) -> Result<(Option<Vec<RulePart<'_>>>, usize), ()> {
+    #[cfg(test)]
+    PART_VEC_ALLOCS.with(|count| count.set(count.get() + 1));
     let mut parts = Vec::new();
+    let (valid, scanned_parts) = scan_rule_components(body, max_parts, |part| parts.push(part))?;
+    if !valid {
+        return Ok((None, scanned_parts));
+    }
+    Ok((Some(parts), scanned_parts))
+}
+
+#[cfg(test)]
+fn split_rule_components(body: &[u8]) -> Vec<RulePart<'_>> {
+    split_rule_components_bounded(body, usize::MAX)
+        .expect("unbounded test split")
+        .0
+        .unwrap_or_default()
+}
+
+/// Scans `body` into non-empty path components without requiring allocation.
+///
+/// Returns `Ok((false, scanned_parts))` when any component is empty (which
+/// makes the rule unmatchable in Git), or `Err(())` as soon as more than
+/// `max_parts` non-empty components are encountered.
+fn scan_rule_components<'a>(
+    body: &'a [u8],
+    max_parts: usize,
+    mut on_part: impl FnMut(RulePart<'a>),
+) -> Result<(bool, usize), ()> {
+    let mut count = 0;
     let mut start = 0;
     let mut in_class = false;
     let mut class_saw_member = false;
@@ -468,8 +1553,16 @@ fn split_rule_components(body: &[u8]) -> Vec<RulePart<'_>> {
                 // Git's wildmatch treats an escaped slash as the same path
                 // separator. The escape is inert here and must not remain in
                 // either component handed to the glob compiler.
-                parts.push(RulePart {
-                    bytes: &body[start..index],
+                let slice = &body[start..index];
+                if slice.is_empty() {
+                    return Ok((false, count));
+                }
+                if count >= max_parts {
+                    return Err(());
+                }
+                count += 1;
+                on_part(RulePart {
+                    bytes: slice,
                     escaped_separator_after: true,
                 });
                 start = index + 2;
@@ -515,8 +1608,16 @@ fn split_rule_components(body: &[u8]) -> Vec<RulePart<'_>> {
                 index += 1;
             }
             b'/' if !in_class => {
-                parts.push(RulePart {
-                    bytes: &body[start..index],
+                let slice = &body[start..index];
+                if slice.is_empty() {
+                    return Ok((false, count));
+                }
+                if count >= max_parts {
+                    return Err(());
+                }
+                count += 1;
+                on_part(RulePart {
+                    bytes: slice,
                     escaped_separator_after: false,
                 });
                 start = index + 1;
@@ -530,11 +1631,19 @@ fn split_rule_components(body: &[u8]) -> Vec<RulePart<'_>> {
             }
         }
     }
-    parts.push(RulePart {
-        bytes: &body[start..],
+    let slice = &body[start..];
+    if slice.is_empty() {
+        return Ok((false, count));
+    }
+    if count >= max_parts {
+        return Err(());
+    }
+    count += 1;
+    on_part(RulePart {
+        bytes: slice,
         escaped_separator_after: false,
     });
-    parts
+    Ok((true, count))
 }
 
 fn compile_component(
@@ -549,12 +1658,12 @@ fn compile_component(
             Component::AnyDirs
         });
     }
-    Pattern::compile(
-        collapse_partial_stars(part),
-        component_options(case_insensitive),
-    )
-    .ok()
-    .map(Component::Pattern)
+    let collapsed = collapse_partial_stars(part);
+    #[cfg(test)]
+    PATTERN_COMPILES.with(|count| count.set(count.get() + 1));
+    Pattern::compile(&collapsed, component_options(case_insensitive))
+        .ok()
+        .map(Component::Pattern)
 }
 
 fn all_stars(part: &[u8]) -> bool {
@@ -583,6 +1692,10 @@ fn normalize_bracket_classes(part: &[u8]) -> Option<Vec<u8>> {
     // Escaping literal dashes and endpoints grows the class by at most one
     // byte per member.
     let mut result = Vec::with_capacity(part.len() * 2);
+    normalize_bracket_classes_into(part, &mut result).then_some(result)
+}
+
+fn normalize_bracket_classes_into(part: &[u8], result: &mut Vec<u8>) -> bool {
     // Shared across all classes in `part`: once `memmem::find` reports no `:]`
     // in the remaining suffix, no later `[:` opener in this or any subsequent
     // class can close either. Successful matches jump `index` past `:]`, so
@@ -596,7 +1709,12 @@ fn normalize_bracket_classes(part: &[u8]) -> Option<Vec<u8>> {
                 index += 2;
             }
             b'[' => {
-                index = normalize_bracket_class(part, index, &mut result, &mut has_posix_closer)?;
+                let Some(next) =
+                    normalize_bracket_class(part, index, result, &mut has_posix_closer)
+                else {
+                    return false;
+                };
+                index = next;
             }
             byte => {
                 result.push(byte);
@@ -604,7 +1722,7 @@ fn normalize_bracket_classes(part: &[u8]) -> Option<Vec<u8>> {
             }
         }
     }
-    Some(result)
+    true
 }
 
 /// Rewrites the class opening at `start` into `result` and returns the index
@@ -910,8 +2028,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        RuleSetBuilder, fuzz_rule, fuzz_rule_bytes, longest_literal_run, normalize_bracket_classes,
-        parse_rule, split_rule_components, without_dot_components,
+        ComponentBudgetExceeded, LineBudgets, MAX_IGNORE_FILE_COMPONENTS,
+        MAX_IGNORE_FILE_RETAINED_BYTES, RuleSetBuilder, fuzz_rule, fuzz_rule_bytes,
+        longest_literal_run, normalize_bracket_classes, parse_rule, split_rule_components,
+        without_dot_components,
     };
 
     #[test]
@@ -1572,6 +2692,638 @@ mod tests {
             "matching took {:?}",
             start.elapsed()
         );
+    }
+
+    fn count_pattern_compiles<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        super::PATTERN_COMPILES.with(|count| count.set(0));
+        let output = f();
+        let compiles = super::PATTERN_COMPILES.with(std::cell::Cell::get);
+        (output, compiles)
+    }
+
+    fn count_part_vec_allocs<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        super::PART_VEC_ALLOCS.with(|count| count.set(0));
+        let output = f();
+        let allocs = super::PART_VEC_ALLOCS.with(std::cell::Cell::get);
+        (output, allocs)
+    }
+
+    #[test]
+    fn glob_ir_budget_estimator_matches_pattern_compile_exact_boundaries() {
+        let options = super::component_options(false);
+        let check = |label: &str, pattern: &[u8], expect_exceeds: bool| {
+            let compiled_err = super::Pattern::compile(pattern, options).is_err();
+            let estimated_err = super::component_exceeds_glob_ir_budget(pattern);
+            assert_eq!(
+                compiled_err, expect_exceeds,
+                "{label}: Pattern::compile unexpected result"
+            );
+            assert_eq!(
+                estimated_err, compiled_err,
+                "{label}: zero-alloc IR estimator disagreed with Pattern::compile"
+            );
+        };
+
+        // `?` token boundary: 1,048,576 fits, 1,048,577 exceeds.
+        check("qmarks-at-limit", &vec![b'?'; 1_048_576], false);
+        check("qmarks-over-limit", &vec![b'?'; 1_048_577], true);
+
+        // WideSweepEngine `*<lit>*` boundary: each 64-position word charges
+        // `(268 * 8) / GLOB_TOKEN_SIZE` IR units (67 on 64-bit, 134 on 32-bit),
+        // plus 3 tokens for `[Star, Literal, Star]`.
+        let wide_word_units = (super::GLOB_WIDE_WORD_ROWS_AT_COMPILE * std::mem::size_of::<u64>())
+            .div_ceil(super::GLOB_TOKEN_SIZE);
+        let max_wide_words = (super::GLOB_MAX_COMPILED_IR_UNITS - 3) / wide_word_units;
+        let max_wide_positions = max_wide_words * (u64::BITS as usize) - 1;
+        let max_lit_len = max_wide_positions - 2;
+        let mut wide_fit = Vec::with_capacity(max_lit_len + 2);
+        wide_fit.push(b'*');
+        wide_fit.resize(max_lit_len + 1, b'a');
+        wide_fit.push(b'*');
+        check("wide-sweep-at-limit", &wide_fit, false);
+        wide_fit.insert(1, b'a');
+        check("wide-sweep-over-limit", &wide_fit, true);
+
+        // Bracket-class boundary: each `[a]` or `[a-z]` is 1 token + 1 member = 2 IR units.
+        check(
+            "class-byte-at-limit",
+            "[a]".repeat(524_288).as_bytes(),
+            false,
+        );
+        check(
+            "class-byte-over-limit",
+            "[a]".repeat(524_289).as_bytes(),
+            true,
+        );
+        check(
+            "class-range-at-limit",
+            "[a-z]".repeat(524_288).as_bytes(),
+            false,
+        );
+        check(
+            "class-range-over-limit",
+            "[a-z]".repeat(524_289).as_bytes(),
+            true,
+        );
+        // Trailing dash `[a-]` is 1 token + 2 members = 3 IR units: 349,525 * 3 = 1,048,575.
+        check(
+            "class-trailing-dash-at-limit",
+            "[a-]".repeat(349_525).as_bytes(),
+            false,
+        );
+        check(
+            "class-trailing-dash-over-limit",
+            "[a-]".repeat(349_526).as_bytes(),
+            true,
+        );
+
+        // PathFilter second-alternative copy (`a/` followed by `?`s):
+        // original = 2 + k tokens, copy = 2 + k tokens -> 2*(2 + k) <= 1,048,576 -> k = 524,286.
+        let mut sep_fit = b"a/".to_vec();
+        sep_fit.resize(2 + 524_286, b'?');
+        check("path-filter-copy-at-limit", &sep_fit, false);
+        sep_fit.push(b'?');
+        check("path-filter-copy-over-limit", &sep_fit, true);
+
+        let root = Path::new("/fixture");
+
+        // A long consecutive `*` run collapses via `collapse_partial_stars` to
+        // one `*` before `Pattern::compile`, so `component_cost` charges its
+        // collapsed length rather than raw source length and never trips
+        // `FileBytes`.
+        let collapsed_star_rule = format!("{}*.log", "*".repeat(2_100_000));
+        let mut collapsed_builder = RuleSetBuilder::new(root, false, false);
+        collapsed_builder
+            .add_line_within_budget(
+                &collapsed_star_rule,
+                LineBudgets::single_file(
+                    MAX_IGNORE_FILE_COMPONENTS,
+                    MAX_IGNORE_FILE_RETAINED_BYTES,
+                ),
+            )
+            .expect("collapsed star run fits comfortably within FileBytes budget");
+        let collapsed_rules = collapsed_builder.build();
+        assert_eq!(
+            collapsed_rules.matched(b"/fixture/foo.log", false),
+            Some(true)
+        );
+        assert_eq!(collapsed_rules.matched(b"/fixture/foo.txt", false), None);
+
+        // Rejecting a large valid component (> 64 KiB) under a tight byte budget
+        // must NOT compile any Pattern or allocate `Vec<RulePart>`.
+        for large_valid in ["?".repeat(200_000), format!("*{}*", "a".repeat(200_000))] {
+            let mut builder = RuleSetBuilder::new(root, false, false);
+            let ((result, compiles), part_vec_allocs) = count_part_vec_allocs(|| {
+                count_pattern_compiles(|| {
+                    builder.add_line_within_budget(
+                        &large_valid,
+                        LineBudgets::single_file(MAX_IGNORE_FILE_COMPONENTS, 1_000_000),
+                    )
+                })
+            });
+            assert_eq!(result, Err(ComponentBudgetExceeded::FileBytes));
+            assert_eq!(compiles, 0);
+            assert_eq!(part_vec_allocs, 0);
+        }
+    }
+
+    #[test]
+    fn retained_byte_constants_cover_rule_and_component_struct_sizes() {
+        let rule_size = std::mem::size_of::<super::Rule>();
+        let component_size = std::mem::size_of::<super::Component>();
+        assert!(
+            rule_size * 2 <= super::RULE_FIXED_RETAINED_BYTES,
+            "RULE_FIXED_RETAINED_BYTES ({}) must cover Rule inline size * 2 ({})",
+            super::RULE_FIXED_RETAINED_BYTES,
+            rule_size * 2
+        );
+        assert!(
+            rule_size * 4 <= super::RULE_FIXED_RETAINED_BYTES + super::RULE_FIRST_EXTRA_BYTES,
+            "first-rule fixed overhead ({}) must cover Rule inline size * 4 ({})",
+            super::RULE_FIXED_RETAINED_BYTES + super::RULE_FIRST_EXTRA_BYTES,
+            rule_size * 4
+        );
+        assert!(
+            component_size * 2 <= super::ANY_DIRS_COMPONENT_BYTES,
+            "ANY_DIRS_COMPONENT_BYTES ({}) must cover Component inline size * 2 ({})",
+            super::ANY_DIRS_COMPONENT_BYTES,
+            component_size * 2
+        );
+        assert!(
+            component_size * 4 <= super::LITERAL_COMPONENT_FIXED_BYTES,
+            "LITERAL_COMPONENT_FIXED_BYTES ({}) must cover Component inline size * 4 ({})",
+            super::LITERAL_COMPONENT_FIXED_BYTES,
+            component_size * 4
+        );
+        assert!(
+            component_size * 4 <= super::PATTERN_COMPONENT_FIXED_BYTES,
+            "PATTERN_COMPONENT_FIXED_BYTES ({}) must cover Component inline size * 4 ({})",
+            super::PATTERN_COMPONENT_FIXED_BYTES,
+            component_size * 4
+        );
+    }
+
+    #[test]
+    fn single_line_component_budget_enforces_boundaries_and_rejects_explosions() {
+        let root = Path::new("/fixture");
+        let budgets = |file_parsed, file_compiled, chain_compiled| LineBudgets {
+            file_parsed_remaining: file_parsed,
+            file_compiled_remaining: file_compiled,
+            file_bytes_remaining: usize::MAX,
+            chain_compiled_remaining: chain_compiled,
+            chain_bytes_remaining: usize::MAX,
+        };
+
+        // Exact anchored boundary: 5 literal parts fit in a budget of 5, not 4.
+        // The first rule charges `RULE_FIRST_EXTRA_BYTES` for the initial
+        // 4-slot `Vec<Rule>` backing allocation; subsequent rules charge only
+        // `RULE_FIXED_RETAINED_BYTES`.
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        assert_eq!(
+            builder.add_line_within_budget("a/b/c/d/e", budgets(4, 4, 100)),
+            Err(ComponentBudgetExceeded::File)
+        );
+        assert_eq!(builder.compiled_units(), 0);
+        let usage = builder
+            .add_line_within_budget("a/b/c/d/e", budgets(5, 5, 100))
+            .expect("five parts fit in five-unit budget");
+        assert_eq!(usage.parsed_parts, 5);
+        assert_eq!(usage.compiled_units, 5);
+        assert_eq!(
+            usage.retained_bytes,
+            super::RULE_FIXED_RETAINED_BYTES
+                + super::RULE_FIRST_EXTRA_BYTES
+                + builder.root_prefix.capacity()
+                + 5 * (super::LITERAL_COMPONENT_FIXED_BYTES + super::LITERAL_BYTES_PER_BYTE)
+        );
+        let second = builder
+            .add_line_within_budget("f/g", budgets(5, 5, 100))
+            .expect("second rule fits");
+        assert_eq!(
+            second.retained_bytes,
+            super::RULE_FIXED_RETAINED_BYTES
+                + 2 * (super::LITERAL_COMPONENT_FIXED_BYTES + super::LITERAL_BYTES_PER_BYTE)
+        );
+        assert_eq!(builder.compiled_units(), 7);
+
+        // Byte-only overflow under the 250k component cap: `/*a*/` repeated
+        // 82,000 times has 82,000 compiled components (< 250,000) and > 256 MiB
+        // estimated retained storage, so it must trigger the zero-allocation
+        // pre-scan without allocating `Vec<RulePart>` or compiling any patterns.
+        let wide_bytes_explosion = format!("/{}", "*a*/".repeat(82_000));
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        let ((result, compiles), part_vec_allocs) = count_part_vec_allocs(|| {
+            count_pattern_compiles(|| {
+                builder.add_line_within_budget(
+                    &wide_bytes_explosion,
+                    LineBudgets::single_file(
+                        MAX_IGNORE_FILE_COMPONENTS,
+                        MAX_IGNORE_FILE_RETAINED_BYTES,
+                    ),
+                )
+            })
+        });
+        assert_eq!(result, Err(ComponentBudgetExceeded::FileBytes));
+        assert_eq!(compiles, 0);
+        assert_eq!(
+            part_vec_allocs, 0,
+            "byte-only multi-component overflow must reject in pre-scan before Vec<RulePart>"
+        );
+
+        // Single-line path-component explosion (`"a/".repeat(250_001)`) must
+        // reject in the zero-allocation pre-scan with 0 `Vec<RulePart>`
+        // allocations and 0 pattern compiles.
+        let component_explosion = "a/".repeat(MAX_IGNORE_FILE_COMPONENTS + 1);
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        let ((result, compiles), part_vec_allocs) = count_part_vec_allocs(|| {
+            count_pattern_compiles(|| {
+                builder.add_line_within_budget(
+                    &component_explosion,
+                    LineBudgets::single_file(
+                        MAX_IGNORE_FILE_COMPONENTS,
+                        MAX_IGNORE_FILE_RETAINED_BYTES,
+                    ),
+                )
+            })
+        });
+        assert_eq!(result, Err(ComponentBudgetExceeded::File));
+        assert_eq!(compiles, 0);
+        assert_eq!(
+            part_vec_allocs, 0,
+            "250,001-component explosion must reject in pre-scan before Vec<RulePart>"
+        );
+
+        // Every compiled `Component` counts as 1 component toward component
+        // budgets: both `/[a/]` (whose `/` is stripped by normalization) and
+        // `/[[:a/b:]]?` (whose `/` survives inside a `[:...:]` span) fit a
+        // 1-component budget, while `/[[:a/b:]]?` doubles retained-byte
+        // accounting compared to an equal-length pattern without a surviving
+        // `/` (`/[[:a_b:]]?`).
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        let stripped_slash_usage = builder
+            .add_line_within_budget("/[a/]", budgets(100, 1, 100))
+            .expect("normalized slash in [a/] costs 1 compiled component");
+        assert_eq!(stripped_slash_usage.compiled_units, 1);
+
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        let slash_usage = builder
+            .add_line_within_budget("/[[:a/b:]]?", budgets(100, 1, 100))
+            .expect("separator-bearing pattern fits 1-component budget");
+        assert_eq!(slash_usage.compiled_units, 1);
+
+        let mut no_slash_builder = RuleSetBuilder::new(root, false, false);
+        let no_slash_usage = no_slash_builder
+            .add_line_within_budget("/[[:a_b:]]?", budgets(100, 1, 100))
+            .expect("equal-length pattern without separator fits 1-component budget");
+        assert_eq!(no_slash_usage.compiled_units, 1);
+        assert!(
+            slash_usage.retained_bytes > no_slash_usage.retained_bytes,
+            "surviving separator inside [:...:] must charge doubled pattern bytes"
+        );
+
+        let slash_class_component_explosion =
+            format!("/{}", "[[:a/b:]]/".repeat(MAX_IGNORE_FILE_COMPONENTS + 1));
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        let ((result, compiles), part_vec_allocs) = count_part_vec_allocs(|| {
+            count_pattern_compiles(|| {
+                builder.add_line_within_budget(
+                    &slash_class_component_explosion,
+                    LineBudgets::single_file(
+                        MAX_IGNORE_FILE_COMPONENTS,
+                        MAX_IGNORE_FILE_RETAINED_BYTES,
+                    ),
+                )
+            })
+        });
+        assert_eq!(result, Err(ComponentBudgetExceeded::File));
+        assert_eq!(compiles, 0);
+        assert_eq!(
+            part_vec_allocs, 0,
+            "separator-bearing class component overflow must reject in pre-scan before Vec<RulePart>"
+        );
+
+        // A long `root_prefix` (~8 KiB) charges `root_prefix.capacity()` once
+        // on the first retained rule (and counts toward byte budgets), while an
+        // empty `RuleSet` retains zero bytes.
+        let deep_root = PathBuf::from(format!("/{}", "dir/".repeat(2_048)));
+        let empty_deep = RuleSetBuilder::new(&deep_root, false, false);
+        let deep_prefix_cap = empty_deep.root_prefix.capacity();
+        assert!(deep_prefix_cap >= 8 * 1024);
+        assert_eq!(empty_deep.retained_bytes(), 0);
+        assert_eq!(empty_deep.build().retained_bytes(), 0);
+
+        let mut deep_builder = RuleSetBuilder::new(&deep_root, false, false);
+        let mut short_builder = RuleSetBuilder::new(Path::new("/a"), false, false);
+        let short_prefix_cap = short_builder.root_prefix.capacity();
+        let deep_first = deep_builder
+            .add_line_within_budget("foo", LineBudgets::UNBOUNDED)
+            .expect("deep root first rule succeeds");
+        let short_first = short_builder
+            .add_line_within_budget("foo", LineBudgets::UNBOUNDED)
+            .expect("short root first rule succeeds");
+        assert_eq!(
+            deep_first.retained_bytes - short_first.retained_bytes,
+            deep_prefix_cap - short_prefix_cap,
+            "first rule must charge exact root_prefix.capacity() difference"
+        );
+        let deep_second = deep_builder
+            .add_line_within_budget("bar", LineBudgets::UNBOUNDED)
+            .expect("deep root second rule succeeds");
+        let short_second = short_builder
+            .add_line_within_budget("bar", LineBudgets::UNBOUNDED)
+            .expect("short root second rule succeeds");
+        assert_eq!(
+            deep_second.retained_bytes, short_second.retained_bytes,
+            "root_prefix.capacity() must be charged only once per non-empty RuleSet"
+        );
+        // Tight chain-byte budget smaller than `deep_first.retained_bytes`
+        // rejects the deep-root rule with `ChainBytes`.
+        let mut tight_deep = RuleSetBuilder::new(&deep_root, false, false);
+        assert_eq!(
+            tight_deep.add_line_within_budget(
+                "foo",
+                LineBudgets {
+                    file_parsed_remaining: 100,
+                    file_compiled_remaining: 100,
+                    file_bytes_remaining: usize::MAX,
+                    chain_compiled_remaining: 100,
+                    chain_bytes_remaining: deep_first.retained_bytes - 1,
+                }
+            ),
+            Err(ComponentBudgetExceeded::ChainBytes)
+        );
+
+        // Wildcard-heavy line `"?x/".repeat(200_000)` (200,000 components <
+        // 250,000, > 256 MiB estimated retained storage) must trigger the
+        // zero-allocation pre-scan and fail fast on `FileBytes` without
+        // allocating `Vec<RulePart>` or compiling any patterns.
+        let qx_explosion = "?x/".repeat(200_000);
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        let ((result, compiles), part_vec_allocs) = count_part_vec_allocs(|| {
+            count_pattern_compiles(|| {
+                builder.add_line_within_budget(
+                    &qx_explosion,
+                    LineBudgets::single_file(
+                        MAX_IGNORE_FILE_COMPONENTS,
+                        MAX_IGNORE_FILE_RETAINED_BYTES,
+                    ),
+                )
+            })
+        });
+        assert_eq!(result, Err(ComponentBudgetExceeded::FileBytes));
+        assert_eq!(compiles, 0);
+        assert_eq!(
+            part_vec_allocs, 0,
+            "wildcard-heavy multi-component byte explosion must reject in pre-scan before Vec<RulePart>"
+        );
+
+        // Unanchored literal rules add a leading `AnyDirs` component (`AnyDirs` + `Pattern`).
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        assert_eq!(
+            builder.add_line_within_budget("foo", budgets(10, 1, 100)),
+            Err(ComponentBudgetExceeded::File)
+        );
+        let usage = builder
+            .add_line_within_budget("foo", budgets(1, 2, 100))
+            .expect("unanchored literal fits in 1 parsed part and 2 compiled components");
+        assert_eq!(usage.parsed_parts, 1);
+        assert_eq!(usage.compiled_units, 2);
+
+        // Ordinary wildcard components count as 1 compiled component (2 with
+        // leading `AnyDirs`) so large realistic glob ignore files fit under the
+        // 250,000-component ceiling, while charging higher retained bytes than
+        // escaped literals.
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        let wildcard_usage = builder
+            .add_line_within_budget("*.generated-00001.json", budgets(10, 2, 10))
+            .expect("wildcard suffix rule counts as 2 compiled components");
+        assert_eq!(wildcard_usage.parsed_parts, 1);
+        assert_eq!(wildcard_usage.compiled_units, 2);
+        let literal_usage = builder
+            .add_line_within_budget("a\\?b", budgets(10, 2, 10))
+            .expect("escaped wildcard stays 2 compiled components");
+        assert_eq!(literal_usage.compiled_units, 2);
+        assert!(wildcard_usage.retained_bytes > literal_usage.retained_bytes);
+
+        // Unrecognized POSIX opener followed by wildcards still bounds retained
+        // bytes by full component length regardless of where `parse_class`
+        // closes `]`.
+        let bogus_posix = format!("[[:bogus:]]{}", "?".repeat(1_000));
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        let usage = builder
+            .add_line_within_budget(&bogus_posix, budgets(10, 2, 2))
+            .expect("single component fits 2 compiled components");
+        assert_eq!(usage.parsed_parts, 1);
+        assert_eq!(usage.compiled_units, 2);
+        assert!(usage.retained_bytes >= bogus_posix.len() * super::PATTERN_BYTES_PER_BYTE);
+
+        // Dense `?` component fails fast on `FileBytes` before allocating
+        // `Vec<RulePart>` or compiling any patterns.
+        let many_qmarks = "?".repeat(60_000);
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        let ((result, compiles), part_vec_allocs) = count_part_vec_allocs(|| {
+            count_pattern_compiles(|| {
+                builder
+                    .add_line_within_budget(&many_qmarks, LineBudgets::single_file(100, 1_000_000))
+            })
+        });
+        assert_eq!(result, Err(ComponentBudgetExceeded::FileBytes));
+        assert_eq!(
+            compiles, 0,
+            "wildcard-heavy component exceeding byte budget must fail before compiling"
+        );
+        assert_eq!(part_vec_allocs, 0);
+        let usage = builder
+            .add_line_within_budget(&many_qmarks, LineBudgets::single_file(100, 10_000_000))
+            .expect("60,000 question marks fit in 10 MB retained-byte budget");
+        assert_eq!(usage.parsed_parts, 1);
+        assert_eq!(usage.compiled_units, 2);
+        assert!(usage.retained_bytes >= many_qmarks.len() * super::PATTERN_BYTES_PER_BYTE);
+
+        // Multi-star `WideSweepEngine` component charges conservative retained
+        // bytes and fails fast on `FileBytes` before compiling.
+        let wide_sweep = format!("*{}*", "a".repeat(40_000));
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        let (result, compiles) = count_pattern_compiles(|| {
+            builder.add_line_within_budget(
+                &wide_sweep,
+                LineBudgets {
+                    file_parsed_remaining: 100,
+                    file_compiled_remaining: 100_000,
+                    file_bytes_remaining: 1_000_000,
+                    chain_compiled_remaining: 1_000_000,
+                    chain_bytes_remaining: 32 * 1024 * 1024,
+                },
+            )
+        });
+        assert_eq!(result, Err(ComponentBudgetExceeded::FileBytes));
+        assert_eq!(
+            compiles, 0,
+            "multi-star WideSweepEngine bomb must fail fast before compiling"
+        );
+
+        // Trailing `/**` adds a synthetic `*` unit (`a`, `AnyDirs`, `*`).
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        assert_eq!(
+            builder.add_line_within_budget("a/**", budgets(2, 2, 100)),
+            Err(ComponentBudgetExceeded::File)
+        );
+        let usage = builder
+            .add_line_within_budget("a/**", budgets(2, 3, 100))
+            .expect("trailing double-star rule fits in 2 parsed parts and 3 compiled units");
+        assert_eq!(usage.parsed_parts, 2);
+        assert_eq!(usage.compiled_units, 3);
+
+        // Repeated `**/` collapses into one `AnyDirs` in the compiled rule,
+        // allocates exact capacity, and tracks parsed parts separately from
+        // compiled units.
+        let repeated_stars = format!("{}a", "**/".repeat(20));
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        assert_eq!(
+            builder.add_line_within_budget(&repeated_stars, budgets(20, 100, 100)),
+            Err(ComponentBudgetExceeded::File)
+        );
+        let usage = builder
+            .add_line_within_budget(&repeated_stars, budgets(21, 2, 100))
+            .expect("collapsed double-star rule fits within 21 parsed parts and 2 compiled slots");
+        assert_eq!(usage.parsed_parts, 21);
+        assert_eq!(usage.compiled_units, 2);
+        let rules = builder.build();
+        assert_eq!(rules.compiled_units(), 2);
+        assert_eq!(rules.rules[0].components.capacity(), 2);
+
+        // With 2 chain slots remaining, `**/**/name` (3 parsed parts, 2 compiled
+        // units) is accepted; with 1 chain slot remaining, it is rejected
+        // as a chain-budget breach without compiling any patterns.
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        let (result, compiles) = count_pattern_compiles(|| {
+            builder.add_line_within_budget("**/**/name", budgets(10, 10, 1))
+        });
+        assert_eq!(result, Err(ComponentBudgetExceeded::Chain));
+        assert_eq!(compiles, 0);
+        let usage = builder
+            .add_line_within_budget("**/**/name", budgets(10, 10, 2))
+            .expect("collapsed rule fits in two remaining chain slots");
+        assert_eq!(usage.parsed_parts, 3);
+        assert_eq!(usage.compiled_units, 2);
+        assert_eq!(
+            builder.build().matched(b"/fixture/x/y/name", false),
+            Some(true)
+        );
+
+        // Discarded malformed rules still charge their parsed parts without
+        // consuming compiled or chain slots — and without invoking
+        // `Pattern::compile`, even for `[[:x][:][]` with 1 compiled slot left.
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        for (malformed, expected_parts) in [
+            ("a/b/c/[", 4),
+            ("a/b/c/[/]", 4),
+            ("a/b/c/[!]", 4),
+            ("a/b/c//d", 3),
+            ("[[:x][:][]", 1),
+        ] {
+            let (result, compiles) = count_pattern_compiles(|| {
+                builder.add_line_within_budget(malformed, budgets(10, 1, 1))
+            });
+            let usage = result.expect("malformed line is discarded instead of triggering overflow");
+            assert_eq!(compiles, 0, "{malformed}");
+            assert_eq!(usage.parsed_parts, expected_parts, "{malformed}");
+            assert_eq!(usage.compiled_units, 0, "{malformed}");
+            assert_eq!(usage.retained_bytes, 0, "{malformed}");
+        }
+        assert_eq!(builder.compiled_units(), 0);
+        assert!(builder.build().is_empty());
+
+        // An anchored rule with `MAX_IGNORE_FILE_COMPONENTS` parsed parts
+        // ending in `/**` requires `MAX_IGNORE_FILE_COMPONENTS + 1` compiled
+        // units (synthetic trailing `*`) and must fail fast BEFORE compiling
+        // any patterns — both without brackets and with `[[:alpha:]]`.
+        let trailing_double_star_overflow =
+            format!("{}**", "a/".repeat(MAX_IGNORE_FILE_COMPONENTS - 1));
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        let (result, compiles) = count_pattern_compiles(|| {
+            builder.add_line_within_budget(
+                &trailing_double_star_overflow,
+                budgets(
+                    MAX_IGNORE_FILE_COMPONENTS,
+                    MAX_IGNORE_FILE_COMPONENTS,
+                    MAX_IGNORE_FILE_COMPONENTS * 4,
+                ),
+            )
+        });
+        assert_eq!(result, Err(ComponentBudgetExceeded::File));
+        assert_eq!(
+            compiles, 0,
+            "synthetic trailing wildcard overflow must fail fast before compiling patterns"
+        );
+        assert_eq!(builder.compiled_units(), 0);
+        assert!(builder.build().is_empty());
+
+        // Over compiled budget with a valid `[[:alpha:]]` POSIX class:
+        // zero-allocation syntax validation avoids `Pattern::compile`
+        // completely and rejects with `ComponentBudgetExceeded::File`.
+        let posix_bracket_overflow = format!(
+            "{}[[:alpha:]]/**",
+            "a/".repeat(MAX_IGNORE_FILE_COMPONENTS - 2)
+        );
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        let (result, compiles) = count_pattern_compiles(|| {
+            builder.add_line_within_budget(
+                &posix_bracket_overflow,
+                budgets(
+                    MAX_IGNORE_FILE_COMPONENTS,
+                    MAX_IGNORE_FILE_COMPONENTS,
+                    MAX_IGNORE_FILE_COMPONENTS * 4,
+                ),
+            )
+        });
+        assert_eq!(result, Err(ComponentBudgetExceeded::File));
+        assert_eq!(
+            compiles, 0,
+            "over-budget rule with a valid POSIX bracket class must fail fast with 0 Pattern::compile calls"
+        );
+
+        // Same scale ending in a malformed pseudo-POSIX class `[[:x][:][]`:
+        // streaming syntax validation detects the malformed component with 0
+        // `Pattern::compile` calls and discards the rule cleanly.
+        let malformed_tail = format!("{}[[:x][:][]", "a/".repeat(MAX_IGNORE_FILE_COMPONENTS - 1));
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        let (result, compiles) = count_pattern_compiles(|| {
+            builder.add_line_within_budget(
+                &malformed_tail,
+                budgets(
+                    MAX_IGNORE_FILE_COMPONENTS,
+                    MAX_IGNORE_FILE_COMPONENTS - 1,
+                    MAX_IGNORE_FILE_COMPONENTS * 4,
+                ),
+            )
+        });
+        let usage =
+            result.expect("over-budget rule with malformed bracket tail is discarded cleanly");
+        assert_eq!(compiles, 0);
+        assert_eq!(usage.parsed_parts, MAX_IGNORE_FILE_COMPONENTS);
+        assert_eq!(usage.compiled_units, 0);
+
+        // A single-line component explosion fails fast without compiling or
+        // retaining rules.
+        let exploding = "a/".repeat(MAX_IGNORE_FILE_COMPONENTS + 1);
+        let mut builder = RuleSetBuilder::new(root, false, false);
+        let (result, compiles) = count_pattern_compiles(|| {
+            builder.add_line_within_budget(
+                &exploding,
+                LineBudgets::single_file(
+                    MAX_IGNORE_FILE_COMPONENTS,
+                    MAX_IGNORE_FILE_RETAINED_BYTES,
+                ),
+            )
+        });
+        assert_eq!(result, Err(ComponentBudgetExceeded::File));
+        assert_eq!(compiles, 0);
+        assert_eq!(builder.compiled_units(), 0);
+        assert!(builder.build().is_empty());
+
+        // Fuzz entry point stays bounded on the same crafted input.
+        assert_eq!(fuzz_rule_bytes(exploding.as_bytes(), b"a", true), None);
     }
 
     #[cfg(target_os = "macos")]

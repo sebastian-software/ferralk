@@ -10,10 +10,17 @@
 //! held before #405 was worked on, given beside it. They catch a structure
 //! that starts growing per alternative or per root again, not a few bytes.
 
-use std::hint::black_box;
+use std::{
+    fs,
+    hint::black_box,
+    io,
+    path::PathBuf,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use ferralk::{
-    Walker,
+    ErrorPolicy, Walker,
     ferralk_glob::{Pattern, PatternOptions, PatternSet},
 };
 
@@ -121,4 +128,370 @@ fn compiled_patterns_stay_within_their_retained_size() {
         "four roots retain {four_roots} bytes against {one_root} for one \
          (5,785,483 before #405)"
     );
+}
+
+static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
+
+struct TempFixture {
+    root: PathBuf,
+}
+
+impl TempFixture {
+    fn new(label: &str) -> Self {
+        let root = loop {
+            let candidate = std::env::temp_dir().join(format!(
+                "ferralk-{label}-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock is after epoch")
+                    .as_nanos(),
+                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create temp fixture: {error}"),
+            }
+        };
+        // Isolate every fixture as its own Git repository root so walks never
+        // inherit ancestor ignore files when `TMPDIR` lies inside a checkout.
+        fs::create_dir(root.join(".git")).expect("create fixture .git");
+        Self { root }
+    }
+}
+
+impl Drop for TempFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn ignore_and_git_config_safety_budgets_bound_peak_memory() {
+    // 1. An 8 MiB `.git/config` consisting of ~8M newline lines must stream
+    //    without per-line `Vec` allocations (previously >8M allocs / >200 MiB).
+    let config_fixture = TempFixture::new("config-stream");
+    let suffix = b"[core]\nignorecase = true\n";
+    let mut config_bytes = vec![b'\n'; 8 * 1024 * 1024 - suffix.len()];
+    config_bytes.extend_from_slice(suffix);
+    fs::write(config_fixture.root.join(".git/config"), config_bytes).expect("write .git/config");
+    fs::write(config_fixture.root.join(".gitignore"), b"IGNORED.LOG\n").expect("write .gitignore");
+    fs::write(config_fixture.root.join("ignored.log"), b"x").expect("write ignored.log");
+    fs::write(config_fixture.root.join("visible.txt"), b"x").expect("write visible.txt");
+
+    let mut config_result = None;
+    let config_allocs = allocation_counter::measure(|| {
+        config_result = Some(
+            Walker::new(&config_fixture.root)
+                .respect_git_ignore(true)
+                .threads(1)
+                .collect()
+                .expect("walk with large .git/config succeeds"),
+        );
+    });
+    let config_result = config_result.expect("walk produced result");
+    assert!(config_result.errors().is_empty());
+    assert!(
+        config_result
+            .entries()
+            .iter()
+            .any(|entry| entry.path().ends_with("visible.txt"))
+    );
+    assert!(
+        !config_result
+            .entries()
+            .iter()
+            .any(|entry| entry.path().ends_with("ignored.log")),
+        "core.ignorecase = true at the end of the 8 MiB config must take effect"
+    );
+    assert!(
+        config_allocs.count_total < 4_096,
+        "streaming an 8 MiB newline .git/config made {} allocations",
+        config_allocs.count_total
+    );
+    // `read_to_end` on an 8 MiB file can double from 8 MiB to 16 MiB (24 MiB
+    // transient peak during realloc). Thirty-two MiB stays far below the old
+    // >200 MiB per-line `Vec<Vec<u8>>` allocation amplification.
+    assert!(
+        config_allocs.bytes_max < 32 * 1024 * 1024,
+        "streaming an 8 MiB newline .git/config peaked at {} bytes",
+        config_allocs.bytes_max
+    );
+
+    // 2. A 1-line ~8 MiB `.gitignore` of `"a/"` repeated 4M times must fail
+    //    fast before allocating millions of `RulePart`s / `Pattern`s
+    //    (previously >12M allocs / ~1 GiB).
+    let ignore_fixture = TempFixture::new("ignore-explode");
+    let mut exploding = Vec::with_capacity(8 * 1024 * 1024);
+    for _ in 0..4_000_000 {
+        exploding.extend_from_slice(b"a/");
+    }
+    exploding.push(b'\n');
+    fs::write(ignore_fixture.root.join(".gitignore"), exploding).expect("write exploding ignore");
+    fs::write(ignore_fixture.root.join("visible.txt"), b"x").expect("write visible.txt");
+
+    let mut ignore_result = None;
+    let ignore_allocs = allocation_counter::measure(|| {
+        ignore_result = Some(
+            Walker::new(&ignore_fixture.root)
+                .respect_git_ignore(true)
+                .threads(1)
+                .error_policy(ErrorPolicy::Collect)
+                .collect()
+                .expect("collect policy keeps walking"),
+        );
+    });
+    let ignore_result = ignore_result.expect("walk produced result");
+    assert_eq!(ignore_result.errors().len(), 1);
+    assert_eq!(
+        ignore_result.errors()[0].operation().as_str(),
+        "read_ignore"
+    );
+    assert_eq!(
+        ignore_result.errors()[0].io_kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert!(
+        ignore_allocs.count_total < 4_096,
+        "rejecting a 4M-component ignore line made {} allocations",
+        ignore_allocs.count_total
+    );
+    // Thirty-two MiB leaves headroom for `read_to_end`'s doubling buffer on an
+    // 8 MiB file while staying far below the old ~1 GiB component explosion.
+    assert!(
+        ignore_allocs.bytes_max < 32 * 1024 * 1024,
+        "rejecting a 4M-component ignore line peaked at {} bytes",
+        ignore_allocs.bytes_max
+    );
+
+    // 3. Repeated 60,000-`?` lines inside a ~6 MiB `.gitignore` must fail fast
+    //    on compiled matcher units rather than retaining hundreds of MiB of
+    //    `Pattern` tokens across all 100 lines.
+    let qmark_fixture = TempFixture::new("ignore-qmarks");
+    let mut qmarks = Vec::with_capacity(100 * 60_001);
+    let qline = format!("{}\n", "?".repeat(60_000));
+    for _ in 0..100 {
+        qmarks.extend_from_slice(qline.as_bytes());
+    }
+    fs::write(qmark_fixture.root.join(".gitignore"), qmarks).expect("write qmark ignore");
+    fs::write(qmark_fixture.root.join("visible.txt"), b"x").expect("write visible.txt");
+
+    let mut qmark_result = None;
+    let qmark_allocs = allocation_counter::measure(|| {
+        qmark_result = Some(
+            Walker::new(&qmark_fixture.root)
+                .respect_git_ignore(true)
+                .threads(1)
+                .error_policy(ErrorPolicy::Collect)
+                .collect()
+                .expect("collect policy keeps walking"),
+        );
+    });
+    let qmark_result = qmark_result.expect("walk produced result");
+    assert_eq!(qmark_result.errors().len(), 1);
+    assert_eq!(qmark_result.errors()[0].operation().as_str(), "read_ignore");
+    assert_eq!(
+        qmark_result.errors()[0].io_kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert!(
+        qmark_allocs.bytes_max < 256 * 1024 * 1024,
+        "rejecting 100 x 60,000-`?` ignore lines peaked at {} bytes",
+        qmark_allocs.bytes_max
+    );
+
+    // 4. Multi-star `WideSweepEngine` bombs (`*` + 40 KiB literal + `*`
+    //    repeated) must fail fast on the 256 MiB retained-byte budget rather
+    //    than retaining unbounded heap state across all 100 lines.
+    let wide_fixture = TempFixture::new("ignore-wide-sweep");
+    let mut wide_rules = Vec::with_capacity(100 * 40_003);
+    let wide_line = format!("*{}*\n", "a".repeat(40_000));
+    for _ in 0..100 {
+        wide_rules.extend_from_slice(wide_line.as_bytes());
+    }
+    fs::write(wide_fixture.root.join(".gitignore"), wide_rules).expect("write wide-sweep ignore");
+    fs::write(wide_fixture.root.join("visible.txt"), b"x").expect("write visible.txt");
+
+    let mut wide_result = None;
+    let wide_allocs = allocation_counter::measure(|| {
+        wide_result = Some(
+            Walker::new(&wide_fixture.root)
+                .respect_git_ignore(true)
+                .threads(1)
+                .error_policy(ErrorPolicy::Collect)
+                .collect()
+                .expect("collect policy keeps walking"),
+        );
+    });
+    let wide_result = wide_result.expect("walk produced result");
+    assert_eq!(wide_result.errors().len(), 1);
+    assert_eq!(wide_result.errors()[0].operation().as_str(), "read_ignore");
+    assert_eq!(
+        wide_result.errors()[0].io_kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert!(
+        wide_allocs.bytes_max < 256 * 1024 * 1024,
+        "rejecting 100 x 40 KiB multi-star ignore lines peaked at {} bytes",
+        wide_allocs.bytes_max
+    );
+
+    // 5. Pathological multi-star component line (`/*a*/` repeated 82,000 times
+    //    = 246,000 units, strictly below the 250,000-unit cap) must trip the
+    //    256 MiB per-file retained-byte safety limit FIRST in the zero-alloc
+    //    pre-scan and report `read_ignore` with bounded peak memory.
+    let bytes_fixture = TempFixture::new("ignore-wide-bytes");
+    fs::write(
+        bytes_fixture.root.join(".gitignore"),
+        format!("/{}\n", "*a*/".repeat(82_000)),
+    )
+    .expect("write wide-bytes ignore");
+    fs::write(bytes_fixture.root.join("visible.txt"), b"x").expect("write visible.txt");
+
+    let mut bytes_result = None;
+    let bytes_allocs = allocation_counter::measure(|| {
+        bytes_result = Some(
+            Walker::new(&bytes_fixture.root)
+                .respect_git_ignore(true)
+                .threads(1)
+                .error_policy(ErrorPolicy::Collect)
+                .collect()
+                .expect("collect policy keeps walking"),
+        );
+    });
+    let bytes_result = bytes_result.expect("walk produced result");
+    assert_eq!(bytes_result.errors().len(), 1);
+    let bytes_error = &bytes_result.errors()[0];
+    assert_eq!(bytes_error.operation().as_str(), "read_ignore");
+    assert_eq!(bytes_error.io_kind(), io::ErrorKind::InvalidData);
+    let bytes_source = std::error::Error::source(bytes_error)
+        .expect("WalkError exposes underlying io::Error")
+        .to_string();
+    assert!(
+        bytes_source.contains("256 MiB"),
+        "expected per-file retained-byte limit error, got: {bytes_source}"
+    );
+    assert!(
+        bytes_allocs.bytes_max < 16 * 1024 * 1024,
+        "rejecting 82,000 multi-star components peaked at {} bytes",
+        bytes_allocs.bytes_max
+    );
+
+    // 6. A single line of 22 valid 100 KiB `*a...a*` components (~2.2 MiB
+    //    file, > 256 MiB estimated retained storage, every component >= 64 KiB
+    //    and within `ferralk-glob`'s `IrBudget`) must reject via the
+    //    zero-materialization IR check without compiling any `Pattern`
+    //    (staying far below the ~70+ MiB that `Pattern::validate` would
+    //    temporarily allocate).
+    let large_valid_fixture = TempFixture::new("ignore-large-valid-nomat");
+    let big_part = format!("*{}*/", "a".repeat(100_000));
+    fs::write(
+        large_valid_fixture.root.join(".gitignore"),
+        format!("/{}\n", big_part.repeat(22)),
+    )
+    .expect("write large valid multi-star ignore");
+    fs::write(large_valid_fixture.root.join("visible.txt"), b"x").expect("write visible.txt");
+
+    let mut large_valid_result = None;
+    let large_valid_allocs = allocation_counter::measure(|| {
+        large_valid_result = Some(
+            Walker::new(&large_valid_fixture.root)
+                .respect_git_ignore(true)
+                .threads(1)
+                .error_policy(ErrorPolicy::Collect)
+                .collect()
+                .expect("collect policy keeps walking"),
+        );
+    });
+    let large_valid_result = large_valid_result.expect("walk produced result");
+    assert_eq!(large_valid_result.errors().len(), 1);
+    assert_eq!(
+        large_valid_result.errors()[0].operation().as_str(),
+        "read_ignore"
+    );
+    assert_eq!(
+        large_valid_result.errors()[0].io_kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert!(
+        large_valid_allocs.count_total < 4_096,
+        "rejecting 22 x 100 KiB valid components made {} allocations",
+        large_valid_allocs.count_total
+    );
+    assert!(
+        large_valid_allocs.bytes_max < 16 * 1024 * 1024,
+        "rejecting 22 x 100 KiB valid components peaked at {} bytes",
+        large_valid_allocs.bytes_max
+    );
+}
+
+#[cfg(feature = "unstable-test-hooks")]
+#[test]
+fn ignore_retained_byte_estimates_upper_bound_measured_rule_set_storage() {
+    // Warm up one-off thread/allocator state before measuring.
+    let _ = retained(|| ferralk::build_ignore_rule_set_for_memory_test(b"warm.txt"));
+
+    let wide_10k = format!("*{}*", "a".repeat(10_000));
+    let qmarks_1025 = "?".repeat(1_025);
+    let qmarks_2049 = "?".repeat(2_049);
+    let classes_513 = "[a]".repeat(513);
+    let classes_1025 = "[a]".repeat(1_025);
+    let astar_513 = "a*".repeat(513);
+    let posix_slash_513 = format!("[[:a/b:]]{}", "?".repeat(513));
+    let posix_slash_1025 = format!("[[:a/b:]]{}", "?".repeat(1_025));
+    let range_posix_slash_513 = format!("[a-[:a/b:]]{}", "?".repeat(513));
+    let range_bracket_posix_slash_513 = format!("[a-b[:a/b:]]{}", "?".repeat(513));
+    let lit_1025 = "a".repeat(1_025);
+    let lit_10k = "a".repeat(10_000);
+    let multi_5 = "a\n".repeat(5);
+    let multi_1025 = "a\n".repeat(1_025);
+    let multi_glob_513 = "*.log\n".repeat(513);
+
+    let cases: [(&str, &str); 26] = [
+        ("a", "a"),
+        ("**", "**"),
+        ("**/a", "**/a"),
+        ("a/**", "a/**"),
+        ("*.log", "*.log"),
+        ("a?", "a?"),
+        ("?*", "?*"),
+        ("[a-z]", "[a-z]"),
+        ("[a-z]*", "[a-z]*"),
+        ("a*b*c", "a*b*c"),
+        ("a/b/c", "a/b/c"),
+        ("*<10KB>*", wide_10k.as_str()),
+        ("?*1025", qmarks_1025.as_str()),
+        ("?*2049", qmarks_2049.as_str()),
+        ("[a]*513", classes_513.as_str()),
+        ("[a]*1025", classes_1025.as_str()),
+        ("a**513", astar_513.as_str()),
+        ("[[:a/b:]]+?*513", posix_slash_513.as_str()),
+        ("[[:a/b:]]+?*1025", posix_slash_1025.as_str()),
+        ("[a-[:a/b:]]+?*513", range_posix_slash_513.as_str()),
+        ("[a-b[:a/b:]]+?*513", range_bracket_posix_slash_513.as_str()),
+        ("lit_1025", lit_1025.as_str()),
+        ("lit_10k", lit_10k.as_str()),
+        ("multi_a_5", multi_5.as_str()),
+        ("multi_a_1025", multi_1025.as_str()),
+        ("multi_glob_513", multi_glob_513.as_str()),
+    ];
+
+    for (label, rule) in cases {
+        let mut kept = None;
+        let info = allocation_counter::measure(|| {
+            kept = Some(ferralk::build_ignore_rule_set_for_memory_test(
+                rule.as_bytes(),
+            ));
+        });
+        let rules = kept.expect("rule build produced result");
+        let estimated = rules.estimated_retained_bytes();
+        let measured =
+            usize::try_from(info.bytes_current).expect("retained bytes are non-negative");
+        drop(black_box(rules));
+        assert!(
+            estimated >= measured,
+            "rule {label} production estimate ({estimated}) fell below measured RuleSet retained storage ({measured})"
+        );
+    }
 }
