@@ -158,7 +158,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.98"
 authors = ["Sebastian Software GmbH"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sebastian-software/ferralk"
