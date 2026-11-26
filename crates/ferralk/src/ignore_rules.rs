@@ -424,6 +424,17 @@ struct NormalizedPart {
     escaped_separator_after: bool,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static POSIX_CLOSER_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn find_posix_closer(haystack: &[u8]) -> Option<usize> {
+    #[cfg(test)]
+    POSIX_CLOSER_SEARCHES.with(|count| count.set(count.get() + 1));
+    memmem::find(haystack, b":]")
+}
+
 /// Splits a rule on path separators, keeping a slash inside a bracket class in
 /// its component. Escaped brackets do not open a class, matching the glob
 /// parser's byte-oriented escape handling. The separator spelling is retained
@@ -433,6 +444,12 @@ fn split_rule_components(body: &[u8]) -> Vec<RulePart<'_>> {
     let mut start = 0;
     let mut in_class = false;
     let mut class_saw_member = false;
+    // Once a `[:` opener fails to find `:]` in the remainder of `body`, no
+    // later opener (whose search slice is a suffix of that remainder) can find
+    // one either. Caching this guarantees at most one failed scan across the
+    // whole rule; every successful scan jumps `index` past `:]`, so total
+    // bytes scanned by `memmem::find` are strictly O(N).
+    let mut has_posix_closer = true;
     let mut index = 0;
     while index < body.len() {
         match body[index] {
@@ -453,12 +470,13 @@ fn split_rule_components(body: &[u8]) -> Vec<RulePart<'_>> {
                 }
                 index += 2;
             }
-            b'[' if in_class && body.get(index + 1) == Some(&b':') => {
+            b'[' if in_class && has_posix_closer && body.get(index + 1) == Some(&b':') => {
                 let start = index + 2;
-                if let Some(end) = memmem::find(&body[start..], b":]") {
+                if let Some(end) = find_posix_closer(&body[start..]) {
                     class_saw_member = true;
                     index = start + end + 2;
                 } else {
+                    has_posix_closer = false;
                     class_saw_member = true;
                     index += 1;
                 }
@@ -554,6 +572,11 @@ fn normalize_bracket_classes(part: &[u8]) -> Option<Vec<u8>> {
     // Escaping literal dashes and endpoints grows the class by at most one
     // byte per member.
     let mut result = Vec::with_capacity(part.len() * 2);
+    // Shared across all classes in `part`: once `memmem::find` reports no `:]`
+    // in the remaining suffix, no later `[:` opener in this or any subsequent
+    // class can close either. Successful matches jump `index` past `:]`, so
+    // total bytes scanned across `part` remain strictly O(N).
+    let mut has_posix_closer = true;
     let mut index = 0;
     while index < part.len() {
         match part[index] {
@@ -561,7 +584,9 @@ fn normalize_bracket_classes(part: &[u8]) -> Option<Vec<u8>> {
                 result.extend_from_slice(&part[index..=index + 1]);
                 index += 2;
             }
-            b'[' => index = normalize_bracket_class(part, index, &mut result)?,
+            b'[' => {
+                index = normalize_bracket_class(part, index, &mut result, &mut has_posix_closer)?;
+            }
             byte => {
                 result.push(byte);
                 index += 1;
@@ -573,7 +598,12 @@ fn normalize_bracket_classes(part: &[u8]) -> Option<Vec<u8>> {
 
 /// Rewrites the class opening at `start` into `result` and returns the index
 /// after its closing bracket.
-fn normalize_bracket_class(part: &[u8], start: usize, result: &mut Vec<u8>) -> Option<usize> {
+fn normalize_bracket_class(
+    part: &[u8],
+    start: usize,
+    result: &mut Vec<u8>,
+    has_posix_closer: &mut bool,
+) -> Option<usize> {
     let class_start = result.len();
     result.push(b'[');
     let mut index = start + 1;
@@ -651,14 +681,15 @@ fn normalize_bracket_class(part: &[u8], start: usize, result: &mut Vec<u8>) -> O
                 previous = Some(escaped);
                 index += 2;
             }
-            b'[' if part.get(index + 1) == Some(&b':') => {
+            b'[' if *has_posix_closer && part.get(index + 1) == Some(&b':') => {
                 let name_start = index + 2;
-                if let Some(end) = memmem::find(&part[name_start..], b":]") {
+                if let Some(end) = find_posix_closer(&part[name_start..]) {
                     let end = name_start + end + 2;
                     result.extend_from_slice(&part[index..end]);
                     previous = None;
                     index = end;
                 } else {
+                    *has_posix_closer = false;
                     result.push(b'[');
                     previous = Some(b'[');
                     index += 1;
@@ -786,7 +817,7 @@ fn longest_literal_run(part: &[u8]) -> Option<Vec<u8>> {
                 }
                 while scan < part.len() && part[scan] != b']' {
                     if part[scan] == b'[' && part.get(scan + 1) == Some(&b':') {
-                        match part[scan + 2..].windows(2).position(|pair| pair == b":]") {
+                        match find_posix_closer(&part[scan + 2..]) {
                             Some(end) => scan += 2 + end + 2,
                             // The rest of an unclosed POSIX class cannot be a
                             // literal run. Skipping it also keeps malformed
@@ -857,7 +888,10 @@ mod tests {
     use std::borrow::Cow;
     use std::path::{Path, PathBuf};
 
-    use super::{RuleSetBuilder, fuzz_rule, fuzz_rule_bytes, parse_rule, without_dot_components};
+    use super::{
+        RuleSetBuilder, fuzz_rule, fuzz_rule_bytes, longest_literal_run, normalize_bracket_classes,
+        parse_rule, split_rule_components, without_dot_components,
+    };
 
     #[test]
     fn dot_components_are_removed_without_resolving_parents_or_separators() {
@@ -1249,6 +1283,86 @@ mod tests {
         let mut rule = String::from("[");
         rule.push_str("[:".repeat(32_768).as_str());
         assert!(parse_rule(&rule).is_none());
+    }
+
+    fn count_posix_closer_searches<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        super::POSIX_CLOSER_SEARCHES.with(|count| count.set(0));
+        let output = f();
+        let searches = super::POSIX_CLOSER_SEARCHES.with(std::cell::Cell::get);
+        (output, searches)
+    }
+
+    #[test]
+    fn large_unclosed_posix_openers_scan_at_most_once_per_pass() {
+        // 262_144 * 2 bytes = 512 KiB of `[:` openers: verify deterministically
+        // that each parser pass performs at most one `:]` search rather than
+        // rescanning the remainder at every nested opener.
+        let openers = "[:".repeat(262_144);
+
+        let mut unclosed = String::with_capacity(openers.len() + 1);
+        unclosed.push('[');
+        unclosed.push_str(&openers);
+        let (parsed, searches) = count_posix_closer_searches(|| parse_rule(&unclosed));
+        assert!(parsed.is_none());
+        // One failed search in `split_rule_components` and one in
+        // `normalize_bracket_class` (`longest_literal_run` is not reached).
+        assert_eq!(searches, 2);
+
+        // Closed with a non-colon byte before `]` so no `:]` exists anywhere
+        // in the rule, forcing all three passes (`split_rule_components`,
+        // `normalize_bracket_class`, `longest_literal_run`) to walk the class.
+        let mut closed_without_posix_closer = String::with_capacity(openers.len() + 3);
+        closed_without_posix_closer.push('[');
+        closed_without_posix_closer.push_str(&openers);
+        closed_without_posix_closer.push_str("a]");
+        let (rule, searches) =
+            count_posix_closer_searches(|| parse_rule(&closed_without_posix_closer));
+        let rule = rule.expect("closed class parses");
+        assert_eq!(searches, 3);
+        assert!(rule.matches(b"[", false));
+        assert!(rule.matches(b":", false));
+        assert!(rule.matches(b"a", false));
+        assert!(!rule.matches(b"b", false));
+
+        // Trailing `:]` without an outer `]` closes the first `[:` opener in
+        // one scan and still leaves the outer class unclosed.
+        let mut trailing_posix_closer = String::with_capacity(openers.len() + 3);
+        trailing_posix_closer.push('[');
+        trailing_posix_closer.push_str(&openers);
+        trailing_posix_closer.push_str(":]");
+        let (parsed, searches) = count_posix_closer_searches(|| parse_rule(&trailing_posix_closer));
+        assert!(parsed.is_none());
+        assert_eq!(searches, 2);
+
+        // Trailing `:]]` closes the first `[:` opener and then the outer class.
+        let mut closed_with_posix_closer = String::with_capacity(openers.len() + 4);
+        closed_with_posix_closer.push('[');
+        closed_with_posix_closer.push_str(&openers);
+        closed_with_posix_closer.push_str(":]]");
+        let (parsed, searches) =
+            count_posix_closer_searches(|| parse_rule(&closed_with_posix_closer));
+        assert!(parsed.is_some());
+        assert_eq!(searches, 3);
+
+        // Repeated separate bracket classes each holding an unclosed `[:` with
+        // no `:]` anywhere: verifies the cached `has_posix_closer` flag carries
+        // across classes so each pass does at most one closer search.
+        let repeated_classes = "[[:a]".repeat(100_000);
+        let (parts, split_searches) =
+            count_posix_closer_searches(|| split_rule_components(repeated_classes.as_bytes()));
+        assert_eq!(parts.len(), 1);
+        assert_eq!(split_searches, 1);
+
+        let (normalized, norm_searches) =
+            count_posix_closer_searches(|| normalize_bracket_classes(parts[0].bytes));
+        let normalized = normalized.expect("repeated closed classes normalize");
+        assert_eq!(normalized.len(), repeated_classes.len());
+        assert_eq!(norm_searches, 1);
+
+        let (literal, literal_searches) =
+            count_posix_closer_searches(|| longest_literal_run(&normalized));
+        assert!(literal.is_none());
+        assert_eq!(literal_searches, 1);
     }
 
     #[test]
