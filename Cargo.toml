@@ -31,6 +31,8 @@ include = [
     "crates/ferralk/tests/parallel_allocation_regression.rs",
     "crates/ferralk/tests/pattern_memory_regression.rs",
     "crates/ferralk/tests/portable_fixtures.rs",
+    "crates/ferralk/tests/visit_prune.rs",
+    "crates/ferralk/tests/walker_case_insensitive.rs",
     "crates/ferralk/tests/wide_frontier_regression.rs",
     "crates/ferralk/README.md",
     "/LICENSE-MIT",
@@ -80,6 +82,14 @@ path = "crates/ferralk/tests/pattern_memory_regression.rs"
 [[test]]
 name = "portable_fixtures"
 path = "crates/ferralk/tests/portable_fixtures.rs"
+
+[[test]]
+name = "visit_prune"
+path = "crates/ferralk/tests/visit_prune.rs"
+
+[[test]]
+name = "walker_case_insensitive"
+path = "crates/ferralk/tests/walker_case_insensitive.rs"
 
 [[test]]
 name = "walker_pattern_preset"

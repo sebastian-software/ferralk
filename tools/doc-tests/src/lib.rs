@@ -1035,6 +1035,29 @@ mod tests {
         }
     }
 
+    /// `ferralk` is the root package while its sources live under
+    /// `crates/ferralk/`, so Cargo never auto-discovers files placed in
+    /// `crates/ferralk/tests/` or `crates/ferralk/examples/`. Every integration
+    /// test and example must be registered in root `Cargo.toml`, or it compiles
+    /// and runs nowhere.
+    #[test]
+    fn every_root_package_test_and_example_is_registered() {
+        let repository_root = repository_root();
+        let metadata = cargo_metadata(&repository_root);
+
+        for (kind, directory) in [
+            ("test", "crates/ferralk/tests"),
+            ("example", "crates/ferralk/examples"),
+        ] {
+            let registered = package_target_paths(&metadata, "ferralk", kind);
+            let discovered = cargo_target_entry_points(&repository_root, directory);
+            assert_eq!(
+                registered, discovered,
+                "every {kind} entry point in {directory} must be registered as a [[{kind}]] target in root Cargo.toml"
+            );
+        }
+    }
+
     #[test]
     fn semver_values_keep_prerelease_and_build_metadata() {
         assert_eq!(semver_values("ferralk = \"1.0.0\""), vec!["1.0.0"]);
@@ -1454,5 +1477,106 @@ mod tests {
                 Some(".git" | "target" | "vendor" | "node_modules")
             )
         })
+    }
+
+    fn cargo_metadata(repository_root: &Path) -> Value {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let output = std::process::Command::new(cargo)
+            .args([
+                "metadata",
+                "--no-deps",
+                "--format-version",
+                "1",
+                "--manifest-path",
+            ])
+            .arg(repository_root.join("Cargo.toml"))
+            .output()
+            .expect("cargo metadata executes");
+        assert!(
+            output.status.success(),
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("cargo metadata outputs JSON")
+    }
+
+    fn package_target_paths(metadata: &Value, package_name: &str, kind: &str) -> BTreeSet<String> {
+        let workspace_root = Path::new(
+            metadata["workspace_root"]
+                .as_str()
+                .expect("cargo metadata reports workspace_root"),
+        );
+        let package = metadata["packages"]
+            .as_array()
+            .expect("cargo metadata lists packages")
+            .iter()
+            .find(|package| package["name"].as_str() == Some(package_name))
+            .unwrap_or_else(|| panic!("cargo metadata includes package {package_name}"));
+        let mut paths = BTreeSet::new();
+        for target in package["targets"]
+            .as_array()
+            .expect("package metadata lists targets")
+        {
+            let kinds = target["kind"]
+                .as_array()
+                .expect("target metadata lists kinds");
+            if kinds.len() == 1 && kinds[0].as_str() == Some(kind) {
+                let src_path = Path::new(
+                    target["src_path"]
+                        .as_str()
+                        .expect("target metadata reports src_path"),
+                );
+                let relative = src_path
+                    .strip_prefix(workspace_root)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "target path {} is below workspace root {}: {error}",
+                            src_path.display(),
+                            workspace_root.display()
+                        )
+                    })
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                assert!(
+                    paths.insert(relative.clone()),
+                    "duplicate {kind} target registration in Cargo.toml: {relative}"
+                );
+            }
+        }
+        paths
+    }
+
+    /// Discovers Cargo target entry points under `relative_directory`:
+    /// top-level `*.rs` files and immediate `<subdir>/main.rs` entry points,
+    /// ignoring helper modules inside subdirectories.
+    fn cargo_target_entry_points(root: &Path, relative_directory: &str) -> BTreeSet<String> {
+        let directory = root.join(relative_directory);
+        let mut discovered = BTreeSet::new();
+        for entry in fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("{relative_directory} is readable: {error}"))
+        {
+            let path = entry
+                .unwrap_or_else(|error| panic!("{relative_directory} entry is readable: {error}"))
+                .path();
+            let entry_point =
+                if path.is_file() && path.extension().is_some_and(|extension| extension == "rs") {
+                    Some(path)
+                } else if path.is_dir() {
+                    let main_rs = path.join("main.rs");
+                    main_rs.is_file().then_some(main_rs)
+                } else {
+                    None
+                };
+            if let Some(entry_point) = entry_point {
+                discovered.insert(
+                    entry_point
+                        .strip_prefix(root)
+                        .expect("source file is below the repository root")
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+        discovered
     }
 }

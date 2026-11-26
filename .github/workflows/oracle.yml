@@ -38,6 +38,7 @@ jobs:
           # test-thread stack on the checked-in stress corpus.
           RUST_MIN_STACK: 16777216
         run: |
+          set -euo pipefail
           cargo test -p oracle --test zlob_oracle --test generated_subset \
             -- --ignored --nocapture 2>&1 | tee oracle-replay.log
       - name: Upload the replay log with its skip counts and disagreements

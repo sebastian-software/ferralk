@@ -216,7 +216,7 @@ impl RetainedDirectory {
             };
         }
         let permit =
-            RETAINED_DIRECTORIES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
+            RETAINED_DIRECTORIES.try_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
                 (retained < retained_directory_limit()).then_some(retained + 1)
             });
         match permit {
@@ -1579,9 +1579,10 @@ mod tests {
 
         let root = fixture_root("lowered-descriptor-limit");
         fs::create_dir_all(&root).expect("create fixture");
-        Walker::new(&root)
+        let before = Walker::new(&root)
             .collect()
             .expect("walk under the original limit");
+        assert!(before.errors().is_empty());
         let measured_before = super::retained_directory_limit();
         let expected_before = usize::try_from(original.rlim_cur)
             .map_or(256, |limit| limit.saturating_div(4).min(256));
@@ -1601,9 +1602,10 @@ mod tests {
             "nothing re-measures the limit between walks"
         );
 
-        Walker::new(&root)
+        let after = Walker::new(&root)
             .collect()
             .expect("walk under the lowered limit");
+        assert!(after.errors().is_empty());
         let expected_after =
             usize::try_from(lowered.rlim_cur).map_or(256, |limit| limit.saturating_div(4).min(256));
         assert_eq!(

@@ -93,6 +93,30 @@ jobs:
           components: miri
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo "+$NIGHTLY_TOOLCHAIN" miri setup
-      # The raw-syscall reader requires a real Linux kernel. This focused test
-      # exercises the bounds-checked parser without crossing that FFI boundary.
-      - run: cargo "+$NIGHTLY_TOOLCHAIN" miri test -p ferralk --features native-linux linux_native::tests::parser_skips_dot_entries_and_rejects_truncated_records
+      # The raw-syscall reader requires a real Linux kernel. These focused tests
+      # exercise the bounds-checked parser without crossing that FFI boundary.
+      # Running each filter individually and checking for `1 passed; 0 failed;
+      # 0 ignored` guarantees a renamed or misspelled test can never turn this
+      # job into a silent zero-test pass.
+      - name: Run Miri on pure-Rust parser unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          miri_tests=(
+            linux_native::tests::parser_skips_dot_entries_and_rejects_malformed_records
+            linux_native::tests::parser_rejects_separators_and_keeps_long_names
+          )
+          if [ "${#miri_tests[@]}" -eq 0 ]; then
+            echo "::error::miri_tests must not be empty" >&2
+            exit 1
+          fi
+          for test_name in "${miri_tests[@]}"; do
+            log="$RUNNER_TEMP/miri-output.log"
+            cargo "+$NIGHTLY_TOOLCHAIN" miri test -p ferralk \
+              --features native-linux --lib --locked -- --exact "$test_name" | tee "$log"
+            if ! grep -Fq "test ${test_name} ... ok" "$log" || \
+               ! grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored' "$log"; then
+              echo "::error::Miri did not run exactly one passing test for $test_name" >&2
+              exit 1
+            fi
+          done

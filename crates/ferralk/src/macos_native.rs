@@ -270,7 +270,7 @@ impl RetainedDirectory {
             };
         }
         let permit =
-            RETAINED_DIRECTORIES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
+            RETAINED_DIRECTORIES.try_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
                 (retained < retained_directory_limit()).then_some(retained + 1)
             });
         match permit {
