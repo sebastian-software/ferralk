@@ -956,6 +956,182 @@ fn a_broken_link_errors_when_followed_and_is_merely_dropped_when_resolved() {
     );
 }
 
+/// A symlink outside `includes` — even a symlink loop that would error on
+/// `stat(2)` — must not be statted by `resolve_symlink_kind`, and contradictory
+/// `files_only && directories_only` must never stat any symlink either.
+#[cfg(unix)]
+#[test]
+fn resolving_symlink_kind_skips_non_included_loops_and_contradictory_filters() {
+    let fixture = Fixture::new();
+    fixture.write("src/lib.rs");
+    fixture.directory("src/sub");
+    fixture.link("loop-b", "loop-a");
+    fixture.link("loop-a", "loop-b");
+
+    for options in [
+        WalkOptions::default()
+            .files_only(true)
+            .resolve_symlink_kind(true)
+            .sort(true),
+        WalkOptions::default()
+            .directories_only(true)
+            .resolve_symlink_kind(true)
+            .sort(true),
+    ] {
+        let expected = if options
+            == WalkOptions::default()
+                .files_only(true)
+                .resolve_symlink_kind(true)
+                .sort(true)
+        {
+            vec![PathBuf::from("src/lib.rs")]
+        } else {
+            vec![PathBuf::from("src"), PathBuf::from("src/sub")]
+        };
+        let actual = paths_from_every_frontend_with(
+            options,
+            |walker| {
+                walker
+                    .include("src/**")
+                    .expect("valid include")
+                    .error_policy(ErrorPolicy::Abort)
+            },
+            &fixture.root,
+        );
+        assert_eq!(actual, expected);
+    }
+
+    let empty = paths_from_every_frontend_with(
+        WalkOptions::default()
+            .files_only(true)
+            .directories_only(true)
+            .resolve_symlink_kind(true)
+            .sort(true),
+        |walker| walker.error_policy(ErrorPolicy::Abort),
+        &fixture.root,
+    );
+    assert!(empty.is_empty());
+}
+
+/// A symlink whose target traverses a regular file fails `stat(2)` with
+/// `ENOTDIR` (`ErrorKind::NotADirectory`): like `ENOENT`, nothing exists at the
+/// target, so `resolve_symlink_kind` drops it without reporting an error.
+#[cfg(unix)]
+#[test]
+fn resolving_symlink_kind_drops_not_a_directory_broken_link_without_error() {
+    let fixture = Fixture::new();
+    fixture.write("plain.txt");
+    fixture.link("plain.txt/child", "link-through-file");
+
+    let files = paths_from_every_frontend_with(
+        WalkOptions::default()
+            .files_only(true)
+            .resolve_symlink_kind(true),
+        |walker| walker.error_policy(ErrorPolicy::Abort),
+        &fixture.root,
+    );
+    assert_eq!(files, vec![PathBuf::from("plain.txt")]);
+
+    let dirs = paths_from_every_frontend_with(
+        WalkOptions::default()
+            .directories_only(true)
+            .resolve_symlink_kind(true),
+        |walker| walker.error_policy(ErrorPolicy::Abort),
+        &fixture.root,
+    );
+    assert!(dirs.is_empty());
+}
+
+/// A pre-cancelled walk under `ErrorPolicy::Abort` reports cancellation with an
+/// empty, error-free result across every public frontend (`collect`, `visit`,
+/// `stream`, `stream_parallel`), even when an ancestor `.gitignore` is
+/// unreadable. Zero-I/O guarantees are pinned separately by the counting-backend
+/// and lazy-stream unit tests in `lib.rs`.
+#[test]
+fn pre_cancelled_walks_report_cancelled_and_empty_across_every_frontend() {
+    let fixture = Fixture::new();
+    fixture.directory(".git");
+    // A directory named `.gitignore` causes `read_ignore_file` to fail when
+    // `IgnoreScope::for_root` inspects ancestor directories.
+    fixture.directory(".gitignore");
+    fixture.write("nested/file.txt");
+    let nested = fixture.root.join("nested");
+
+    // Sanity check: an un-cancelled walk under `ErrorPolicy::Abort` fails while
+    // reading the ancestor `.gitignore`.
+    let error = Walker::new(&nested)
+        .respect_git_ignore(true)
+        .error_policy(ErrorPolicy::Abort)
+        .collect()
+        .expect_err("uncancelled walk must report the unreadable ancestor .gitignore");
+    assert_eq!(error.operation().as_str(), "read_ignore");
+
+    let token = ferralk::CancellationToken::default();
+    token.cancel();
+
+    for threads in [1, 4] {
+        let collected = Walker::new(&nested)
+            .threads(threads)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Abort)
+            .cancellation(token.clone())
+            .collect()
+            .expect("pre-cancelled collect must not read ancestor .gitignore");
+        assert!(collected.was_cancelled());
+        assert!(collected.entries().is_empty());
+        assert!(collected.errors().is_empty());
+
+        let visited = Walker::new(&nested)
+            .threads(threads)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Abort)
+            .cancellation(token.clone())
+            .visit(|_| ferralk::Verdict::Keep)
+            .expect("pre-cancelled visit must not read ancestor .gitignore");
+        assert!(visited.was_cancelled());
+        assert!(visited.entries().is_empty());
+        assert!(visited.errors().is_empty());
+
+        let mut parallel_stream = Walker::new(&nested)
+            .threads(threads)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Abort)
+            .cancellation(token.clone())
+            .stream_parallel();
+        assert!(parallel_stream.next().is_none());
+        assert!(parallel_stream.was_cancelled());
+
+        let deferred = ferralk::CancellationToken::default();
+        let mut parallel_stream = Walker::new(&nested)
+            .threads(threads)
+            .respect_git_ignore(true)
+            .error_policy(ErrorPolicy::Abort)
+            .cancellation(deferred.clone())
+            .stream_parallel();
+        deferred.cancel();
+        assert!(parallel_stream.next().is_none());
+        assert!(parallel_stream.was_cancelled());
+    }
+
+    let mut stream = Walker::new(&nested)
+        .respect_git_ignore(true)
+        .error_policy(ErrorPolicy::Abort)
+        .cancellation(token.clone())
+        .stream();
+    assert!(stream.next().is_none());
+    assert!(stream.was_cancelled());
+
+    let deferred = ferralk::CancellationToken::default();
+    let mut stream = Walker::new(&nested)
+        .respect_git_ignore(true)
+        .error_policy(ErrorPolicy::Abort)
+        .cancellation(deferred.clone())
+        .stream();
+    deferred.cancel();
+    assert!(stream.next().is_none());
+    assert!(stream.was_cancelled());
+}
+
 /// The fixture path in the spelling an absolute pattern is written in: `/`
 /// separators on every platform, per ADR-0005.
 fn pattern_spelling(path: &Path) -> String {

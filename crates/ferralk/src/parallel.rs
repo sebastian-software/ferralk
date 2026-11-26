@@ -79,6 +79,9 @@ fn run<B: DirectoryBackend + Sync>(
     backend: &B,
     shared: Arc<Shared<'_>>,
 ) -> Result<WalkResult, WalkError> {
+    if shared.should_stop() {
+        return finish(shared, Vec::new());
+    }
     let mut caller = WorkerScratch::new(0);
     let caller_slot = shared.coordinator.claim_caller_slot();
 
@@ -86,7 +89,11 @@ fn run<B: DirectoryBackend + Sync>(
     // parallel directory work available, as required by ADR-0009. Several roots
     // are several initial tasks and nothing more: the caller reads them in
     // order, and whatever they uncover is ordinary work for the same pool.
-    let roots = walker.root_tasks(backend);
+    let Some(roots) = walker.root_tasks(backend) else {
+        shared.stop();
+        drop(caller_slot);
+        return finish(shared, Vec::new());
+    };
     catch_worker_panic(&shared, || {
         for root in roots {
             if shared.should_stop() {
