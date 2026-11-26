@@ -142,7 +142,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf target/criterion
-          cargo bench -p bench --bench walker ${{ matrix.features }} -- \
+          cargo bench --locked -p bench --bench walker ${{ matrix.features }} -- \
             --warm-up-time 1 --measurement-time 5 --sample-size 20 \
             --output-format bencher | tee walker-${{ matrix.lane }}.txt
       # A performance lane that prints nothing must not report success.
@@ -213,7 +213,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf target/criterion
-          cargo bench -p bench --bench walker -- \
+          cargo bench --locked -p bench --bench walker -- \
             --warm-up-time 1 --measurement-time 5 --sample-size 20 \
             --output-format bencher | tee walker-windows.txt
       - name: Check that the lane actually measured something
@@ -407,7 +407,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo bench -p bench --bench walker_palamedes -- \
+          cargo bench --locked -p bench --bench walker_palamedes -- \
             --output-format bencher | tee walker-palamedes.txt
       - name: Publish the medians
         if: always()

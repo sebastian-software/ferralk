@@ -1,0 +1,2 @@
+# Preserve exact raw bytes for fuzz seed corpora on CRLF checkouts.
+fuzz/corpus/** -text

@@ -80,15 +80,20 @@ jobs:
           fuzz/corpus/pattern_matcher -- -runs=1 -rss_limit_mb=4096
           -malloc_limit_mb=256 -print_final_stats=1
       - name: Run ${{ matrix.target }}
+        shell: bash
         env:
           FERRALK_FUZZ_SUBSET_STATS: ${{ runner.temp }}/ferralk-fast-glob-subset.txt
           # The matcher target has direct seed replay for its long-candidate
           # case; automated mutation should spend its budget on syntax shape.
           MAX_LEN: ${{ matrix.target == 'pattern_matcher' && '128' || '0' }}
-        run: >-
-          cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }}
-          -- -max_total_time=$MAX_TOTAL_TIME -rss_limit_mb=4096 -malloc_limit_mb=256
-          -max_len=$MAX_LEN -print_final_stats=1
+        run: |
+          if [[ ! "$MAX_TOTAL_TIME" =~ ^[1-9][0-9]{0,4}$ ]] || (( MAX_TOTAL_TIME > 14400 )); then
+            echo "::error::max_total_time must be an integer between 1 and 14400, got: $MAX_TOTAL_TIME" >&2
+            exit 1
+          fi
+          cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} \
+            -- -max_total_time="$MAX_TOTAL_TIME" -rss_limit_mb=4096 -malloc_limit_mb=256 \
+            -max_len="$MAX_LEN" -print_final_stats=1
       - name: Report differential subset hit rate
         if: always() && matrix.target == 'ferralk_vs_fast_glob'
         run: |

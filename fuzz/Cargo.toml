@@ -1,6 +1,7 @@
 [package]
 name = "ferralk-fuzz"
 version = "0.0.0"
+license = "MIT OR Apache-2.0"
 publish = false
 edition = "2024"
 rust-version = "1.98"
@@ -11,15 +12,16 @@ cargo-fuzz = true
 [dependencies]
 corpus = { path = "../tools/corpus" }
 fast-glob = "1.1.2"
+ferralk = { path = "..", features = ["unstable-test-hooks"] }
 ferralk-glob = { path = "../crates/ferralk-glob", features = ["unstable-test-hooks"] }
 libfuzzer-sys = "0.4.13"
 serde_json = "1.0.151"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-ferralk = { path = "..", features = ["native-macos", "unstable-test-hooks"] }
+ferralk = { path = "..", features = ["native-macos"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-ferralk = { path = "..", features = ["native-linux", "unstable-test-hooks"] }
+ferralk = { path = "..", features = ["native-linux"] }
 
 [[bin]]
 name = "ignore_rule_parser"

@@ -24,6 +24,9 @@ exceptions = [
     # MIT. Reached only by the development-only corpus harness, through
     # jsonschema.
     { allow = ["MIT-0"], crate = "borrow-or-share" },
+    # Permissive University of Illinois/NCSA license used by LLVM's libFuzzer.
+    # Reached only by the unpublished fuzz workspace.
+    { allow = ["NCSA"], crate = "libfuzzer-sys" },
 ]
 confidence-threshold = 0.8
 

@@ -94,24 +94,30 @@ pub fn in_shared_subset(pattern: &[u8], path: &[u8]) -> bool {
                 continue;
             }
             b']' => return false,
-            b'*' if pattern.get(index + 1) == Some(&b'*') => {
-                if !double_star_is_shared(pattern, index) {
-                    return false;
-                }
-                if index == 0 || pattern[index - 1] != b'*' {
-                    let end = index
-                        + pattern[index..]
-                            .iter()
-                            .take_while(|&&byte| byte == b'*')
-                            .count();
+            b'*' => {
+                // Consume the whole unescaped star run at once so an escaped
+                // `\*` immediately before `**` cannot disguise the start of
+                // the run as a continuation of an earlier run.
+                let end = index
+                    + pattern[index..]
+                        .iter()
+                        .take_while(|&&byte| byte == b'*')
+                        .count();
+                let run_len = end - index;
+                if run_len >= 2 {
+                    if !double_star_is_shared(pattern, index, end) {
+                        return false;
+                    }
                     if pattern.get(end) == Some(&b'/') {
                         if index == 0 || pattern[index - 1] == b'/' {
                             recursive_prefix_seen = true;
-                        } else if recursive_prefix_seen && (end - index).is_multiple_of(2) {
+                        } else if recursive_prefix_seen && run_len.is_multiple_of(2) {
                             attached_run_after_recursive = true;
                         }
                     }
                 }
+                index = end;
+                continue;
             }
             b'{' | b'}' | b',' => {
                 match pattern[index] {
@@ -165,38 +171,29 @@ pub fn in_shared_subset(pattern: &[u8], path: &[u8]) -> bool {
     brace_depth == 0 && !has_leading_dot_slash_alternative(pattern)
 }
 
-/// Whether one syntactic star run starting with `**` reads the same in both
-/// engines.
+/// Whether one unescaped star run `pattern[index..end]` (length >= 2) reads
+/// the same in both engines.
 ///
 /// Both engines read `**` as recursive only when it is a whole path component
 /// and as an ordinary star anywhere else (#419). Two whole-component shapes
 /// still differ: a trailing `/**` elides to nothing in ferralk while fast-glob
 /// requires a component, and a whole-component run of three or more stars
-/// stays recursive in ferralk while fast-glob reads it as ordinary stars. The
-/// classifier sees each star of a run, so a run is judged once, at its first
-/// star.
-fn double_star_is_shared(pattern: &[u8], index: usize) -> bool {
-    if index > 0 && pattern[index - 1] == b'*' {
-        return true;
-    }
-    let end = index
-        + pattern[index..]
-            .iter()
-            .take_while(|&&byte| byte == b'*')
-            .count();
+/// stays recursive in ferralk while fast-glob reads it as ordinary stars.
+fn double_star_is_shared(pattern: &[u8], index: usize, end: usize) -> bool {
     let starts_component = index == 0 || pattern[index - 1] == b'/';
     let ends_component = pattern.get(end).is_none_or(|&byte| byte == b'/');
     if !(starts_component && ends_component) {
-        // fast-glob 1.1.1 lets a component that ends in an attached `**` run
-        // hand straight over to a following `/**/`, as if the separator
-        // between them were optional: `x**/**/*` accepts `xa`, while
-        // `x**/*`, `x*/**/*` and `x***/**/*` do not. ferralk requires the
-        // separator (#419), as Bash globstar does.
-        let attached_pair_before_globstar = !starts_component
-            && end - index == 2
+        // fast-glob 1.1.2 advances over `**` pairs and calls `skip_globstars`
+        // on the final pair before `/**/`, so a component ending in any
+        // attached even star run hands straight over to a following `/**/` as
+        // if the separator between them were optional: `x**/**/*` and
+        // `x****/**/*` accept `xa`, while `x**/*`, `x*/**/*`, and `x***/**/*`
+        // do not. ferralk requires the separator (#419), as Bash globstar does.
+        let attached_even_run_before_globstar = !starts_component
+            && (end - index).is_multiple_of(2)
             && pattern.get(end) == Some(&b'/')
             && pattern[end + 1..].starts_with(b"**/");
-        return !attached_pair_before_globstar;
+        return !attached_even_run_before_globstar;
     }
     end - index == 2 && (end < pattern.len() || index == 0)
 }
@@ -361,6 +358,7 @@ mod tests {
             b"a***b",
             b"x*/**/*",
             b"x***/**/*",
+            b"x*****/**/*",
             b"x**/b/**/*",
         ] {
             assert!(
@@ -375,6 +373,7 @@ mod tests {
             b"***/a",
             b"a/***/b",
             b"x**/**/*",
+            b"x****/**/*",
             b"*x**/**/*",
             b"a/x**/**/a",
         ] {
@@ -383,6 +382,30 @@ mod tests {
                 "expected {pattern:?} outside the shared subset"
             );
         }
+
+        // Load the recorded attached even-star handoff regressions from the
+        // corpus so `corpus/fast-glob.jsonl` stays the single source of truth;
+        // `harness`'s fast-glob oracle test replays their verdicts.
+        let mut handoff_regressions = 0;
+        for line in include_str!("../../corpus/fast-glob.jsonl").lines() {
+            let case = corpus::parse_case(line).expect("parse fast-glob case");
+            if !matches!(
+                case.id.as_str(),
+                "fastglob-attached-even-stars-before-globstar"
+                    | "fastglob-escaped-star-even-run-before-globstar"
+            ) {
+                continue;
+            }
+            let pattern = corpus::decode_bytes(&case.pattern).expect("decode pattern");
+            let candidate = corpus::decode_bytes(&case.path).expect("decode candidate");
+            assert!(
+                !in_shared_subset(&pattern, &candidate),
+                "{} must not reach the differential assertion",
+                case.id
+            );
+            handoff_regressions += 1;
+        }
+        assert_eq!(handoff_regressions, 2);
 
         assert!(in_shared_subset(br"\**", b"*suffix"));
         assert!(in_shared_subset(b"[**]", b"*"));
@@ -453,5 +476,36 @@ mod tests {
                 seed.display()
             );
         }
+    }
+
+    #[test]
+    fn every_checked_in_ignore_rule_seed_replays_cleanly() {
+        let seed_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/ignore_rule_parser");
+        let mut seeds = fs::read_dir(&seed_dir)
+            .expect("read ignore_rule_parser seed directory")
+            .map(|entry| entry.expect("read ignore_rule_parser seed entry").path())
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        seeds.sort();
+        assert!(
+            !seeds.is_empty(),
+            "the ignore_rule_parser seed corpus is empty"
+        );
+
+        let mut saw_ignored = false;
+        let mut saw_negated = false;
+        let mut saw_unmatched = false;
+        for seed in seeds {
+            let data = fs::read(&seed).expect("read ignore_rule_parser seed");
+            let (line, candidate) = split_input(&data);
+            for is_dir in [false, true] {
+                match ferralk::fuzz_ignore_rule_bytes(line, candidate, is_dir) {
+                    Some(true) => saw_ignored = true,
+                    Some(false) => saw_negated = true,
+                    None => saw_unmatched = true,
+                }
+            }
+        }
+        assert!(saw_ignored && saw_negated && saw_unmatched);
     }
 }

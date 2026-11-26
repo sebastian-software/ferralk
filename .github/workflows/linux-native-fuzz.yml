@@ -49,9 +49,22 @@ jobs:
       # cargo-fuzz defaults to the target it was itself built for, and the
       # prebuilt binary is musl, where the sanitizer cannot link against a
       # static libc. Name the host target the sanitizer job already uses.
-      - run: >-
-          cargo fuzz run --target x86_64-unknown-linux-gnu linux_dirent_parser
-          -- -max_total_time=$MAX_TOTAL_TIME
+      - name: Run linux_dirent_parser
+        shell: bash
+        run: |
+          if [[ ! "$MAX_TOTAL_TIME" =~ ^[1-9][0-9]{0,4}$ ]] || (( MAX_TOTAL_TIME > 14400 )); then
+            echo "::error::max_total_time must be an integer between 1 and 14400, got: $MAX_TOTAL_TIME" >&2
+            exit 1
+          fi
+          cargo fuzz run --target x86_64-unknown-linux-gnu linux_dirent_parser \
+            -- -max_total_time="$MAX_TOTAL_TIME"
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-native-fuzz-artifacts-linux_dirent_parser
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
 
   address-sanitizer:
     name: Linux AddressSanitizer
@@ -75,7 +88,7 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zsanitizer=address
         run: >-
-          cargo test --target x86_64-unknown-linux-gnu -p ferralk --features native-linux --lib
+          cargo test --locked --target x86_64-unknown-linux-gnu -p ferralk --features native-linux --lib
 
   miri-parser:
     name: Linux Miri parser
