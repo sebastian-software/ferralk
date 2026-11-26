@@ -35,7 +35,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf target/criterion
-          cargo bench -p bench --features zlob-oracle,thread-sweep \
+          cargo bench --locked -p bench --features zlob-oracle,thread-sweep \
             --bench walker_palamedes --bench walker_zlob --bench matcher_zlob -- \
             --warm-up-time 1 --measurement-time 5 --sample-size 20 \
             --output-format bencher | tee zlob-comparison.txt

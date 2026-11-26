@@ -13,9 +13,9 @@ use zlob::{
 /// Any corpus change must update this inventory deliberately, so additions
 /// cannot bypass the oracle through a broadened skip condition.
 const EXPECTED_REPLAYED: usize = 633;
-// The three #447 fast-glob regressions belong to the secondary oracle, and
+// The #447 and #499 fast-glob regressions belong to the secondary oracle, and
 // the fourteen #488 escaped-bracket ignore cases belong to the Git oracle.
-const EXPECTED_SKIPPED: usize = 406;
+const EXPECTED_SKIPPED: usize = 408;
 
 /// Cases the zlob 1.6.3 Rust API cannot express, counted by reason.
 #[derive(Default)]

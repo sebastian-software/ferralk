@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+import http.client
 import importlib.util
 import io
 import json
@@ -86,13 +88,131 @@ class PublishTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     publisher.registry_version("ferralk", "1.2.0")
         payload = json.dumps(PUBLISHED).encode()
-        with patch.object(publisher.urllib.request, "urlopen", return_value=io.BytesIO(payload)):
+        seen_headers = {}
+
+        def fake_urlopen(request, timeout):
+            seen_headers.update(request.header_items())
+            self.assertEqual(timeout, 30)
+            return io.BytesIO(payload)
+
+        with patch.object(publisher.urllib.request, "urlopen", side_effect=fake_urlopen):
             self.assertEqual(publisher.registry_version("ferralk", "1.2.0"), PUBLISHED)
+        self.assertEqual(seen_headers.get("Cache-control"), "no-cache")
+
+    def test_dry_run_packages_all_crates_in_one_cargo_invocation(self):
+        commands = []
+
+        def cargo(command, *, check):
+            self.assertTrue(check)
+            commands.append(command)
+
+        publisher.dry_run(PACKAGES, run=cargo)
+        self.assertEqual(
+            commands,
+            [["cargo", "package", "--locked", "-p", "ferralk-glob", "-p", "ferralk"]],
+        )
+
+    def test_visibility_polling_retries_transient_errors_only(self):
+        url = "https://index.crates.io/fe/rr/ferralk-glob"
+        fixed_now = lambda: datetime(2026, 11, 26, 18, 0, 0, tzinfo=timezone.utc)
+        transient_sequence = [
+            None,  # pre-upload check
+            urllib.error.HTTPError(url, 429, "too many requests", {"Retry-After": "30"}, None),
+            urllib.error.HTTPError(
+                url,
+                429,
+                "too many requests",
+                {"Retry-After": "Thu, 26 Nov 2026 18:00:45 GMT"},
+                None,
+            ),
+            urllib.error.HTTPError(
+                url,
+                429,
+                "too many requests",
+                {"Retry-After": "Thu, 26 Nov 2026 17:59:00 GMT"},
+                None,
+            ),
+            urllib.error.HTTPError(url, 429, "too many requests", {"Retry-After": "invalid"}, None),
+            urllib.error.HTTPError(url, 503, "unavailable", {}, None),
+            urllib.error.URLError("connection reset"),
+            TimeoutError("timed out"),
+            http.client.IncompleteRead(b"partial"),
+            ConnectionResetError("connection reset by peer"),
+            PUBLISHED,
+        ]
+        calls = iter(transient_sequence)
+        waits = []
+
+        def lookup(_name, _version):
+            outcome = next(calls)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        publisher.publish([("ferralk-glob", "1.2.0")], lookup=lookup,
+                          run=lambda *_a, **_kw: None, sleep=waits.append, now=fixed_now)
+        self.assertEqual(waits, [30, 45, 15, 15, 15, 15, 15, 15, 15])
+
+        # Excessive Retry-After waits fail explicitly instead of polling early.
+        for header_value in ["9999", "Thu, 26 Nov 2026 18:05:00 GMT"]:
+            excessive_calls = iter([
+                None,
+                urllib.error.HTTPError(
+                    url, 429, "too many requests", {"Retry-After": header_value}, None
+                ),
+            ])
+            excessive_waits = []
+
+            def excessive_lookup(_name, _version):
+                outcome = next(excessive_calls)
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+
+            with self.assertRaisesRegex(RuntimeError, "exceeding the 60s retry budget"):
+                publisher.publish([("ferralk-glob", "1.2.0")], lookup=excessive_lookup,
+                                  run=lambda *_a, **_kw: None, sleep=excessive_waits.append,
+                                  now=fixed_now)
+            self.assertEqual(excessive_waits, [])
+
+        # Non-5xx HTTP errors and malformed index responses fail immediately.
+        for fatal in [
+            urllib.error.HTTPError(url, 403, "forbidden", {}, None),
+            ValueError("Invalid registry index for ferralk-glob"),
+        ]:
+            fatal_calls = iter([None, fatal])
+            fatal_waits = []
+
+            def fatal_lookup(_name, _version):
+                outcome = next(fatal_calls)
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+
+            with self.assertRaises(type(fatal)):
+                publisher.publish([("ferralk-glob", "1.2.0")], lookup=fatal_lookup,
+                                  run=lambda *_a, **_kw: None, sleep=fatal_waits.append)
+            self.assertEqual(fatal_waits, [])
+
+        # Exhausting retries on transient errors surfaces a visibility timeout.
+        always_502 = iter([None] + [urllib.error.HTTPError(url, 502, "bad gateway", {}, None)] * 10)
+
+        def failing_lookup(_name, _version):
+            outcome = next(always_502)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        with self.assertRaisesRegex(RuntimeError, "did not become visible"):
+            publisher.publish([("ferralk-glob", "1.2.0")], lookup=failing_lookup,
+                              run=lambda *_a, **_kw: None, sleep=lambda _: None)
 
     def test_workflow_uses_resumable_publisher_and_runs_its_tests(self):
         root = Path(__file__).resolve().parent.parent
         workflow = (root / ".github/workflows/publish.yml").read_text()
-        self.assertIn("python3 scripts/publish-crates.py", workflow)
+        run_lines = [line.strip() for line in workflow.splitlines()]
+        self.assertIn("run: python3 scripts/publish-crates.py --dry-run", run_lines)
+        self.assertIn("run: python3 scripts/publish-crates.py", run_lines)
         self.assertNotIn("cargo publish --locked -p", workflow)
         self.assertIn("python3 -m unittest discover -s scripts -p 'test_*.py'",
                       (root / ".github/workflows/ci.yml").read_text())

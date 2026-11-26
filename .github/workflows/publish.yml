@@ -45,8 +45,8 @@ jobs:
           cargo test --locked -p corpus -p harness
           cargo run --locked -p harness -- corpus
 
-      - name: Package ferralk-glob
-        run: cargo package --locked --no-verify -p ferralk-glob
+      - name: Package both crates (dry-run)
+        run: python3 scripts/publish-crates.py --dry-run
 
       # Same auth as ferrocat: exchange the workflow's OIDC identity for a
       # short-lived crates.io token (trusted publishing). The secret is only

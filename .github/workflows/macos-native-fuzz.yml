@@ -19,7 +19,7 @@ env:
 
 jobs:
   fuzz:
-    name: macOS native fuzz
+    name: macOS native fuzz (${{ matrix.target }})
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -53,9 +53,22 @@ jobs:
       # cargo-fuzz defaults to the target it was itself built for, and the
       # prebuilt binary is x86_64 while this runner is aarch64. Name the host
       # target the sanitizer job already uses.
-      - run: >-
-          cargo fuzz run --target aarch64-apple-darwin ${{ matrix.target }}
-          -- -max_total_time=$MAX_TOTAL_TIME
+      - name: Run ${{ matrix.target }}
+        shell: bash
+        run: |
+          if [[ ! "$MAX_TOTAL_TIME" =~ ^[1-9][0-9]{0,4}$ ]] || (( MAX_TOTAL_TIME > 14400 )); then
+            echo "::error::max_total_time must be an integer between 1 and 14400, got: $MAX_TOTAL_TIME" >&2
+            exit 1
+          fi
+          cargo fuzz run --target aarch64-apple-darwin ${{ matrix.target }} \
+            -- -max_total_time="$MAX_TOTAL_TIME"
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-native-fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
 
   address-sanitizer:
     name: macOS AddressSanitizer
@@ -80,4 +93,4 @@ jobs:
           CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS: -Zsanitizer=address
           ASAN_OPTIONS: detect_leaks=1
         run: >-
-          cargo test --target aarch64-apple-darwin -p ferralk --features native-macos --lib
+          cargo test --locked --target aarch64-apple-darwin -p ferralk --features native-macos --lib

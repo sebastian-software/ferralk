@@ -98,7 +98,8 @@ cargo clippy --workspace --exclude oracle --all-targets --locked -- -D warnings
 cargo test --workspace --exclude oracle --locked
 cargo run -p harness -- corpus
 cargo check --manifest-path fuzz/Cargo.toml \
-  --bin pattern_parser --bin pattern_matcher --bin ferralk_vs_fast_glob --locked
+  --bin pattern_parser --bin pattern_matcher --bin ignore_rule_parser \
+  --bin ferralk_vs_fast_glob --locked
 ./scripts/readme-family-block.sh --check
 mise run readme:check
 ```

@@ -4,12 +4,18 @@
 arbitrary bytes and option combinations. `pattern_matcher` also holds a
 one-member `PatternSet` to its member's verdicts, so the set's literal index
 never skips a pattern that matches. Their checked-in seeds derive from the
-executable matcher corpus. On macOS, `macos_dirent_parser` and
-`macos_bulk_record_parser` separately fuzz the feature-gated `getdirentries64`
-and `getattrlistbulk` record validators without issuing syscalls or touching
-paths. Linux has the equivalent `linux_dirent_parser`. The native targets keep
-small structure-aware checked-in records and CI preserves each target's corpus
-between runs, so their bounded budgets start from valid parser shapes.
+executable matcher corpus. `ignore_rule_parser` exercises the `gitignore(5)`
+rule layer from ADR-0014 by splitting each input on its first newline into a
+rule line and candidate bytes and evaluating both file and directory candidates;
+its checked-in seeds under `fuzz/corpus/ignore_rule_parser/` cover anchored and
+unanchored rules, negations, trailing spaces and backslashes, bracket and POSIX
+classes, `**`, comments, and non-UTF-8 bytes. On macOS, `macos_dirent_parser`
+and `macos_bulk_record_parser` separately fuzz the feature-gated
+`getdirentries64` and `getattrlistbulk` record validators without issuing
+syscalls or touching paths. Linux has the equivalent `linux_dirent_parser`. The
+native targets keep small structure-aware checked-in records and CI preserves
+each target's corpus between runs, so their bounded budgets start from valid
+parser shapes.
 `cargo run --manifest-path fuzz/Cargo.toml --bin generate_macos_native_seeds`
 and `cargo run --manifest-path fuzz/Cargo.toml --bin generate_linux_native_seeds`
 regenerate the native records byte-for-byte; the matching native tests replay
@@ -70,9 +76,9 @@ run opens or refreshes the repository's nightly glob-fuzz tracking issue, in
 addition to uploading its reproducer. The same workflow runs on demand, where
 the dispatch inputs pick one target or all of them and set the budget.
 
-Install cargo-fuzz, then run cargo fuzz run pattern_parser, cargo fuzz run
-pattern_matcher, or cargo fuzz run ferralk_vs_fast_glob from the repository
-root.
+Install cargo-fuzz, then run `cargo fuzz run pattern_parser`, `cargo fuzz run
+pattern_matcher`, `cargo fuzz run ignore_rule_parser`, or `cargo fuzz run
+ferralk_vs_fast_glob` from the repository root.
 Run `cargo fuzz run macos_dirent_parser` or `cargo fuzz run
 macos_bulk_record_parser` on macOS for the native record parsers. Run `cargo
 fuzz run linux_dirent_parser` on Linux for the native record parser.
