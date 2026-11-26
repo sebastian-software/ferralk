@@ -618,7 +618,10 @@ pub use ignore_rules::fuzz_rule as fuzz_ignore_rule;
 pub use ignore_rules::fuzz_rule_bytes as fuzz_ignore_rule_bytes;
 #[doc(hidden)]
 #[cfg(feature = "unstable-test-hooks")]
-pub use ignore_rules::{MemoryTestRuleSet, build_ignore_rule_set_for_memory_test};
+pub use ignore_rules::{
+    MemoryTestRuleSet, build_ignore_rule_set_for_memory_test,
+    build_ignore_rule_set_for_memory_test_with_options,
+};
 mod parallel;
 mod parallel_stream;
 mod scheduler;
@@ -2772,6 +2775,7 @@ impl Walker {
             pending: Vec::new(),
             walker: self,
             scratch: Vec::new(),
+            ignore_scratch: gitignore::IgnoreScratch::default(),
             pending_errors: Vec::new(),
             started: false,
             cancelled: false,
@@ -4382,24 +4386,44 @@ impl Listing {
         self.deferred_errors.pop_front()
     }
 
-    /// Whether the directory holds an entry of this name, which is how the
-    /// ignore chain recognizes its own files without probing for them.
+    /// Whether the directory holds an entry of this name.
+    #[cfg(all(
+        test,
+        any(
+            all(feature = "native-linux", target_os = "linux"),
+            all(feature = "native-macos", target_os = "macos")
+        )
+    ))]
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.entries().iter().any(|entry| entry.name == *name)
     }
 
-    /// Whether a directory contains a possible spelling of a Git ignore file.
+    /// Checks in a single pass whether the listing contains a possible spelling
+    /// of `.gitignore` and/or `.ignore`, matching ASCII case-insensitively.
+    ///
     /// The caller still opens the canonical name: on a case-sensitive
     /// filesystem that open fails for `.GITIGNORE`, while on APFS/NTFS it
     /// resolves exactly as Git's `open(".gitignore")` does.
-    pub(crate) fn contains_git_ignore_name(&self, name: &str) -> bool {
-        self.contains(name)
-            || self.entries().iter().any(|entry| {
-                entry
-                    .name
-                    .as_encoded_bytes()
-                    .eq_ignore_ascii_case(name.as_bytes())
-            })
+    pub(crate) fn present_git_ignore_files(&self) -> [bool; 2] {
+        let mut present = [false; 2];
+        for entry in self.entries() {
+            let bytes = entry.name.as_encoded_bytes();
+            if bytes.first() != Some(&b'.') {
+                continue;
+            }
+            if !present[0] && bytes.eq_ignore_ascii_case(b".gitignore") {
+                present[0] = true;
+                if present[1] {
+                    break;
+                }
+            } else if !present[1] && bytes.eq_ignore_ascii_case(b".ignore") {
+                present[1] = true;
+                if present[0] {
+                    break;
+                }
+            }
+        }
+        present
     }
 }
 
@@ -4759,6 +4783,8 @@ pub struct WalkStream {
     pending: Vec<SerialTask>,
     /// Completed frames return their buffers here for later directories.
     scratch: Vec<DirectoryScratch>,
+    /// Reusable Gitignore evaluation scratch shared across all frames.
+    ignore_scratch: gitignore::IgnoreScratch,
     /// Ignore-file failures discovered while preparing the current directory.
     pending_errors: Vec<PendingWalkError>,
     /// Whether root tasks have been queued. Deferred until the first `next`
@@ -4978,7 +5004,7 @@ impl WalkStream {
                     ancestors: &frame.task.ancestors,
                     listing: &frame.scratch.listing,
                     glob_bytes_scratch: &mut frame.scratch.glob_bytes,
-                    ignore_bytes_scratch: &mut frame.scratch.ignore_bytes,
+                    ignore_scratch: &mut self.ignore_scratch,
                 },
             );
             match action {
@@ -5059,6 +5085,8 @@ impl WalkStream {
     }
 
     fn finish_directory(&mut self, frame: DirectoryFrame) {
+        self.ignore_scratch
+            .reset_for_reuse(MAX_RETAINED_SCRATCH_BYTES);
         recycle_scratch(&mut self.scratch, frame.scratch);
     }
 
@@ -5129,6 +5157,8 @@ struct WalkState<'walker> {
     /// directory owns its scratch while a child is being processed; completed
     /// frames return it here for the next directory.
     scratch: Vec<DirectoryScratch>,
+    /// Reusable Gitignore evaluation scratch shared across all frames.
+    ignore_scratch: gitignore::IgnoreScratch,
     /// The path buffer the last dropped entry left behind. See [`own_path`].
     spare: PathBuf,
     cancelled: bool,
@@ -5141,7 +5171,6 @@ struct DirectoryScratch {
     listing: Listing,
     path: PathBuf,
     glob_bytes: Vec<u8>,
-    ignore_bytes: Vec<u8>,
 }
 
 impl DirectoryScratch {
@@ -5154,10 +5183,6 @@ impl DirectoryScratch {
         self.glob_bytes.clear();
         if self.glob_bytes.capacity() > MAX_RETAINED_SCRATCH_BYTES {
             self.glob_bytes.shrink_to(MAX_RETAINED_SCRATCH_BYTES);
-        }
-        self.ignore_bytes.clear();
-        if self.ignore_bytes.capacity() > MAX_RETAINED_SCRATCH_BYTES {
-            self.ignore_bytes.shrink_to(MAX_RETAINED_SCRATCH_BYTES);
         }
     }
 }
@@ -5299,6 +5324,7 @@ impl<'walker> WalkState<'walker> {
             entries: Vec::new(),
             errors: Vec::new(),
             scratch: Vec::new(),
+            ignore_scratch: gitignore::IgnoreScratch::default(),
             spare: PathBuf::new(),
             cancelled: false,
         }
@@ -5523,7 +5549,7 @@ impl<'walker> WalkState<'walker> {
                     ancestors: &frame.task.ancestors,
                     listing: &frame.scratch.listing,
                     glob_bytes_scratch: &mut frame.scratch.glob_bytes,
-                    ignore_bytes_scratch: &mut frame.scratch.ignore_bytes,
+                    ignore_scratch: &mut self.ignore_scratch,
                 },
             );
             match action {
@@ -5596,6 +5622,8 @@ impl<'walker> WalkState<'walker> {
     }
 
     fn finish_directory(&mut self, frame: DirectoryFrame) -> Result<(), WalkError> {
+        self.ignore_scratch
+            .reset_for_reuse(MAX_RETAINED_SCRATCH_BYTES);
         recycle_scratch(&mut self.scratch, frame.scratch);
         Ok(())
     }
@@ -16366,17 +16394,17 @@ mod tests {
             scratch
                 .glob_bytes
                 .resize(super::MAX_RETAINED_SCRATCH_BYTES * 2, b'b');
-            scratch
-                .ignore_bytes
-                .resize(super::MAX_RETAINED_SCRATCH_BYTES * 2, b'c');
             super::recycle_scratch(&mut pool, scratch);
         }
         assert_eq!(pool.len(), super::MAX_RETAINED_SCRATCH_FRAMES);
         for scratch in &pool {
             assert!(scratch.path.capacity() <= super::MAX_RETAINED_SCRATCH_BYTES);
             assert!(scratch.glob_bytes.capacity() <= super::MAX_RETAINED_SCRATCH_BYTES);
-            assert!(scratch.ignore_bytes.capacity() <= super::MAX_RETAINED_SCRATCH_BYTES);
         }
+        let mut ignore_scratch = super::gitignore::IgnoreScratch::default();
+        ignore_scratch.resize_for_test(super::MAX_RETAINED_SCRATCH_BYTES * 2);
+        ignore_scratch.reset_for_reuse(super::MAX_RETAINED_SCRATCH_BYTES);
+        assert!(ignore_scratch.max_capacity() <= super::MAX_RETAINED_SCRATCH_BYTES);
 
         // 3. WalkStream releases peak listing capacity after finishing a wide
         // directory while continuing to walk subsequent small directories.

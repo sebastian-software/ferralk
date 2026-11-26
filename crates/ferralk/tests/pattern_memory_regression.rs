@@ -577,20 +577,23 @@ fn ignore_retained_byte_estimates_upper_bound_measured_rule_set_storage() {
     ];
 
     for (label, rule) in cases {
-        let mut kept = None;
-        let info = allocation_counter::measure(|| {
-            kept = Some(ferralk::build_ignore_rule_set_for_memory_test(
-                rule.as_bytes(),
-            ));
-        });
-        let rules = kept.expect("rule build produced result");
-        let estimated = rules.estimated_retained_bytes();
-        let measured =
-            usize::try_from(info.bytes_current).expect("retained bytes are non-negative");
-        drop(black_box(rules));
-        assert!(
-            estimated >= measured,
-            "rule {label} production estimate ({estimated}) fell below measured RuleSet retained storage ({measured})"
-        );
+        for case_insensitive in [false, true] {
+            let mut kept = None;
+            let info = allocation_counter::measure(|| {
+                kept = Some(ferralk::build_ignore_rule_set_for_memory_test_with_options(
+                    rule.as_bytes(),
+                    case_insensitive,
+                ));
+            });
+            let rules = kept.expect("rule build produced result");
+            let estimated = rules.estimated_retained_bytes();
+            let measured =
+                usize::try_from(info.bytes_current).expect("retained bytes are non-negative");
+            drop(black_box(rules));
+            assert!(
+                estimated >= measured,
+                "rule {label} (case_insensitive={case_insensitive}) production estimate ({estimated}) fell below measured RuleSet retained storage ({measured})"
+            );
+        }
     }
 }

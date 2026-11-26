@@ -26,8 +26,8 @@ use super::glob_path_bytes;
 use super::{
     BoundedFileRead, DirectoryBackend, Listing, Walker,
     ignore_rules::{
-        ComponentBudgetExceeded, LineBudgets, MAX_IGNORE_FILE_COMPONENTS,
-        MAX_IGNORE_FILE_RETAINED_BYTES, RuleSet, RuleSetBuilder,
+        ComponentBudgetExceeded, EntryMatchContext, IgnoreMatchScratch, LineBudgets,
+        MAX_IGNORE_FILE_COMPONENTS, MAX_IGNORE_FILE_RETAINED_BYTES, RuleSet, RuleSetBuilder,
     },
     read_bounded_file, read_bounded_prefix_no_follow,
 };
@@ -113,6 +113,41 @@ impl IgnoreReadError {
 struct GitIgnoreAdaptation {
     case_insensitive: bool,
     precompose_unicode: bool,
+}
+
+/// Reusable per-worker / per-frame scratch buffers for Gitignore evaluation.
+///
+/// Keeps candidate spelling, NFC precomposition, and ASCII case-folding
+/// allocations off the per-entry hot path across every [`IgnoreNode`] in a
+/// walk.
+#[derive(Debug, Default)]
+pub(crate) struct IgnoreScratch {
+    spelled: Vec<u8>,
+    match_scratch: IgnoreMatchScratch,
+}
+
+impl IgnoreScratch {
+    pub(crate) fn reset_for_reuse(&mut self, max_retained_bytes: usize) {
+        self.spelled.clear();
+        if self.spelled.capacity() > max_retained_bytes {
+            self.spelled.shrink_to(max_retained_bytes);
+        }
+        self.match_scratch.reset_for_reuse(max_retained_bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resize_for_test(&mut self, len: usize) {
+        self.spelled.resize(len, b'c');
+        self.match_scratch.resize_for_test(len);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_capacity(&self) -> usize {
+        self.spelled
+            .capacity()
+            .max(self.match_scratch.precomposed_capacity())
+            .max(self.match_scratch.folded_capacity())
+    }
 }
 
 /// The ignore rules in force inside one directory.
@@ -273,13 +308,13 @@ impl IgnoreScope {
         if !walker.respect_git_ignore {
             return (self, Vec::new());
         }
-        let present = IGNORE_FILES
-            .into_iter()
-            .filter(|file| listing.contains_git_ignore_name(file))
-            .collect::<Vec<_>>();
-        if present.is_empty() {
-            return (self, Vec::new());
-        }
+        let [has_gitignore, has_ignore] = listing.present_git_ignore_files();
+        let present: &[&str] = match (has_gitignore, has_ignore) {
+            (false, false) => return (self, Vec::new()),
+            (true, false) => &IGNORE_FILES[..1],
+            (false, true) => &IGNORE_FILES[1..],
+            (true, true) => &IGNORE_FILES,
+        };
         let match_directory = self.candidate_root.as_ref().map_or_else(
             || Cow::Borrowed(directory),
             |root| Cow::Owned(root.map_directory(directory)),
@@ -288,7 +323,7 @@ impl IgnoreScope {
             backend,
             directory,
             match_directory.as_ref(),
-            &present,
+            present,
             self.adaptation,
             self.chain_usage(),
             IgnoreBudget::DEFAULT,
@@ -302,23 +337,28 @@ impl IgnoreScope {
     /// precedence. An entry below an ignored directory never reaches this: the
     /// walk does not enter such a directory.
     ///
-    /// `scratch` is the walk's buffer for the candidate in the discovery
-    /// spelling; see [`CandidateRoot::spell_into`].
+    /// `scratch` holds the walk's reusable buffers for discovery spelling,
+    /// NFC precomposition, and ASCII case-folding across the ancestor chain.
     #[cfg(not(windows))]
-    pub(crate) fn is_ignored(&self, path: &Path, is_dir: bool, scratch: &mut Vec<u8>) -> bool {
+    pub(crate) fn is_ignored(
+        &self,
+        path: &Path,
+        is_dir: bool,
+        scratch: &mut IgnoreScratch,
+    ) -> bool {
         let Some(node) = self.rules.as_ref() else {
             return false;
         };
         // Converted once for the whole chain: every set below slices its own
         // prefix off these bytes.
-        // Repository discovery and ignore-file roots use lexical path
-        // components, while a caller-supplied walk root can retain an inner
-        // `.` in every emitted path. Align the spelling once for the whole
-        // rule chain without resolving `..` or following the filesystem.
         let candidate = glob_path_bytes(path);
         match self.candidate_root.as_ref() {
-            Some(root) => node.verdict(root.spell_into(&candidate, scratch), is_dir),
-            None => node.verdict(&candidate, is_dir),
+            Some(root) => node.verdict_with_scratch(
+                root.spell_into(&candidate, &mut scratch.spelled),
+                is_dir,
+                &mut scratch.match_scratch,
+            ),
+            None => node.verdict_with_scratch(&candidate, is_dir, &mut scratch.match_scratch),
         }
         .unwrap_or(false)
     }
@@ -328,14 +368,18 @@ impl IgnoreScope {
         &self,
         candidate: &[u8],
         is_dir: bool,
-        scratch: &mut Vec<u8>,
+        scratch: &mut IgnoreScratch,
     ) -> bool {
         let Some(node) = self.rules.as_ref() else {
             return false;
         };
         match self.candidate_root.as_ref() {
-            Some(root) => node.verdict(root.spell_into(candidate, scratch), is_dir),
-            None => node.verdict(candidate, is_dir),
+            Some(root) => node.verdict_with_scratch(
+                root.spell_into(candidate, &mut scratch.spelled),
+                is_dir,
+                &mut scratch.match_scratch,
+            ),
+            None => node.verdict_with_scratch(candidate, is_dir, &mut scratch.match_scratch),
         }
         .unwrap_or(false)
     }
@@ -364,12 +408,12 @@ impl IgnoreScope {
             .retained_bytes
             .saturating_add(rules.retained_bytes());
         Self {
-            rules: Some(Arc::new(IgnoreNode {
+            rules: Some(Arc::new(IgnoreNode::new(
                 rules,
                 cumulative_units,
                 cumulative_bytes,
-                parent: self.rules,
-            })),
+                self.rules,
+            ))),
             adaptation: self.adaptation,
             candidate_root: self.candidate_root,
         }
@@ -446,19 +490,45 @@ impl Drop for IgnoreNode {
 }
 
 impl IgnoreNode {
+    fn new(
+        rules: RuleSet,
+        cumulative_units: usize,
+        cumulative_bytes: usize,
+        parent: Option<Arc<IgnoreNode>>,
+    ) -> Self {
+        Self {
+            rules,
+            cumulative_units,
+            cumulative_bytes,
+            parent,
+        }
+    }
+
     /// The verdict of the deepest node that matches, or `None` when no node in
     /// the chain matches. Each node sees the path relative to its own
     /// directory, which the matcher strips, so this costs one match per ignore
     /// file in force rather than one per ancestor directory.
-    fn verdict(&self, candidate: &[u8], is_dir: bool) -> Option<bool> {
+    fn verdict_with_scratch(
+        &self,
+        candidate: &[u8],
+        is_dir: bool,
+        scratch: &mut IgnoreMatchScratch,
+    ) -> Option<bool> {
+        let mut ctx = EntryMatchContext::new(candidate, scratch);
         let mut current = Some(self);
         while let Some(node) = current {
-            if let Some(verdict) = node.rules.matched(candidate, is_dir) {
+            if let Some(verdict) = node.rules.matched_in_context(&mut ctx, is_dir) {
                 return Some(verdict);
             }
             current = node.parent.as_deref();
         }
         None
+    }
+
+    #[cfg(test)]
+    fn verdict(&self, candidate: &[u8], is_dir: bool) -> Option<bool> {
+        let mut scratch = IgnoreMatchScratch::default();
+        self.verdict_with_scratch(candidate, is_dir, &mut scratch)
     }
 }
 
@@ -1234,13 +1304,14 @@ fn add_rules(builder: &mut RuleSetBuilder, contents: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{path::Path, sync::Arc};
 
     use super::{
-        BoundedFileRead, CandidateRoot, GitConfig, GitIgnoreAdaptation, IGNORE_FILES, IgnoreBudget,
-        IgnoreScope, MAX_IGNORE_FILE_COMPONENTS, MAX_IGNORE_RULES, RuleSetBuilder, add_rules,
-        add_rules_within_budget, apply_config, for_each_logical_config_line,
-        is_valid_git_head_contents, parse_git_bool, read_rules, validate_rule_count,
+        BoundedFileRead, CandidateRoot, DirectoryBackend, GitConfig, GitIgnoreAdaptation,
+        IGNORE_FILES, IgnoreBudget, IgnoreScope, Listing, MAX_IGNORE_FILE_COMPONENTS,
+        MAX_IGNORE_RULES, RuleSetBuilder, Walker, add_rules, add_rules_within_budget, apply_config,
+        for_each_logical_config_line, is_valid_git_head_contents, parse_git_bool, read_rules,
+        validate_rule_count,
     };
 
     #[test]
@@ -1636,12 +1707,12 @@ mod tests {
                 let root_rules = build_rules(b"*.log\n");
                 let mut cumulative_units = root_rules.compiled_units();
                 let mut cumulative_bytes = root_rules.retained_bytes();
-                let shared_root = Arc::new(super::IgnoreNode {
-                    rules: root_rules,
+                let shared_root = Arc::new(super::IgnoreNode::new(
+                    root_rules,
                     cumulative_units,
                     cumulative_bytes,
-                    parent: None,
-                });
+                    None,
+                ));
 
                 let mut head = Arc::clone(&shared_root);
                 for depth in 1..=DEPTH {
@@ -1654,12 +1725,12 @@ mod tests {
                     };
                     cumulative_units += rules.compiled_units();
                     cumulative_bytes += rules.retained_bytes();
-                    head = Arc::new(super::IgnoreNode {
+                    head = Arc::new(super::IgnoreNode::new(
                         rules,
                         cumulative_units,
                         cumulative_bytes,
-                        parent: Some(head),
-                    });
+                        Some(head),
+                    ));
                 }
 
                 // Deepest matching node wins, and full-chain traversal does not
@@ -2578,5 +2649,664 @@ mod tests {
         ] {
             assert_eq!(parse_git_bool(value.as_bytes()), expected, "{value:?}");
         }
+    }
+
+    #[test]
+    fn listing_present_git_ignore_files_scans_once_and_preserves_precedence() {
+        let mut listing = Listing::default();
+        assert_eq!(listing.present_git_ignore_files(), [false, false]);
+
+        listing.push("README.md".as_ref(), false, false);
+        listing.push(".git".as_ref(), true, false);
+        listing.push(".gitignore.bak".as_ref(), false, false);
+        listing.push(".ignored".as_ref(), false, false);
+        assert_eq!(listing.present_git_ignore_files(), [false, false]);
+
+        // Zero heap allocations in `IgnoreScope::enter` when no ignore files exist.
+        struct EmptyBackend;
+        impl DirectoryBackend for EmptyBackend {
+            fn read_directory(
+                &self,
+                _path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                _listing: &mut Listing,
+            ) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let walker = Walker::new("/repo").respect_git_ignore(true);
+        let scope = IgnoreScope::default();
+        let mut entered = None;
+        let allocs = allocation_counter::measure(|| {
+            entered = Some(scope.enter(&walker, &EmptyBackend, Path::new("/repo"), &listing));
+        });
+        let (scope, errors) = entered.expect("enter produced scope");
+        assert!(errors.is_empty());
+        assert_eq!(
+            allocs.count_total, 0,
+            "IgnoreScope::enter without ignore files must not allocate"
+        );
+
+        // Single `.gitignore` (and case-insensitive `.GITIGNORE` spelling).
+        listing.push(".GITIGNORE".as_ref(), false, false);
+        assert_eq!(listing.present_git_ignore_files(), [true, false]);
+
+        // Both `.gitignore` and `.ignore` (mixed case).
+        listing.push(".Ignore".as_ref(), false, false);
+        assert_eq!(listing.present_git_ignore_files(), [true, true]);
+
+        // Only `.ignore`.
+        let mut ignore_only = Listing::default();
+        ignore_only.push("src".as_ref(), true, false);
+        ignore_only.push(".ignore".as_ref(), false, false);
+        assert_eq!(ignore_only.present_git_ignore_files(), [false, true]);
+
+        // Verify precedence (`.ignore` overrides `.gitignore`) via a mock backend.
+        struct IgnorePrecedenceBackend;
+        impl DirectoryBackend for IgnorePrecedenceBackend {
+            fn read_directory(
+                &self,
+                _path: &Path,
+                _follow_symlinks: bool,
+                _refuse_final_symlink: bool,
+                _listing: &mut Listing,
+            ) -> std::io::Result<()> {
+                Ok(())
+            }
+
+            fn read_ignore_file(&self, path: &Path) -> std::io::Result<BoundedFileRead> {
+                match path.file_name().and_then(|name| name.to_str()) {
+                    Some(".gitignore") => Ok(BoundedFileRead::Contents(b"*.log\n".to_vec())),
+                    Some(".ignore") => Ok(BoundedFileRead::Contents(b"!keep.log\n".to_vec())),
+                    _ => Ok(BoundedFileRead::Missing),
+                }
+            }
+        }
+        let (scope, errors) = scope.enter(
+            &walker,
+            &IgnorePrecedenceBackend,
+            Path::new("/repo"),
+            &listing,
+        );
+        assert!(errors.is_empty());
+        let mut scratch = super::IgnoreScratch::default();
+        #[cfg(not(windows))]
+        {
+            assert!(scope.is_ignored(Path::new("/repo/drop.log"), false, &mut scratch));
+            assert!(!scope.is_ignored(Path::new("/repo/keep.log"), false, &mut scratch));
+        }
+        #[cfg(windows)]
+        {
+            assert!(scope.is_ignored_bytes(b"/repo/drop.log", false, &mut scratch));
+            assert!(!scope.is_ignored_bytes(b"/repo/keep.log", false, &mut scratch));
+        }
+    }
+
+    #[test]
+    fn ignore_scope_warm_scratch_avoids_per_entry_allocations_across_chains() {
+        let mut root_builder =
+            RuleSetBuilder::new(Path::new("/abs/repo"), true, cfg!(target_os = "macos"));
+        root_builder.add_line("*.LOG");
+        root_builder.add_line("caf\u{e9}.txt");
+        let root_node = Arc::new(super::IgnoreNode::new(root_builder.build(), 4, 1024, None));
+
+        let mut sub_builder = RuleSetBuilder::new(Path::new("/abs/repo/sub"), true, false);
+        sub_builder.add_line("!Keep.LOG");
+        sub_builder.add_line("nai\u{0308}ve.raw");
+        let sub_node = Arc::new(super::IgnoreNode::new(
+            sub_builder.build(),
+            8,
+            2048,
+            Some(root_node),
+        ));
+
+        let mut leaf_builder = RuleSetBuilder::new(
+            Path::new("/abs/repo/sub/deep"),
+            true,
+            cfg!(target_os = "macos"),
+        );
+        leaf_builder.add_line("*.TMP");
+        let leaf_node = Arc::new(super::IgnoreNode::new(
+            leaf_builder.build(),
+            10,
+            3072,
+            Some(sub_node),
+        ));
+
+        // Scope 1: `candidate_root == None` (canonical root).
+        let direct_scope = IgnoreScope {
+            rules: Some(Arc::clone(&leaf_node)),
+            adaptation: GitIgnoreAdaptation {
+                case_insensitive: true,
+                precompose_unicode: cfg!(target_os = "macos"),
+            },
+            candidate_root: None,
+        };
+        // Scope 2: `candidate_root == Some` (`/abs/repo/./sub` -> `/abs/repo/sub`).
+        let dot_scope = IgnoreScope {
+            rules: Some(leaf_node),
+            adaptation: direct_scope.adaptation,
+            candidate_root: CandidateRoot::between(
+                Path::new("/abs/repo/./sub"),
+                Path::new("/abs/repo/sub"),
+            )
+            .map(Arc::new),
+        };
+        assert!(dot_scope.candidate_root.is_some());
+
+        let mut scratch = super::IgnoreScratch::default();
+        let warm_candidates: &[(&IgnoreScope, &str, bool)] = &[
+            (&direct_scope, "/abs/repo/sub/deep/Upper.LOG", true),
+            (&direct_scope, "/abs/repo/sub/deep/Keep.LOG", false),
+            (&direct_scope, "/abs/repo/sub/deep/plain.rs", false),
+            (&dot_scope, "/abs/repo/./sub/deep/Upper.LOG", true),
+            (&dot_scope, "/abs/repo/./sub/deep/Keep.LOG", false),
+            (&dot_scope, "/abs/repo/./sub/deep/plain.rs", false),
+            (
+                &direct_scope,
+                "/abs/repo/sub/deep/Cafe\u{0301}.TXT",
+                cfg!(target_os = "macos"),
+            ),
+            (&direct_scope, "/abs/repo/sub/deep/NAi\u{0308}ve.RAW", true),
+        ];
+
+        // Warm scratch once across all shapes.
+        for &(scope, path, expected) in warm_candidates {
+            #[cfg(not(windows))]
+            let actual = scope.is_ignored(Path::new(path), false, &mut scratch);
+            #[cfg(windows)]
+            let actual = scope.is_ignored_bytes(path.as_bytes(), false, &mut scratch);
+            assert_eq!(actual, expected, "warm pass mismatch for {path}");
+        }
+
+        // Steady-state checks must allocate ZERO bytes across all shapes.
+        let steady_allocs = allocation_counter::measure(|| {
+            for _ in 0..20 {
+                for &(scope, path, expected) in warm_candidates {
+                    #[cfg(not(windows))]
+                    let actual = scope.is_ignored(Path::new(path), false, &mut scratch);
+                    #[cfg(windows)]
+                    let actual = scope.is_ignored_bytes(path.as_bytes(), false, &mut scratch);
+                    assert_eq!(actual, expected);
+                }
+            }
+        });
+        assert_eq!(
+            steady_allocs.count_total, 0,
+            "warm ignore evaluation must not allocate per entry across direct, dot-spelled, uppercase, or NFD paths"
+        );
+
+        // Multi-level `IgnoreNode` chain under a root containing `e` + 12
+        // combining acute accents must never normalize the root prefix when
+        // evaluating 100 already-NFC Japanese filenames.
+        #[cfg(target_os = "macos")]
+        {
+            let combining_root = format!("/tmp/e{}/repo", "\u{0301}".repeat(12));
+            let mut outer = RuleSetBuilder::new(Path::new(&combining_root), true, true);
+            outer.add_line("*.log");
+            let outer_node = Arc::new(super::IgnoreNode::new(outer.build(), 2, 512, None));
+            let mut inner =
+                RuleSetBuilder::new(Path::new(&format!("{combining_root}/sub")), true, true);
+            inner.add_line("*.tmp");
+            let inner_node = Arc::new(super::IgnoreNode::new(
+                inner.build(),
+                4,
+                1024,
+                Some(outer_node),
+            ));
+            let nfc_paths: Vec<Vec<u8>> = (0..100)
+                .map(|index| format!("{combining_root}/sub/日本語-{index:03}.txt").into_bytes())
+                .collect();
+            let mut match_scratch = super::IgnoreMatchScratch::default();
+            let nfc_allocs = allocation_counter::measure(|| {
+                for candidate in &nfc_paths {
+                    assert_eq!(
+                        inner_node.verdict_with_scratch(candidate, false, &mut match_scratch),
+                        None
+                    );
+                }
+            });
+            assert_eq!(
+                nfc_allocs.count_total, 0,
+                "IgnoreNode chain under a combining-mark root must not allocate on already-NFC non-ASCII filenames"
+            );
+
+            // Child directory named `e` + 12 combining acute accents with a
+            // leaf `*.txt` rule and an unrelated root rule: leaf matches first
+            // without ever normalizing the combining-mark child directory name.
+            let mut root_outer = RuleSetBuilder::new(Path::new("/repo"), true, true);
+            root_outer.add_line("*.log");
+            let root_outer_node =
+                Arc::new(super::IgnoreNode::new(root_outer.build(), 2, 512, None));
+            let combining_child = format!("/repo/e{}", "\u{0301}".repeat(12));
+            let mut child_leaf = RuleSetBuilder::new(Path::new(&combining_child), true, true);
+            child_leaf.add_line("*.txt");
+            let child_leaf_node = Arc::new(super::IgnoreNode::new(
+                child_leaf.build(),
+                4,
+                1024,
+                Some(root_outer_node),
+            ));
+            let leaf_nfc_paths: Vec<Vec<u8>> = (0..100)
+                .map(|index| format!("{combining_child}/日本語-{index:03}.txt").into_bytes())
+                .collect();
+            let mut leaf_scratch = super::IgnoreMatchScratch::default();
+            let leaf_allocs = allocation_counter::measure(|| {
+                for candidate in &leaf_nfc_paths {
+                    assert_eq!(
+                        child_leaf_node.verdict_with_scratch(candidate, false, &mut leaf_scratch),
+                        Some(true)
+                    );
+                }
+            });
+            assert_eq!(
+                leaf_allocs.count_total, 0,
+                "leaf-decided already-NFC filenames inside a combining-mark child dir must not allocate"
+            );
+
+            // 3-level chain with `*.log` at leaf, `*.rs` (or `sub/*.rs`) at
+            // parent, `e` + 12 combining accents above parent, and an unrelated
+            // root rule: parent decides `日本語.rs` without ever normalizing the
+            // combining-mark directory above parent (0 warm allocations across
+            // 100 verdicts).
+            for parent_rule in ["*.rs", "sub/*.rs"] {
+                let mut gp_root = RuleSetBuilder::new(Path::new("/repo"), true, true);
+                gp_root.add_line("*.tmp");
+                let gp_node = Arc::new(super::IgnoreNode::new(gp_root.build(), 2, 512, None));
+                let mid_dir = format!("/repo/e{}", "\u{0301}".repeat(12));
+                let mut parent_builder = RuleSetBuilder::new(Path::new(&mid_dir), true, true);
+                parent_builder.add_line(parent_rule);
+                let parent_node = Arc::new(super::IgnoreNode::new(
+                    parent_builder.build(),
+                    4,
+                    1024,
+                    Some(gp_node),
+                ));
+                let leaf_dir = format!("{mid_dir}/sub");
+                let mut leaf_only = RuleSetBuilder::new(Path::new(&leaf_dir), true, true);
+                leaf_only.add_line("*.log");
+                let leaf_chain = Arc::new(super::IgnoreNode::new(
+                    leaf_only.build(),
+                    6,
+                    1536,
+                    Some(parent_node),
+                ));
+                let parent_decided_paths: Vec<Vec<u8>> = (0..100)
+                    .map(|index| format!("{leaf_dir}/日本語-{index:03}.rs").into_bytes())
+                    .collect();
+                let mut scratch_mid = super::IgnoreMatchScratch::default();
+                let mid_allocs = allocation_counter::measure(|| {
+                    for candidate in &parent_decided_paths {
+                        assert_eq!(
+                            leaf_chain.verdict_with_scratch(candidate, false, &mut scratch_mid),
+                            Some(true)
+                        );
+                    }
+                });
+                assert_eq!(
+                    mid_allocs.count_total, 0,
+                    "parent-decided rule ({parent_rule}) must not normalize combining-mark directory above parent"
+                );
+            }
+
+            // 5-level nested non-ASCII ancestor chain with an NFD filename that
+            // misses every node: each reached non-ASCII segment is normalized
+            // at most once (`PRECOMPOSE_BYTES <= repo_relative_len`,
+            // `NFC_OFFSET_MAP_BYTES <= 2 * repo_relative_len`, and 0 warm
+            // allocations).
+            let long_root = format!("/{}", "OuterRoot/".repeat(40));
+            let repo_root = format!("{long_root}repo");
+            let dirs = [
+                repo_root.clone(),
+                format!("{repo_root}/日本語1"),
+                format!("{repo_root}/日本語1/caf\u{00e9}2"),
+                format!("{repo_root}/日本語1/caf\u{00e9}2/日本語3"),
+                format!("{repo_root}/日本語1/caf\u{00e9}2/日本語3/na\u{00ef}ve4"),
+            ];
+            let mut chain: Option<Arc<super::IgnoreNode>> = None;
+            for (idx, dir) in dirs.iter().enumerate() {
+                let mut builder = RuleSetBuilder::new(Path::new(dir), true, true);
+                builder.add_line(format!("unmatched-{idx}/*.log"));
+                chain = Some(Arc::new(super::IgnoreNode::new(
+                    builder.build(),
+                    (idx + 1) * 2,
+                    (idx + 1) * 512,
+                    chain,
+                )));
+            }
+            let deep_node = chain.expect("5-level chain built");
+            let rel_nfd = "日本語1/caf\u{00e9}2/日本語3/na\u{00ef}ve4/Cafe\u{0301}.TXT";
+            let full_nfd = format!("{repo_root}/{rel_nfd}");
+            let mut precomp_scratch = super::IgnoreMatchScratch::default();
+            // Warm once.
+            assert_eq!(
+                deep_node.verdict_with_scratch(full_nfd.as_bytes(), false, &mut precomp_scratch),
+                None
+            );
+            crate::ignore_rules::PRECOMPOSE_CALLS.with(|c| c.set(0));
+            crate::ignore_rules::PRECOMPOSE_BYTES.with(|c| c.set(0));
+            crate::ignore_rules::NFC_OFFSET_MAP_BYTES.with(|c| c.set(0));
+            let precomp_allocs = allocation_counter::measure(|| {
+                assert_eq!(
+                    deep_node.verdict_with_scratch(
+                        full_nfd.as_bytes(),
+                        false,
+                        &mut precomp_scratch
+                    ),
+                    None
+                );
+            });
+            assert!(
+                crate::ignore_rules::PRECOMPOSE_CALLS.with(|c| c.get()) <= dirs.len(),
+                "5-level non-ASCII chain must call precompose at most once per reached level, got {}",
+                crate::ignore_rules::PRECOMPOSE_CALLS.with(|c| c.get())
+            );
+            assert!(
+                crate::ignore_rules::PRECOMPOSE_BYTES.with(|c| c.get()) <= rel_nfd.len(),
+                "5-level non-ASCII chain must normalize at most repo_relative_len ({}) bytes, got {}",
+                rel_nfd.len(),
+                crate::ignore_rules::PRECOMPOSE_BYTES.with(|c| c.get())
+            );
+            assert!(
+                crate::ignore_rules::NFC_OFFSET_MAP_BYTES.with(|c| c.get()) <= 2 * rel_nfd.len(),
+                "5-level non-ASCII chain must map NFC offsets linearly (<= {}), got {}",
+                2 * rel_nfd.len(),
+                crate::ignore_rules::NFC_OFFSET_MAP_BYTES.with(|c| c.get())
+            );
+            assert_eq!(precomp_allocs.count_total, 0);
+
+            // 16-level deep non-ASCII chain with an NFD leaf that misses every
+            // node: front-growing headroom must keep total moved suffix bytes
+            // strictly O(L) (`<= 4 * rel.len()`) with 0 warm allocations.
+            let mut deep16_dirs = Vec::with_capacity(16);
+            let mut cur = format!("{long_root}repo16");
+            deep16_dirs.push(cur.clone());
+            for idx in 1..16 {
+                cur = format!("{cur}/日本語dir{idx:02}");
+                deep16_dirs.push(cur.clone());
+            }
+            let mut chain16: Option<Arc<super::IgnoreNode>> = None;
+            for (idx, dir) in deep16_dirs.iter().enumerate() {
+                let mut builder = RuleSetBuilder::new(Path::new(dir), true, true);
+                builder.add_line(format!("unmatched-{idx}/*.log"));
+                chain16 = Some(Arc::new(super::IgnoreNode::new(
+                    builder.build(),
+                    (idx + 1) * 2,
+                    (idx + 1) * 512,
+                    chain16,
+                )));
+            }
+            let deep16_node = chain16.expect("16-level chain built");
+            let full16_nfd = format!("{}/Cafe\u{0301}.TXT", deep16_dirs.last().unwrap());
+            let rel16_len = full16_nfd.len() - (deep16_dirs[0].len() + 1);
+            let mut scratch16 = super::IgnoreMatchScratch::default();
+            // Warm once.
+            assert_eq!(
+                deep16_node.verdict_with_scratch(full16_nfd.as_bytes(), false, &mut scratch16),
+                None
+            );
+            crate::ignore_rules::PRECOMPOSE_BYTES.with(|c| c.set(0));
+            crate::ignore_rules::PRECOMPOSE_SUFFIX_MOVE_BYTES.with(|c| c.set(0));
+            let deep16_allocs = allocation_counter::measure(|| {
+                assert_eq!(
+                    deep16_node.verdict_with_scratch(full16_nfd.as_bytes(), false, &mut scratch16),
+                    None
+                );
+            });
+            assert!(
+                crate::ignore_rules::PRECOMPOSE_BYTES.with(|c| c.get()) <= rel16_len,
+                "16-level non-ASCII chain must normalize <= {rel16_len} bytes, got {}",
+                crate::ignore_rules::PRECOMPOSE_BYTES.with(|c| c.get())
+            );
+            assert!(
+                crate::ignore_rules::PRECOMPOSE_SUFFIX_MOVE_BYTES.with(|c| c.get())
+                    <= 4 * rel16_len,
+                "16-level non-ASCII chain must move suffix bytes linearly (<= {}), got {}",
+                4 * rel16_len,
+                crate::ignore_rules::PRECOMPOSE_SUFFIX_MOVE_BYTES.with(|c| c.get())
+            );
+            assert_eq!(deep16_allocs.count_total, 0);
+
+            // 16-level chain of ASCII directories above an already-NFC
+            // non-ASCII filename: ASCII checks must inspect only each newly
+            // exposed ancestor prefix (`<= 2 * rel_len`), never rescanning
+            // `&raw[precomposed_origin..]`.
+            let mut ascii16_dirs = Vec::with_capacity(16);
+            let mut acur = format!("{long_root}ascii16");
+            ascii16_dirs.push(acur.clone());
+            for idx in 1..16 {
+                acur = format!("{acur}/dir{idx:02}");
+                ascii16_dirs.push(acur.clone());
+            }
+            let mut ascii_chain16: Option<Arc<super::IgnoreNode>> = None;
+            for (idx, dir) in ascii16_dirs.iter().enumerate() {
+                let mut builder = RuleSetBuilder::new(Path::new(dir), true, true);
+                builder.add_line(format!("unmatched-{idx}/*.log"));
+                ascii_chain16 = Some(Arc::new(super::IgnoreNode::new(
+                    builder.build(),
+                    (idx + 1) * 2,
+                    (idx + 1) * 512,
+                    ascii_chain16,
+                )));
+            }
+            let ascii16_node = ascii_chain16.expect("16-level ASCII chain built");
+            let full16_nfc = format!("{}/日本語.txt", ascii16_dirs.last().unwrap());
+            let rel16_nfc_len = full16_nfc.len() - (ascii16_dirs[0].len() + 1);
+            let mut ascii_scratch16 = super::IgnoreMatchScratch::default();
+            crate::ignore_rules::NFC_ASCII_SCAN_BYTES.with(|c| c.set(0));
+            let ascii16_allocs = allocation_counter::measure(|| {
+                assert_eq!(
+                    ascii16_node.verdict_with_scratch(
+                        full16_nfc.as_bytes(),
+                        false,
+                        &mut ascii_scratch16
+                    ),
+                    None
+                );
+            });
+            assert!(
+                crate::ignore_rules::NFC_ASCII_SCAN_BYTES.with(|c| c.get()) <= 2 * rel16_nfc_len,
+                "16-level ASCII chain above non-ASCII leaf must scan <= {} ASCII bytes, got {}",
+                2 * rel16_nfc_len,
+                crate::ignore_rules::NFC_ASCII_SCAN_BYTES.with(|c| c.get())
+            );
+            assert_eq!(ascii16_allocs.count_total, 0);
+
+            // 16-level deep chain with BOTH `ignoreCase = true` and
+            // `precomposeUnicode = true` + gated `Multi` rules (`**/unmatched-i/*.log`)
+            // + uppercase NFD filename (`Cafe\u{0301}.TXT`): front-headroom
+            // prepending on `scratch.folded` must keep moved suffix bytes
+            // strictly O(L) (`<= 4 * rel16_len`) with 0 warm allocations.
+            let mut fold16_chain: Option<Arc<super::IgnoreNode>> = None;
+            for (idx, dir) in deep16_dirs.iter().enumerate() {
+                let mut builder = RuleSetBuilder::new(Path::new(dir), true, true);
+                builder.add_line(format!("**/unmatched-{idx}/*.log"));
+                fold16_chain = Some(Arc::new(super::IgnoreNode::new(
+                    builder.build(),
+                    (idx + 1) * 2,
+                    (idx + 1) * 512,
+                    fold16_chain,
+                )));
+            }
+            let fold16_node = fold16_chain.expect("16-level CI+precompose chain built");
+            let mut fold16_scratch = super::IgnoreMatchScratch::default();
+            // Warm once.
+            assert_eq!(
+                fold16_node.verdict_with_scratch(full16_nfd.as_bytes(), false, &mut fold16_scratch),
+                None
+            );
+            crate::ignore_rules::FOLD_SUFFIX_MOVE_BYTES.with(|c| c.set(0));
+            let fold16_allocs = allocation_counter::measure(|| {
+                assert_eq!(
+                    fold16_node.verdict_with_scratch(
+                        full16_nfd.as_bytes(),
+                        false,
+                        &mut fold16_scratch
+                    ),
+                    None
+                );
+            });
+            assert!(
+                crate::ignore_rules::FOLD_SUFFIX_MOVE_BYTES.with(|c| c.get()) <= 4 * rel16_len,
+                "16-level CI+precompose chain must move folded suffix bytes linearly (<= {}), got {}",
+                4 * rel16_len,
+                crate::ignore_rules::FOLD_SUFFIX_MOVE_BYTES.with(|c| c.get())
+            );
+            assert_eq!(fold16_allocs.count_total, 0);
+
+            // 16-level alternating basename-only (`*.log`) and multi-component
+            // (`**/unmatched-{idx}/*.txt`) chain over non-ASCII dirs + NFD
+            // leaf: basename-only sets must read the cached basename directly
+            // without bouncing `map_precomposed_offset` (`NFC_OFFSET_MAP_BYTES
+            // <= 2 * rel16_len`, 0 warm allocations).
+            let mut alt16_chain: Option<Arc<super::IgnoreNode>> = None;
+            for (idx, dir) in deep16_dirs.iter().enumerate() {
+                let mut builder = RuleSetBuilder::new(Path::new(dir), true, true);
+                if idx % 2 == 0 {
+                    builder.add_line(format!("**/unmatched-{idx}/*.txt"));
+                } else {
+                    builder.add_line(format!("*miss{idx}*.log"));
+                }
+                alt16_chain = Some(Arc::new(super::IgnoreNode::new(
+                    builder.build(),
+                    (idx + 1) * 2,
+                    (idx + 1) * 512,
+                    alt16_chain,
+                )));
+            }
+            let alt16_node = alt16_chain.expect("16-level alternating chain built");
+            let mut alt16_scratch = super::IgnoreMatchScratch::default();
+            // Warm once.
+            assert_eq!(
+                alt16_node.verdict_with_scratch(full16_nfd.as_bytes(), false, &mut alt16_scratch),
+                None
+            );
+            crate::ignore_rules::NFC_OFFSET_MAP_BYTES.with(|c| c.set(0));
+            let alt16_allocs = allocation_counter::measure(|| {
+                assert_eq!(
+                    alt16_node.verdict_with_scratch(
+                        full16_nfd.as_bytes(),
+                        false,
+                        &mut alt16_scratch
+                    ),
+                    None
+                );
+            });
+            assert!(
+                crate::ignore_rules::NFC_OFFSET_MAP_BYTES.with(|c| c.get()) <= 2 * rel16_len,
+                "16-level alternating basename/multi chain must map NFC offsets linearly (<= {}), got {}",
+                2 * rel16_len,
+                crate::ignore_rules::NFC_OFFSET_MAP_BYTES.with(|c| c.get())
+            );
+            assert_eq!(alt16_allocs.count_total, 0);
+        }
+
+        // 5-level nested `case_insensitive` chain with unanchored
+        // multi-component rules under an 800-byte root + uppercase basename
+        // that misses every node: each level prepends only its newly exposed
+        // prefix into front headroom (never touching the 800-byte root),
+        // keeping folded bytes `<= repo_relative_len`, suffix moves amortized
+        // linear, and 0 warm allocations.
+        let long_root = format!("/{}", "LongRootDir/".repeat(67));
+        let repo_root = format!("{long_root}repo");
+        let ci_dirs = [
+            repo_root.clone(),
+            format!("{repo_root}/Dir1"),
+            format!("{repo_root}/Dir1/Dir2"),
+            format!("{repo_root}/Dir1/Dir2/Dir3"),
+            format!("{repo_root}/Dir1/Dir2/Dir3/Dir4"),
+        ];
+        let mut ci_chain: Option<Arc<super::IgnoreNode>> = None;
+        for (idx, dir) in ci_dirs.iter().enumerate() {
+            let mut builder = RuleSetBuilder::new(Path::new(dir), true, false);
+            builder.add_line(format!("**/obj-{idx}/*.o"));
+            ci_chain = Some(Arc::new(super::IgnoreNode::new(
+                builder.build(),
+                (idx + 1) * 2,
+                (idx + 1) * 512,
+                ci_chain,
+            )));
+        }
+        let deep_ci_node = ci_chain.expect("5-level CI chain built");
+        let rel_upper = "Dir1/Dir2/Dir3/Dir4/UPPER.TXT";
+        let full_upper = format!("{repo_root}/{rel_upper}");
+        let mut ci_scratch = super::IgnoreMatchScratch::default();
+        // Warm once.
+        assert_eq!(
+            deep_ci_node.verdict_with_scratch(full_upper.as_bytes(), false, &mut ci_scratch),
+            None
+        );
+        crate::ignore_rules::CASE_FOLD_BYTES.with(|c| c.set(0));
+        crate::ignore_rules::FOLD_SUFFIX_MOVE_BYTES.with(|c| c.set(0));
+        let ci_allocs = allocation_counter::measure(|| {
+            assert_eq!(
+                deep_ci_node.verdict_with_scratch(full_upper.as_bytes(), false, &mut ci_scratch),
+                None
+            );
+        });
+        assert!(
+            crate::ignore_rules::CASE_FOLD_BYTES.with(|c| c.get()) <= rel_upper.len(),
+            "5-level case_insensitive chain must fold at most repo_relative_len ({}) bytes, got {}",
+            rel_upper.len(),
+            crate::ignore_rules::CASE_FOLD_BYTES.with(|c| c.get())
+        );
+        assert!(
+            crate::ignore_rules::FOLD_SUFFIX_MOVE_BYTES.with(|c| c.get()) <= 4 * rel_upper.len(),
+            "5-level case_insensitive chain must move folded suffix bytes linearly (<= {}), got {}",
+            4 * rel_upper.len(),
+            crate::ignore_rules::FOLD_SUFFIX_MOVE_BYTES.with(|c| c.get())
+        );
+        assert_eq!(ci_allocs.count_total, 0);
+
+        // Leaf `.gitignore` containing both a gated basename rule
+        // (`tmp-????.bin`, same 12-byte length as `REPORT-1.LOG`) and a gated
+        // multi-component rule (`**/sub/report-*.log`) below 500 bytes of
+        // uppercase ancestor directories + an outer root rule: matching
+        // `sub/REPORT-1.LOG` must fold ONLY the 16-byte leaf-relative path,
+        // never the 500 bytes of ancestors above the leaf.
+        let mut anc_root_builder = RuleSetBuilder::new(Path::new("/repo"), true, false);
+        anc_root_builder.add_line("*.bak");
+        let anc_root_node = Arc::new(super::IgnoreNode::new(
+            anc_root_builder.build(),
+            2,
+            512,
+            None,
+        ));
+        let anc_leaf_dir = format!("/repo/{}leaf", "UpperAnc/".repeat(56));
+        let mut anc_leaf_builder = RuleSetBuilder::new(Path::new(&anc_leaf_dir), true, false);
+        anc_leaf_builder.add_line("**/sub/report-*.log");
+        anc_leaf_builder.add_line("tmp-????.bin");
+        let anc_leaf_node = Arc::new(super::IgnoreNode::new(
+            anc_leaf_builder.build(),
+            6,
+            1536,
+            Some(anc_root_node),
+        ));
+        let leaf_rel = "sub/REPORT-1.LOG";
+        let leaf_full = format!("{anc_leaf_dir}/{leaf_rel}");
+        let mut leaf_ci_scratch = super::IgnoreMatchScratch::default();
+        // Warm once.
+        assert_eq!(
+            anc_leaf_node.verdict_with_scratch(leaf_full.as_bytes(), false, &mut leaf_ci_scratch),
+            Some(true)
+        );
+        crate::ignore_rules::CASE_FOLD_BYTES.with(|c| c.set(0));
+        let leaf_ci_allocs = allocation_counter::measure(|| {
+            assert_eq!(
+                anc_leaf_node.verdict_with_scratch(
+                    leaf_full.as_bytes(),
+                    false,
+                    &mut leaf_ci_scratch
+                ),
+                Some(true)
+            );
+        });
+        assert_eq!(
+            crate::ignore_rules::CASE_FOLD_BYTES.with(|c| c.get()),
+            leaf_rel.len(),
+            "leaf multi-component expansion must fold strictly the leaf-relative suffix, never unreached ancestors"
+        );
+        assert_eq!(leaf_ci_allocs.count_total, 0);
     }
 }

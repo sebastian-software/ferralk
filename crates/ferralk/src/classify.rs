@@ -26,7 +26,7 @@ use super::glob_bytes;
 use super::{
     AncestorChain, DirectoryBackend, DirectoryOpen, ListedEntry, Listing, SharedRoot, WalkEntry,
     WalkOperation, Walker,
-    gitignore::{IgnoreReadError, IgnoreScope},
+    gitignore::{IgnoreReadError, IgnoreScope, IgnoreScratch},
     has_hidden_component, should_skip_git_directory,
 };
 
@@ -126,9 +126,9 @@ pub(crate) struct TraversalContext<'a> {
     pub(crate) listing: &'a Listing,
     /// Reusable Windows-normalized bytes for both glob filters and gitignore.
     pub(crate) glob_bytes_scratch: &'a mut Vec<u8>,
-    /// Reusable bytes for the ignore candidate in the repository discovery
-    /// spelling, when that differs from the walk root's spelling.
-    pub(crate) ignore_bytes_scratch: &'a mut Vec<u8>,
+    /// Reusable ignore evaluation buffers (discovery spelling, NFC
+    /// precomposition, and ASCII case folding).
+    pub(crate) ignore_scratch: &'a mut IgnoreScratch,
 }
 
 /// A filesystem call that failed while classifying one entry.
@@ -228,7 +228,7 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
     let glob_bytes_scratch = context.glob_bytes_scratch;
     #[cfg(not(windows))]
     let _ = glob_bytes_scratch;
-    let ignore_bytes_scratch = context.ignore_bytes_scratch;
+    let ignore_scratch = context.ignore_scratch;
     let plan = &walker.roots[context.root];
     let mut is_dir = entry.is_dir();
     let path_bytes = path.as_os_str().as_encoded_bytes();
@@ -270,10 +270,9 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
             .iter()
             .any(|pattern| pattern.matches(bytes, false, walker.wildcard_mode));
         #[cfg(windows)]
-        let ignored_as_link =
-            ignores.is_ignored_bytes(glob_bytes_scratch, false, ignore_bytes_scratch);
+        let ignored_as_link = ignores.is_ignored_bytes(glob_bytes_scratch, false, ignore_scratch);
         #[cfg(not(windows))]
-        let ignored_as_link = ignores.is_ignored(path, false, ignore_bytes_scratch);
+        let ignored_as_link = ignores.is_ignored(path, false, ignore_scratch);
         // Git ignores cannot be overridden by the walker's include patterns.
         // A plain exclude can: when one of those patterns may select a
         // descendant, resolve the link and let the regular directory path
@@ -326,9 +325,9 @@ pub(crate) fn classify_entry<B: DirectoryBackend + ?Sized>(
         return EntryAction::Skip;
     }
     #[cfg(windows)]
-    let git_ignored = ignores.is_ignored_bytes(glob_bytes_scratch, is_dir, ignore_bytes_scratch);
+    let git_ignored = ignores.is_ignored_bytes(glob_bytes_scratch, is_dir, ignore_scratch);
     #[cfg(not(windows))]
-    let git_ignored = ignores.is_ignored(path, is_dir, ignore_bytes_scratch);
+    let git_ignored = ignores.is_ignored(path, is_dir, ignore_scratch);
     if git_ignored && !is_dir {
         return EntryAction::Skip;
     }
