@@ -20,13 +20,13 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let unique = format!(
-            "ferralk-integration-{}-{}",
+            "ferralk-integration-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock is after epoch")
-                .as_nanos()
-                + NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed) as u128
+                .as_nanos(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         );
         let root = std::env::temp_dir().join(unique);
         fs::create_dir_all(&root).expect("create fixture root");
@@ -1051,9 +1051,11 @@ fn resolving_symlink_kind_drops_not_a_directory_broken_link_without_error() {
 fn pre_cancelled_walks_report_cancelled_and_empty_across_every_frontend() {
     let fixture = Fixture::new();
     fixture.directory(".git");
-    // A directory named `.gitignore` causes `read_ignore_file` to fail when
-    // `IgnoreScope::for_root` inspects ancestor directories.
-    fixture.directory(".gitignore");
+    // A regular `.gitignore` exceeding the 100,000-rule safety limit causes
+    // `IgnoreScope::for_root` to report a `read_ignore` error on every platform
+    // (directories named `.gitignore` are intentionally skipped as non-regular).
+    fs::write(fixture.root.join(".gitignore"), "a\n".repeat(100_001))
+        .expect("write oversized ancestor .gitignore");
     fixture.write("nested/file.txt");
     let nested = fixture.root.join("nested");
 

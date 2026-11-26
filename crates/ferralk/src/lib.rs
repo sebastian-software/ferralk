@@ -14434,7 +14434,7 @@ mod tests {
                 )
             }
 
-            fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            fn read_ignore_file(&self, path: &Path) -> std::io::Result<super::BoundedFileRead> {
                 self.read_ignores.fetch_add(1, Ordering::Relaxed);
                 super::SystemBackend.read_ignore_file(path)
             }
@@ -14630,7 +14630,7 @@ mod tests {
                 )
             }
 
-            fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            fn read_ignore_file(&self, path: &Path) -> std::io::Result<super::BoundedFileRead> {
                 self.read_ignores.fetch_add(1, Ordering::Relaxed);
                 super::SystemBackend.read_ignore_file(path)
             }
@@ -14742,7 +14742,7 @@ mod tests {
                 )
             }
 
-            fn read_ignore_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            fn read_ignore_file(&self, path: &Path) -> std::io::Result<super::BoundedFileRead> {
                 self.ignore_paths
                     .lock()
                     .expect("lock ignore_paths")
