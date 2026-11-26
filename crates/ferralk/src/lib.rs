@@ -3860,6 +3860,15 @@ struct AncestorLink {
     parent: Option<Arc<AncestorLink>>,
 }
 
+impl Drop for AncestorLink {
+    fn drop(&mut self) {
+        let mut current = self.parent.take();
+        while let Some(mut inner) = current.and_then(Arc::into_inner) {
+            current = inner.parent.take();
+        }
+    }
+}
+
 impl AncestorChain {
     /// Extends this task's chain with `key`, unless it would revisit an
     /// ancestor and therefore close a directory cycle.
@@ -13256,5 +13265,53 @@ mod tests {
             relative_paths(result.entries(), &fixture.root),
             vec![PathBuf::from(name)]
         );
+    }
+
+    #[test]
+    fn deep_ancestor_chain_drops_iteratively_without_stack_overflow() {
+        use std::sync::Arc;
+
+        const DEPTH: usize = 25_000;
+
+        #[cfg(unix)]
+        let make_key = |depth: usize| (1_u64, depth as u64);
+        #[cfg(not(unix))]
+        let make_key = |depth: usize| PathBuf::from(format!("dir-{depth}"));
+
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let shared_root = super::AncestorChain(Some(Arc::new(super::AncestorLink {
+                    key: make_key(0),
+                    parent: None,
+                })));
+                let mut chain = shared_root.clone();
+                for depth in 1..=DEPTH {
+                    chain = super::AncestorChain(Some(Arc::new(super::AncestorLink {
+                        key: make_key(depth),
+                        parent: chain.0,
+                    })));
+                }
+
+                // Cycle detection traverses all 25,001 links iteratively.
+                assert!(chain.enter(make_key(0)).is_none());
+                let extended = chain
+                    .enter(make_key(DEPTH + 1))
+                    .expect("unseen key extends deep chain");
+
+                // Dropping the deep tail unwinds 25,000+ uniquely-owned links
+                // iteratively and stops at the shared root without overflowing
+                // the 256 KiB thread stack.
+                drop(extended);
+                drop(chain);
+
+                assert!(shared_root.enter(make_key(0)).is_none());
+                drop(shared_root);
+            })
+            .expect("spawn small-stack thread");
+
+        handle
+            .join()
+            .expect("deep AncestorChain drop succeeds on a 256 KiB stack");
     }
 }

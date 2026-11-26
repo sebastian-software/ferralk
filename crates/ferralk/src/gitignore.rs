@@ -353,17 +353,29 @@ struct IgnoreNode {
     parent: Option<Arc<IgnoreNode>>,
 }
 
+impl Drop for IgnoreNode {
+    fn drop(&mut self) {
+        let mut current = self.parent.take();
+        while let Some(mut inner) = current.and_then(Arc::into_inner) {
+            current = inner.parent.take();
+        }
+    }
+}
+
 impl IgnoreNode {
     /// The verdict of the deepest node that matches, or `None` when no node in
     /// the chain matches. Each node sees the path relative to its own
     /// directory, which the matcher strips, so this costs one match per ignore
     /// file in force rather than one per ancestor directory.
     fn verdict(&self, candidate: &[u8], is_dir: bool) -> Option<bool> {
-        self.rules.matched(candidate, is_dir).or_else(|| {
-            self.parent
-                .as_ref()
-                .and_then(|parent| parent.verdict(candidate, is_dir))
-        })
+        let mut current = Some(self);
+        while let Some(node) = current {
+            if let Some(verdict) = node.rules.matched(candidate, is_dir) {
+                return Some(verdict);
+            }
+            current = node.parent.as_deref();
+        }
+        None
     }
 }
 
@@ -1113,5 +1125,63 @@ mod tests {
 
         assert_eq!(config.ignore_case, Some(false));
         assert_eq!(config.precompose_unicode, Some(true));
+    }
+
+    #[test]
+    fn deep_ignore_node_chain_evaluates_and_drops_iteratively() {
+        use std::sync::Arc;
+
+        const DEPTH: usize = 25_000;
+
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let root = Path::new("/fixture");
+                let build_rules = |contents: &[u8]| {
+                    let mut builder = RuleSetBuilder::new(root, false, false);
+                    if !contents.is_empty() {
+                        add_rules(&mut builder, contents);
+                    }
+                    builder.build()
+                };
+
+                let shared_root = Arc::new(super::IgnoreNode {
+                    rules: build_rules(b"*.log\n"),
+                    parent: None,
+                });
+
+                let mut head = Arc::clone(&shared_root);
+                for depth in 1..=DEPTH {
+                    let rules = if depth == DEPTH / 2 {
+                        build_rules(b"!keep.log\n")
+                    } else if depth == DEPTH {
+                        build_rules(b"other.tmp\n")
+                    } else {
+                        build_rules(b"")
+                    };
+                    head = Arc::new(super::IgnoreNode {
+                        rules,
+                        parent: Some(head),
+                    });
+                }
+
+                // Deepest matching node wins, and full-chain traversal does not
+                // overflow the 256 KiB thread stack.
+                assert_eq!(head.verdict(b"/fixture/other.tmp", false), Some(true));
+                assert_eq!(head.verdict(b"/fixture/keep.log", false), Some(false));
+                assert_eq!(head.verdict(b"/fixture/app.log", false), Some(true));
+                assert_eq!(head.verdict(b"/fixture/unmatched.txt", false), None);
+
+                // Dropping the tail unwinds all 25,000 uniquely-owned nodes
+                // iteratively and leaves the shared root intact.
+                drop(head);
+                assert_eq!(shared_root.verdict(b"/fixture/keep.log", false), Some(true));
+                drop(shared_root);
+            })
+            .expect("spawn small-stack thread");
+
+        handle
+            .join()
+            .expect("deep IgnoreNode verdict and drop succeed on a 256 KiB stack");
     }
 }
