@@ -140,6 +140,7 @@ jobs:
         if: github.event_name != 'pull_request'
         shell: bash
         run: |
+          set -euo pipefail
           rm -rf target/criterion
           cargo bench -p bench --bench walker ${{ matrix.features }} -- \
             --warm-up-time 1 --measurement-time 5 --sample-size 20 \
@@ -210,6 +211,7 @@ jobs:
       - name: Measure
         shell: bash
         run: |
+          set -euo pipefail
           rm -rf target/criterion
           cargo bench -p bench --bench walker -- \
             --warm-up-time 1 --measurement-time 5 --sample-size 20 \
@@ -403,9 +405,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Measure
         shell: bash
-        run: >-
-          cargo bench -p bench --bench walker_palamedes --
-          --output-format bencher | tee walker-palamedes.txt
+        run: |
+          set -euo pipefail
+          cargo bench -p bench --bench walker_palamedes -- \
+            --output-format bencher | tee walker-palamedes.txt
       - name: Publish the medians
         if: always()
         run: |
