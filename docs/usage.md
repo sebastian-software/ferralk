@@ -22,11 +22,13 @@ switch that changes it; the sections below explain the semantics.
 | Concern | Default | Switch |
 | --- | --- | --- |
 | Which entries qualify | Every non-excluded entry when no include is set; otherwise any include, OR-ed | `Walker::include`, `Walker::exclude`, and the borrowed `try_` forms |
+| Pattern case sensitivity | Case-sensitive on every platform | `Walker::case_insensitive(true)?` folds ASCII case in includes, excludes, and their pruning |
 | Wildcards and a leading period | Not matched by an include, so `**/*.ts` skips `.cache/x.ts`; always matched by an exclude, as in `.gitignore` | `Walker::match_hidden(true)` for includes |
 | Hidden entries at all | Traversed and reported | `WalkOptions::skip_hidden(true)` drops them before any pattern runs |
 | `.gitignore`, `.ignore`, `.git/info/exclude` | Not read | `Walker::respect_git_ignore(true)` |
 | The `.git` directory under Git ignores | Skipped | `WalkOptions::keep_git_dir(true)` |
 | Symlinks below a root | Reported, not followed | `WalkOptions::follow_symlinks(true)` |
+| Mount and filesystem boundaries | Crossed during descent | `WalkOptions::same_file_system(true)` restricts descent to each root's filesystem |
 | Symlink kind for `files_only` and `directories_only` | The listing's kind: a symlink is a symlink | `WalkOptions::resolve_symlink_kind(true)` classifies by target |
 | Entry kinds | Files, directories, and symlinks | `WalkOptions::files_only(true)` or `directories_only(true)` |
 | Depth | Unlimited | `WalkOptions::max_depth(n)` |
@@ -381,6 +383,18 @@ Important defaults:
   aliases — start independent chains. A root that is itself a directory
   symlink is opened regardless, because the caller supplied it as the tree to
   walk.
+- Mount and filesystem boundaries are crossed unless
+  `WalkOptions::same_file_system(true)` is selected, which restricts directory
+  descent to the filesystem of each root. A selected boundary directory is still
+  returned, without reading its children. Root symlinks are always followed and
+  followed directory symlinks are checked against their root's target
+  filesystem; unfollowed links and files remain leaf entries. Unix compares
+  device numbers, so bind mounts of the same device remain traversable; Windows
+  compares volume serial numbers. On platforms other than Unix and Windows,
+  enabling it reports an unsupported `metadata` error for each root. Identity
+  failures are reported as `WalkOperation::Metadata` under `ErrorPolicy` and
+  prevent descent; the path-based check is not a security boundary against
+  concurrent filesystem changes.
 - Repository discovery and ignore-rule anchoring resolve the root once, the
   way Git resolves its working directory: `.` and `..` are folded and every
   symlink is followed, so a root reached through a link belongs to the

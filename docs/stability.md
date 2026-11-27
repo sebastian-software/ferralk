@@ -61,7 +61,7 @@ text with `ferralk_glob::escape`, and porting from `globset`. In short:
   combination with escaping enabled. The exact set of escaped bytes is not
   promised: it grows if the pattern language gains syntax.
 - `PatternError::offset()` is stable program-facing error information.
-  `message()` and `Display` are not, as listed below.
+  `message()` and `Display` are not, as listed above.
 
 ## Public enum policy
 

@@ -31,8 +31,10 @@ it made.
 
 `match_hidden`, `case_insensitive` (ASCII only) and `escape` are further
 switches on either preset. A `Walker` has no switch that turns braces,
-extglobs or recursive `**` off; its only dialect switch is
-`Walker::match_hidden`, and its excludes always cover a leading `.`.
+extglobs or recursive `**` off; its dialect switches are
+`Walker::match_hidden` (for includes; excludes always cover a leading `.`)
+and `Walker::case_insensitive` (ASCII case folding for includes, excludes,
+and their pruning).
 
 **The reach of a wildcard, chosen by the entry point:**
 

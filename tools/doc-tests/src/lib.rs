@@ -898,6 +898,13 @@ mod tests {
             contributing.lines().any(|line| line.contains(&restated)),
             "CONTRIBUTING must state the {percent}% CPU gate"
         );
+        for path in ["README.md.src", "README.md"] {
+            let readme = normalize_whitespace(&read(path));
+            assert!(
+                readme.contains(&restated),
+                "{path} must state the {percent}% CPU gate"
+            );
+        }
         for (path, text) in [
             ("CONTRIBUTING.md", &contributing),
             ("docs/benchmark-evidence.md", &evidence),
@@ -908,6 +915,234 @@ mod tests {
                 "{path} must name the acceptance marker {marker:?}"
             );
         }
+    }
+
+    /// The minimum supported Rust version is declared once under
+    /// `[workspace.package]` in the root `Cargo.toml`. Both `README.md.src`
+    /// and the generated `README.md` carry a badge restating it, so this
+    /// contract holds both copies to the workspace manifest.
+    #[test]
+    fn the_msrv_badge_matches_workspace_rust_version() {
+        let repository_root = repository_root();
+        let msrv = workspace_rust_version(&repository_root);
+
+        for path in ["README.md.src", "README.md"] {
+            let document = fs::read_to_string(repository_root.join(path))
+                .unwrap_or_else(|error| panic!("{path} is readable: {error}"));
+            let badge = document
+                .lines()
+                .find(|line| line.contains("img.shields.io/badge/MSRV-"))
+                .unwrap_or_else(|| panic!("{path} carries the MSRV badge"));
+            assert!(
+                badge.contains(&format!("[![MSRV {msrv}]")),
+                "the {path} MSRV badge must read {msrv} in its link text: {badge}"
+            );
+            assert!(
+                badge.contains(&format!("img.shields.io/badge/MSRV-{msrv}-")),
+                "the {path} MSRV badge must render {msrv} in its image: {badge}"
+            );
+        }
+    }
+
+    /// The corpus total and divergence count restated in `README.md.src` (and
+    /// generated `README.md`) must match the checked-in `corpus/*.jsonl` files.
+    #[test]
+    fn readme_corpus_counts_match_the_checked_in_corpus() {
+        let repository_root = repository_root();
+        let (total_cases, divergences) = corpus_case_and_divergence_counts(&repository_root);
+        let expected_cases = format!(
+            "The {} checked-in behavioral cases",
+            format_with_commas(total_cases)
+        );
+        let expected_divergences =
+            format!("and all {} of them do.", format_with_commas(divergences));
+
+        for path in ["README.md.src", "README.md"] {
+            let document = fs::read_to_string(repository_root.join(path))
+                .unwrap_or_else(|error| panic!("{path} is readable: {error}"));
+            let normalized = normalize_whitespace(&document);
+            assert!(
+                normalized.contains(&expected_cases),
+                "{path} must state the exact corpus case count ({expected_cases:?})"
+            );
+            assert!(
+                normalized.contains(&expected_divergences),
+                "{path} must state the exact corpus divergence count ({expected_divergences:?})"
+            );
+        }
+    }
+
+    /// `docs/corpus-format.md` enumerates every topic file under `corpus/`.
+    /// Keep that prose inventory exact so new or renamed `.jsonl` files never
+    /// disappear from the format guide.
+    #[test]
+    fn corpus_format_topic_list_matches_corpus_directory() {
+        let repository_root = repository_root();
+        let discovered = corpus_topic_files(&repository_root);
+        assert!(
+            !discovered.is_empty(),
+            "corpus/ must contain at least one .jsonl topic file"
+        );
+
+        let guide = fs::read_to_string(repository_root.join("docs/corpus-format.md"))
+            .expect("docs/corpus-format.md is readable");
+        let normalized = normalize_whitespace(&guide);
+        let after_prefix = normalized
+            .split_once("The topic files are ")
+            .expect("docs/corpus-format.md lists the corpus topic files")
+            .1;
+        let sentence = after_prefix
+            .split_once(". Files are added")
+            .expect("docs/corpus-format.md closes the topic-file list")
+            .0;
+
+        let tokens = extract_backticked_tokens(sentence);
+        let mut documented = BTreeSet::new();
+        for token in tokens {
+            assert!(
+                token.ends_with(".jsonl"),
+                "unexpected non-.jsonl entry in docs/corpus-format.md topic list: {token:?}"
+            );
+            assert!(
+                documented.insert(token.to_owned()),
+                "duplicate topic file in docs/corpus-format.md: {token:?}"
+            );
+        }
+
+        assert_eq!(
+            documented, discovered,
+            "docs/corpus-format.md topic file list must match corpus/*.jsonl on disk"
+        );
+    }
+
+    /// The pinned `mdtheme` CLI version lives in `mise.toml`. Both README
+    /// theme docs restate it, so keep them aligned with the tool manifest.
+    #[test]
+    fn mdtheme_version_in_docs_matches_mise_toml() {
+        let repository_root = repository_root();
+        let mise =
+            fs::read_to_string(repository_root.join("mise.toml")).expect("mise.toml is readable");
+        let version = mise_tool_version(&mise, "github:sebastian-software/mdtheme")
+            .expect("mise.toml pins github:sebastian-software/mdtheme");
+        let expected_phrase = format!("The project pins mdtheme {version}");
+
+        for path in [
+            "docs/readme-theme.md",
+            "docs/adr/readme-theme-composition.md",
+        ] {
+            let document = fs::read_to_string(repository_root.join(path))
+                .unwrap_or_else(|error| panic!("{path} is readable: {error}"));
+            let normalized = normalize_whitespace(&document);
+            assert!(
+                normalized.contains(&expected_phrase),
+                "{path} must state the mise.toml mdtheme version ({expected_phrase:?})"
+            );
+            for mentioned in mdtheme_versions(&normalized) {
+                assert_eq!(
+                    mentioned, version,
+                    "{path} mentions stale mdtheme version {mentioned:?}; mise.toml pins {version:?}"
+                );
+            }
+        }
+    }
+
+    /// Every Git theme entry in `mdtheme.yaml` and `FERRAMENTA_PIN` in
+    /// `scripts/readme-family-block.sh` must pin an exact 40-character
+    /// lowercase hex commit SHA rather than a moving branch or tag.
+    ///
+    /// The two `sebastian-software/ferramenta` pins are intentionally
+    /// distinct: `ferramenta-family` 2.0+ dropped the `ferramenta-readme` CLI
+    /// binary used by `scripts/readme-family-block.sh` for published crate
+    /// READMEs, so that script stays on the last pre-2.0 CLI revision while
+    /// `mdtheme.yaml` pins the `mdtheme` frame revision (PR #467).
+    #[test]
+    fn readme_theme_and_family_block_pins_are_exact_commit_shas() {
+        let repository_root = repository_root();
+        let mdtheme = fs::read_to_string(repository_root.join("mdtheme.yaml"))
+            .expect("mdtheme.yaml is readable");
+        let git_themes = mdtheme_git_theme_refs(&mdtheme);
+        assert!(
+            !git_themes.is_empty(),
+            "mdtheme.yaml must declare at least one git theme"
+        );
+        for (url, reference) in git_themes {
+            let pin = reference
+                .unwrap_or_else(|| panic!("mdtheme.yaml git theme {url} must declare a ref"));
+            assert!(
+                is_commit_sha(pin),
+                "mdtheme.yaml ref for {url} must be a 40-char lowercase hex commit SHA: {pin:?}"
+            );
+        }
+
+        let script = fs::read_to_string(repository_root.join("scripts/readme-family-block.sh"))
+            .expect("scripts/readme-family-block.sh is readable");
+        let script_pins = script
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("FERRAMENTA_PIN=\"")?
+                    .strip_suffix('"')
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            script_pins.len(),
+            1,
+            "scripts/readme-family-block.sh must declare FERRAMENTA_PIN exactly once"
+        );
+        assert!(
+            is_commit_sha(script_pins[0]),
+            "FERRAMENTA_PIN in scripts/readme-family-block.sh must be a 40-char lowercase hex commit SHA: {:?}",
+            script_pins[0]
+        );
+    }
+
+    /// `homepage/samples/Cargo.toml` depends on the published crates from
+    /// crates.io (and can only be raised after a release reaches crates.io, so
+    /// it deliberately stays independent of an in-flight Release Please bump).
+    /// Within the homepage sample pipeline, however, the manifest pins for
+    /// `ferralk` and `ferralk-glob`, `homepage/samples/Cargo.lock`, and the
+    /// `renderedWith.ferralk` field in `homepage/app/data/home-samples.json`
+    /// must always agree on one exact version.
+    #[test]
+    fn homepage_samples_manifest_lockfile_and_rendered_json_agree() {
+        let repository_root = repository_root();
+        let manifest = fs::read_to_string(repository_root.join("homepage/samples/Cargo.toml"))
+            .expect("homepage/samples/Cargo.toml is readable");
+        let ferralk_pin = exact_dependency_pin(&manifest, "ferralk")
+            .expect("homepage/samples/Cargo.toml pins ferralk with =<version>");
+        let ferralk_glob_pin = exact_dependency_pin(&manifest, "ferralk-glob")
+            .expect("homepage/samples/Cargo.toml pins ferralk-glob with =<version>");
+        assert_eq!(
+            ferralk_glob_pin, ferralk_pin,
+            "homepage/samples/Cargo.toml must pin ferralk and ferralk-glob to the same version"
+        );
+
+        let lockfile = fs::read_to_string(repository_root.join("homepage/samples/Cargo.lock"))
+            .expect("homepage/samples/Cargo.lock is readable");
+        for name in ["ferralk", "ferralk-glob"] {
+            let entry = format!("name = \"{name}\"");
+            let version = lockfile
+                .lines()
+                .skip_while(|line| *line != entry)
+                .nth(1)
+                .unwrap_or_else(|| panic!("homepage/samples/Cargo.lock locks {name}"));
+            assert_eq!(
+                version,
+                format!("version = \"{ferralk_pin}\""),
+                "homepage/samples/Cargo.lock must lock {name} at {ferralk_pin}"
+            );
+        }
+
+        let samples_json =
+            fs::read_to_string(repository_root.join("homepage/app/data/home-samples.json"))
+                .expect("homepage/app/data/home-samples.json is readable");
+        let samples: Value = serde_json::from_str(&samples_json)
+            .expect("homepage/app/data/home-samples.json is valid JSON");
+        assert_eq!(
+            samples["renderedWith"]["ferralk"].as_str(),
+            Some(ferralk_pin),
+            "homepage/app/data/home-samples.json renderedWith.ferralk must match homepage/samples/Cargo.toml"
+        );
     }
 
     /// The coverage floor is declared once, as `COVERAGE_MIN_LINES` in the
@@ -1138,6 +1373,79 @@ mod tests {
         assert!(!is_rust_fence("unknown-language"));
     }
 
+    #[test]
+    fn doc_sync_helpers_parse_counts_pins_and_tokens() {
+        assert_eq!(format_with_commas(0), "0");
+        assert_eq!(format_with_commas(84), "84");
+        assert_eq!(format_with_commas(994), "994");
+        assert_eq!(format_with_commas(1_000), "1,000");
+        assert_eq!(format_with_commas(1_123), "1,123");
+        assert_eq!(format_with_commas(1_000_000), "1,000,000");
+
+        assert_eq!(
+            extract_backticked_tokens("`a.jsonl`, `b.jsonl`, and `c.jsonl`"),
+            vec!["a.jsonl", "b.jsonl", "c.jsonl"]
+        );
+        assert_eq!(
+            mdtheme_versions("The project pins mdtheme 0.4.1 and runs mdtheme 0.4.1."),
+            vec!["0.4.1", "0.4.1"]
+        );
+        assert_eq!(
+            mdtheme_versions("mdtheme owns the README and pins mdtheme 0.4.1"),
+            vec!["0.4.1"]
+        );
+        assert_eq!(
+            mise_tool_version(
+                "[tools.\"github:sebastian-software/mdtheme\"]\nversion = \"0.4.1\"\n[settings]\n",
+                "github:sebastian-software/mdtheme"
+            ),
+            Some("0.4.1")
+        );
+        assert_eq!(
+            mdtheme_git_theme_refs(
+                "themes:\n  \
+                 - git: https://example.com/a.git\n    \
+                   ref: abcdef0123456789abcdef0123456789abcdef01\n  \
+                 - git: https://example.com/b.git\n    \
+                   ref: main\n  \
+                 - path: markdown\n    \
+                   git: https://example.com/reordered.git\n    \
+                   ref: \"0123456789abcdef0123456789abcdef01234567\" # pinned\n  \
+                 - path: local-only\n  \
+                 - ref: fedcba9876543210fedcba9876543210fedcba98\n    \
+                   git: https://example.com/ref-first.git\n  \
+                 - path: markdown\n    \
+                   git: https://example.com/missing-ref.git\n"
+            ),
+            vec![
+                (
+                    "https://example.com/a.git",
+                    Some("abcdef0123456789abcdef0123456789abcdef01")
+                ),
+                ("https://example.com/b.git", Some("main")),
+                (
+                    "https://example.com/reordered.git",
+                    Some("0123456789abcdef0123456789abcdef01234567")
+                ),
+                (
+                    "https://example.com/ref-first.git",
+                    Some("fedcba9876543210fedcba9876543210fedcba98")
+                ),
+                ("https://example.com/missing-ref.git", None),
+            ]
+        );
+        assert!(is_commit_sha("abcdef0123456789abcdef0123456789abcdef01"));
+        assert!(!is_commit_sha("main"));
+        assert!(!is_commit_sha("ABCDEF0123456789ABCDEF0123456789ABCDEF01"));
+        assert_eq!(
+            exact_dependency_pin(
+                "[dependencies]\nferralk = \"=1.2.1\"\nferralk-glob = \"=1.2.1\"\n",
+                "ferralk"
+            ),
+            Some("1.2.1")
+        );
+    }
+
     fn repository_root() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
@@ -1159,6 +1467,25 @@ mod tests {
             .expect("the root package declares a concrete version")
     }
 
+    /// The workspace MSRV declared under `[workspace.package].rust-version`
+    /// in the root `Cargo.toml`.
+    fn workspace_rust_version(repository_root: &Path) -> String {
+        let manifest = fs::read_to_string(repository_root.join("Cargo.toml"))
+            .expect("workspace manifest is readable");
+        manifest
+            .lines()
+            .skip_while(|line| line.trim() != "[workspace.package]")
+            .skip(1)
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("rust-version = \"")
+                    .and_then(|value| value.strip_suffix('\"'))
+            })
+            .map(str::to_owned)
+            .expect("root Cargo.toml declares [workspace.package].rust-version")
+    }
+
     /// The concrete `version` in a manifest's `[package]` table, or `None`
     /// when it is missing or inherited from the workspace.
     fn package_version(manifest: &str) -> Option<&str> {
@@ -1172,6 +1499,216 @@ mod tests {
                     .strip_prefix("version = \"")
                     .and_then(|value| value.strip_suffix('\"'))
             })
+    }
+
+    fn normalize_whitespace(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn format_with_commas(value: usize) -> String {
+        let digits = value.to_string();
+        let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+        for (index, byte) in digits.bytes().enumerate() {
+            let remaining = digits.len() - index;
+            if index > 0 && remaining.is_multiple_of(3) {
+                formatted.push(',');
+            }
+            formatted.push(char::from(byte));
+        }
+        formatted
+    }
+
+    fn corpus_topic_files(repository_root: &Path) -> BTreeSet<String> {
+        let corpus_dir = repository_root.join("corpus");
+        let mut files = BTreeSet::new();
+        for entry in fs::read_dir(&corpus_dir).expect("corpus/ directory is readable") {
+            let path = entry.expect("corpus/ entry is readable").path();
+            if path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("corpus topic file names are UTF-8")
+                    .to_owned();
+                files.insert(name);
+            }
+        }
+        files
+    }
+
+    fn corpus_case_and_divergence_counts(repository_root: &Path) -> (usize, usize) {
+        let corpus_dir = repository_root.join("corpus");
+        let mut total_cases = 0_usize;
+        let mut divergences = 0_usize;
+        for name in corpus_topic_files(repository_root) {
+            let contents = fs::read_to_string(corpus_dir.join(&name))
+                .unwrap_or_else(|error| panic!("corpus/{name} is readable: {error}"));
+            for (line_index, line) in contents.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let value: Value = serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!("corpus/{name}:{} is valid JSON: {error}", line_index + 1)
+                });
+                let object = value
+                    .as_object()
+                    .unwrap_or_else(|| panic!("corpus/{name}:{} is a JSON object", line_index + 1));
+                total_cases += 1;
+                if object.contains_key("oracle_expected")
+                    || object.contains_key("oracle_matches")
+                    || object.contains_key("oracle_indices")
+                {
+                    divergences += 1;
+                }
+            }
+        }
+        (total_cases, divergences)
+    }
+
+    fn extract_backticked_tokens(text: &str) -> Vec<&str> {
+        let mut tokens = Vec::new();
+        let mut remainder = text;
+        while let Some((_, after_open)) = remainder.split_once('`') {
+            let (token, after_close) = after_open
+                .split_once('`')
+                .expect("every backticked token in corpus-format.md is closed");
+            tokens.push(token);
+            remainder = after_close;
+        }
+        tokens
+    }
+
+    fn mise_tool_version<'a>(mise: &'a str, tool: &str) -> Option<&'a str> {
+        let header = format!("[tools.\"{tool}\"]");
+        mise.lines()
+            .skip_while(|line| line.trim() != header)
+            .skip(1)
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("version = \"")
+                    .and_then(|value| value.strip_suffix('\"'))
+            })
+    }
+
+    fn mdtheme_versions(text: &str) -> Vec<&str> {
+        let mut versions = Vec::new();
+        let mut remainder = text;
+        while let Some((_, after)) = remainder.split_once("mdtheme ") {
+            if let Some(first) = after.as_bytes().first()
+                && first.is_ascii_digit()
+            {
+                let end = after
+                    .bytes()
+                    .take_while(|byte| byte.is_ascii_digit() || *byte == b'.')
+                    .count();
+                let version = after[..end].trim_end_matches('.');
+                if !version.is_empty() {
+                    versions.push(version);
+                }
+                remainder = &after[end..];
+            } else {
+                remainder = after;
+            }
+        }
+        versions
+    }
+
+    fn is_commit_sha(value: &str) -> bool {
+        value.len() == 40
+            && value
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    fn mdtheme_git_theme_refs(mdtheme_yaml: &str) -> Vec<(&str, Option<&str>)> {
+        let mut results = Vec::new();
+        let mut in_themes = false;
+        let mut current_git: Option<&str> = None;
+        let mut current_ref: Option<&str> = None;
+
+        for line in mdtheme_yaml.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+            if indent == 0 && !trimmed.starts_with('-') {
+                if let Some(url) = current_git.take() {
+                    results.push((url, current_ref.take()));
+                }
+                current_ref = None;
+                in_themes = trimmed
+                    .split_once(':')
+                    .is_some_and(|(key, _)| key.trim() == "themes");
+                continue;
+            }
+            if !in_themes {
+                continue;
+            }
+
+            let kv_line = if trimmed == "-" {
+                if let Some(url) = current_git.take() {
+                    results.push((url, current_ref.take()));
+                }
+                current_ref = None;
+                continue;
+            } else if let Some(rest) = trimmed.strip_prefix("- ") {
+                if let Some(url) = current_git.take() {
+                    results.push((url, current_ref.take()));
+                }
+                current_ref = None;
+                rest.trim()
+            } else {
+                trimmed
+            };
+
+            if let Some((key, value)) = kv_line.split_once(':') {
+                let scalar = parse_yaml_scalar(value);
+                if scalar.is_empty() {
+                    continue;
+                }
+                match key.trim() {
+                    "git" => current_git = Some(scalar),
+                    "ref" => current_ref = Some(scalar),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(url) = current_git {
+            results.push((url, current_ref));
+        }
+
+        results
+    }
+
+    fn parse_yaml_scalar(raw: &str) -> &str {
+        let trimmed = raw.trim();
+        for quote in ['"', '\''] {
+            if let Some(rest) = trimmed.strip_prefix(quote)
+                && let Some((quoted, _)) = rest.split_once(quote)
+            {
+                return quoted;
+            }
+        }
+        let without_comment = trimmed
+            .find(" #")
+            .or_else(|| trimmed.find("\t#"))
+            .map_or(trimmed, |index| &trimmed[..index]);
+        without_comment.trim()
+    }
+
+    fn exact_dependency_pin<'a>(manifest: &'a str, dependency: &str) -> Option<&'a str> {
+        let prefix = format!("{dependency} = \"=");
+        manifest
+            .lines()
+            .skip_while(|line| line.trim() != "[dependencies]")
+            .skip(1)
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .find_map(|line| line.trim().strip_prefix(&prefix)?.strip_suffix('\"'))
     }
 
     fn semver_values(line: &str) -> Vec<&str> {

@@ -260,7 +260,8 @@ The two zlob versions on this page are deliberate. The semantic oracle in
 commit recorded in [NOTICE](../NOTICE) and
 [ADR-0007](adr/0007-differential-corpus-and-dev-time-oracle.md), so an upstream
 release can never move the corpus expectations under it; the performance
-harness in [`tools/bench`](../tools/bench/Cargo.toml) pins `=1.6.5`, the latest
+harness in [`tools/bench`](../tools/bench/Cargo.toml) declares caret `1.6.5`
+(per [ADR-0021](adr/0021-dependency-range-policy.md)), the latest
 registry release, because a speed comparison is only useful against what a
 consumer would install today. Cargo keeps the two 1.6.x packages apart because
 one comes from Git and the other from the registry. The current local run used

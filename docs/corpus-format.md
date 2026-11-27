@@ -39,12 +39,12 @@ Every record conforms to [`corpus.schema.json`](corpus.schema.json):
 | `oracle_defect` | no | `true` when the disagreement is an oracle defect or documented limit of a secondary oracle. |
 | `note` | no | Short explanation or cross-oracle disagreement. |
 
-The topic files are `basic.jsonl`, `braces.jsonl`, `bytes.jsonl`,
-`case-folding.jsonl`, `classes.jsonl`, `dotfiles.jsonl`, `edge-cases.jsonl`, `errors.jsonl`,
-`extglob-suite.jsonl`, `fast-glob.jsonl`, `fnmatch.jsonl`,
-`glibc-recursive.jsonl`, `globstar.jsonl`, `ignore.jsonl`, `match-paths.jsonl`,
-`path-matcher.jsonl`, `platform.jsonl`, `preflight.jsonl`, and
-`wildcards.jsonl`. Files are added when a topic gains a case. Case IDs do
+The topic files are `absolute-patterns.jsonl`, `basic.jsonl`, `braces.jsonl`,
+`bytes.jsonl`, `case-folding.jsonl`, `classes.jsonl`, `dotfiles.jsonl`,
+`edge-cases.jsonl`, `errors.jsonl`, `extglob-suite.jsonl`, `fast-glob.jsonl`,
+`fnmatch.jsonl`, `glibc-recursive.jsonl`, `globstar.jsonl`, `ignore.jsonl`,
+`match-paths.jsonl`, `path-matcher.jsonl`, `platform.jsonl`, `preflight.jsonl`,
+and `wildcards.jsonl`. Files are added when a topic gains a case. Case IDs do
 not change once published; a changed expected value is a new case plus an
 explanation in `note`. The one-time explicit-kind migration also normalized
 the previously self-compared list and absolute-pattern `expected` fields from

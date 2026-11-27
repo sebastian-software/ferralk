@@ -28,6 +28,7 @@ Use `is_match_glob_path` for paths: it reads a pattern as a shell and the walker
 | Unsorted | `WalkOptions::sort(true)`, for `collect()` and `visit()` only; `Path` order, root included |
 | Recoverable errors collected in `WalkResult::errors()` | `Walker::error_policy(ErrorPolicy::Abort)` to fail fast |
 | Symlinks below the root not followed | `WalkOptions::follow_symlinks(true)` |
+| Mount and filesystem boundaries crossed during descent | `WalkOptions::same_file_system(true)` restricts descent to each root's filesystem (Unix device number, Windows volume serial); a selected boundary directory is still returned without reading its children |
 
 **Traps that compile and return the wrong result:**
 

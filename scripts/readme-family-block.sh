@@ -20,6 +20,9 @@ set -euo pipefail
 # The generator commit in sebastian-software/ferramenta. Pinned rather than
 # tracking `main` so a run is reproducible: the block CI blesses today is the
 # one it blessed yesterday. See CONTRIBUTING.md for the bump procedure.
+# Intentionally distinct from `mdtheme.yaml`'s `mdtheme` frame ref: stays on
+# the last pre-2.0 `ferramenta-readme` CLI revision because `ferramenta-family`
+# 2.0+ dropped the CLI binary (see PR #467).
 FERRAMENTA_PIN="05fadd21d86b69bb15179ef4461bef6b3b531f88"
 
 # The `&path:` fragment is required. Without it pnpm installs the site rather
