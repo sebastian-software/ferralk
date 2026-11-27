@@ -46,7 +46,7 @@ compatible with zlob and deliberately has no C ABI.
   that out from the pattern. With `ignore`, the same saving needs a
   hand-written `filter_entry`, and passing the globs as overrides alone still
   reads the whole tree. The [benchmark snapshot](#benchmark-snapshot) reports
-both approaches on the same fixture.
+  both approaches on the same fixture.
 - **Sized for the machine, not for the core count.** A warm walk is filesystem
   metadata work: profiled on macOS, 95% of it is `openat`, `getdirentries64`,
   and `close`, and a raw C walker issuing the same syscalls is no faster. What
