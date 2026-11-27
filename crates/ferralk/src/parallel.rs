@@ -693,7 +693,7 @@ struct WorkerScratch {
     /// That directory's path, with the entry being classified pushed onto it.
     path: PathBuf,
     glob_bytes: Vec<u8>,
-    ignore_bytes: Vec<u8>,
+    ignore_scratch: super::gitignore::IgnoreScratch,
     /// The path buffer the last dropped entry left behind. See [`own_path`].
     spare: PathBuf,
 }
@@ -775,7 +775,7 @@ impl WorkerScratch {
             listing: Listing::default(),
             path: PathBuf::new(),
             glob_bytes: Vec::new(),
-            ignore_bytes: Vec::new(),
+            ignore_scratch: super::gitignore::IgnoreScratch::default(),
             spare: PathBuf::new(),
         }
     }
@@ -1117,7 +1117,7 @@ fn walk_directory(
                 ancestors: &ancestors,
                 listing: &worker.listing,
                 glob_bytes_scratch: &mut worker.glob_bytes,
-                ignore_bytes_scratch: &mut worker.ignore_bytes,
+                ignore_scratch: &mut worker.ignore_scratch,
             },
         );
         let should_continue = act(shared, worker, action);

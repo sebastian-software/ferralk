@@ -24,7 +24,7 @@
 //!   collapses to `a*b`; only a whole `**` component spans directories. Before
 //!   an escaped slash that run must consume at least one component.
 
-use std::{borrow::Cow, path::Path};
+use std::{borrow::Cow, num::NonZeroU32, path::Path};
 
 use ferralk_glob::{Pattern, PatternOptions};
 use memchr::memmem;
@@ -162,6 +162,474 @@ fn component_options(case_insensitive: bool) -> PatternOptions {
         .case_insensitive(case_insensitive)
 }
 
+/// Reusable per-entry buffers hoisted across every [`RuleSet`] in an ancestor
+/// chain so NFC precomposition and ASCII case folding happen at most once per
+/// entry with zero heap allocations once warm.
+#[derive(Debug, Default)]
+pub(crate) struct IgnoreMatchScratch {
+    precomposed: Vec<u8>,
+    precomposed_prefix: Vec<u8>,
+    folded: Vec<u8>,
+}
+
+impl IgnoreMatchScratch {
+    pub(crate) fn reset_for_reuse(&mut self, max_retained_bytes: usize) {
+        self.precomposed.clear();
+        if self.precomposed.capacity() > max_retained_bytes {
+            self.precomposed.shrink_to(max_retained_bytes);
+        }
+        self.precomposed_prefix.clear();
+        if self.precomposed_prefix.capacity() > max_retained_bytes {
+            self.precomposed_prefix.shrink_to(max_retained_bytes);
+        }
+        self.folded.clear();
+        if self.folded.capacity() > max_retained_bytes {
+            self.folded.shrink_to(max_retained_bytes);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resize_for_test(&mut self, len: usize) {
+        self.precomposed.resize(len, b'p');
+        self.precomposed_prefix.resize(len, b'x');
+        self.folded.resize(len, b'f');
+    }
+
+    #[cfg(test)]
+    pub(crate) fn precomposed_capacity(&self) -> usize {
+        self.precomposed
+            .capacity()
+            .max(self.precomposed_prefix.capacity())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn folded_capacity(&self) -> usize {
+        self.folded.capacity()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrecomposedState {
+    Unchecked,
+    SameAsRaw,
+    Buffered,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewKind {
+    Raw,
+    Precomposed,
+}
+
+/// Per-entry lazy view state shared across every [`RuleSet`] in one ancestor
+/// chain. Carries only stack metadata while borrowing the caller's reusable
+/// [`IgnoreMatchScratch`].
+pub(crate) struct EntryMatchContext<'a> {
+    raw: &'a [u8],
+    raw_basename_start: Option<usize>,
+    precomposed_basename_start: Option<usize>,
+    precomposed_state: PrecomposedState,
+    /// Byte offset into `raw` where `precomposed_state` (`SameAsRaw` or
+    /// `Buffered`) starts. Bytes before this offset lie above the outermost
+    /// applicable `precompose_unicode` rule set and are never normalized.
+    precomposed_origin: usize,
+    /// Start index of the active precomposed slice inside
+    /// `scratch.precomposed` (`&scratch.precomposed[precomposed_head..]`).
+    /// Headroom before `precomposed_head` allows prepending ancestor prefixes
+    /// in amortized `O(1)` per byte instead of rotating the suffix on every
+    /// ancestor.
+    precomposed_head: usize,
+    /// Invariant: `raw[raw_ascii_from..]` is known to be pure ASCII.
+    raw_ascii_from: usize,
+    /// Which view `scratch.folded` currently holds, if populated.
+    folded_view: Option<ViewKind>,
+    /// Byte offset into `view_bytes(folded_view)` where the active folded
+    /// slice `&scratch.folded[folded_head..]` begins, so basename-only rules
+    /// fold only the basename instead of the entire ancestor path.
+    folded_from: usize,
+    /// Start index of the active folded slice inside `scratch.folded`
+    /// (`&scratch.folded[folded_head..]`). Headroom before `folded_head` allows
+    /// prepending outer-ancestor prefixes in amortized `O(1)` per byte instead
+    /// of rotating the suffix on every ancestor.
+    folded_head: usize,
+    /// Invariant: `raw[raw_clean_from..]` contains no ASCII uppercase bytes.
+    raw_clean_from: usize,
+    /// Invariant: `view_bytes(ViewKind::Precomposed)[precomposed_clean_from..]`
+    /// contains no ASCII uppercase bytes.
+    precomposed_clean_from: usize,
+    scratch: &'a mut IgnoreMatchScratch,
+}
+
+impl<'a> EntryMatchContext<'a> {
+    #[inline]
+    pub(crate) fn new(raw: &'a [u8], scratch: &'a mut IgnoreMatchScratch) -> Self {
+        let (precomposed_state, precomposed_origin) = if cfg!(not(target_os = "macos")) {
+            (PrecomposedState::SameAsRaw, 0)
+        } else {
+            (PrecomposedState::Unchecked, raw.len())
+        };
+        let raw_clean_from = trimmed_trailing_slash_len(raw);
+        Self {
+            raw,
+            raw_basename_start: None,
+            precomposed_basename_start: None,
+            precomposed_state,
+            precomposed_origin,
+            precomposed_head: 0,
+            raw_ascii_from: raw.len(),
+            folded_view: None,
+            folded_from: 0,
+            folded_head: 0,
+            raw_clean_from,
+            precomposed_clean_from: 0,
+            scratch,
+        }
+    }
+
+    #[inline]
+    fn view_bytes(&self, view: ViewKind) -> &[u8] {
+        match view {
+            ViewKind::Raw => self.raw,
+            ViewKind::Precomposed => &self.scratch.precomposed[self.precomposed_head..],
+        }
+    }
+
+    fn resolve_precomposed(&mut self, raw_rel_start: usize) -> (ViewKind, usize) {
+        if self.precomposed_state == PrecomposedState::SameAsRaw
+            && raw_rel_start >= self.precomposed_origin
+        {
+            return (ViewKind::Raw, raw_rel_start);
+        }
+        if self.precomposed_state == PrecomposedState::Buffered
+            && raw_rel_start >= self.precomposed_origin
+        {
+            let eff_rel_start = if raw_rel_start == self.precomposed_origin {
+                0
+            } else {
+                map_rel_start_to_precomposed(
+                    &self.raw[self.precomposed_origin..],
+                    raw_rel_start - self.precomposed_origin,
+                    &self.scratch.precomposed[self.precomposed_head..],
+                )
+            };
+            return (ViewKind::Precomposed, eff_rel_start);
+        }
+        match self.precomposed_state {
+            PrecomposedState::Unchecked => {
+                // Fast ASCII bypass: pure-ASCII relative suffixes never change
+                // under NFC and skip UTF-8 validation and NFC table lookups
+                // completely without touching any bytes above `raw_rel_start`.
+                if raw_rel_start >= self.raw_ascii_from {
+                    return (ViewKind::Raw, raw_rel_start);
+                }
+                if is_ascii_tracked(&self.raw[raw_rel_start..self.raw_ascii_from]) {
+                    self.raw_ascii_from = raw_rel_start;
+                    return (ViewKind::Raw, raw_rel_start);
+                }
+                // Normalize only the current node's required suffix so
+                // ancestors and root prefixes are never touched when an inner
+                // ignore file already decides the verdict.
+                self.precomposed_origin = raw_rel_start;
+                if precompose_into(&self.raw[raw_rel_start..], &mut self.scratch.precomposed) {
+                    self.precomposed_state = PrecomposedState::Buffered;
+                    self.precomposed_head = 0;
+                    self.precomposed_clean_from =
+                        trimmed_trailing_slash_len(&self.scratch.precomposed);
+                    self.precomposed_basename_start = None;
+                    if self.folded_view == Some(ViewKind::Precomposed) {
+                        self.folded_view = None;
+                    }
+                    (ViewKind::Precomposed, 0)
+                } else {
+                    self.precomposed_state = PrecomposedState::SameAsRaw;
+                    (ViewKind::Raw, raw_rel_start)
+                }
+            }
+            PrecomposedState::SameAsRaw => {
+                // Expand strictly across `&raw[raw_rel_start..old_origin]`:
+                // never rescan `&raw[old_origin..]` for ASCII and never jump
+                // past this node into unreached grandparents.
+                let old_origin = self.precomposed_origin;
+                let prefix = &self.raw[raw_rel_start..old_origin];
+                if is_ascii_tracked(prefix) {
+                    self.precomposed_origin = raw_rel_start;
+                    return (ViewKind::Raw, raw_rel_start);
+                }
+                let changed = if prefix.ends_with(b"/") {
+                    if precompose_into(prefix, &mut self.scratch.precomposed) {
+                        self.scratch
+                            .precomposed
+                            .extend_from_slice(&self.raw[old_origin..]);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    precompose_into(&self.raw[raw_rel_start..], &mut self.scratch.precomposed)
+                };
+                self.precomposed_origin = raw_rel_start;
+                if changed {
+                    self.precomposed_state = PrecomposedState::Buffered;
+                    self.precomposed_head = 0;
+                    self.precomposed_clean_from =
+                        trimmed_trailing_slash_len(&self.scratch.precomposed);
+                    self.precomposed_basename_start = None;
+                    if self.folded_view == Some(ViewKind::Precomposed) {
+                        self.folded_view = None;
+                    }
+                    (ViewKind::Precomposed, 0)
+                } else {
+                    (ViewKind::Raw, raw_rel_start)
+                }
+            }
+            PrecomposedState::Buffered => {
+                // Expand strictly across `&raw[raw_rel_start..old_origin]` by
+                // prepending the newly exposed segment into headroom before
+                // `precomposed_head` — amortized O(L) bytes moved and never
+                // touching ancestors above the deciding node.
+                let old_origin = self.precomposed_origin;
+                let prefix = &self.raw[raw_rel_start..old_origin];
+                if is_ascii_tracked(prefix) {
+                    let _moved = prepend_with_headroom(
+                        &mut self.scratch.precomposed,
+                        &mut self.precomposed_head,
+                        prefix,
+                    );
+                    #[cfg(test)]
+                    PRECOMPOSE_SUFFIX_MOVE_BYTES.with(|count| count.set(count.get() + _moved));
+                    let prefix_nfc_len = prefix.len();
+                    if let Some(basename_start) = self.precomposed_basename_start {
+                        self.precomposed_basename_start = Some(basename_start + prefix_nfc_len);
+                    }
+                    self.precomposed_clean_from += prefix_nfc_len;
+                    if self.folded_view == Some(ViewKind::Precomposed) {
+                        self.folded_from += prefix_nfc_len;
+                    }
+                } else if prefix.ends_with(b"/") {
+                    self.scratch.precomposed_prefix.clear();
+                    precompose_append(prefix, &mut self.scratch.precomposed_prefix);
+                    let _moved = prepend_with_headroom(
+                        &mut self.scratch.precomposed,
+                        &mut self.precomposed_head,
+                        &self.scratch.precomposed_prefix,
+                    );
+                    #[cfg(test)]
+                    PRECOMPOSE_SUFFIX_MOVE_BYTES.with(|count| count.set(count.get() + _moved));
+                    let prefix_nfc_len = self.scratch.precomposed_prefix.len();
+                    if let Some(basename_start) = self.precomposed_basename_start {
+                        self.precomposed_basename_start = Some(basename_start + prefix_nfc_len);
+                    }
+                    self.precomposed_clean_from += prefix_nfc_len;
+                    if self.folded_view == Some(ViewKind::Precomposed) {
+                        self.folded_from += prefix_nfc_len;
+                    }
+                } else {
+                    precompose_into(&self.raw[raw_rel_start..], &mut self.scratch.precomposed);
+                    self.precomposed_head = 0;
+                    self.precomposed_clean_from =
+                        trimmed_trailing_slash_len(&self.scratch.precomposed);
+                    self.precomposed_basename_start = None;
+                    if self.folded_view == Some(ViewKind::Precomposed) {
+                        self.folded_view = None;
+                    }
+                }
+                self.precomposed_origin = raw_rel_start;
+                (ViewKind::Precomposed, 0)
+            }
+        }
+    }
+
+    /// Resolves the precomposed view for a basename-only rule set without
+    /// expanding ancestor directories when `Precomposed` is already buffered.
+    fn resolve_precomposed_basename(&mut self, raw_rel_start: usize) -> (ViewKind, usize) {
+        let raw_base_start = self.basename_range(ViewKind::Raw, raw_rel_start).0;
+        if self.precomposed_state == PrecomposedState::Buffered
+            && raw_base_start >= self.precomposed_origin
+            && (raw_base_start == 0 || self.raw[raw_base_start - 1] == b'/')
+        {
+            let base_start = self.basename_range(ViewKind::Precomposed, 0).0;
+            return (ViewKind::Precomposed, base_start);
+        }
+        self.resolve_precomposed(raw_base_start)
+    }
+
+    #[cfg(test)]
+    fn folded_len(&self) -> usize {
+        self.scratch.folded.len() - self.folded_head
+    }
+
+    /// Returns `(start, end)` byte offsets into `view_bytes(view)` for the
+    /// final path component of `&view_bytes(view)[rel_start..]`, matching
+    /// [`matches_components`] for `[Component::AnyDirs, Component::Pattern(_)]`.
+    #[inline]
+    fn basename_range(&mut self, view: ViewKind, rel_start: usize) -> (usize, usize) {
+        let (bytes, cached_start) = match view {
+            ViewKind::Raw => (self.raw, &mut self.raw_basename_start),
+            ViewKind::Precomposed => (
+                &self.scratch.precomposed[self.precomposed_head..],
+                &mut self.precomposed_basename_start,
+            ),
+        };
+        let trimmed_len = trimmed_trailing_slash_len(bytes);
+        let path_basename_start = *cached_start.get_or_insert_with(|| {
+            memchr::memrchr(b'/', &bytes[..trimmed_len]).map_or(0, |pos| pos + 1)
+        });
+        let start = path_basename_start.max(rel_start).min(trimmed_len);
+        (start, trimmed_len)
+    }
+
+    /// Returns the ASCII-lowercased haystack slice for a case-insensitive
+    /// rule's `memmem::Finder` gate.
+    ///
+    /// Borrows `&view_bytes[start..end]` with zero copying whenever that slice
+    /// has no ASCII uppercase bytes. Otherwise folds only `&view_bytes[start..]`
+    /// on the first uppercase slice, and if an outer rule or ancestor later
+    /// needs `start < folded_from`, prepends strictly `&view_bytes[start..old_from]`
+    /// into front headroom so neither unreached ancestors nor root prefixes are
+    /// ever folded and total moved bytes stay amortized `O(repo_relative_len)`.
+    #[inline]
+    fn gate_haystack_ci(&mut self, view: ViewKind, start: usize, end: usize) -> &[u8] {
+        if self.folded_view == Some(view) {
+            if start >= self.folded_from {
+                let head = self.folded_head;
+                let offset = self.folded_from;
+                return &self.scratch.folded[head + (start - offset)..head + (end - offset)];
+            }
+            if end > self.folded_from {
+                let old_from = self.folded_from;
+                let prefix_len = old_from - start;
+                #[cfg(test)]
+                {
+                    CASE_FOLD_CALLS.with(|count| count.set(count.get() + 1));
+                    CASE_FOLD_BYTES.with(|count| count.set(count.get() + prefix_len));
+                }
+                let prefix = match view {
+                    ViewKind::Raw => &self.raw[start..old_from],
+                    ViewKind::Precomposed => {
+                        &self.scratch.precomposed
+                            [self.precomposed_head + start..self.precomposed_head + old_from]
+                    }
+                };
+                let _moved =
+                    prepend_with_headroom(&mut self.scratch.folded, &mut self.folded_head, prefix);
+                #[cfg(test)]
+                FOLD_SUFFIX_MOVE_BYTES.with(|count| count.set(count.get() + _moved));
+                let head = self.folded_head;
+                self.scratch.folded[head..head + prefix_len].make_ascii_lowercase();
+                self.folded_from = start;
+                return &self.scratch.folded[head..head + (end - start)];
+            }
+        }
+        let clean_from = match view {
+            ViewKind::Raw => &mut self.raw_clean_from,
+            ViewKind::Precomposed => &mut self.precomposed_clean_from,
+        };
+        if start >= *clean_from {
+            return &self.view_bytes(view)[start..end];
+        }
+        let bytes = match view {
+            ViewKind::Raw => self.raw,
+            ViewKind::Precomposed => &self.scratch.precomposed[self.precomposed_head..],
+        };
+        let scan_end = end.min(*clean_from);
+        let has_upper = bytes[start..scan_end].iter().any(u8::is_ascii_uppercase);
+        if !has_upper {
+            if end >= *clean_from {
+                *clean_from = start;
+            }
+            return &bytes[start..end];
+        }
+        #[cfg(test)]
+        {
+            CASE_FOLD_CALLS.with(|count| count.set(count.get() + 1));
+            CASE_FOLD_BYTES.with(|count| count.set(count.get() + (bytes.len() - start)));
+        }
+        self.scratch.folded.clear();
+        self.folded_head = 0;
+        match view {
+            ViewKind::Raw => self.scratch.folded.extend_from_slice(&self.raw[start..]),
+            ViewKind::Precomposed => self
+                .scratch
+                .folded
+                .extend_from_slice(&self.scratch.precomposed[self.precomposed_head + start..]),
+        }
+        self.scratch.folded.make_ascii_lowercase();
+        self.folded_view = Some(view);
+        self.folded_from = start;
+        &self.scratch.folded[..end - start]
+    }
+}
+
+#[inline]
+fn is_ascii_tracked(bytes: &[u8]) -> bool {
+    #[cfg(test)]
+    NFC_ASCII_SCAN_BYTES.with(|count| count.set(count.get() + bytes.len()));
+    bytes.is_ascii()
+}
+
+/// Prepends `prefix` in front of `&buf[*head..]` using amortized geometric
+/// headroom so repeated outer-ancestor prepends move `O(total_len)` suffix
+/// bytes across arbitrarily deep chains rather than `O(D * total_len)`.
+/// Returns the number of suffix bytes moved.
+fn prepend_with_headroom(buf: &mut Vec<u8>, head: &mut usize, prefix: &[u8]) -> usize {
+    let p = prefix.len();
+    if p == 0 {
+        return 0;
+    }
+    if *head >= p {
+        let new_head = *head - p;
+        buf[new_head..*head].copy_from_slice(prefix);
+        *head = new_head;
+        return 0;
+    }
+    let old_head = *head;
+    let old_len = buf.len();
+    let suffix_len = old_len - old_head;
+    let new_head = (suffix_len + p).max(64);
+    let new_suffix_start = new_head + p;
+    buf.resize(new_suffix_start + suffix_len, 0);
+    buf.copy_within(old_head..old_len, new_suffix_start);
+    buf[new_head..new_suffix_start].copy_from_slice(prefix);
+    *head = new_head;
+    suffix_len
+}
+
+#[inline]
+fn trimmed_trailing_slash_len(bytes: &[u8]) -> usize {
+    if bytes.ends_with(b"/") {
+        bytes.len() - 1
+    } else {
+        bytes.len()
+    }
+}
+
+/// Maps a relative-candidate offset in `raw` to the corresponding offset in
+/// `precomposed`. Component-wise NFC preserves every `/` separator 1-to-1, so
+/// counting `/` bytes inside `&raw[raw_rel_start..]` locates the exact matching
+/// separator in `precomposed`.
+fn map_rel_start_to_precomposed(raw: &[u8], raw_rel_start: usize, precomposed: &[u8]) -> usize {
+    if raw_rel_start == 0 {
+        return 0;
+    }
+    #[cfg(test)]
+    NFC_OFFSET_MAP_BYTES.with(|count| count.set(count.get() + raw.len()));
+    if raw[raw_rel_start - 1] == b'/' {
+        let trailing_slashes = memchr::memchr_iter(b'/', &raw[raw_rel_start..]).count();
+        if let Some(slash) = memchr::memrchr_iter(b'/', precomposed).nth(trailing_slashes) {
+            return slash + 1;
+        }
+    }
+    debug_assert!(raw[..raw_rel_start].is_ascii());
+    raw_rel_start
+}
+
+#[inline]
+fn last_component_offset(candidate: &[u8]) -> (usize, usize) {
+    let trimmed_len = trimmed_trailing_slash_len(candidate);
+    let start = memchr::memrchr(b'/', &candidate[..trimmed_len]).map_or(0, |pos| pos + 1);
+    (start, trimmed_len)
+}
+
 /// The rules of one ignore file, in file order.
 ///
 /// Rules are scanned one by one, where the engine this replaced compiled all of
@@ -183,7 +651,17 @@ pub(crate) struct RuleSet {
     /// components again. Checking the prefix also prevents a mismatched
     /// spelling from slicing mid-filename.
     root_prefix: Vec<u8>,
+    case_insensitive: bool,
     precompose_unicode: bool,
+    /// Whether at least one rule in `rules` can match non-directory entries
+    /// (`!rule.directory_only`). Lets file candidates skip directory-only rule
+    /// sets (such as a root `.gitignore` containing only `node_modules/`) in
+    /// one branch before prefix stripping or normalization.
+    has_file_rules: bool,
+    /// Whether every rule in `rules` is `RuleKind::Basename`, meaning this set
+    /// depends strictly on the final path component and never needs ancestor
+    /// directories to be NFC-precomposed.
+    only_basename_rules: bool,
     rules: Vec<Rule>,
     compiled_units: usize,
     retained_bytes: usize,
@@ -206,38 +684,527 @@ impl RuleSet {
     ///
     /// `path` is the candidate's whole path in glob bytes; the part below this
     /// set's directory is what the rules see. Last-match-wins is Git's rule, so
-    /// the scan runs backwards and stops at the first hit. The ordinary
-    /// byte-exact path is allocation-free; enabled precomposition allocates
-    /// only when a valid UTF-8 component actually changes under NFC.
+    /// the scan runs backwards and stops at the first hit.
+    #[cfg(any(test, feature = "unstable-test-hooks"))]
     pub(crate) fn matched(&self, path: &[u8], is_dir: bool) -> Option<bool> {
-        let candidate = if self.root_prefix.is_empty() {
-            path
-        } else {
-            let rest = path.strip_prefix(self.root_prefix.as_slice())?;
-            if self.root_prefix.ends_with(b"/") {
-                let extra = rest.iter().take_while(|&&byte| byte == b'/').count();
-                &rest[extra..]
-            } else {
-                rest
-            }
-        };
-        if self.precompose_unicode {
-            let candidate = normalize_candidate(candidate);
-            self.matched_candidate(&candidate, is_dir)
-        } else {
-            // The ordinary byte-exact path neither allocates nor constructs a
-            // normalization iterator.
-            self.matched_candidate(candidate, is_dir)
-        }
+        let mut scratch = IgnoreMatchScratch::default();
+        let mut ctx = EntryMatchContext::new(path, &mut scratch);
+        self.matched_in_context(&mut ctx, is_dir)
     }
 
-    fn matched_candidate(&self, candidate: &[u8], is_dir: bool) -> Option<bool> {
-        self.rules
-            .iter()
-            .rev()
-            .find(|rule| rule.matches(candidate, is_dir))
-            .map(|rule| !rule.negated)
+    /// Evaluates this rule set using a shared [`EntryMatchContext`] hoisted
+    /// across an ancestor chain, reusing precomposed and case-folded buffers
+    /// without per-node allocation or redundant normalization.
+    pub(crate) fn matched_in_context(
+        &self,
+        ctx: &mut EntryMatchContext<'_>,
+        is_dir: bool,
+    ) -> Option<bool> {
+        if !is_dir && !self.has_file_rules {
+            return None;
+        }
+        let raw_rel_start = self.strip_root_prefix_offset(ctx.raw)?;
+        if raw_rel_start == ctx.raw.len() {
+            return None;
+        }
+        let (view, rel_start) = if self.precompose_unicode {
+            if self.only_basename_rules {
+                ctx.resolve_precomposed_basename(raw_rel_start)
+            } else {
+                ctx.resolve_precomposed(raw_rel_start)
+            }
+        } else {
+            (ViewKind::Raw, raw_rel_start)
+        };
+        let end = ctx.view_bytes(view).len();
+        if rel_start == end {
+            return None;
+        }
+
+        if !self.case_insensitive {
+            let candidate = &ctx.view_bytes(view)[rel_start..end];
+            if candidate.len() <= 256 {
+                // Typical paths: SIMD `memmem::Finder` over `candidate` is
+                // faster than extracting a short basename (< 16 B SIMD width),
+                // so run `rule.gate` directly before dispatching on `rule.kind`.
+                let mut basename_offset: Option<(usize, usize)> = None;
+                let mut is_nested: Option<bool> = None;
+                let mut component_counter = ComponentCounter::default();
+                for rule in self.rules.iter().rev() {
+                    if rule.directory_only && !is_dir {
+                        continue;
+                    }
+                    if let Some(gate) = rule.gate.as_ref()
+                        && gate.find(candidate).is_none()
+                    {
+                        continue;
+                    }
+                    let matched = match rule.kind {
+                        RuleKind::RootSingle => {
+                            let nested = *is_nested.get_or_insert_with(|| {
+                                let trimmed = trimmed_trailing_slash_len(candidate);
+                                memchr::memchr(b'/', &candidate[..trimmed]).is_some()
+                            });
+                            if nested {
+                                false
+                            } else {
+                                let trimmed = trimmed_trailing_slash_len(candidate);
+                                match rule.components.as_slice() {
+                                    [Component::AnyOne] => true,
+                                    [Component::Pattern(pattern)] => {
+                                        pattern.is_match_glob_path(&candidate[..trimmed])
+                                    }
+                                    components => matches_components(components, candidate),
+                                }
+                            }
+                        }
+                        RuleKind::Basename => {
+                            let (base_start, base_end) = *basename_offset
+                                .get_or_insert_with(|| last_component_offset(candidate));
+                            match rule.components.as_slice() {
+                                [_, Component::AnyOne] => true,
+                                [_, Component::Pattern(pattern)] => {
+                                    pattern.is_match_glob_path(&candidate[base_start..base_end])
+                                }
+                                components => matches_components(components, candidate),
+                            }
+                        }
+                        RuleKind::FixedDepthBasename => {
+                            let (depth, fixed_byte_len) = unpack_pair_meta(rule.fast_meta);
+                            if !component_counter.matches_exact(candidate, depth) {
+                                false
+                            } else {
+                                let (base_start, base_end) = *basename_offset
+                                    .get_or_insert_with(|| last_component_offset(candidate));
+                                let base = &candidate[base_start..base_end];
+                                if let Some(expected_len) = fixed_byte_len
+                                    && base.len() != expected_len
+                                {
+                                    false
+                                } else {
+                                    match rule.components.last() {
+                                        Some(Component::AnyOne) => true,
+                                        Some(Component::Pattern(pattern)) => {
+                                            pattern.is_match_glob_path(base)
+                                        }
+                                        _ => matches_components(&rule.components, candidate),
+                                    }
+                                }
+                            }
+                        }
+                        RuleKind::AnchoredFastPrefix | RuleKind::Multi => {
+                            matches_components(&rule.components, candidate)
+                        }
+                    };
+                    if matched {
+                        return Some(!rule.negated);
+                    }
+                }
+                return None;
+            }
+            let mut basename_offset: Option<(usize, usize)> = None;
+            let mut is_nested: Option<bool> = None;
+            let mut component_counter = ComponentCounter::default();
+            for rule in self.rules.iter().rev() {
+                if rule.directory_only && !is_dir {
+                    continue;
+                }
+                match rule.kind {
+                    RuleKind::RootSingle => {
+                        let nested = *is_nested.get_or_insert_with(|| {
+                            let trimmed = trimmed_trailing_slash_len(candidate);
+                            memchr::memchr(b'/', &candidate[..trimmed]).is_some()
+                        });
+                        if nested {
+                            continue;
+                        }
+                        let trimmed = trimmed_trailing_slash_len(candidate);
+                        if let Some(expected_len) = rule.fast_meta
+                            && trimmed != expected_len.get() as usize
+                        {
+                            continue;
+                        }
+                        if let Some(gate) = rule.gate.as_ref()
+                            && gate.find(candidate).is_none()
+                        {
+                            continue;
+                        }
+                        let matched = match rule.components.as_slice() {
+                            [Component::AnyOne] => true,
+                            [Component::Pattern(pattern)] => {
+                                pattern.is_match_glob_path(&candidate[..trimmed])
+                            }
+                            components => matches_components(components, candidate),
+                        };
+                        if matched {
+                            return Some(!rule.negated);
+                        }
+                    }
+                    RuleKind::Basename => {
+                        let (base_start, base_end) = *basename_offset
+                            .get_or_insert_with(|| last_component_offset(candidate));
+                        let base = &candidate[base_start..base_end];
+                        if let Some(expected_len) = rule.fast_meta
+                            && base.len() != expected_len.get() as usize
+                        {
+                            continue;
+                        }
+                        if let Some(gate) = rule.gate.as_ref()
+                            && gate.find(base).is_none()
+                        {
+                            continue;
+                        }
+                        let matched = match rule.components.as_slice() {
+                            [_, Component::AnyOne] => true,
+                            [_, Component::Pattern(pattern)] => pattern.is_match_glob_path(base),
+                            components => matches_components(components, candidate),
+                        };
+                        if matched {
+                            return Some(!rule.negated);
+                        }
+                    }
+                    RuleKind::FixedDepthBasename => {
+                        let (depth, fixed_byte_len) = unpack_pair_meta(rule.fast_meta);
+                        if !component_counter.matches_exact(candidate, depth) {
+                            continue;
+                        }
+                        let (base_start, base_end) = *basename_offset
+                            .get_or_insert_with(|| last_component_offset(candidate));
+                        let base = &candidate[base_start..base_end];
+                        if let Some(expected_len) = fixed_byte_len
+                            && base.len() != expected_len
+                        {
+                            continue;
+                        }
+                        if let Some(gate) = rule.gate.as_ref()
+                            && gate.find(base).is_none()
+                        {
+                            continue;
+                        }
+                        let matched = match rule.components.last() {
+                            Some(Component::AnyOne) => true,
+                            Some(Component::Pattern(pattern)) => pattern.is_match_glob_path(base),
+                            _ => matches_components(&rule.components, candidate),
+                        };
+                        if matched {
+                            return Some(!rule.negated);
+                        }
+                    }
+                    RuleKind::AnchoredFastPrefix => {
+                        let (_, fixed_depth) = unpack_pair_meta(rule.fast_meta);
+                        if self.rules.len() > 1
+                            && let Some(expected_depth) = fixed_depth
+                            && !component_counter.matches_exact(candidate, expected_depth)
+                        {
+                            continue;
+                        }
+                        if let Some(gate) = rule.gate.as_ref()
+                            && gate.find(candidate).is_none()
+                        {
+                            continue;
+                        }
+                        if matches_components(&rule.components, candidate) {
+                            return Some(!rule.negated);
+                        }
+                    }
+                    RuleKind::Multi => {
+                        if let Some(expected_depth) = rule.fast_meta
+                            && !component_counter
+                                .matches_exact(candidate, expected_depth.get() as usize)
+                        {
+                            continue;
+                        }
+                        if let Some(gate) = rule.gate.as_ref()
+                            && gate.find(candidate).is_none()
+                        {
+                            continue;
+                        }
+                        if matches_components(&rule.components, candidate) {
+                            return Some(!rule.negated);
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+
+        // Case-insensitive path: reject impossible `RootSingle` rules on
+        // nested candidates, reject fixed-width `RootSingle`/`Basename` rules
+        // by byte length before folding/gating, match all leading non-universal
+        // anchored components of `AnchoredFastPrefix` rules before folding or
+        // gating any tail, reject fixed-depth `Multi`/`AnchoredFastPrefix`
+        // rules by component count before folding/gating, and gate `Basename`
+        // rules strictly on the basename slice (skipping folding completely
+        // when `!rule.gate_needs_fold`).
+        let mut basename: Option<(usize, usize)> = None;
+        let mut is_nested: Option<bool> = None;
+        let mut first_split: Option<(usize, usize)> = None;
+        let mut component_counter = ComponentCounter::default();
+        for rule in self.rules.iter().rev() {
+            if rule.directory_only && !is_dir {
+                continue;
+            }
+            match rule.kind {
+                RuleKind::RootSingle => {
+                    let nested = *is_nested.get_or_insert_with(|| {
+                        let cand = &ctx.view_bytes(view)[rel_start..end];
+                        let trimmed = trimmed_trailing_slash_len(cand);
+                        memchr::memchr(b'/', &cand[..trimmed]).is_some()
+                    });
+                    if nested {
+                        continue;
+                    }
+                    let trimmed_end = rel_start
+                        + trimmed_trailing_slash_len(&ctx.view_bytes(view)[rel_start..end]);
+                    if let Some(expected_len) = rule.fast_meta
+                        && trimmed_end - rel_start != expected_len.get() as usize
+                    {
+                        continue;
+                    }
+                    if let Some(gate) = rule.gate.as_ref() {
+                        let haystack = if rule.gate_needs_fold {
+                            ctx.gate_haystack_ci(view, rel_start, trimmed_end)
+                        } else {
+                            &ctx.view_bytes(view)[rel_start..trimmed_end]
+                        };
+                        if gate.find(haystack).is_none() {
+                            continue;
+                        }
+                    }
+                    let bytes = ctx.view_bytes(view);
+                    let matched = match rule.components.as_slice() {
+                        [Component::AnyOne] => true,
+                        [Component::Pattern(pattern)] => {
+                            pattern.is_match_glob_path(&bytes[rel_start..trimmed_end])
+                        }
+                        components => matches_components(components, &bytes[rel_start..end]),
+                    };
+                    if matched {
+                        return Some(!rule.negated);
+                    }
+                }
+                RuleKind::AnchoredFastPrefix => {
+                    let (leading, fixed_depth) = unpack_pair_meta(rule.fast_meta);
+                    if self.rules.len() > 1
+                        && let Some(expected_depth) = fixed_depth
+                        && !component_counter
+                            .matches_exact(&ctx.view_bytes(view)[rel_start..end], expected_depth)
+                    {
+                        continue;
+                    }
+                    let (first_head_end, first_tail_start) =
+                        *first_split.get_or_insert_with(|| {
+                            let cand = &ctx.view_bytes(view)[rel_start..end];
+                            match memchr::memchr(b'/', cand) {
+                                Some(sep) => (rel_start + sep, rel_start + sep + 1),
+                                None => (end, end),
+                            }
+                        });
+                    let bytes = ctx.view_bytes(view);
+                    match rule.components.first() {
+                        Some(Component::AnyOne) => {}
+                        Some(Component::Pattern(first_pat)) => {
+                            if !first_pat.is_match_glob_path(&bytes[rel_start..first_head_end]) {
+                                continue;
+                            }
+                        }
+                        _ => {
+                            if matches_components(&rule.components, &bytes[rel_start..end]) {
+                                return Some(!rule.negated);
+                            }
+                            continue;
+                        }
+                    }
+                    let mut cursor = first_tail_start;
+                    let mut prefix_matched = true;
+                    for comp in &rule.components[1..leading] {
+                        let rem = &bytes[cursor..end];
+                        if rem.is_empty() {
+                            prefix_matched = false;
+                            break;
+                        }
+                        let (head_end, next_cursor) = match memchr::memchr(b'/', rem) {
+                            Some(sep) => (cursor + sep, cursor + sep + 1),
+                            None => (end, end),
+                        };
+                        match comp {
+                            Component::AnyOne => {}
+                            Component::Pattern(pat) => {
+                                if !pat.is_match_glob_path(&bytes[cursor..head_end]) {
+                                    prefix_matched = false;
+                                    break;
+                                }
+                            }
+                            _ => {
+                                prefix_matched = false;
+                                break;
+                            }
+                        }
+                        cursor = next_cursor;
+                    }
+                    if !prefix_matched {
+                        continue;
+                    }
+                    let rest = &rule.components[leading..];
+                    let matched = if rest.is_empty() {
+                        cursor == end
+                    } else {
+                        // `rule.gate` was derived strictly from
+                        // `parts[leading..]`, so search only `cursor..end`.
+                        let gate_ok = rule.gate.as_ref().is_none_or(|gate| {
+                            let haystack = if rule.gate_needs_fold {
+                                ctx.gate_haystack_ci(view, cursor, end)
+                            } else {
+                                &ctx.view_bytes(view)[cursor..end]
+                            };
+                            gate.find(haystack).is_some()
+                        });
+                        gate_ok && matches_components(rest, &ctx.view_bytes(view)[cursor..end])
+                    };
+                    if matched {
+                        return Some(!rule.negated);
+                    }
+                }
+                RuleKind::Basename => {
+                    let (base_start, base_end) =
+                        *basename.get_or_insert_with(|| ctx.basename_range(view, rel_start));
+                    if let Some(expected_len) = rule.fast_meta
+                        && base_end - base_start != expected_len.get() as usize
+                    {
+                        continue;
+                    }
+                    if let Some(gate) = rule.gate.as_ref() {
+                        let haystack = if rule.gate_needs_fold {
+                            ctx.gate_haystack_ci(view, base_start, base_end)
+                        } else {
+                            &ctx.view_bytes(view)[base_start..base_end]
+                        };
+                        if gate.find(haystack).is_none() {
+                            continue;
+                        }
+                    }
+                    let bytes = ctx.view_bytes(view);
+                    let base = &bytes[base_start..base_end];
+                    #[cfg(debug_assertions)]
+                    {
+                        let candidate = &bytes[rel_start..end];
+                        let (s, e) = last_component_offset(candidate);
+                        debug_assert_eq!(base, &candidate[s..e]);
+                    }
+                    let matched = match rule.components.as_slice() {
+                        [_, Component::AnyOne] => true,
+                        [_, Component::Pattern(pattern)] => pattern.is_match_glob_path(base),
+                        components => matches_components(components, &bytes[rel_start..end]),
+                    };
+                    if matched {
+                        return Some(!rule.negated);
+                    }
+                }
+                RuleKind::FixedDepthBasename => {
+                    let (depth, fixed_byte_len) = unpack_pair_meta(rule.fast_meta);
+                    if !component_counter
+                        .matches_exact(&ctx.view_bytes(view)[rel_start..end], depth)
+                    {
+                        continue;
+                    }
+                    let (base_start, base_end) =
+                        *basename.get_or_insert_with(|| ctx.basename_range(view, rel_start));
+                    if let Some(expected_len) = fixed_byte_len
+                        && base_end - base_start != expected_len
+                    {
+                        continue;
+                    }
+                    if let Some(gate) = rule.gate.as_ref() {
+                        let haystack = if rule.gate_needs_fold {
+                            ctx.gate_haystack_ci(view, base_start, base_end)
+                        } else {
+                            &ctx.view_bytes(view)[base_start..base_end]
+                        };
+                        if gate.find(haystack).is_none() {
+                            continue;
+                        }
+                    }
+                    let bytes = ctx.view_bytes(view);
+                    let base = &bytes[base_start..base_end];
+                    let matched = match rule.components.last() {
+                        Some(Component::AnyOne) => true,
+                        Some(Component::Pattern(pattern)) => pattern.is_match_glob_path(base),
+                        _ => matches_components(&rule.components, &bytes[rel_start..end]),
+                    };
+                    if matched {
+                        return Some(!rule.negated);
+                    }
+                }
+                RuleKind::Multi => {
+                    if let Some(expected_depth) = rule.fast_meta
+                        && !component_counter.matches_exact(
+                            &ctx.view_bytes(view)[rel_start..end],
+                            expected_depth.get() as usize,
+                        )
+                    {
+                        continue;
+                    }
+                    if let Some(gate) = rule.gate.as_ref() {
+                        let haystack = if rule.gate_needs_fold {
+                            ctx.gate_haystack_ci(view, rel_start, end)
+                        } else {
+                            &ctx.view_bytes(view)[rel_start..end]
+                        };
+                        if gate.find(haystack).is_none() {
+                            continue;
+                        }
+                    }
+                    if matches_components(&rule.components, &ctx.view_bytes(view)[rel_start..end]) {
+                        return Some(!rule.negated);
+                    }
+                }
+            }
+        }
+        None
     }
+
+    #[inline]
+    fn strip_root_prefix_offset(&self, path: &[u8]) -> Option<usize> {
+        if self.root_prefix.is_empty() {
+            return Some(0);
+        }
+        let rest = path.strip_prefix(self.root_prefix.as_slice())?;
+        let mut offset = self.root_prefix.len();
+        if self.root_prefix.ends_with(b"/") && rest.first() == Some(&b'/') {
+            offset += rest.iter().take_while(|&&byte| byte == b'/').count();
+        }
+        Some(offset)
+    }
+}
+
+/// Fast-path shape of a compiled [`Rule`], stored inline so rule scanning
+/// selects the gate haystack without chasing `Rule::components` on gate misses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleKind {
+    /// `[Component::AnyDirs, Component::AnyOne | Component::Pattern(_)]` —
+    /// matches only the final path component. `Rule::fast_meta` holds the exact
+    /// byte length when the pattern is fixed-width (contains no `*`).
+    Basename,
+    /// `[Component::AnyOne | Component::Pattern(_)]` — matches only a
+    /// single-component candidate. `Rule::fast_meta` holds the exact byte
+    /// length when the pattern is fixed-width (contains no `*`).
+    RootSingle,
+    /// Multi-component anchored rule starting with `Rule::fast_meta` (`>= 1`)
+    /// leading single-component elements (`Component::AnyOne | Component::Pattern(_)`,
+    /// before any `AnyDirs` / `AnyDirsNonEmpty`) that include at least one
+    /// non-universal `Component::Pattern` (excluding `FixedDepthBasename`,
+    /// whose leading `k - 1` components are all `Component::AnyOne`). Checks
+    /// all leading components before folding or gating any tail.
+    AnchoredFastPrefix,
+    /// Fixed-depth rule `[AnyOne, ..., AnyOne, AnyOne | Pattern]` (`k >= 2`
+    /// components where all `k - 1` leading components are universal `*`). Once
+    /// `ComponentCounter::matches_exact(candidate, k)` succeeds, all leading
+    /// `*` components match unconditionally and only the final component
+    /// (`basename`) needs matching (zero folding on simple tail patterns).
+    FixedDepthBasename,
+    /// General multi-component rule gated first and walked by
+    /// [`matches_components`].
+    Multi,
 }
 
 #[derive(Debug)]
@@ -251,15 +1218,98 @@ struct Rule {
     /// spells out `node_modules` or `.tmp7` cannot match a candidate that does
     /// not contain those bytes, so one substring search rejects it before the
     /// component walk starts. The searcher is built once with the rule, not per
-    /// candidate, because building one costs more than running it. Rules made
-    /// only of wildcards have no gate and are walked as before.
+    /// candidate, because building one costs more than running it. When
+    /// `core.ignoreCase = true`, the gate literal is stored ASCII-lowercased
+    /// and tested against either the raw candidate (when it has no ASCII
+    /// uppercase bytes or `!gate_needs_fold`) or a per-entry folded buffer.
+    /// Rules made only of wildcards have no gate and are walked as before.
     gate: Option<memmem::Finder<'static>>,
+    /// Inline fast-path discriminator for `components`.
+    kind: RuleKind,
     /// `!` prefix: a match re-includes instead of ignoring.
     negated: bool,
     /// Trailing `/`: the rule matches directories only.
     directory_only: bool,
+    /// Whether `gate` contains at least one ASCII letter under
+    /// `case_insensitive = true`. When `false`, the gate literal is case-neutral
+    /// (e.g. `"2026"`, `"---123---"`) and searches raw/precomposed bytes
+    /// directly without ASCII folding.
+    gate_needs_fold: bool,
+    /// Kind-specific inline fast-path metadata (fits in existing 4-byte tail
+    /// padding of `Rule`, keeping `size_of::<Rule>()` unchanged):
+    /// - `Basename` / `RootSingle`: exact matched byte length when fixed-width.
+    /// - `AnchoredFastPrefix`: low 16 bits = count of leading anchored
+    ///   single-component elements (`1..=u16::MAX`, containing at least one
+    ///   `Component::Pattern`), high 16 bits = exact fixed component count (`0`
+    ///   when variable depth).
+    /// - `FixedDepthBasename`: low 16 bits = exact component count `k`
+    ///   (`2..=u16::MAX`), high 16 bits = exact byte length of the final
+    ///   component (`0` when variable width).
+    /// - `Multi`: exact fixed component count when every component is
+    ///   `Component::AnyOne | Component::Pattern(_)` (no
+    ///   `AnyDirs`/`AnyDirsNonEmpty`), else `None`.
+    fast_meta: Option<NonZeroU32>,
 }
 
+#[inline]
+fn pack_pair_meta(primary: usize, secondary: Option<usize>) -> Option<NonZeroU32> {
+    let primary = u16::try_from(primary).ok().filter(|&n| n > 0)?;
+    let secondary = secondary
+        .and_then(|value| u16::try_from(value).ok())
+        .unwrap_or(0);
+    NonZeroU32::new((u32::from(secondary) << 16) | u32::from(primary))
+}
+
+#[inline]
+fn unpack_pair_meta(meta: Option<NonZeroU32>) -> (usize, Option<usize>) {
+    let raw = meta.map_or(1, NonZeroU32::get);
+    let primary = (raw & 0xFFFF) as usize;
+    let secondary = (raw >> 16) as usize;
+    (primary, (secondary != 0).then_some(secondary))
+}
+
+/// Progressive, resumable component-count checker for a non-empty `candidate`.
+///
+/// Advances through `&candidate[..trimmed_trailing_slash_len(candidate)]` only
+/// until either `components > needed` or the entire slice has been scanned, so
+/// shallow fixed-depth rules stop at the `needed`-th `/` on multi-kilobyte deep
+/// paths while mixed-depth rule sets resume without ever rescanning a byte.
+struct ComponentCounter {
+    components: usize,
+    scanned: usize,
+}
+
+impl Default for ComponentCounter {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            components: 1,
+            scanned: 0,
+        }
+    }
+}
+
+impl ComponentCounter {
+    #[inline]
+    fn matches_exact(&mut self, candidate: &[u8], needed: usize) -> bool {
+        let trimmed = &candidate[..trimmed_trailing_slash_len(candidate)];
+        while self.components <= needed && self.scanned < trimmed.len() {
+            match memchr::memchr(b'/', &trimmed[self.scanned..]) {
+                Some(pos) => {
+                    self.components += 1;
+                    self.scanned += pos + 1;
+                }
+                None => {
+                    self.scanned = trimmed.len();
+                    break;
+                }
+            }
+        }
+        self.components == needed && self.scanned == trimmed.len()
+    }
+}
+
+#[cfg(test)]
 impl Rule {
     fn matches(&self, candidate: &[u8], is_dir: bool) -> bool {
         if self.directory_only && !is_dir {
@@ -281,6 +1331,9 @@ enum Component {
     /// Git lets that star run cross separators, but its zero-width shortcut
     /// applies only when the following slash is unescaped.
     AnyDirsNonEmpty,
+    /// A single universal `*` component: matches exactly one path component
+    /// unconditionally without invoking `ferralk-glob`.
+    AnyOne,
     /// One component, matched by ferralk-glob.
     Pattern(Pattern),
 }
@@ -298,6 +1351,9 @@ enum Component {
 /// parsed, not here: `abc/**` gains a component that requires something below
 /// `abc`.
 fn matches_components(components: &[Component], candidate: &[u8]) -> bool {
+    #[cfg(test)]
+    FULL_COMPONENT_MATCHES.with(|count| count.set(count.get() + 1));
+
     let mut index = 0;
     let mut rest = candidate;
     // Where the last `**` began: its position in the rule, and what it had not
@@ -313,6 +1369,12 @@ fn matches_components(components: &[Component], candidate: &[u8]) -> bool {
         if let Some(Component::AnyDirsNonEmpty) = components.get(index) {
             let (_, tail) = split_component(rest);
             run = Some((index, tail));
+            index += 1;
+            rest = tail;
+            continue;
+        }
+        if let Some(Component::AnyOne) = components.get(index) {
+            let (_, tail) = split_component(rest);
             index += 1;
             rest = tail;
             continue;
@@ -346,9 +1408,66 @@ fn matches_components(components: &[Component], candidate: &[u8]) -> bool {
         .all(|component| matches!(component, Component::AnyDirs))
 }
 
+/// Returns `true` when `pattern` has at most one unescaped `*` run and no
+/// unescaped `?` or `[` metacharacters (`literal`, `*literal`, `literal*`, or
+/// `literal*literal`). `ferralk-glob` matches these directly without scanning
+/// the full component, so a `memmem::Finder` gate under `case_insensitive = true`
+/// adds redundant folding/scanning overhead.
+fn is_simple_single_component_pattern(pattern: &[u8]) -> bool {
+    let mut stars = 0_usize;
+    let mut index = 0;
+    while index < pattern.len() {
+        match pattern[index] {
+            b'\\' => index += 2,
+            b'?' | b'[' => return false,
+            b'*' => {
+                stars += 1;
+                if stars > 1 {
+                    return false;
+                }
+                while index < pattern.len() && pattern[index] == b'*' {
+                    index += 1;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    true
+}
+
+/// Returns the exact byte length matched by a normalized single component when
+/// it contains no unescaped `*` wildcard, or `None` if its matched length is
+/// variable or overflows `u32`.
+fn fixed_component_byte_len(pattern: &[u8]) -> Option<NonZeroU32> {
+    let mut byte_len = 0_usize;
+    let mut index = 0;
+    while index < pattern.len() {
+        match pattern[index] {
+            b'*' => return None,
+            b'\\' => {
+                if index + 1 >= pattern.len() {
+                    return None;
+                }
+                byte_len += 1;
+                index += 2;
+            }
+            b'[' => {
+                let (_, next) = parse_class_ir_members(pattern, index)?;
+                byte_len += 1;
+                index = next;
+            }
+            _ => {
+                byte_len += 1;
+                index += 1;
+            }
+        }
+    }
+    u32::try_from(byte_len).ok().and_then(NonZeroU32::new)
+}
+
 /// Splits off the first path component; the tail is empty at the last one.
 fn split_component(candidate: &[u8]) -> (&[u8], &[u8]) {
-    match candidate.iter().position(|byte| *byte == b'/') {
+    match memchr::memchr(b'/', candidate) {
         Some(separator) => (&candidate[..separator], &candidate[separator + 1..]),
         None => (candidate, &[]),
     }
@@ -466,9 +1585,17 @@ impl RuleSetBuilder {
     }
 
     pub(crate) fn build(self) -> RuleSet {
+        let has_file_rules = self.rules.iter().any(|rule| !rule.directory_only);
+        let only_basename_rules = self
+            .rules
+            .iter()
+            .all(|rule| rule.kind == RuleKind::Basename);
         RuleSet {
             root_prefix: self.root_prefix,
+            case_insensitive: self.case_insensitive,
             precompose_unicode: self.precompose_unicode,
+            has_file_rules,
+            only_basename_rules,
             rules: self.rules,
             compiled_units: self.compiled_units,
             retained_bytes: self.retained_bytes,
@@ -532,7 +1659,18 @@ impl MemoryTestRuleSet {
 #[doc(hidden)]
 #[cfg(feature = "unstable-test-hooks")]
 pub fn build_ignore_rule_set_for_memory_test(contents: &[u8]) -> MemoryTestRuleSet {
-    let mut builder = RuleSetBuilder::new(Path::new("/fixture"), false, false);
+    build_ignore_rule_set_for_memory_test_with_options(contents, false)
+}
+
+/// Development-only hook for `pattern_memory_regression` with explicit
+/// `case_insensitive` configuration.
+#[doc(hidden)]
+#[cfg(feature = "unstable-test-hooks")]
+pub fn build_ignore_rule_set_for_memory_test_with_options(
+    contents: &[u8],
+    case_insensitive: bool,
+) -> MemoryTestRuleSet {
+    let mut builder = RuleSetBuilder::new(Path::new("/fixture"), case_insensitive, false);
     for line in contents.split(|&byte| byte == b'\n') {
         if line.is_empty() {
             continue;
@@ -564,7 +1702,19 @@ pub fn build_ignore_rule_set_for_memory_test(contents: &[u8]) -> MemoryTestRuleS
 pub fn fuzz_rule_bytes(line: &[u8], candidate: &[u8], is_dir: bool) -> Option<bool> {
     let mut builder = RuleSetBuilder::new(Path::new(""), false, false);
     builder.add_line(line);
-    builder.build().matched(candidate, is_dir)
+    let rules = builder.build();
+    // Production walks normalize `\` to `/` before calling `RuleSet` on
+    // Windows; mirror that boundary here so `Component::AnyOne` sees the same
+    // slash-separated candidate form as real walks.
+    #[cfg(windows)]
+    if candidate.contains(&b'\\') {
+        let normalized: Vec<u8> = candidate
+            .iter()
+            .map(|&byte| if byte == b'\\' { b'/' } else { byte })
+            .collect();
+        return rules.matched(&normalized, is_dir);
+    }
+    rules.matched(candidate, is_dir)
 }
 
 struct ParsedRuleLine {
@@ -763,16 +1913,10 @@ fn parse_rule_with_options(
     };
 
     let mut normalized = Vec::with_capacity(parts.len());
-    let mut gate: Option<Vec<u8>> = None;
     for part in &parts {
         let Some(bytes) = normalize_bracket_classes(part.bytes, case_insensitive) else {
             return Ok(ParsedRuleLine::discarded(parsed_parts));
         };
-        if let Some(literal) = longest_literal_run(&bytes)
-            && gate.as_ref().is_none_or(|best| best.len() < literal.len())
-        {
-            gate = Some(literal);
-        }
         normalized.push(NormalizedPart {
             bytes,
             escaped_separator_after: part.escaped_separator_after,
@@ -807,16 +1951,135 @@ fn parse_rule_with_options(
     }
     debug_assert_eq!(components.len(), cost.compiled_count);
 
+    let leading_pattern_count = if anchored {
+        components
+            .iter()
+            .take_while(|comp| matches!(comp, Component::AnyOne | Component::Pattern(_)))
+            .count()
+    } else {
+        0
+    };
+    let leading_has_non_universal = components[..leading_pattern_count]
+        .iter()
+        .any(|comp| matches!(comp, Component::Pattern(_)));
+    let leading_anchored_count = if leading_has_non_universal {
+        leading_pattern_count
+    } else {
+        0
+    };
+
+    let fixed_depth = components
+        .iter()
+        .all(|comp| matches!(comp, Component::AnyOne | Component::Pattern(_)))
+        .then_some(components.len());
+
+    let is_fixed_depth_basename = fixed_depth.is_some_and(|depth| depth >= 2)
+        && components[..components.len() - 1]
+            .iter()
+            .all(|comp| matches!(comp, Component::AnyOne));
+
+    let (kind, fast_meta) = match components.as_slice() {
+        [
+            Component::AnyDirs,
+            Component::AnyOne | Component::Pattern(_),
+        ] => (
+            RuleKind::Basename,
+            normalized
+                .last()
+                .and_then(|part| fixed_component_byte_len(&part.bytes)),
+        ),
+        [Component::AnyOne | Component::Pattern(_)] => (
+            RuleKind::RootSingle,
+            normalized
+                .last()
+                .and_then(|part| fixed_component_byte_len(&part.bytes)),
+        ),
+        [Component::AnyOne | Component::Pattern(_), _, ..]
+            if is_fixed_depth_basename
+                && let Some(meta) = pack_pair_meta(
+                    components.len(),
+                    normalized
+                        .last()
+                        .and_then(|part| fixed_component_byte_len(&part.bytes))
+                        .map(|len| len.get() as usize),
+                ) =>
+        {
+            (RuleKind::FixedDepthBasename, Some(meta))
+        }
+        [Component::AnyOne | Component::Pattern(_), _, ..]
+            if let Some(meta) = pack_pair_meta(leading_anchored_count, fixed_depth) =>
+        {
+            (RuleKind::AnchoredFastPrefix, Some(meta))
+        }
+        _ => (
+            RuleKind::Multi,
+            fixed_depth
+                .and_then(|depth| u32::try_from(depth).ok())
+                .and_then(NonZeroU32::new),
+        ),
+    };
+
+    let gate_part_start = if case_insensitive {
+        match kind {
+            RuleKind::AnchoredFastPrefix => {
+                // Under `case_insensitive = true`, `AnchoredFastPrefix` matches
+                // all `leading_anchored_count` leading components directly;
+                // skip compiling any gate when all components are covered, and
+                // otherwise derive the gate strictly from `normalized[K..]`.
+                if leading_anchored_count == components.len() {
+                    None
+                } else {
+                    Some(leading_anchored_count)
+                }
+            }
+            RuleKind::Basename | RuleKind::RootSingle | RuleKind::FixedDepthBasename
+                if normalized
+                    .last()
+                    .is_some_and(|part| is_simple_single_component_pattern(&part.bytes)) =>
+            {
+                // Simple single-component patterns (`literal`, `*literal`,
+                // `literal*`, `literal*literal`) already use direct fast paths
+                // in `ferralk-glob`, so a case-insensitive `memmem::Finder`
+                // gate would only add redundant folding/scanning overhead.
+                None
+            }
+            RuleKind::FixedDepthBasename => Some(normalized.len() - 1),
+            _ => Some(0),
+        }
+    } else {
+        Some(0)
+    };
+    let gate_literal = gate_part_start.and_then(|start| {
+        let mut best: Option<Vec<u8>> = None;
+        for part in &normalized[start..] {
+            if let Some(literal) = longest_literal_run(&part.bytes)
+                && best.as_ref().is_none_or(|cur| cur.len() < literal.len())
+            {
+                best = Some(literal);
+            }
+        }
+        best
+    });
+    let gate_needs_fold = case_insensitive
+        && gate_literal
+            .as_ref()
+            .is_some_and(|literal| literal.iter().any(u8::is_ascii_alphabetic));
+    let gate = gate_literal.map(|mut literal| {
+        if gate_needs_fold {
+            literal.make_ascii_lowercase();
+        }
+        memmem::Finder::new(&literal).into_owned()
+    });
+
     Ok(ParsedRuleLine {
         rule: Some(Rule {
             components,
-            // This prefilter is byte-exact, so it would reject a case-folded
-            // candidate before the rule matcher can evaluate it.
-            gate: (!case_insensitive)
-                .then(|| gate.map(|literal| memmem::Finder::new(&literal).into_owned()))
-                .flatten(),
+            gate,
+            kind,
             negated,
             directory_only,
+            gate_needs_fold,
+            fast_meta,
         }),
         parsed_parts,
         compiled_units: cost.compiled_count,
@@ -1756,6 +3019,15 @@ std::thread_local! {
     static POSIX_CLOSER_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PATTERN_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PART_VEC_ALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static PRECOMPOSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static PRECOMPOSE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static PRECOMPOSE_SUFFIX_MOVE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static NFC_ASCII_SCAN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static NFC_OFFSET_MAP_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static CASE_FOLD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static CASE_FOLD_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static FOLD_SUFFIX_MOVE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FULL_COMPONENT_MATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Finds the first `]` at or after `from` in `haystack`, caching the last
@@ -1913,6 +3185,9 @@ fn compile_component(
         } else {
             Component::AnyDirs
         });
+    }
+    if part == b"*" {
+        return Some(Component::AnyOne);
     }
     let collapsed = collapse_partial_stars(part);
     #[cfg(test)]
@@ -2263,43 +3538,110 @@ fn push_range_endpoint(result: &mut Vec<u8>, byte: u8) {
     result.push(byte);
 }
 
-/// Adapts the candidate that one ignore file sees, not its raw pattern. Mac
-/// Git precomposes filesystem names this way before matching; each path
+/// Adapts the candidate path that ignore files see, not their raw patterns.
+/// Mac Git precomposes filesystem names this way before matching; each path
 /// component is independent so an invalid UTF-8 component cannot make a valid
 /// sibling component lose its NFC conversion.
+///
+/// Returns `false` when `candidate` is already unchanged under component-wise
+/// NFC (including all pure-ASCII inputs, with zero UTF-8 or NFC table work),
+/// and `true` after writing the precomposed bytes into `out`.
 #[cfg(target_os = "macos")]
-fn normalize_candidate(candidate: &[u8]) -> Cow<'_, [u8]> {
+fn precompose_into(candidate: &[u8], out: &mut Vec<u8>) -> bool {
     use unicode_normalization::{UnicodeNormalization, is_nfc};
 
-    if candidate
-        .split(|byte| *byte == b'/')
-        .all(|component| std::str::from_utf8(component).map_or(true, is_nfc))
+    if candidate.is_ascii() {
+        return false;
+    }
+    #[cfg(test)]
     {
-        return Cow::Borrowed(candidate);
+        PRECOMPOSE_CALLS.with(|count| count.set(count.get() + 1));
+        PRECOMPOSE_BYTES.with(|count| count.set(count.get() + candidate.len()));
     }
 
-    let mut normalized = Vec::with_capacity(candidate.len());
-    for (index, component) in candidate.split(|byte| *byte == b'/').enumerate() {
+    let already_nfc = candidate.split(|&byte| byte == b'/').all(|component| {
+        component.is_ascii() || std::str::from_utf8(component).map_or(true, is_nfc)
+    });
+    if already_nfc {
+        return false;
+    }
+
+    out.clear();
+    out.reserve(candidate.len());
+    for (index, component) in candidate.split(|&byte| byte == b'/').enumerate() {
         if index != 0 {
-            normalized.push(b'/');
+            out.push(b'/');
+        }
+        if component.is_ascii() {
+            out.extend_from_slice(component);
+            continue;
         }
         match std::str::from_utf8(component) {
             Ok(component) => {
                 for character in component.nfc() {
                     let mut encoded = [0; 4];
-                    normalized.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+                    out.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
                 }
             }
-            Err(_) => normalized.extend_from_slice(component),
+            Err(_) => out.extend_from_slice(component),
         }
     }
-    Cow::Owned(normalized)
+    true
+}
+
+/// Appends the component-wise NFC form of `prefix` to `out` (used in Stage 2
+/// before `rotate_right` so an already-precomposed leaf suffix is never
+/// re-normalized).
+#[cfg(target_os = "macos")]
+fn precompose_append(prefix: &[u8], out: &mut Vec<u8>) {
+    use unicode_normalization::{UnicodeNormalization, is_nfc};
+
+    if prefix.is_ascii() {
+        out.extend_from_slice(prefix);
+        return;
+    }
+    #[cfg(test)]
+    {
+        PRECOMPOSE_CALLS.with(|count| count.set(count.get() + 1));
+        PRECOMPOSE_BYTES.with(|count| count.set(count.get() + prefix.len()));
+    }
+
+    let already_nfc = prefix.split(|&byte| byte == b'/').all(|component| {
+        component.is_ascii() || std::str::from_utf8(component).map_or(true, is_nfc)
+    });
+    if already_nfc {
+        out.extend_from_slice(prefix);
+        return;
+    }
+
+    out.reserve(prefix.len());
+    for (index, component) in prefix.split(|&byte| byte == b'/').enumerate() {
+        if index != 0 {
+            out.push(b'/');
+        }
+        if component.is_ascii() {
+            out.extend_from_slice(component);
+            continue;
+        }
+        match std::str::from_utf8(component) {
+            Ok(component) => {
+                for character in component.nfc() {
+                    let mut encoded = [0; 4];
+                    out.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+                }
+            }
+            Err(_) => out.extend_from_slice(component),
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn normalize_candidate(candidate: &[u8]) -> Cow<'_, [u8]> {
-    Cow::Borrowed(candidate)
+fn precompose_into(_candidate: &[u8], _out: &mut Vec<u8>) -> bool {
+    false
 }
+
+#[cfg(not(target_os = "macos"))]
+fn precompose_append(_prefix: &[u8], _out: &mut Vec<u8>) {}
 
 /// Drops the trailing spaces Git drops: those that are not escaped.
 fn strip_trailing_spaces(line: &[u8]) -> &[u8] {
@@ -2439,10 +3781,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        ComponentBudgetExceeded, LineBudgets, MAX_IGNORE_FILE_COMPONENTS,
-        MAX_IGNORE_FILE_RETAINED_BYTES, RuleSetBuilder, fuzz_rule, fuzz_rule_bytes,
-        longest_literal_run, normalize_bracket_classes, parse_rule, split_rule_components,
-        without_dot_components,
+        ComponentBudgetExceeded, EntryMatchContext, IgnoreMatchScratch, LineBudgets,
+        MAX_IGNORE_FILE_COMPONENTS, MAX_IGNORE_FILE_RETAINED_BYTES, RuleSetBuilder, fuzz_rule,
+        fuzz_rule_bytes, longest_literal_run, matches_components, normalize_bracket_classes,
+        parse_rule, split_rule_components, without_dot_components,
     };
 
     #[test]
@@ -4318,10 +5660,12 @@ mod tests {
             let theirs = theirs.build().expect("the previous engine builds");
 
             let rounds = 200;
+            let mut scratch = IgnoreMatchScratch::default();
             let start = Instant::now();
             for _ in 0..rounds {
                 for path in &candidates {
-                    std::hint::black_box(ours.matched(path, false));
+                    let mut ctx = EntryMatchContext::new(path, &mut scratch);
+                    std::hint::black_box(ours.matched_in_context(&mut ctx, false));
                 }
             }
             let ours_ns = start.elapsed().as_nanos() as f64 / (rounds * candidates.len()) as f64;
@@ -4341,5 +5685,950 @@ mod tests {
                 "{count:>3} rules: ours {ours_ns:6.1} ns/verdict   previous engine {theirs_ns:6.1} ns/verdict"
             );
         }
+    }
+
+    #[test]
+    fn case_insensitive_literal_gates_stay_active_and_fold_lazily() {
+        let mut root_builder = RuleSetBuilder::new(Path::new("/Users/Sebastian/repo"), true, false);
+        for line in [
+            // Complex wildcard and multi-component rules keep active
+            // `memmem::Finder` gates under `core.ignoreCase = true`.
+            "*Cache-*.BIN*",
+            "[0-9]*Report*.LOG",
+            "a?b-marker",
+            "**/vendor/Bundle-*.JS",
+            "src/**/generated-42",
+            // Simple single-component fast-path rules and 2-component
+            // `AnchoredLiteralFirst` skip redundant/unused gates under
+            // `core.ignoreCase = true`.
+            "*.LOG",
+            "Node_Modules/",
+            "/build-out",
+            "dist/Bundle-*.JS",
+            "*",
+        ] {
+            root_builder.add_line(line);
+        }
+        let root_rules = root_builder.build();
+        assert_eq!(root_rules.rules.len(), 10);
+        for rule in &root_rules.rules[..5] {
+            assert!(
+                rule.gate.is_some(),
+                "expected active memmem gate for complex/multi rule under case_insensitive=true"
+            );
+        }
+        for rule in &root_rules.rules[5..] {
+            assert!(
+                rule.gate.is_none(),
+                "expected no redundant/unused memmem gate for simple/2-comp literal-first rule under case_insensitive=true"
+            );
+        }
+
+        // Check accuracy across ASCII lowercase, uppercase, case-neutral, and
+        // non-ASCII bytes (Git's WM_CASEFOLD is strictly ASCII-only).
+        let mut builder = RuleSetBuilder::new(Path::new("/Users/Sebastian/repo"), true, false);
+        for line in [
+            "*.LOG",
+            "Node_Modules/",
+            "---123---",
+            "ÄPFEL.txt",
+            "!Keep.LOG",
+            "dist/Bundle-*.JS",
+            "**/vendor/Bundle-*.JS",
+        ] {
+            builder.add_line(line);
+        }
+        let rules = builder.build();
+        assert_eq!(
+            rules.matched(b"/Users/Sebastian/repo/a/b/app.log", false),
+            Some(true)
+        );
+        assert_eq!(
+            rules.matched(b"/Users/Sebastian/repo/a/b/APP.LOG", false),
+            Some(true)
+        );
+        assert_eq!(
+            rules.matched(b"/Users/Sebastian/repo/a/b/keep.log", false),
+            Some(false)
+        );
+        assert_eq!(
+            rules.matched(b"/Users/Sebastian/repo/a/b/KEEP.Log", false),
+            Some(false)
+        );
+        assert_eq!(
+            rules.matched(b"/Users/Sebastian/repo/a/node_modules", true),
+            Some(true)
+        );
+        assert_eq!(
+            rules.matched(b"/Users/Sebastian/repo/a/NODE_MODULES", false),
+            None
+        );
+        assert_eq!(
+            rules.matched(b"/Users/Sebastian/repo/a/---123---", false),
+            Some(true)
+        );
+        assert_eq!(
+            rules.matched("/Users/Sebastian/repo/a/Äpfel.TXT".as_bytes(), false),
+            Some(true)
+        );
+        // Non-ASCII `ä` does NOT match `Ä` under Git's ASCII-only WM_CASEFOLD.
+        assert_eq!(
+            rules.matched("/Users/Sebastian/repo/a/äpfel.TXT".as_bytes(), false),
+            None
+        );
+        assert_eq!(
+            rules.matched(b"/Users/Sebastian/repo/DIST/bundle-1.js", false),
+            Some(true)
+        );
+        assert_eq!(
+            rules.matched(b"/Users/Sebastian/repo/a/b/plain.rs", false),
+            None
+        );
+
+        // Multi-level nested rule sets sharing one `EntryMatchContext`:
+        // 1) Pure lowercase relative candidate under an uppercase walk root
+        //    never folds.
+        // 2) Uppercase relative candidate folds AT MOST ONCE across all 3 sets
+        //    and performs zero allocations once scratch is warm.
+        let mut mid_builder =
+            RuleSetBuilder::new(Path::new("/Users/Sebastian/repo/apps"), true, false);
+        mid_builder.add_line("*.TMP");
+        mid_builder.add_line("sub/Cache-*.BIN");
+        let mid_rules = mid_builder.build();
+
+        let mut leaf_builder =
+            RuleSetBuilder::new(Path::new("/Users/Sebastian/repo/apps/sub"), true, false);
+        leaf_builder.add_line("*.BAK");
+        let leaf_rules = leaf_builder.build();
+
+        let mut scratch = IgnoreMatchScratch::default();
+        // Warm scratch once with an uppercase path.
+        {
+            let mut ctx = EntryMatchContext::new(
+                b"/Users/Sebastian/repo/apps/sub/WarmUpper.TXT",
+                &mut scratch,
+            );
+            assert_eq!(leaf_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(mid_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(rules.matched_in_context(&mut ctx, false), None);
+        }
+
+        // Lowercase relative path under uppercase walk root: 0 folds, 0 allocs.
+        super::CASE_FOLD_CALLS.with(|c| c.set(0));
+        let lower_allocs = allocation_counter::measure(|| {
+            let mut ctx =
+                EntryMatchContext::new(b"/Users/Sebastian/repo/apps/sub/plain.rs", &mut scratch);
+            assert_eq!(leaf_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(mid_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(rules.matched_in_context(&mut ctx, false), None);
+        });
+        assert_eq!(
+            super::CASE_FOLD_CALLS.with(|c| c.get()),
+            0,
+            "lowercase relative path must not case-fold even under uppercase walk root"
+        );
+        assert_eq!(lower_allocs.count_total, 0);
+
+        // Uppercase relative path across all 3 levels: each level folds only
+        // its own needed suffix (never the `/Users/Sebastian/repo/` root
+        // prefix), with zero allocations once scratch is warm.
+        super::CASE_FOLD_CALLS.with(|c| c.set(0));
+        let upper_allocs = allocation_counter::measure(|| {
+            let mut ctx = EntryMatchContext::new(
+                b"/Users/Sebastian/repo/apps/sub/PlainUpper.RS",
+                &mut scratch,
+            );
+            assert_eq!(leaf_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(mid_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(
+                ctx.folded_len(),
+                "apps/sub/PlainUpper.RS".len(),
+                "Multi rules must fold only from rel_start, never the walk root prefix"
+            );
+        });
+        assert!(super::CASE_FOLD_CALLS.with(|c| c.get()) <= 3);
+        assert_eq!(upper_allocs.count_total, 0);
+
+        // Long 800-byte root prefix + unanchored multi-component rule
+        // `**/obj/*.o` on `src/T.c`: must fold ONLY the 7 bytes of `src/T.c`,
+        // never the 800-byte root prefix.
+        let long_root = format!("/{}", "LongRootDir/".repeat(67));
+        let mut long_builder = RuleSetBuilder::new(Path::new(&long_root), true, false);
+        long_builder.add_line("**/obj/*.o");
+        let long_rules = long_builder.build();
+        let long_candidate = format!("{long_root}src/T.c");
+        {
+            let mut ctx = EntryMatchContext::new(long_candidate.as_bytes(), &mut scratch);
+            assert_eq!(long_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(
+                ctx.folded_len(),
+                "src/T.c".len(),
+                "UnanchoredMulti rules under an 800-byte root must fold only the 7-byte relative candidate"
+            );
+        }
+
+        // Depth-128 path with 100 anchored `RootSingle` rules (`/build-N`)
+        // must skip every rule BEFORE folding or gating (`CASE_FOLD_CALLS == 0`).
+        let mut anchored_builder = RuleSetBuilder::new(Path::new("/repo"), true, false);
+        for index in 0..100 {
+            anchored_builder.add_line(format!("/build-{index}"));
+        }
+        let anchored_rules = anchored_builder.build();
+        let deep_upper_path = format!("/repo/{}UPPER.TXT", "Dir/".repeat(128));
+        let deep_lower_base = format!("/repo/{}plain.rs", "Dir/".repeat(128));
+        super::CASE_FOLD_CALLS.with(|c| c.set(0));
+        let anchored_allocs = allocation_counter::measure(|| {
+            let mut ctx = EntryMatchContext::new(deep_upper_path.as_bytes(), &mut scratch);
+            assert_eq!(anchored_rules.matched_in_context(&mut ctx, false), None);
+        });
+        assert_eq!(
+            super::CASE_FOLD_CALLS.with(|c| c.get()),
+            0,
+            "RootSingle rules on nested paths must reject before folding"
+        );
+        assert_eq!(anchored_allocs.count_total, 0);
+
+        // Depth-128 path (`src/.../UPPER.rs`) with anchored multi-component
+        // rules (`target/*.txt`, `target/**/*.txt`) must reject on the first
+        // component BEFORE folding or gating (`CASE_FOLD_CALLS == 0`), while
+        // still matching valid `TARGET/file.TXT` and `TARGET/a/b/file.TXT`.
+        let mut anchored_multi_builder = RuleSetBuilder::new(Path::new("/repo"), true, false);
+        for index in 0..100 {
+            anchored_multi_builder.add_line(format!("target-{index}/*.txt"));
+        }
+        anchored_multi_builder.add_line("target/*.txt");
+        anchored_multi_builder.add_line("target/deep/**/*.bin");
+        let anchored_multi_rules = anchored_multi_builder.build();
+        let deep_src_path = format!("/repo/{}UPPER.rs", "src/".repeat(128));
+        super::CASE_FOLD_CALLS.with(|c| c.set(0));
+        let anchored_multi_allocs = allocation_counter::measure(|| {
+            let mut ctx = EntryMatchContext::new(deep_src_path.as_bytes(), &mut scratch);
+            assert_eq!(
+                anchored_multi_rules.matched_in_context(&mut ctx, false),
+                None
+            );
+        });
+        assert_eq!(
+            super::CASE_FOLD_CALLS.with(|c| c.get()),
+            0,
+            "AnchoredMulti rules must reject mismatched first components before folding"
+        );
+        assert_eq!(anchored_multi_allocs.count_total, 0);
+        assert_eq!(
+            anchored_multi_rules.matched(b"/repo/TARGET/file.TXT", false),
+            Some(true)
+        );
+        assert_eq!(
+            anchored_multi_rules.matched(b"/repo/TARGET/sub/file.TXT", false),
+            None
+        );
+        assert_eq!(anchored_multi_rules.matched(b"/repo/TARGET", false), None);
+        assert_eq!(
+            anchored_multi_rules.matched(b"/repo/TARGET/DEEP/a/b/out.BIN", false),
+            Some(true)
+        );
+
+        // Fixed-depth rules with universal leading `*` components
+        // (`*/generated-42.txt`, `*/generated-42.?xt`) use
+        // `RuleKind::FixedDepthBasename` (matching the basename directly
+        // without folding simple tails, and gating complex tails strictly on
+        // the basename); anchored rules whose leading non-`AnyDirs` prefix has
+        // at least one non-universal component (`target/*.txt`,
+        // `build-*/artifact-*.o`, `pkg[0-9]/specificname-42.log`,
+        // `src/x/generated*`, `*/build-0/**/generated-output.txt`,
+        // `*/a*/generated-42.txt`, `lit\*/file.txt`) use
+        // `RuleKind::AnchoredFastPrefix`; unanchored multi-component rules
+        // (`**/vendor/Bundle-*.JS`) stay `RuleKind::Multi` with an active
+        // folded gate.
+        let mut kind_builder = RuleSetBuilder::new(Path::new("/repo"), true, false);
+        kind_builder.add_line("*/generated-42.txt");
+        kind_builder.add_line("target/*.txt");
+        kind_builder.add_line("build-*/artifact-*.o");
+        kind_builder.add_line("pkg[0-9]/specificname-42.log");
+        kind_builder.add_line("src/x/generated*");
+        kind_builder.add_line(r"lit\*/file.txt");
+        kind_builder.add_line("*/build-0/**/generated-output.txt");
+        kind_builder.add_line("*/generated-42.?xt");
+        kind_builder.add_line("**/vendor/Bundle-*.JS");
+        let kind_rules = kind_builder.build();
+        assert_eq!(
+            kind_rules.rules[0].kind,
+            super::RuleKind::FixedDepthBasename
+        );
+        assert_eq!(
+            super::unpack_pair_meta(kind_rules.rules[0].fast_meta),
+            (2, Some(16))
+        );
+        assert!(kind_rules.rules[0].gate.is_none());
+        assert_eq!(
+            kind_rules.rules[1].kind,
+            super::RuleKind::AnchoredFastPrefix
+        );
+        assert_eq!(
+            kind_rules.rules[2].kind,
+            super::RuleKind::AnchoredFastPrefix
+        );
+        assert_eq!(
+            kind_rules.rules[3].kind,
+            super::RuleKind::AnchoredFastPrefix
+        );
+        assert_eq!(
+            kind_rules.rules[4].kind,
+            super::RuleKind::AnchoredFastPrefix
+        );
+        assert_eq!(
+            super::unpack_pair_meta(kind_rules.rules[4].fast_meta),
+            (3, Some(3))
+        );
+        assert!(kind_rules.rules[4].gate.is_none());
+        assert_eq!(
+            kind_rules.rules[5].kind,
+            super::RuleKind::AnchoredFastPrefix
+        );
+        assert_eq!(
+            kind_rules.rules[6].kind,
+            super::RuleKind::AnchoredFastPrefix
+        );
+        assert_eq!(
+            super::unpack_pair_meta(kind_rules.rules[6].fast_meta),
+            (2, None)
+        );
+        assert!(kind_rules.rules[6].gate.is_some());
+        assert_eq!(
+            kind_rules.rules[7].kind,
+            super::RuleKind::FixedDepthBasename
+        );
+        assert_eq!(
+            super::unpack_pair_meta(kind_rules.rules[7].fast_meta),
+            (2, Some(16))
+        );
+        assert!(
+            kind_rules.rules[7].gate.is_some() && kind_rules.rules[7].gate_needs_fold,
+            "corpus rule `*/generated-42.?xt` must keep an active folded gate under case_insensitive=true"
+        );
+        assert_eq!(kind_rules.rules[8].kind, super::RuleKind::Multi);
+        assert!(kind_rules.rules[8].gate.is_some() && kind_rules.rules[8].gate_needs_fold);
+        super::CASE_FOLD_CALLS.with(|c| c.set(0));
+        {
+            let mut b_only = RuleSetBuilder::new(Path::new("/repo"), true, false);
+            b_only.add_line("*/generated-42.txt");
+            let r_only = b_only.build();
+            let mut ctx = EntryMatchContext::new(b"/repo/any/GENERATED-42.TXT", &mut scratch);
+            assert_eq!(r_only.matched_in_context(&mut ctx, false), Some(true));
+        }
+        {
+            let mut b_star_lead = RuleSetBuilder::new(Path::new("/repo"), true, false);
+            b_star_lead.add_line("*/build-0/**/generated-output.txt");
+            let r_star_lead = b_star_lead.build();
+            let mut ctx = EntryMatchContext::new(deep_src_path.as_bytes(), &mut scratch);
+            assert_eq!(r_star_lead.matched_in_context(&mut ctx, false), None);
+        }
+        assert_eq!(
+            super::CASE_FOLD_CALLS.with(|c| c.get()),
+            0,
+            "FixedDepthBasename (`*/generated-42.txt`) and leading-star AnchoredFastPrefix (`*/build-0/**/...`) must not fold"
+        );
+        assert_eq!(
+            kind_rules.matched(b"/repo/any/BUILD-0/x/y/GENERATED-OUTPUT.TXT", false),
+            Some(true)
+        );
+        assert_eq!(
+            kind_rules.matched(b"/repo/any/GENERATED-43.TXT", false),
+            None
+        );
+        assert_eq!(
+            kind_rules.matched(b"/repo/any/sub/GENERATED-42.TXT", false),
+            None
+        );
+        assert_eq!(
+            kind_rules.matched(b"/repo/any/GENERATED-42.TXT", false),
+            Some(true)
+        );
+        assert_eq!(
+            kind_rules.matched(b"/repo/BUILD-OUT/ARTIFACT-1.O", false),
+            Some(true)
+        );
+        assert_eq!(
+            kind_rules.matched(b"/repo/PKG3/SPECIFICNAME-42.LOG", false),
+            Some(true)
+        );
+        assert_eq!(
+            kind_rules.matched(b"/repo/SRC/X/GENERATED-1", false),
+            Some(true)
+        );
+        assert_eq!(
+            kind_rules.matched(b"/repo/SRC/X/sub/GENERATED-1", false),
+            None
+        );
+        assert_eq!(
+            kind_rules.matched(b"/repo/LIT*/FILE.TXT", false),
+            Some(true)
+        );
+        let mut multi_prefix_builder = RuleSetBuilder::new(Path::new("/repo"), true, false);
+        multi_prefix_builder.add_line("pkg[0-9]/specificname-42.log");
+        multi_prefix_builder.add_line("src/x/generated*");
+        let multi_prefix_rules = multi_prefix_builder.build();
+        super::CASE_FOLD_CALLS.with(|c| c.set(0));
+        {
+            let mut ctx = EntryMatchContext::new(deep_src_path.as_bytes(), &mut scratch);
+            assert_eq!(multi_prefix_rules.matched_in_context(&mut ctx, false), None);
+        }
+        assert_eq!(
+            super::CASE_FOLD_CALLS.with(|c| c.get()),
+            0,
+            "AnchoredFastPrefix (`pkg[0-9]/...`, `src/x/generated*`) must reject mismatched prefix components without folding"
+        );
+
+        // Case-neutral gate (`**/2026/*.o`): needle `"2026"` has no ASCII
+        // letters so `gate_needs_fold == false` and uppercase candidates never
+        // fold.
+        let mut neutral_builder = RuleSetBuilder::new(Path::new("/repo"), true, false);
+        neutral_builder.add_line("**/2026/*.o");
+        let neutral_rules = neutral_builder.build();
+        assert!(neutral_rules.rules[0].gate.is_some());
+        assert!(!neutral_rules.rules[0].gate_needs_fold);
+        super::CASE_FOLD_CALLS.with(|c| c.set(0));
+        {
+            let mut ctx = EntryMatchContext::new(b"/repo/UPPER/FILE.TXT", &mut scratch);
+            assert_eq!(neutral_rules.matched_in_context(&mut ctx, false), None);
+        }
+        {
+            let mut ctx = EntryMatchContext::new(b"/repo/UPPER/2026/FILE.O", &mut scratch);
+            assert_eq!(
+                neutral_rules.matched_in_context(&mut ctx, false),
+                Some(true)
+            );
+        }
+        assert_eq!(
+            super::CASE_FOLD_CALLS.with(|c| c.get()),
+            0,
+            "case-neutral gate (`**/2026/*.o`) must never fold uppercase paths"
+        );
+
+        // Fixed-width `RootSingle` / `Basename` rules (`/artifact-???.tar`,
+        // `img-[0-9][0-9].png`): reject wrong-length uppercase candidates by
+        // byte length BEFORE folding or gating (`CASE_FOLD_CALLS == 0`).
+        let mut fixed_builder = RuleSetBuilder::new(Path::new("/repo"), true, false);
+        fixed_builder.add_line("/artifact-???.tar");
+        fixed_builder.add_line("img-[0-9][0-9].png");
+        let fixed_rules = fixed_builder.build();
+        assert_eq!(
+            fixed_rules.rules[0].fast_meta,
+            std::num::NonZeroU32::new(16)
+        );
+        assert_eq!(
+            fixed_rules.rules[1].fast_meta,
+            std::num::NonZeroU32::new(10)
+        );
+        super::CASE_FOLD_CALLS.with(|c| c.set(0));
+        {
+            let mut ctx =
+                EntryMatchContext::new(b"/repo/LONG_UPPERCASE_FILENAME_32_BYTES", &mut scratch);
+            assert_eq!(fixed_rules.matched_in_context(&mut ctx, false), None);
+        }
+        assert_eq!(
+            super::CASE_FOLD_CALLS.with(|c| c.get()),
+            0,
+            "fixed-width RootSingle/Basename rules must reject wrong-length uppercase candidates before folding"
+        );
+        assert_eq!(
+            fixed_rules.matched(b"/repo/ARTIFACT-123.TAR", false),
+            Some(true)
+        );
+        assert_eq!(
+            fixed_rules.matched(b"/repo/sub/IMG-42.PNG", false),
+            Some(true)
+        );
+
+        // Fixed-depth `Multi` (`*/output0`) and `AnchoredFastPrefix`
+        // (`src/*/output0`) rules must reject wrong-depth uppercase candidates
+        // by component count BEFORE folding or gating (`CASE_FOLD_CALLS == 0`).
+        let mut depth_builder = RuleSetBuilder::new(Path::new("/repo"), true, false);
+        for index in 0..20 {
+            depth_builder.add_line(format!("*/output{index}"));
+            depth_builder.add_line(format!("src/*/output{index}"));
+        }
+        let depth_rules = depth_builder.build();
+        assert_eq!(
+            depth_rules.rules[0].kind,
+            super::RuleKind::FixedDepthBasename
+        );
+        assert_eq!(
+            super::unpack_pair_meta(depth_rules.rules[0].fast_meta),
+            (2, Some(7))
+        );
+        assert_eq!(
+            depth_rules.rules[1].kind,
+            super::RuleKind::AnchoredFastPrefix
+        );
+        assert_eq!(
+            super::unpack_pair_meta(depth_rules.rules[1].fast_meta),
+            (3, Some(3))
+        );
+        super::CASE_FOLD_CALLS.with(|c| c.set(0));
+        {
+            let mut ctx = EntryMatchContext::new(deep_src_path.as_bytes(), &mut scratch);
+            assert_eq!(depth_rules.matched_in_context(&mut ctx, false), None);
+        }
+        assert_eq!(
+            super::CASE_FOLD_CALLS.with(|c| c.get()),
+            0,
+            "fixed-depth Multi and AnchoredFastPrefix rules must reject wrong-depth candidates before folding"
+        );
+        assert_eq!(depth_rules.matched(b"/repo/any/OUTPUT0", false), Some(true));
+        assert_eq!(
+            depth_rules.matched(b"/repo/SRC/mid/OUTPUT0", false),
+            Some(true)
+        );
+        assert_eq!(depth_rules.matched(b"/repo/SRC/a/b/OUTPUT0", false), None);
+
+        // Progressive resumable component counter: mixed fixed depths (k=2,
+        // k=5, k=3) in any rule order agree with `matches_components` across
+        // depths 0, 1, 2, 3, 5, and 24 (including trailing/double slashes) and
+        // stop scanning early on long 24-level paths.
+        let mixed_orders: [&[&str]; 3] = [
+            &["*/hit.txt", "*/*/*/*/hit.txt", "*/*/hit.txt"],
+            &["*/*/*/*/hit.txt", "*/hit.txt", "*/*/hit.txt"],
+            &["*/*/hit.txt", "*/*/*/*/hit.txt", "*/hit.txt"],
+        ];
+        let seg = "z".repeat(145);
+        let deep24_path = format!("/repo/{}HIT.TXT", format!("{seg}/").repeat(23));
+        let depth_candidates: Vec<(&[u8], Option<bool>)> = vec![
+            (b"/repo/", None),
+            (b"/repo/HIT.TXT", None),
+            (b"/repo/a/HIT.TXT", Some(true)),
+            (b"/repo/a/HIT.TXT/", Some(true)),
+            (b"/repo/a/HIT.TXT//", None),
+            (b"/repo/a/b/HIT.TXT", Some(true)),
+            (b"/repo/a/b/c/HIT.TXT", None),
+            (b"/repo/a/b/c/d/HIT.TXT", Some(true)),
+            (b"/repo/a/b/c/d/e/HIT.TXT", None),
+            (deep24_path.as_bytes(), None),
+        ];
+        for ci in [false, true] {
+            for order in mixed_orders {
+                let mut b = RuleSetBuilder::new(Path::new("/repo"), ci, false);
+                for rule in order {
+                    b.add_line(rule);
+                }
+                let set = b.build();
+                for &(cand, expected_ci) in &depth_candidates {
+                    let expected = if ci { expected_ci } else { None };
+                    assert_eq!(
+                        set.matched(cand, false),
+                        expected,
+                        "mixed-depth mismatch (ci={ci}, order={order:?}) on {:?}",
+                        String::from_utf8_lossy(cand)
+                    );
+                }
+                // Lowercase exact hits match under both `ci=false` and `ci=true`.
+                assert_eq!(set.matched(b"/repo/a/hit.txt", false), Some(true));
+                assert_eq!(set.matched(b"/repo/a/b/hit.txt", false), Some(true));
+                assert_eq!(set.matched(b"/repo/a/b/c/d/hit.txt", false), Some(true));
+                assert_eq!(set.matched(b"/repo/a/b/c/hit.txt", false), None);
+            }
+        }
+        // Verify `ComponentCounter` stops at the 2nd `/` on a 3.5 KB 24-level
+        // path when asked for `needed = 2` (never scanning all 3.5 KB).
+        let rel24 = &deep24_path.as_bytes()[b"/repo/".len()..];
+        let mut counter = super::ComponentCounter::default();
+        assert!(!counter.matches_exact(rel24, 2));
+        assert_eq!(counter.components, 3);
+        assert_eq!(counter.scanned, 2 * (145 + 1));
+        assert!(counter.scanned < 400 && rel24.len() > 3000);
+        // Resuming for `needed = 5` advances only to the 5th `/` without rescanning.
+        assert!(!counter.matches_exact(rel24, 5));
+        assert_eq!(counter.components, 6);
+        assert_eq!(counter.scanned, 5 * (145 + 1));
+        // Asking for `needed = 3` does not advance further.
+        assert!(!counter.matches_exact(rel24, 3));
+        assert_eq!(counter.components, 6);
+        assert_eq!(counter.scanned, 5 * (145 + 1));
+
+        // 2-component `AnchoredLiteralFirst` (`generated/*.o`) must NOT fold
+        // or run a redundant `components[0]` gate after `generated` matches;
+        // 3+ component `AnchoredLiteralFirst` draws its gate strictly from
+        // `parts[1..]` so uppercase `components[0]` does not trigger folding.
+        let mut tail_gate_builder = RuleSetBuilder::new(Path::new("/repo"), true, false);
+        tail_gate_builder.add_line("generated/*.o");
+        tail_gate_builder.add_line("generated_dir/**/a");
+        tail_gate_builder.add_line("src/**/generated-42");
+        let tail_gate_rules = tail_gate_builder.build();
+        assert!(tail_gate_rules.rules[0].gate.is_none());
+        assert!(tail_gate_rules.rules[1].gate.is_none());
+        assert!(tail_gate_rules.rules[2].gate.is_some());
+        super::CASE_FOLD_CALLS.with(|c| c.set(0));
+        {
+            let mut ctx = EntryMatchContext::new(b"/repo/generated/SomeFile.rs", &mut scratch);
+            assert_eq!(tail_gate_rules.matched_in_context(&mut ctx, false), None);
+        }
+        {
+            let mut ctx = EntryMatchContext::new(b"/repo/SRC/sub/main.rs", &mut scratch);
+            assert_eq!(tail_gate_rules.matched_in_context(&mut ctx, false), None);
+        }
+        assert_eq!(
+            super::CASE_FOLD_CALLS.with(|c| c.get()),
+            0,
+            "AnchoredLiteralFirst must not fold for 2-component rules or uppercase component 0 when tail is lowercase"
+        );
+        assert_eq!(
+            tail_gate_rules.matched(b"/repo/GENERATED/out.O", false),
+            Some(true)
+        );
+        assert_eq!(
+            tail_gate_rules.matched(b"/repo/SRC/sub/GENERATED-42", false),
+            Some(true)
+        );
+
+        // Under `case_insensitive = false`, long-path `AnchoredFastPrefix`
+        // rules with a wildcard prefix (`a????*/unmatched-output-{i}.tmp`) must
+        // check `rule.gate` before running `matches_components`.
+        let mut cs_wildcard_prefix = RuleSetBuilder::new(Path::new("/repo"), false, false);
+        for index in 0..16 {
+            cs_wildcard_prefix.add_line(format!("a????*/unmatched-output-{index}.tmp"));
+        }
+        let cs_wildcard_rules = cs_wildcard_prefix.build();
+        assert!(
+            cs_wildcard_rules
+                .rules
+                .iter()
+                .all(|rule| rule.kind == super::RuleKind::AnchoredFastPrefix && rule.gate.is_some())
+        );
+        let long_miss = format!("/repo/a{}/foo.rs", "x".repeat(255));
+        let long_hit = format!("/repo/a{}/unmatched-output-7.tmp", "x".repeat(255));
+        super::FULL_COMPONENT_MATCHES.with(|c| c.set(0));
+        assert_eq!(cs_wildcard_rules.matched(long_miss.as_bytes(), false), None);
+        assert_eq!(
+            super::FULL_COMPONENT_MATCHES.with(|c| c.get()),
+            0,
+            "case-sensitive AnchoredFastPrefix must reject via rule.gate before matches_components"
+        );
+        assert_eq!(
+            cs_wildcard_rules.matched(long_hit.as_bytes(), false),
+            Some(true)
+        );
+
+        // Under `case_insensitive = true`, multi-rule fixed-depth
+        // `AnchoredFastPrefix` sets (`src/*/output-{i}`) must reject
+        // wrong-depth candidates via `ComponentCounter` BEFORE matching
+        // leading components (zero folds and zero full component matches).
+        let mut ci_fixed_anchored = RuleSetBuilder::new(Path::new("/repo"), true, false);
+        for index in 0..16 {
+            ci_fixed_anchored.add_line(format!("src/*/output-{index}"));
+        }
+        let ci_fixed_anchored_rules = ci_fixed_anchored.build();
+        assert!(
+            ci_fixed_anchored_rules
+                .rules
+                .iter()
+                .all(|rule| rule.kind == super::RuleKind::AnchoredFastPrefix
+                    && super::unpack_pair_meta(rule.fast_meta) == (3, Some(3)))
+        );
+        super::CASE_FOLD_CALLS.with(|c| c.set(0));
+        super::FULL_COMPONENT_MATCHES.with(|c| c.set(0));
+        assert_eq!(
+            ci_fixed_anchored_rules.matched(b"/repo/src/a/b/c/d/file.txt", false),
+            None
+        );
+        assert_eq!(
+            super::CASE_FOLD_CALLS.with(|c| c.get()),
+            0,
+            "fixed-depth AnchoredFastPrefix must not fold on wrong-depth miss"
+        );
+        assert_eq!(
+            super::FULL_COMPONENT_MATCHES.with(|c| c.get()),
+            0,
+            "fixed-depth AnchoredFastPrefix must reject wrong-depth candidates before component matching"
+        );
+        assert_eq!(
+            ci_fixed_anchored_rules.matched(b"/repo/SRC/sub/OUTPUT-7", false),
+            Some(true)
+        );
+        assert_eq!(
+            ci_fixed_anchored_rules.matched(b"/repo/SRC/sub/OUTPUT-7/extra", false),
+            None
+        );
+
+        // `fuzz_rule_bytes` preserves platform separator semantics for
+        // `Component::AnyOne` (`/*`): `\` is a separator on Windows and a
+        // normal filename byte on Unix.
+        #[cfg(windows)]
+        assert_eq!(super::fuzz_rule_bytes(b"/*", br"dir\file", false), None);
+        #[cfg(not(windows))]
+        assert_eq!(
+            super::fuzz_rule_bytes(b"/*", br"dir\file", false),
+            Some(true)
+        );
+
+        // Depth-128 path with 100 simple `Basename` rules (`*.TMP{i}`):
+        // direct fast path in `Pattern` skips folding completely even on
+        // uppercase basenames (`CASE_FOLD_CALLS == 0`).
+        let mut simple_basename_builder = RuleSetBuilder::new(Path::new("/repo"), true, false);
+        for index in 0..100 {
+            simple_basename_builder.add_line(format!("*.TMP{index}"));
+        }
+        let simple_basename_rules = simple_basename_builder.build();
+        super::CASE_FOLD_CALLS.with(|c| c.set(0));
+        {
+            let mut ctx = EntryMatchContext::new(deep_upper_path.as_bytes(), &mut scratch);
+            assert_eq!(
+                simple_basename_rules.matched_in_context(&mut ctx, false),
+                None
+            );
+        }
+        assert_eq!(
+            super::CASE_FOLD_CALLS.with(|c| c.get()),
+            0,
+            "simple Basename rules (`*.TMPN`) must not fold or gate under case_insensitive=true"
+        );
+
+        // Depth-128 path with 100 complex wildcard `Basename` rules
+        // (`*TMP{i}*.BAK`):
+        // - uppercase ancestors + lowercase basename: 0 folds!
+        // - uppercase ancestors + uppercase basename: 1 fold of ONLY the basename!
+        let mut basename_builder = RuleSetBuilder::new(Path::new("/repo"), true, false);
+        for index in 0..100 {
+            basename_builder.add_line(format!("*TMP{index}*.BAK"));
+        }
+        let basename_rules = basename_builder.build();
+        super::CASE_FOLD_CALLS.with(|c| c.set(0));
+        {
+            let mut ctx = EntryMatchContext::new(deep_lower_base.as_bytes(), &mut scratch);
+            assert_eq!(basename_rules.matched_in_context(&mut ctx, false), None);
+        }
+        assert_eq!(
+            super::CASE_FOLD_CALLS.with(|c| c.get()),
+            0,
+            "complex Basename rules must not fold when only ancestor directories have uppercase"
+        );
+        super::CASE_FOLD_CALLS.with(|c| c.set(0));
+        {
+            let mut ctx = EntryMatchContext::new(deep_upper_path.as_bytes(), &mut scratch);
+            assert_eq!(basename_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(
+                ctx.folded_len(),
+                "UPPER.TXT".len(),
+                "complex Basename rules on deep paths must fold only the basename slice"
+            );
+        }
+        assert_eq!(super::CASE_FOLD_CALLS.with(|c| c.get()), 1);
+    }
+
+    #[test]
+    fn basename_and_single_component_fast_paths_match_full_component_walk() {
+        let rule_lines = [
+            "*.log",
+            "node_modules/",
+            "!keep.log",
+            "**/foo",
+            r"**\/foo",
+            "/foo",
+            "/*.log",
+            "*",
+            "target/*.txt",
+            "target/**",
+            "target/**/*.txt",
+            "*/output0",
+            "src/*/output0",
+            "a/b/*.log",
+        ];
+        let candidates: [&[u8]; 26] = [
+            b"",
+            b"/",
+            b"//",
+            b"foo",
+            b"foo/",
+            b"foo//",
+            b"app.log",
+            b"APP.LOG",
+            b"keep.log",
+            b"KEEP.LOG",
+            b"target",
+            b"target/",
+            b"target/app.txt",
+            b"TARGET/APP.TXT",
+            b"target/sub/app.txt",
+            b"a/output0",
+            b"a/output0/",
+            b"a/output0//",
+            b"src/mid/output0",
+            b"src/mid/output0/",
+            b"src/mid/output0//",
+            b"a/b/c/d/e/f/g/foo",
+            b"a/b/c/d/e/f/g/foo/",
+            b"a/b/c/d/e/f/g/foo//",
+            b"a/b/c/d/e/f/g/node_modules",
+            b"a/b/app.log",
+        ];
+
+        for case_insensitive in [false, true] {
+            for line in rule_lines {
+                let mut builder = RuleSetBuilder::new(Path::new(""), case_insensitive, false);
+                builder.add_line(line);
+                let set = builder.build();
+                let rule = &set.rules[0];
+                for candidate in candidates {
+                    for is_dir in [false, true] {
+                        let expected = if rule.directory_only && !is_dir {
+                            None
+                        } else if matches_components(&rule.components, candidate) {
+                            Some(!rule.negated)
+                        } else {
+                            None
+                        };
+                        let actual = set.matched(candidate, is_dir);
+                        assert_eq!(
+                            actual,
+                            expected,
+                            "fast-path mismatch for rule {line:?} (ignoreCase={case_insensitive}, is_dir={is_dir}) on {:?}",
+                            String::from_utf8_lossy(candidate)
+                        );
+                    }
+                }
+            }
+        }
+
+        // Verify basename-only and single-component anchored rules bypass
+        // `matches_components` completely on deeply nested paths.
+        let mut builder = RuleSetBuilder::new(Path::new("/repo"), true, false);
+        for line in ["*.log", "node_modules/", "!keep.log", "**/foo", "/root.txt"] {
+            builder.add_line(line);
+        }
+        let set = builder.build();
+        super::FULL_COMPONENT_MATCHES.with(|c| c.set(0));
+        for candidate in [
+            b"/repo/a/b/c/d/e/f/g/h/i/j/app.log".as_slice(),
+            b"/repo/a/b/c/d/e/f/g/h/i/j/KEEP.LOG",
+            b"/repo/a/b/c/d/e/f/g/h/i/j/node_modules",
+            b"/repo/a/b/c/d/e/f/g/h/i/j/FOO",
+            b"/repo/a/b/c/d/e/f/g/h/i/j/unmatched.rs",
+            b"/repo/ROOT.TXT",
+            b"/repo/sub/ROOT.TXT",
+        ] {
+            let _ = set.matched(candidate, false);
+            let _ = set.matched(candidate, true);
+        }
+        assert_eq!(
+            super::FULL_COMPONENT_MATCHES.with(|c| c.get()),
+            0,
+            "basename-only and anchored single-component rules must not call matches_components"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn precompose_unicode_skips_ascii_and_hoists_nfd_across_rule_sets() {
+        // Three nested rule sets with mixed `core.precomposeUnicode` settings:
+        // leaf=true, mid=false, root=true (e.g., nested repos with different config).
+        let mut root_builder = RuleSetBuilder::new(Path::new("/repo"), true, true);
+        root_builder.add_line("caf\u{e9}.txt");
+        let root_rules = root_builder.build();
+
+        let mut mid_builder = RuleSetBuilder::new(Path::new("/repo/sub"), true, false);
+        // Matches only raw NFD `na\u{0069}\u{0308}ve.raw` (NOT NFC).
+        mid_builder.add_line("nai\u{0308}ve.raw");
+        let mid_rules = mid_builder.build();
+
+        let mut leaf_builder = RuleSetBuilder::new(Path::new("/repo/sub/deep"), true, true);
+        leaf_builder.add_line("other.tmp");
+        let leaf_rules = leaf_builder.build();
+
+        let mut scratch = IgnoreMatchScratch::default();
+
+        // 1. Pure ASCII path never invokes `precompose_into`.
+        super::PRECOMPOSE_CALLS.with(|c| c.set(0));
+        {
+            let mut ctx = EntryMatchContext::new(b"/repo/sub/deep/plain_ascii.rs", &mut scratch);
+            assert_eq!(leaf_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(mid_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(root_rules.matched_in_context(&mut ctx, false), None);
+        }
+        assert_eq!(super::PRECOMPOSE_CALLS.with(|c| c.get()), 0);
+
+        // 2. Non-ASCII NFD walk root prefix with ASCII relative path also
+        //    skips `precompose_into`.
+        let mut nfd_root_builder =
+            RuleSetBuilder::new(Path::new("/tmp/cafe\u{0301}/repo"), true, true);
+        nfd_root_builder.add_line("*.log");
+        let nfd_root_rules = nfd_root_builder.build();
+        super::PRECOMPOSE_CALLS.with(|c| c.set(0));
+        {
+            let mut ctx = EntryMatchContext::new(
+                "/tmp/cafe\u{0301}/repo/src/main.rs".as_bytes(),
+                &mut scratch,
+            );
+            assert_eq!(nfd_root_rules.matched_in_context(&mut ctx, false), None);
+        }
+        assert_eq!(super::PRECOMPOSE_CALLS.with(|c| c.get()), 0);
+
+        // 3. Warm scratch on NFD + uppercase candidate, then verify:
+        //    - `precompose_into` runs AT MOST ONCE across all 3 nested sets;
+        //    - outer `precompose=true` set matches NFC + case-insensitive;
+        //    - middle `precompose=false` set still sees raw NFD bytes;
+        //    - zero heap allocations once scratch is warm.
+        let nfd_cafe = "/repo/sub/deep/Cafe\u{0301}.TXT".as_bytes();
+        let nfd_naive = "/repo/sub/deep/NAi\u{0308}ve.RAW".as_bytes();
+        {
+            let mut ctx = EntryMatchContext::new(nfd_cafe, &mut scratch);
+            assert_eq!(leaf_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(mid_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(root_rules.matched_in_context(&mut ctx, false), Some(true));
+        }
+        {
+            let mut ctx = EntryMatchContext::new(nfd_naive, &mut scratch);
+            assert_eq!(leaf_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(mid_rules.matched_in_context(&mut ctx, false), Some(true));
+        }
+
+        super::PRECOMPOSE_CALLS.with(|c| c.set(0));
+        let cafe_allocs = allocation_counter::measure(|| {
+            let mut ctx = EntryMatchContext::new(nfd_cafe, &mut scratch);
+            assert_eq!(leaf_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(mid_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(root_rules.matched_in_context(&mut ctx, false), Some(true));
+        });
+        assert_eq!(
+            super::PRECOMPOSE_CALLS.with(|c| c.get()),
+            1,
+            "NFD candidate with ASCII ancestors must precompose at most once across nested precompose_unicode sets"
+        );
+        assert_eq!(cafe_allocs.count_total, 0);
+
+        // Middle node (`precompose_unicode = false`) sees raw NFD and matches
+        // `nai\u{0308}ve.raw` case-insensitively, even after leaf node
+        // (`precompose_unicode = true`) precomposed the path into scratch.
+        super::PRECOMPOSE_CALLS.with(|c| c.set(0));
+        let mixed_allocs = allocation_counter::measure(|| {
+            let mut ctx = EntryMatchContext::new(nfd_naive, &mut scratch);
+            assert_eq!(leaf_rules.matched_in_context(&mut ctx, false), None);
+            assert_eq!(mid_rules.matched_in_context(&mut ctx, false), Some(true));
+        });
+        assert_eq!(super::PRECOMPOSE_CALLS.with(|c| c.get()), 1);
+        assert_eq!(mixed_allocs.count_total, 0);
+
+        // 4. Root prefix containing `e` + 12 combining acute accents (which
+        //    would spill `unicode_normalization`'s internal stack buffer if
+        //    normalized) must NEVER be normalized when matching 100 already-NFC
+        //    non-ASCII filenames below that root.
+        let combining_root = format!("/tmp/e{}/repo", "\u{0301}".repeat(12));
+        let mut combining_builder = RuleSetBuilder::new(Path::new(&combining_root), true, true);
+        combining_builder.add_line("*.log");
+        let combining_rules = combining_builder.build();
+        let nfc_candidates: Vec<Vec<u8>> = (0..100)
+            .map(|index| format!("{combining_root}/日本語-{index:03}.txt").into_bytes())
+            .collect();
+        let mut fresh_scratch = IgnoreMatchScratch::default();
+        let nfc_allocs = allocation_counter::measure(|| {
+            for candidate in &nfc_candidates {
+                let mut ctx = EntryMatchContext::new(candidate, &mut fresh_scratch);
+                assert_eq!(combining_rules.matched_in_context(&mut ctx, false), None);
+            }
+        });
+        assert_eq!(
+            nfc_allocs.count_total, 0,
+            "already-NFC filenames under a combining-mark root must make zero NFC allocations"
+        );
+        assert_eq!(fresh_scratch.precomposed_capacity(), 0);
     }
 }
