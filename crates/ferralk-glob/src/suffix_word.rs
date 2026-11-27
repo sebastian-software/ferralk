@@ -40,6 +40,7 @@ impl PreparedSuffix16 {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> [u8; WORD_BYTES] {
         let mut bytes = [0; WORD_BYTES];
         bytes[..8].copy_from_slice(&self.expected[0].to_ne_bytes());
