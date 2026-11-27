@@ -282,6 +282,54 @@ fn hot_paths_keep_their_allocation_floors() {
         "warm compiled matches must not allocate"
     );
 
+    let nested_scoped = Pattern::compile(r"{a,a\/.b}/**/*.{rs,ts}", PatternOptions::walker())
+        .expect("compile nested scoped suffix set pattern");
+    assert!(nested_scoped.is_match_glob_path("a/.b/x.ts"));
+    assert!(!nested_scoped.is_match_glob_path("a/.b/x.md"));
+    let nested_matcher = allocation_counter::measure(|| {
+        for _ in 0..1_000 {
+            black_box(nested_scoped.is_match_glob_path(black_box("a/.b/x.ts")));
+            black_box(nested_scoped.is_match_glob_path(black_box("a/.b/x.md")));
+        }
+    });
+    assert_eq!(
+        nested_matcher.count_total, 0,
+        "warm nested-prefix ScopedSuffixSet matches must not allocate"
+    );
+
+    let deep_prefixes: Vec<String> = (1..=24)
+        .map(|depth| {
+            if depth == 1 {
+                "a".to_string()
+            } else {
+                let mut parts = vec!["a", ".b"];
+                parts.extend(std::iter::repeat_n("a", depth - 2));
+                parts.join(r"\/")
+            }
+        })
+        .collect();
+    let deep_scoped = Pattern::compile(
+        format!("{{{}}}/**/*.{{rs,ts}}", deep_prefixes.join(",")),
+        PatternOptions::walker(),
+    )
+    .expect("compile deep nested scoped suffix set pattern");
+    let mut deep_parts = vec!["a", ".b"];
+    deep_parts.extend(std::iter::repeat_n("a", 22));
+    let deep_accept = format!("{}/x.ts", deep_parts.join("/"));
+    let deep_reject = format!("{}/x.md", deep_parts.join("/"));
+    assert!(deep_scoped.is_match_glob_path(&deep_accept));
+    assert!(!deep_scoped.is_match_glob_path(&deep_reject));
+    let deep_matcher = allocation_counter::measure(|| {
+        for _ in 0..1_000 {
+            black_box(deep_scoped.is_match_glob_path(black_box(deep_accept.as_str())));
+            black_box(deep_scoped.is_match_glob_path(black_box(deep_reject.as_str())));
+        }
+    });
+    assert_eq!(
+        deep_matcher.count_total, 0,
+        "warm deep nested-prefix ScopedSuffixSet spill matches must not allocate"
+    );
+
     let small = Fixture::plain(1);
     let large = Fixture::plain(2);
     let plain_small = count_skipping_walk(&small.root, false);

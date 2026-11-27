@@ -196,7 +196,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use memchr::{memchr, memchr2, memchr3, memmem};
+use memchr::{memchr, memchr2, memchr3, memmem, memrchr};
 
 mod set;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -2770,6 +2770,7 @@ struct SuffixSet {
 struct ScopedSuffixSet {
     prefixes: AffixTrie,
     suffixes: AffixTrie,
+    has_nested_prefixes: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2913,67 +2914,465 @@ impl ScopedSuffixSet {
         {
             return Ok(None);
         }
+        let prefix_trie = AffixTrie::new(&prefixes, false, case_insensitive, budget)?;
+        let has_nested_prefixes = prefix_trie
+            .nodes
+            .iter()
+            .any(|node| node.terminal && node.edge_count > 0);
         Ok(Some(Self {
-            prefixes: AffixTrie::new(&prefixes, false, case_insensitive, budget)?,
+            prefixes: prefix_trie,
             suffixes: AffixTrie::new(&suffixes, true, case_insensitive, budget)?,
+            has_nested_prefixes,
         }))
     }
 
     fn is_match(&self, path: &[u8], options: PatternOptions) -> bool {
+        #[cfg(test)]
+        SCOPED_SUFFIX_SET_SCAN_STATS.with(|stats| stats.set((0, 0, 0)));
+
+        if !self.has_nested_prefixes {
+            return self.is_match_disjoint(path, options);
+        }
+        self.is_match_nested(path, options)
+    }
+
+    fn is_match_disjoint(&self, path: &[u8], options: PatternOptions) -> bool {
         let mut prefix_node = 0;
-        let mut prefix_len = None;
+        let mut variable_start = None;
         for (offset, &byte) in path.iter().enumerate() {
+            #[cfg(test)]
+            SCOPED_SUFFIX_SET_SCAN_STATS.with(|stats| {
+                let (prefix_steps, suffix_steps, hidden_bytes) = stats.get();
+                stats.set((prefix_steps + 1, suffix_steps, hidden_bytes));
+            });
             let Some(next) = self
                 .prefixes
                 .next(prefix_node, fold_ascii(byte, options.case_insensitive))
             else {
-                return false;
+                break;
             };
             prefix_node = next;
             if self.prefixes.nodes[prefix_node].terminal
                 && path.get(offset + 1).is_some_and(|byte| is_separator(*byte))
             {
-                prefix_len = Some(offset + 1);
+                variable_start = Some(offset + 2);
                 break;
             }
         }
-        let Some(prefix_len) = prefix_len else {
+        let Some(variable_start) = variable_start else {
             return false;
         };
-        let variable_start = prefix_len + 1;
+        matches!(
+            self.matches_suffixes_single_start(path, variable_start, options),
+            SuffixCheckOutcome::Matched
+        )
+    }
+
+    #[cold]
+    fn is_match_nested(&self, path: &[u8], options: PatternOptions) -> bool {
+        let mut prefix_node = 0;
+        let mut min_hidden: Option<usize> = None;
+        let mut inline_starts = [0_usize; SCOPED_SUFFIX_INLINE_PREFIXES];
+        let mut inline_len = 0_usize;
+        for (offset, &byte) in path.iter().enumerate() {
+            #[cfg(test)]
+            SCOPED_SUFFIX_SET_SCAN_STATS.with(|stats| {
+                let (prefix_steps, suffix_steps, hidden_bytes) = stats.get();
+                stats.set((prefix_steps + 1, suffix_steps, hidden_bytes));
+            });
+            let Some(next) = self
+                .prefixes
+                .next(prefix_node, fold_ascii(byte, options.case_insensitive))
+            else {
+                break;
+            };
+            prefix_node = next;
+            if self.prefixes.nodes[prefix_node].terminal
+                && path.get(offset + 1).is_some_and(|byte| is_separator(*byte))
+            {
+                let variable_start = offset + 2;
+                let Some(required_hidden) = min_hidden else {
+                    // Check the shortest matching prefix before walking longer
+                    // prefixes: a match wins immediately, and a suffix miss
+                    // rules out every longer prefix too.
+                    match self.matches_suffixes(path, &[variable_start], options) {
+                        SuffixCheckOutcome::Matched => return true,
+                        SuffixCheckOutcome::NoSuffixMatch => return false,
+                        SuffixCheckOutcome::BlockedByHidden { min_hidden: hidden } => {
+                            if options.match_hidden || self.prefixes.is_leaf(prefix_node) {
+                                return false;
+                            }
+                            min_hidden = Some(hidden);
+                            continue;
+                        }
+                    }
+                };
+                if variable_start <= required_hidden {
+                    continue;
+                }
+                if inline_len < inline_starts.len() {
+                    inline_starts[inline_len] = variable_start;
+                    inline_len += 1;
+                } else {
+                    return self.is_match_with_spill(
+                        path,
+                        &inline_starts,
+                        prefix_node,
+                        offset + 1,
+                        variable_start,
+                        required_hidden,
+                        options,
+                    );
+                }
+            }
+        }
+        if inline_len == 0 {
+            return false;
+        }
+        matches!(
+            self.matches_suffixes(path, &inline_starts[..inline_len], options),
+            SuffixCheckOutcome::Matched
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn is_match_with_spill(
+        &self,
+        path: &[u8],
+        inline_starts: &[usize],
+        prefix_node: usize,
+        resume_offset: usize,
+        overflow_start: usize,
+        required_hidden: usize,
+        options: PatternOptions,
+    ) -> bool {
+        let collect_and_match = |starts: &mut Vec<usize>| {
+            starts.clear();
+            starts.extend_from_slice(inline_starts);
+            starts.push(overflow_start);
+            let mut prefix_node = prefix_node;
+            for (offset, &byte) in path.iter().enumerate().skip(resume_offset) {
+                #[cfg(test)]
+                SCOPED_SUFFIX_SET_SCAN_STATS.with(|stats| {
+                    let (prefix_steps, suffix_steps, hidden_bytes) = stats.get();
+                    stats.set((prefix_steps + 1, suffix_steps, hidden_bytes));
+                });
+                let Some(next) = self
+                    .prefixes
+                    .next(prefix_node, fold_ascii(byte, options.case_insensitive))
+                else {
+                    break;
+                };
+                prefix_node = next;
+                if self.prefixes.nodes[prefix_node].terminal
+                    && path.get(offset + 1).is_some_and(|byte| is_separator(*byte))
+                {
+                    let variable_start = offset + 2;
+                    if variable_start > required_hidden {
+                        starts.push(variable_start);
+                    }
+                }
+            }
+            matches!(
+                self.matches_suffixes(path, starts, options),
+                SuffixCheckOutcome::Matched
+            )
+        };
+        SCOPED_SUFFIX_SET_PREFIX_STARTS.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut starts) => {
+                let matched = collect_and_match(&mut starts);
+                starts.clear();
+                if starts.capacity() > RETAINED_SCRATCH_WORDS {
+                    starts.shrink_to(RETAINED_SCRATCH_WORDS);
+                }
+                matched
+            }
+            Err(_) => {
+                let mut starts = Vec::with_capacity(inline_starts.len() + 1);
+                collect_and_match(&mut starts)
+            }
+        })
+    }
+
+    /// Evaluates every matching suffix in a single right-to-left pass against
+    /// strictly increasing matched prefix `starts`.
+    ///
+    /// For a single start `[variable_start]`, the longest eligible matching
+    /// suffix (`min_variable_end`) strictly dominates every shorter suffix
+    /// because `[variable_start..min_variable_end)` is a subset of every
+    /// `[variable_start..larger_variable_end)`, so one forward hidden scan
+    /// rejects an early hidden component immediately.
+    ///
+    /// For multiple starts, for any `variable_end`, the largest
+    /// `variable_start <= variable_end` minimizes the variable span and
+    /// keeping a monotonic hidden-dot cursor ensures each byte of `path` is
+    /// scanned at most once across the entire call.
+    fn matches_suffixes(
+        &self,
+        path: &[u8],
+        starts: &[usize],
+        options: PatternOptions,
+    ) -> SuffixCheckOutcome {
+        debug_assert!(!starts.is_empty());
+        if let &[variable_start] = starts {
+            return self.matches_suffixes_single_start(path, variable_start, options);
+        }
+        let min_start = starts[0];
+        let mut prefix_idx = starts.len() - 1;
+        // Rightmost hidden-component dot found by an earlier suffix split.
+        // Because `variable_end` only decreases and every previous reverse
+        // scan stopped at `hidden`, no byte below `hidden` has been scanned
+        // yet and every split with `hidden < variable_end` fails in O(1).
+        let mut known_hidden: Option<usize> = None;
+        let mut min_hidden: Option<usize> = None;
+        let outcome = |min_hidden: Option<usize>| match min_hidden {
+            Some(min_hidden) => SuffixCheckOutcome::BlockedByHidden { min_hidden },
+            None => SuffixCheckOutcome::NoSuffixMatch,
+        };
 
         let mut suffix_node = 0;
         for (offset, &byte) in path.iter().rev().enumerate() {
+            #[cfg(test)]
+            SCOPED_SUFFIX_SET_SCAN_STATS.with(|stats| {
+                let (prefix_steps, suffix_steps, hidden_bytes) = stats.get();
+                stats.set((prefix_steps, suffix_steps + 1, hidden_bytes));
+            });
             let Some(next) = self
                 .suffixes
                 .next(suffix_node, fold_ascii(byte, options.case_insensitive))
             else {
-                return false;
+                return outcome(min_hidden);
             };
             suffix_node = next;
             if !self.suffixes.nodes[suffix_node].terminal {
                 continue;
             }
             let variable_end = path.len() - offset - 1;
-            if variable_start > variable_end {
-                continue;
+            if variable_end < min_start {
+                return outcome(min_hidden);
+            }
+            while starts[prefix_idx] > variable_end {
+                prefix_idx -= 1;
             }
             if star_stops_before_hidden_component(path, variable_end, options) {
                 continue;
             }
-            if options.match_hidden
-                || !contains_hidden_component_in(
+            if options.match_hidden {
+                return SuffixCheckOutcome::Matched;
+            }
+
+            let variable_start = starts[prefix_idx];
+            if let Some(hidden) = known_hidden
+                && hidden < variable_end
+            {
+                if hidden >= variable_start {
+                    min_hidden = Some(min_hidden.map_or(hidden, |prev| prev.min(hidden)));
+                    continue;
+                }
+                return SuffixCheckOutcome::Matched;
+            }
+            let no_longer_suffix = self.suffixes.is_leaf(suffix_node)
+                || variable_end <= min_start
+                || self
+                    .suffixes
+                    .next(
+                        suffix_node,
+                        fold_ascii(path[variable_end - 1], options.case_insensitive),
+                    )
+                    .is_none();
+            if no_longer_suffix {
+                // No longer suffix can match from this node on `path`, so scan
+                // forward and stop at the earliest hidden component.
+                return match first_hidden_component_in(
                     path,
                     variable_start,
                     variable_end,
                     options.candidate_starts_component,
-                )
-            {
-                return true;
+                ) {
+                    Some(hidden) => {
+                        #[cfg(test)]
+                        SCOPED_SUFFIX_SET_SCAN_STATS.with(|stats| {
+                            let (prefix_steps, suffix_steps, hidden_bytes) = stats.get();
+                            stats.set((
+                                prefix_steps,
+                                suffix_steps,
+                                hidden_bytes + (hidden - variable_start + 1),
+                            ));
+                        });
+                        SuffixCheckOutcome::BlockedByHidden {
+                            min_hidden: min_hidden.map_or(hidden, |prev| prev.min(hidden)),
+                        }
+                    }
+                    None => {
+                        #[cfg(test)]
+                        SCOPED_SUFFIX_SET_SCAN_STATS.with(|stats| {
+                            let (prefix_steps, suffix_steps, hidden_bytes) = stats.get();
+                            stats.set((
+                                prefix_steps,
+                                suffix_steps,
+                                hidden_bytes + (variable_end - variable_start),
+                            ));
+                        });
+                        SuffixCheckOutcome::Matched
+                    }
+                };
+            }
+
+            match rightmost_hidden_component_in(
+                path,
+                variable_start,
+                variable_end,
+                options.candidate_starts_component,
+            ) {
+                Some(hidden) => {
+                    #[cfg(test)]
+                    SCOPED_SUFFIX_SET_SCAN_STATS.with(|stats| {
+                        let (prefix_steps, suffix_steps, hidden_bytes) = stats.get();
+                        stats.set((
+                            prefix_steps,
+                            suffix_steps,
+                            hidden_bytes + (variable_end - hidden),
+                        ));
+                    });
+                    known_hidden = Some(hidden);
+                    min_hidden = Some(min_hidden.map_or(hidden, |prev| prev.min(hidden)));
+                }
+                None => {
+                    #[cfg(test)]
+                    SCOPED_SUFFIX_SET_SCAN_STATS.with(|stats| {
+                        let (prefix_steps, suffix_steps, hidden_bytes) = stats.get();
+                        stats.set((
+                            prefix_steps,
+                            suffix_steps,
+                            hidden_bytes + (variable_end - variable_start),
+                        ));
+                    });
+                    return SuffixCheckOutcome::Matched;
+                }
             }
         }
-        false
+        outcome(min_hidden)
     }
+
+    /// Single-start fast path: walks the suffix trie from the end of `path`,
+    /// running at most one forward hidden scan on the first eligible terminal
+    /// suffix so an unblocked short suffix returns immediately without walking
+    /// deeper trie branches, while any longer suffix ending at or before the
+    /// cached first hidden period still wins in O(1).
+    fn matches_suffixes_single_start(
+        &self,
+        path: &[u8],
+        variable_start: usize,
+        options: PatternOptions,
+    ) -> SuffixCheckOutcome {
+        let mut first_hidden: Option<usize> = None;
+        let mut suffix_node = 0;
+        for (offset, &byte) in path.iter().rev().enumerate() {
+            #[cfg(test)]
+            SCOPED_SUFFIX_SET_SCAN_STATS.with(|stats| {
+                let (prefix_steps, suffix_steps, hidden_bytes) = stats.get();
+                stats.set((prefix_steps, suffix_steps + 1, hidden_bytes));
+            });
+            let Some(next) = self
+                .suffixes
+                .next(suffix_node, fold_ascii(byte, options.case_insensitive))
+            else {
+                break;
+            };
+            suffix_node = next;
+            if !self.suffixes.nodes[suffix_node].terminal {
+                continue;
+            }
+            let variable_end = path.len() - offset - 1;
+            if variable_end < variable_start {
+                break;
+            }
+            if star_stops_before_hidden_component(path, variable_end, options) {
+                continue;
+            }
+            if options.match_hidden {
+                return SuffixCheckOutcome::Matched;
+            }
+            match first_hidden {
+                None => match first_hidden_component_in(
+                    path,
+                    variable_start,
+                    variable_end,
+                    options.candidate_starts_component,
+                ) {
+                    Some(hidden) => {
+                        #[cfg(test)]
+                        SCOPED_SUFFIX_SET_SCAN_STATS.with(|stats| {
+                            let (prefix_steps, suffix_steps, hidden_bytes) = stats.get();
+                            stats.set((
+                                prefix_steps,
+                                suffix_steps,
+                                hidden_bytes + (hidden - variable_start + 1),
+                            ));
+                        });
+                        first_hidden = Some(hidden);
+                    }
+                    None => {
+                        #[cfg(test)]
+                        SCOPED_SUFFIX_SET_SCAN_STATS.with(|stats| {
+                            let (prefix_steps, suffix_steps, hidden_bytes) = stats.get();
+                            stats.set((
+                                prefix_steps,
+                                suffix_steps,
+                                hidden_bytes + (variable_end - variable_start),
+                            ));
+                        });
+                        return SuffixCheckOutcome::Matched;
+                    }
+                },
+                Some(hidden) => {
+                    // `hidden` is the leftmost component-leading `.` in
+                    // `[variable_start..first_variable_end)`. Since every
+                    // subsequent suffix has a strictly smaller `variable_end`,
+                    // `[variable_start..variable_end)` is hidden-free iff
+                    // `variable_end <= hidden`.
+                    if variable_end <= hidden {
+                        return SuffixCheckOutcome::Matched;
+                    }
+                }
+            }
+        }
+        match first_hidden {
+            Some(min_hidden) => SuffixCheckOutcome::BlockedByHidden { min_hidden },
+            None => SuffixCheckOutcome::NoSuffixMatch,
+        }
+    }
+}
+
+enum SuffixCheckOutcome {
+    Matched,
+    NoSuffixMatch,
+    BlockedByHidden { min_hidden: usize },
+}
+
+const SCOPED_SUFFIX_INLINE_PREFIXES: usize = 16;
+
+thread_local! {
+    static SCOPED_SUFFIX_SET_PREFIX_STARTS: RefCell<Vec<usize>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `(prefix_trie_steps, suffix_trie_steps, hidden_scan_bytes)` recorded by
+    /// the most recent `ScopedSuffixSet::is_match` call.
+    static SCOPED_SUFFIX_SET_SCAN_STATS: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+#[cfg(test)]
+fn reset_scoped_suffix_set_scan_stats() {
+    SCOPED_SUFFIX_SET_SCAN_STATS.with(|stats| stats.set((usize::MAX, usize::MAX, usize::MAX)));
+}
+
+#[cfg(test)]
+fn scoped_suffix_set_scan_stats() -> (usize, usize, usize) {
+    SCOPED_SUFFIX_SET_SCAN_STATS.with(std::cell::Cell::get)
 }
 
 fn literal_index<'a>(
@@ -3069,6 +3468,10 @@ impl AffixTrie {
         }
         building[node].terminal = true;
         Ok(())
+    }
+
+    fn is_leaf(&self, node: usize) -> bool {
+        self.nodes[node].edge_count == 0
     }
 
     fn next(&self, node: usize, byte: u8) -> Option<usize> {
@@ -3555,26 +3958,54 @@ fn strip_literal_suffix<'a>(
         .then_some(&path[..start])
 }
 
-fn contains_hidden_component_in(
+fn first_hidden_component_in(
     path: &[u8],
     start: usize,
     end: usize,
     candidate_starts_component: bool,
-) -> bool {
-    let Some(segment) = path.get(start..end) else {
-        return false;
-    };
+) -> Option<usize> {
+    let segment = path.get(start..end)?;
     let mut offset = start;
     while let Some(found) = memchr(b'.', &segment[offset - start..]) {
         let index = offset + found;
         if (index == 0 && candidate_starts_component)
             || (index > 0 && is_separator(path[index - 1]))
         {
-            return true;
+            return Some(index);
         }
         offset = index + 1;
     }
-    false
+    None
+}
+
+fn contains_hidden_component_in(
+    path: &[u8],
+    start: usize,
+    end: usize,
+    candidate_starts_component: bool,
+) -> bool {
+    first_hidden_component_in(path, start, end, candidate_starts_component).is_some()
+}
+
+/// Returns the rightmost component-leading period index in `path[start..end]`.
+fn rightmost_hidden_component_in(
+    path: &[u8],
+    start: usize,
+    end: usize,
+    candidate_starts_component: bool,
+) -> Option<usize> {
+    let mut search_end = end.min(path.len());
+    while search_end > start {
+        let found = memrchr(b'.', &path[start..search_end])?;
+        let index = start + found;
+        if (index == 0 && candidate_starts_component)
+            || (index > 0 && is_separator(path[index - 1]))
+        {
+            return Some(index);
+        }
+        search_end = index;
+    }
+    None
 }
 
 /// Whether an ordinary star would hand a component-leading period to the
@@ -4202,7 +4633,7 @@ impl CompiledExtglob {
         let mut index = 0;
         while let Some(step) = self.steps.get(index) {
             match step {
-                ExtglobStep::Byte(b'/') => {
+                ExtglobStep::Separator { .. } => {
                     let offset = self
                         .walker_source_provenance
                         .as_ref()
@@ -5512,7 +5943,14 @@ struct CompiledExtglob {
     /// the zero-directory continuation after a recursive `**/` prefix.
     /// The byte-indexed step table remains the interpreter's address space.
     memo_state_indices: Vec<usize>,
+    /// Memo rows needed on the fast path; fallback retry rows for retryable
+    /// outer-star segments are assigned strictly above this count and allocated
+    /// lazily only when a deferred retry fires.
+    fast_memo_state_count: usize,
     memo_state_count: usize,
+    /// Whether any outer-star segment can hit a retryable hidden-dot or
+    /// separator barrier behind an overwritten earlier star.
+    has_retryable_star_segment: bool,
     /// The step offset of a separator that a candidate ending right in front
     /// of it may leave out, because only a trailing whole-component `**`
     /// follows it; see [`trailing_globstar_separator`].
@@ -5536,6 +5974,10 @@ enum ExtglobStep {
         /// A whole-component star run ending in a recursive `**/` prefix is
         /// exempt, including longer even runs such as `****/`.
         blocks_leading_period: bool,
+        /// Whether this star precedes a retryable barrier in its outer-star
+        /// segment and must keep expanding in the memoized fallback rather
+        /// than handing off to the linear latest-star fast path.
+        memoize_tail: bool,
     },
     /// `?`.
     Any,
@@ -5546,6 +5988,11 @@ enum ExtglobStep {
     /// with the escaped byte as syntax, exactly as in the plain engines and
     /// in Bash.
     Escape { escaped: u8 },
+    /// An unescaped `/` path separator, matching `/` everywhere and `\` on
+    /// Windows (ADR-0005). `recursive_prefix` is true when this separator
+    /// closes a whole-component recursive star run (`**/`, `****/`), matching
+    /// `Token::RecursivePrefix` in the plain token engine.
+    Separator { recursive_prefix: bool },
     /// An ordinary byte.
     Byte(u8),
     /// An extglob group, indexing [`CompiledExtglob::groups`].
@@ -5817,6 +6264,8 @@ impl PositiveExtglobNfa {
             let start =
                 match &steps[index] {
                     ExtglobStep::NoMatch => None,
+                    ExtglobStep::Separator { .. } => builder
+                        .consume(PositiveExtglobMatcher::GroupSeparator, suffixes[index + 1])?,
                     ExtglobStep::Byte(byte) => builder
                         .consume(PositiveExtglobMatcher::Literal(*byte), suffixes[index + 1])?,
                     ExtglobStep::Any => builder.consume(
@@ -6064,7 +6513,13 @@ fn token_position_component_local(
 }
 
 fn extglob_step_component_local(steps: &[ExtglobStep], step_index: usize) -> bool {
-    step_index > 0 && matches!(steps[step_index - 1], ExtglobStep::Byte(byte) if is_separator(byte))
+    step_index > 0
+        && matches!(
+            steps[step_index - 1],
+            ExtglobStep::Separator {
+                recursive_prefix: false
+            }
+        )
 }
 
 impl PositiveExtglobBuilder<'_> {
@@ -6356,6 +6811,8 @@ fn compile_extglob(
     let mut segment_has_crossing_star = false;
     let mut segment_needs_paged_memo = false;
     let mut prev_was_separator = false;
+    let mut prev_was_any_separator = false;
+    let mut prev_was_recursive_star = false;
     while let Some(index) = pending.pop() {
         if index >= pattern.len() || compiled[index] {
             continue;
@@ -6364,6 +6821,9 @@ fn compile_extglob(
         let step = compile_extglob_step(
             pattern,
             index,
+            prev_was_separator,
+            prev_was_any_separator,
+            prev_was_recursive_star,
             options,
             &mut closing_parens,
             &mut groups,
@@ -6405,11 +6865,14 @@ fn compile_extglob(
                 segment_has_crossing_star = false;
                 segment_needs_paged_memo = !group.through_separator.is_empty();
                 prev_was_separator = false;
+                prev_was_any_separator = false;
+                prev_was_recursive_star = false;
                 pending.push(group.rest);
             }
             ExtglobStep::Star {
                 next,
                 blocks_leading_period,
+                ..
             } => {
                 if !*blocks_leading_period {
                     segment_needs_paged_memo = true;
@@ -6418,16 +6881,22 @@ fn compile_extglob(
                 }
                 segment_has_star = true;
                 prev_was_separator = false;
+                prev_was_any_separator = false;
+                prev_was_recursive_star = !*blocks_leading_period;
                 pending.push(*next);
             }
             ExtglobStep::Class { next, .. } => {
                 prev_was_separator = false;
+                prev_was_any_separator = false;
+                prev_was_recursive_star = false;
                 pending.push(*next);
             }
             // The escaped byte is consumed together with its backslash; the
             // offset between them is never where a walk stands.
             ExtglobStep::Escape { .. } => {
                 prev_was_separator = false;
+                prev_was_any_separator = false;
+                prev_was_recursive_star = false;
                 pending.push(index + 2);
             }
             ExtglobStep::UnclosedGroup { byte: b'*' } => {
@@ -6436,14 +6905,26 @@ fn compile_extglob(
                 }
                 segment_has_star = true;
                 prev_was_separator = false;
+                prev_was_any_separator = false;
+                prev_was_recursive_star = false;
                 pending.push(index + 1);
             }
-            ExtglobStep::Byte(byte) => {
-                prev_was_separator = is_separator(*byte);
+            ExtglobStep::Separator { recursive_prefix } => {
+                prev_was_separator = !*recursive_prefix;
+                prev_was_any_separator = true;
+                prev_was_recursive_star = false;
+                pending.push(index + 1);
+            }
+            ExtglobStep::Byte(_) => {
+                prev_was_separator = false;
+                prev_was_any_separator = false;
+                prev_was_recursive_star = false;
                 pending.push(index + 1);
             }
             ExtglobStep::Any | ExtglobStep::UnclosedGroup { .. } => {
                 prev_was_separator = false;
+                prev_was_any_separator = false;
+                prev_was_recursive_star = false;
                 pending.push(index + 1);
             }
             // The matcher still stops at this state, but compiling the suffix
@@ -6451,6 +6932,8 @@ fn compile_extglob(
             // to classify every generated branch.
             ExtglobStep::NoMatch => {
                 prev_was_separator = false;
+                prev_was_any_separator = false;
+                prev_was_recursive_star = false;
                 pending.push(index + 1);
             }
         }
@@ -6458,37 +6941,120 @@ fn compile_extglob(
     }
     let mut memo_state_indices = vec![usize::MAX; pattern.len() + 1];
     let mut memo_state_count = 0;
+    let fast_memo_state_count = {
+        let mut add_memo_state = |offset| {
+            if memo_state_indices[offset] == usize::MAX {
+                memo_state_indices[offset] = memo_state_count;
+                memo_state_count += 1;
+            }
+        };
+        add_memo_state(0);
+        for group in &groups {
+            if matches!(
+                group.entry_memo,
+                GroupEntryMemo::MonotonicOrCrossingStar | GroupEntryMemo::Paged
+            ) {
+                add_memo_state(group.start);
+            }
+            add_memo_state(group.rest);
+            if !group.through_separator.is_empty() {
+                // Alternatives that take the separator along resume behind it.
+                add_memo_state(group.rest + 1);
+            }
+        }
+        for step in &steps {
+            if let ExtglobStep::Star {
+                next,
+                blocks_leading_period: false,
+                ..
+            } = step
+                && steps
+                    .get(*next)
+                    .is_some_and(|step| matches!(step, ExtglobStep::Separator { .. }))
+            {
+                add_memo_state(*next + 1);
+            }
+        }
+        memo_state_count
+    };
+    // Fallback memo indices are assigned strictly above `fast_memo_state_count`
+    // and only for outer-star segments that can encounter a retryable hidden-
+    // dot or separator barrier behind an overwritten star.
     let mut add_memo_state = |offset| {
         if memo_state_indices[offset] == usize::MAX {
             memo_state_indices[offset] = memo_state_count;
             memo_state_count += 1;
         }
     };
-    add_memo_state(0);
-    for group in &groups {
-        if matches!(
-            group.entry_memo,
-            GroupEntryMemo::MonotonicOrCrossingStar | GroupEntryMemo::Paged
-        ) {
-            add_memo_state(group.start);
+    let mut has_retryable_star_segment = false;
+    let mut segment_cursor = 0;
+    while segment_cursor < steps.len() {
+        let mut first_star = None;
+        let mut cursor = segment_cursor;
+        let segment_end = loop {
+            match steps.get(cursor) {
+                None | Some(ExtglobStep::NoMatch) => break steps.len(),
+                Some(ExtglobStep::Group(group)) => break groups[*group].rest,
+                Some(ExtglobStep::Star { next, .. }) => {
+                    first_star.get_or_insert(cursor);
+                    cursor = *next;
+                }
+                Some(ExtglobStep::UnclosedGroup { byte: b'*' }) => {
+                    first_star.get_or_insert(cursor);
+                    cursor += 1;
+                }
+                Some(ExtglobStep::Class { next, .. }) => cursor = *next,
+                Some(ExtglobStep::Escape { .. }) => cursor += 2,
+                Some(
+                    ExtglobStep::Any
+                    | ExtglobStep::Separator { .. }
+                    | ExtglobStep::Byte(_)
+                    | ExtglobStep::UnclosedGroup { .. },
+                ) => cursor += 1,
+            }
+        };
+        if let Some(star_start) = first_star {
+            let retry = extglob_retryable_star_segment(&steps, star_start, steps.len(), options);
+            if retry.any() {
+                has_retryable_star_segment = true;
+                let memo_cutoff = retry.memo_cutoff;
+                let mut cursor = star_start;
+                while cursor < segment_end {
+                    match steps.get_mut(cursor) {
+                        None | Some(ExtglobStep::NoMatch) => break,
+                        Some(ExtglobStep::Group(group)) => {
+                            add_memo_state(cursor);
+                            cursor = groups[*group].rest;
+                        }
+                        Some(ExtglobStep::Star {
+                            next, memoize_tail, ..
+                        }) => {
+                            add_memo_state(cursor);
+                            if cursor < memo_cutoff {
+                                *memoize_tail = true;
+                            }
+                            cursor = *next;
+                        }
+                        Some(ExtglobStep::UnclosedGroup { byte: b'*' }) => {
+                            add_memo_state(cursor);
+                            cursor += 1;
+                        }
+                        Some(ExtglobStep::Class { next, .. }) => cursor = *next,
+                        Some(ExtglobStep::Escape { .. }) => cursor += 2,
+                        Some(
+                            ExtglobStep::Any
+                            | ExtglobStep::Separator { .. }
+                            | ExtglobStep::Byte(_)
+                            | ExtglobStep::UnclosedGroup { .. },
+                        ) => cursor += 1,
+                    }
+                }
+            }
         }
-        add_memo_state(group.rest);
-        if !group.through_separator.is_empty() {
-            // Alternatives that take the separator along resume behind it.
-            add_memo_state(group.rest + 1);
+        if segment_end <= segment_cursor {
+            break;
         }
-    }
-    for step in &steps {
-        if let ExtglobStep::Star {
-            next,
-            blocks_leading_period: false,
-        } = step
-            && steps
-                .get(*next)
-                .is_some_and(|step| matches!(step, ExtglobStep::Byte(byte) if is_separator(*byte)))
-        {
-            add_memo_state(*next + 1);
-        }
+        segment_cursor = segment_end;
     }
     let trailing_globstar_separator =
         trailing_globstar_separator(pattern, &steps, &groups, options);
@@ -6500,6 +7066,7 @@ fn compile_extglob(
         .iter()
         .map_while(|step| match step {
             ExtglobStep::Byte(byte) => Some(*byte),
+            ExtglobStep::Separator { .. } => Some(b'/'),
             _ => None,
         })
         .collect();
@@ -6509,11 +7076,186 @@ fn compile_extglob(
         groups,
         positive_nfa,
         memo_state_indices,
+        fast_memo_state_count,
         memo_state_count,
+        has_retryable_star_segment,
         trailing_globstar_separator,
         walker_source_provenance: walker_source_provenance.cloned(),
         leading_dot_is_normalized,
     })))
+}
+
+/// Which barrier types in an outer-star segment can require retrying an
+/// overwritten earlier star via the memoized fallback.
+#[derive(Clone, Copy, Default)]
+struct RetryableStarSegment {
+    /// An explicit leading-`.` step appears strictly between two stars
+    /// (`star_start < dot < later_star <= max_star_step`).
+    explicit_dot: bool,
+    /// Under `is_match_path` (or at compile time), a separator-crossing
+    /// wildcard (`?` or separator-matching `[...]`) separates an earlier
+    /// component-local star from a later component-local star.
+    crossing_wildcard_before_local_star: bool,
+    /// Strict upper bound on stars in this segment that precede a retryable
+    /// barrier; the first star at or past this offset can hand off to the
+    /// linear latest-star fast path.
+    memo_cutoff: usize,
+}
+
+impl RetryableStarSegment {
+    const fn any(self) -> bool {
+        self.explicit_dot || self.crossing_wildcard_before_local_star
+    }
+}
+
+/// Classifies whether an outer-star segment starting at `star_start` can
+/// require retrying an overwritten star after hitting a hidden-dot or
+/// separator barrier.
+fn extglob_retryable_star_segment(
+    steps: &[ExtglobStep],
+    star_start: usize,
+    max_star_step: usize,
+    options: PatternOptions,
+) -> RetryableStarSegment {
+    let mut result = RetryableStarSegment::default();
+    let allow_path_crossing_wildcards =
+        !options.component_wildcards || !options.root_component_wildcards;
+    let path_options = PatternOptions {
+        component_wildcards: true,
+        root_component_wildcards: false,
+        ..options
+    };
+    let mut index = star_start;
+    let mut saw_crossing_star = false;
+    let mut saw_local_star = false;
+    let mut saw_crossing_wildcard_after_local_star = false;
+    let mut prev_can_end_at_component_start = false;
+    let mut prev_from_crossing_wildcard = false;
+    let mut has_explicit_dot = false;
+    let mut last_dot_trigger = 0;
+    while index <= max_star_step && index < steps.len() {
+        match &steps[index] {
+            ExtglobStep::Group(_) | ExtglobStep::NoMatch => break,
+            ExtglobStep::Star {
+                next,
+                blocks_leading_period,
+                ..
+            } => {
+                if has_explicit_dot {
+                    result.explicit_dot = true;
+                    result.memo_cutoff = result.memo_cutoff.max(last_dot_trigger);
+                }
+                if allow_path_crossing_wildcards
+                    && extglob_star_component_local(steps, index, path_options)
+                {
+                    if saw_crossing_wildcard_after_local_star {
+                        result.crossing_wildcard_before_local_star = true;
+                        result.memo_cutoff = result.memo_cutoff.max(index);
+                    }
+                    saw_local_star = true;
+                } else {
+                    saw_local_star = false;
+                    saw_crossing_wildcard_after_local_star = false;
+                }
+                if !extglob_star_component_local(steps, index, options) {
+                    saw_crossing_star = true;
+                }
+                prev_can_end_at_component_start = !*blocks_leading_period;
+                prev_from_crossing_wildcard = false;
+                index = *next;
+            }
+            ExtglobStep::UnclosedGroup { byte: b'*' } => {
+                if has_explicit_dot {
+                    result.explicit_dot = true;
+                    result.memo_cutoff = result.memo_cutoff.max(last_dot_trigger);
+                }
+                if allow_path_crossing_wildcards
+                    && extglob_wildcard_component_local(steps, index, path_options)
+                {
+                    if saw_crossing_wildcard_after_local_star {
+                        result.crossing_wildcard_before_local_star = true;
+                        result.memo_cutoff = result.memo_cutoff.max(index);
+                    }
+                    saw_local_star = true;
+                } else {
+                    saw_local_star = false;
+                    saw_crossing_wildcard_after_local_star = false;
+                }
+                if !extglob_wildcard_component_local(steps, index, options) {
+                    saw_crossing_star = true;
+                }
+                prev_can_end_at_component_start = false;
+                prev_from_crossing_wildcard = false;
+                index += 1;
+            }
+            ExtglobStep::Byte(b'.') => {
+                if (saw_crossing_star && prev_can_end_at_component_start)
+                    || prev_from_crossing_wildcard
+                {
+                    has_explicit_dot = true;
+                    last_dot_trigger = index + 1;
+                }
+                prev_can_end_at_component_start = false;
+                prev_from_crossing_wildcard = false;
+                index += 1;
+            }
+            ExtglobStep::Escape { escaped: b'.' } => {
+                if (saw_crossing_star && prev_can_end_at_component_start)
+                    || prev_from_crossing_wildcard
+                {
+                    has_explicit_dot = true;
+                    last_dot_trigger = index + 2;
+                }
+                prev_can_end_at_component_start = false;
+                prev_from_crossing_wildcard = false;
+                index += 2;
+            }
+            ExtglobStep::Separator { .. } => {
+                prev_can_end_at_component_start = true;
+                prev_from_crossing_wildcard = false;
+                index += 1;
+            }
+            ExtglobStep::Any | ExtglobStep::UnclosedGroup { byte: b'?' } => {
+                let can_cross = !extglob_wildcard_component_local(steps, index, options);
+                prev_can_end_at_component_start = can_cross;
+                prev_from_crossing_wildcard = can_cross;
+                if saw_local_star
+                    && allow_path_crossing_wildcards
+                    && !extglob_wildcard_component_local(steps, index, path_options)
+                {
+                    saw_crossing_wildcard_after_local_star = true;
+                }
+                index += 1;
+            }
+            ExtglobStep::Class { class, next } => {
+                let matches_sep = class.matches(b'/', options.case_insensitive)
+                    || (cfg!(windows) && class.matches(b'\\', options.case_insensitive));
+                let can_cross =
+                    !extglob_wildcard_component_local(steps, index, options) && matches_sep;
+                prev_can_end_at_component_start = can_cross;
+                prev_from_crossing_wildcard = can_cross;
+                if saw_local_star
+                    && allow_path_crossing_wildcards
+                    && !extglob_wildcard_component_local(steps, index, path_options)
+                    && matches_sep
+                {
+                    saw_crossing_wildcard_after_local_star = true;
+                }
+                index = *next;
+            }
+            ExtglobStep::Byte(byte) | ExtglobStep::UnclosedGroup { byte } => {
+                prev_can_end_at_component_start = is_separator(*byte);
+                prev_from_crossing_wildcard = false;
+                index += 1;
+            }
+            ExtglobStep::Escape { escaped } => {
+                prev_can_end_at_component_start = is_separator(*escaped);
+                prev_from_crossing_wildcard = false;
+                index += 2;
+            }
+        }
+    }
+    result
 }
 
 /// Classifies one byte offset the way the interpreter classified it.
@@ -6521,6 +7263,9 @@ fn compile_extglob(
 fn compile_extglob_step(
     pattern: &[u8],
     index: usize,
+    prev_was_separator: bool,
+    prev_was_any_separator: bool,
+    prev_was_recursive_star: bool,
     options: PatternOptions,
     closing_parens: &mut ExtglobClosingParens,
     groups: &mut Vec<ExtglobGroup>,
@@ -6615,7 +7360,14 @@ fn compile_extglob_step(
             alternatives,
             start: index,
             rest: close + 1,
-            component_local: index > 0 && is_separator(pattern[index - 1]),
+            // Negated groups behind `**/` stay component-local (#393), while
+            // positive groups follow the plain token rule (`Token::RecursivePrefix`
+            // does not make a following wildcard component-local under `is_match_path`).
+            component_local: if kind == ExtglobKind::Negated {
+                prev_was_any_separator
+            } else {
+                prev_was_separator
+            },
             spans_components,
             root_wildcard,
             through_separator,
@@ -6624,6 +7376,9 @@ fn compile_extglob_step(
         return Ok(ExtglobStep::Group(groups.len() - 1));
     }
     Ok(match pattern[index] {
+        b'/' => ExtglobStep::Separator {
+            recursive_prefix: prev_was_recursive_star,
+        },
         b'*' => {
             let mut next = index + 1;
             // Shell extglob grammar gives the final star in a run to a closed
@@ -6649,6 +7404,7 @@ fn compile_extglob_step(
                     && (next - index).is_multiple_of(2)
                     && pattern.get(next) == Some(&b'/')
                     && starts_component_at(pattern, index, options.escape, ComponentBounds::WHOLE)),
+                memoize_tail: false,
             }
         }
         b'?' => ExtglobStep::Any,
@@ -6770,7 +7526,7 @@ fn trailing_globstar_separator(
     };
     // Either one is a whole component only behind an unescaped separator.
     let separator = globstar.checked_sub(1)?;
-    (matches!(steps[separator], ExtglobStep::Byte(b'/'))
+    (matches!(steps[separator], ExtglobStep::Separator { .. })
         && starts_component_at(
             pattern,
             separator + 1,
@@ -7108,6 +7864,15 @@ struct ExtglobScratch {
     /// Deferred `(program, candidate)` continuations. Extglob groups append
     /// work here instead of recursing through the native stack.
     pending: Vec<(usize, usize)>,
+    /// Non-retryable tail stars handed off from `match_extglob_task_memoized`
+    /// to the linear latest-star matcher with shared star-state deduplication.
+    handoff_pending: Vec<(usize, usize)>,
+    /// Memoized outer-star segment continuations `(program, candidate)` used
+    /// only when a retryable outer-star segment hits a hidden-dot or separator
+    /// barrier behind an overwritten earlier star.
+    memo_pending: Vec<(usize, usize)>,
+    /// Deferred memoized outer-star retries queued after fast-path failure.
+    deferred_retries: Vec<DeferredMemoRetry>,
     /// Reused match ends for ordinary and repeated extglob groups.
     ends: Vec<usize>,
     /// Temporary ends while one repetition alternative falls back to the
@@ -7122,11 +7887,23 @@ struct ExtglobScratch {
     prefix_sweep_state: Option<SweepState>,
 }
 
+/// A deferred memoized outer-star retry queued when the latest-star fast path
+/// hits a hidden-component or separator barrier behind an overwritten star.
+struct DeferredMemoRetry {
+    star_start: usize,
+    star_start_path: usize,
+    already_marked: bool,
+    monotonic_group: Option<(usize, (usize, usize))>,
+}
+
 /// Borrows the extglob scratch buffers for one match.
 struct ExtglobMatchState<'scratch> {
     visited: &'scratch mut Vec<u64>,
     failed: ExtglobFailedStates<'scratch>,
     pending: &'scratch mut Vec<(usize, usize)>,
+    handoff_pending: &'scratch mut Vec<(usize, usize)>,
+    memo_pending: &'scratch mut Vec<(usize, usize)>,
+    deferred_retries: &'scratch mut Vec<DeferredMemoRetry>,
     #[cfg(test)]
     pending_peak: &'scratch mut usize,
     #[cfg(test)]
@@ -7140,6 +7917,28 @@ struct ExtglobMatchState<'scratch> {
 
 thread_local! {
     static EXTGLOB_SCRATCH: RefCell<ExtglobScratch> = RefCell::new(ExtglobScratch::default());
+    #[cfg(test)]
+    static EXTGLOB_MEMOIZED_STAR_FALLBACKS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    static EXTGLOB_MEMOIZED_STAR_VISITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_extglob_memoized_star_fallbacks() {
+    EXTGLOB_MEMOIZED_STAR_FALLBACKS.with(|count| count.set(0));
+    EXTGLOB_MEMOIZED_STAR_VISITS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn extglob_memoized_star_fallbacks() -> usize {
+    EXTGLOB_MEMOIZED_STAR_FALLBACKS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn extglob_memoized_star_visits() -> usize {
+    EXTGLOB_MEMOIZED_STAR_VISITS.with(std::cell::Cell::get)
 }
 
 /// Runs a compiled extglob program on the thread's reusable visited buffer.
@@ -7151,10 +7950,13 @@ thread_local! {
 fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: PatternOptions) -> bool {
     let prefix = &program.literal_prefix;
     if path.len() < prefix.len()
-        || !prefix
-            .iter()
-            .zip(path)
-            .all(|(&expected, &actual)| bytes_equal(expected, actual, options.case_insensitive))
+        || !prefix.iter().zip(path).all(|(&expected, &actual)| {
+            if expected == b'/' {
+                is_separator(actual)
+            } else {
+                bytes_equal(expected, actual, options.case_insensitive)
+            }
+        })
     {
         return false;
     }
@@ -7176,15 +7978,25 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                     #[cfg(test)]
                     group_expansions,
                     pending,
+                    handoff_pending,
+                    memo_pending,
+                    deferred_retries,
                     ends,
                     candidate_ends,
                     excluded,
                     sweep_states,
                     prefix_sweep_state,
                 } = &mut *scratch;
+                let use_retries = program.has_retryable_star_segment
+                    && (!options.match_hidden || options.component_wildcards);
                 visited.clear();
                 failed.clear();
                 pending.clear();
+                if use_retries {
+                    handoff_pending.clear();
+                    memo_pending.clear();
+                    deferred_retries.clear();
+                }
                 ends.clear();
                 candidate_ends.clear();
                 excluded.clear();
@@ -7207,6 +8019,9 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                         failed_state_count,
                     ),
                     pending,
+                    handoff_pending,
+                    memo_pending,
+                    deferred_retries,
                     #[cfg(test)]
                     pending_peak,
                     #[cfg(test)]
@@ -7232,6 +8047,22 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
             scratch.pending.clear();
             if scratch.pending.capacity() > RETAINED_SCRATCH_WORDS {
                 scratch.pending.shrink_to(RETAINED_SCRATCH_WORDS);
+            }
+            if program.has_retryable_star_segment
+                && (!options.match_hidden || options.component_wildcards)
+            {
+                scratch.handoff_pending.clear();
+                if scratch.handoff_pending.capacity() > RETAINED_SCRATCH_WORDS {
+                    scratch.handoff_pending.shrink_to(RETAINED_SCRATCH_WORDS);
+                }
+                scratch.memo_pending.clear();
+                if scratch.memo_pending.capacity() > RETAINED_SCRATCH_WORDS {
+                    scratch.memo_pending.shrink_to(RETAINED_SCRATCH_WORDS);
+                }
+                scratch.deferred_retries.clear();
+                if scratch.deferred_retries.capacity() > RETAINED_SCRATCH_WORDS {
+                    scratch.deferred_retries.shrink_to(RETAINED_SCRATCH_WORDS);
+                }
             }
             scratch.ends.clear();
             if scratch.ends.capacity() > RETAINED_SCRATCH_WORDS {
@@ -7270,6 +8101,9 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                 #[cfg(test)]
                 group_expansions,
                 pending,
+                handoff_pending,
+                memo_pending,
+                deferred_retries,
                 ends,
                 candidate_ends,
                 excluded,
@@ -7287,6 +8121,9 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                     failed_state_count,
                 ),
                 pending,
+                handoff_pending,
+                memo_pending,
+                deferred_retries,
                 #[cfg(test)]
                 pending_peak,
                 #[cfg(test)]
@@ -7363,7 +8200,7 @@ const EXTGLOB_MEMO_PAGE_BITS: usize = EXTGLOB_MEMO_PAGE_WORDS * u64::BITS as usi
 /// offsets. Its boolean semantics are identical to a flat matrix, while only
 /// recurrence states actually reached by the match materialize storage.
 struct ExtglobFailedStates<'scratch> {
-    rows: &'scratch mut [ExtglobFailedRow],
+    rows: &'scratch mut Vec<ExtglobFailedRow>,
     #[cfg(test)]
     page_count: &'scratch mut usize,
     #[cfg(test)]
@@ -7377,13 +8214,20 @@ impl<'scratch> ExtglobFailedStates<'scratch> {
         #[cfg(test)] page_count: &'scratch mut usize,
         #[cfg(test)] state_count: &'scratch mut usize,
     ) -> Self {
-        scratch.resize_with(program.memo_state_count, ExtglobFailedRow::default);
+        scratch.resize_with(program.fast_memo_state_count, ExtglobFailedRow::default);
         Self {
             rows: scratch,
             #[cfg(test)]
             page_count,
             #[cfg(test)]
             state_count,
+        }
+    }
+
+    fn grow_to(&mut self, state_count: usize) {
+        if self.rows.len() < state_count {
+            self.rows
+                .resize_with(state_count, ExtglobFailedRow::default);
         }
     }
 
@@ -7449,32 +8293,163 @@ fn match_extglob_from(
     options: PatternOptions,
     state: &mut ExtglobMatchState<'_>,
 ) -> bool {
+    let use_retries = program.has_retryable_star_segment
+        && (!options.match_hidden || options.component_wildcards);
+    if !use_retries {
+        match_extglob_from_inner::<false>(program, path, start, start_path_index, options, state)
+    } else {
+        match_extglob_from_retryable(program, path, start, start_path_index, options, state)
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn match_extglob_from_retryable(
+    program: &CompiledExtglob,
+    path: &[u8],
+    start: usize,
+    start_path_index: usize,
+    options: PatternOptions,
+    state: &mut ExtglobMatchState<'_>,
+) -> bool {
+    match_extglob_from_inner::<true>(program, path, start, start_path_index, options, state)
+}
+
+#[inline(always)]
+fn match_extglob_from_inner<const TRACK_RETRIES: bool>(
+    program: &CompiledExtglob,
+    path: &[u8],
+    start: usize,
+    start_path_index: usize,
+    options: PatternOptions,
+    state: &mut ExtglobMatchState<'_>,
+) -> bool {
     let pending_base = state.pending.len();
+    let handoff_pending_base = if TRACK_RETRIES {
+        state.handoff_pending.len()
+    } else {
+        0
+    };
+    let memo_pending_base = if TRACK_RETRIES {
+        state.memo_pending.len()
+    } else {
+        0
+    };
+    let deferred_retries_base = if TRACK_RETRIES {
+        state.deferred_retries.len()
+    } else {
+        0
+    };
     queue_extglob_continuation(program, state, start, start_path_index);
     let mut matched = false;
-    while state.pending.len() > pending_base {
-        let (start, start_path_index) = state
-            .pending
-            .pop()
-            .expect("the extglob continuation slice is non-empty");
-        if match_extglob_task(program, path, start, start_path_index, options, state) {
-            matched = true;
-            break;
+    let mut active_monotonic_group: Option<(usize, (usize, usize))> = None;
+    loop {
+        if state.pending.len() > pending_base {
+            let (task_start, task_path) = state
+                .pending
+                .pop()
+                .expect("the extglob continuation slice is non-empty");
+            if match_extglob_task::<TRACK_RETRIES>(
+                program, path, task_start, task_path, false, options, state,
+            ) {
+                matched = true;
+                break;
+            }
+            continue;
         }
+        if TRACK_RETRIES && state.handoff_pending.len() > handoff_pending_base {
+            let (task_start, task_path) = state
+                .handoff_pending
+                .pop()
+                .expect("the handed-off tail worklist is non-empty");
+            if match_extglob_task::<true>(
+                program, path, task_start, task_path, true, options, state,
+            ) {
+                matched = true;
+                break;
+            }
+            continue;
+        }
+        if TRACK_RETRIES && state.memo_pending.len() > memo_pending_base {
+            let (task_start, task_path) = state
+                .memo_pending
+                .pop()
+                .expect("the memoized extglob worklist is non-empty");
+            if match_extglob_task_memoized(
+                program,
+                path,
+                task_start,
+                task_path,
+                active_monotonic_group,
+                options,
+                state,
+            ) {
+                matched = true;
+                break;
+            }
+            continue;
+        }
+        if TRACK_RETRIES && state.deferred_retries.len() > deferred_retries_base {
+            let retry = state
+                .deferred_retries
+                .pop()
+                .expect("the deferred extglob retry stack is non-empty");
+            state.failed.grow_to(program.memo_state_count);
+            let retry_memo = program.memo_state_index(retry.star_start);
+            if retry.already_marked || state.failed.insert(retry_memo, retry.star_start_path) {
+                #[cfg(test)]
+                EXTGLOB_MEMOIZED_STAR_FALLBACKS.with(|count| count.set(count.get() + 1));
+                active_monotonic_group = retry.monotonic_group;
+                state
+                    .memo_pending
+                    .push((retry.star_start, retry.star_start_path));
+                #[cfg(test)]
+                {
+                    *state.pending_peak = (*state.pending_peak).max(
+                        state.pending.len()
+                            + state.handoff_pending.len()
+                            + state.memo_pending.len(),
+                    );
+                }
+            }
+            continue;
+        }
+        break;
+    }
+    if TRACK_RETRIES {
+        state.deferred_retries.truncate(deferred_retries_base);
+        state.memo_pending.truncate(memo_pending_base);
+        state.handoff_pending.truncate(handoff_pending_base);
     }
     state.pending.truncate(pending_base);
     matched
+}
+
+/// Saved backtrack state for a separator-crossing outer star that a later
+/// component-local star superseded.
+#[derive(Clone, Copy)]
+struct CrossingStar {
+    resume: usize,
+    consumed: usize,
+    memo_index: usize,
+    blocks_leading_period: bool,
 }
 
 /// Runs one deterministic outer-program branch. Groups append their possible
 /// continuations to the shared work list, so sequential groups consume heap
 /// work rather than native call frames. A preceding plain star keeps its local
 /// two-pointer backtrack state and queues the group for each reachable split.
-fn match_extglob_task(
+///
+/// If an overwritten earlier star in a retryable outer-star segment hits a
+/// hidden-dot or separator barrier, the task queues an iterative memoized retry
+/// from that segment's first star.
+#[allow(clippy::too_many_arguments)]
+fn match_extglob_task<const TRACK_RETRIES: bool>(
     program: &CompiledExtglob,
     path: &[u8],
     start: usize,
     start_path_index: usize,
+    dedup_stars: bool,
     options: PatternOptions,
     state: &mut ExtglobMatchState<'_>,
 ) -> bool {
@@ -7483,252 +8458,643 @@ fn match_extglob_task(
     let mut path_index = start_path_index;
     let mut star_pattern_index = 0_usize;
     let mut star_path_index = 0_usize;
+    let mut star_memo_index = 0_usize;
     let mut has_star = false;
     let mut star_component_local = false;
+    let mut star_blocks_leading_period = false;
     let mut monotonic_range: Option<(usize, usize)> = None;
+    let mut monotonic_group_index = 0_usize;
     let mut rewound_crossing_star = false;
     // The last separator-crossing star that a later component-local star
-    // replaced as the backtrack point, as `(pattern resume, path consumed)`.
-    // Only the latest star is normally kept, because it can absorb whatever
-    // an earlier one would have: a component-local star cannot absorb a
-    // separator, so when it reaches one, the crossing star before it has to
-    // take the next byte instead. Without this, `**/*.@(x)` refused
-    // `a/b/c.x` under the component policies although `**/*.x` accepts it.
-    let mut crossing_star: Option<(usize, usize)> = None;
+    // replaced as the backtrack point. Only the latest star is normally kept,
+    // because it can absorb whatever an earlier one would have: a
+    // component-local star cannot absorb a separator, so when it reaches one,
+    // the crossing star before it has to take the next byte instead. Without
+    // this, `**/*.@(x)` refused `a/b/c.x` under the component policies
+    // although `**/*.x` accepts it.
+    let mut crossing_star: Option<CrossingStar> = None;
+    let mut first_retryable_star: Option<(usize, usize)> = None;
+    let mut max_star_step = 0_usize;
+    let mut earlier_retryable_star_overwritten = false;
+    let mut hit_hidden_barrier = false;
+    let mut hit_separator_barrier = false;
 
     while path_index < path.len() || pattern_index < steps.len() {
         if pattern_index < steps.len() {
-            let leading_period_is_forbidden = match &steps[pattern_index] {
+            let leading_period_blocked = !options.match_hidden
+                && path.get(path_index) == Some(&b'.')
+                && at_component_start(path, path_index, options)
+                && match &steps[pattern_index] {
+                    ExtglobStep::Group(group) => {
+                        !extglob_group_allows_literal_leading_period(&program.groups[*group])
+                    }
+                    ExtglobStep::UnclosedGroup { .. } => true,
+                    _ => false,
+                };
+            if leading_period_blocked {
+                if TRACK_RETRIES {
+                    hit_hidden_barrier = true;
+                }
+            } else {
+                match &steps[pattern_index] {
+                    ExtglobStep::Group(group) => {
+                        let group = &program.groups[*group];
+                        let should_expand = match group.entry_memo {
+                            GroupEntryMemo::None => true,
+                            GroupEntryMemo::Monotonic => {
+                                if monotonic_range.is_some_and(|(_, hi)| path_index == hi) {
+                                    false
+                                } else {
+                                    monotonic_range = Some((
+                                        monotonic_range.map_or(path_index, |(lo, _)| lo),
+                                        path_index,
+                                    ));
+                                    if TRACK_RETRIES {
+                                        monotonic_group_index = pattern_index;
+                                    }
+                                    true
+                                }
+                            }
+                            GroupEntryMemo::MonotonicOrCrossingStar if !rewound_crossing_star => {
+                                if monotonic_range.is_some_and(|(_, hi)| path_index == hi) {
+                                    false
+                                } else {
+                                    monotonic_range = Some((
+                                        monotonic_range.map_or(path_index, |(lo, _)| lo),
+                                        path_index,
+                                    ));
+                                    if TRACK_RETRIES {
+                                        monotonic_group_index = pattern_index;
+                                    }
+                                    true
+                                }
+                            }
+                            GroupEntryMemo::MonotonicOrCrossingStar => {
+                                !monotonic_range
+                                    .is_some_and(|(lo, hi)| (lo..=hi).contains(&path_index))
+                                    && ((pattern_index == start && path_index == start_path_index)
+                                        || state.failed.insert(
+                                            program.memo_state_index(pattern_index),
+                                            path_index,
+                                        ))
+                            }
+                            GroupEntryMemo::Paged => {
+                                (pattern_index == start && path_index == start_path_index)
+                                    || state
+                                        .failed
+                                        .insert(program.memo_state_index(pattern_index), path_index)
+                            }
+                        };
+                        if should_expand {
+                            queue_extglob_group(program, group, path, path_index, options, state);
+                        }
+                        // The group's continuations are queued; this branch
+                        // then backtracks through the preceding star like any
+                        // failed step, below.
+                    }
+                    ExtglobStep::Star {
+                        next,
+                        blocks_leading_period,
+                        ..
+                    } => {
+                        if TRACK_RETRIES {
+                            max_star_step = max_star_step.max(pattern_index);
+                        }
+                        let hidden_blocked = *blocks_leading_period
+                            && star_stops_before_hidden_component(path, path_index, options);
+                        let dedup_blocked = if !hidden_blocked && TRACK_RETRIES && dedup_stars {
+                            let memo_index = program.memo_state_index(pattern_index);
+                            let blocked = !(pattern_index == start
+                                && path_index == start_path_index)
+                                && !state.failed.insert(memo_index, path_index);
+                            #[cfg(test)]
+                            if !blocked {
+                                EXTGLOB_MEMOIZED_STAR_VISITS
+                                    .with(|count| count.set(count.get() + 1));
+                            }
+                            blocked
+                        } else {
+                            false
+                        };
+                        if hidden_blocked {
+                            if TRACK_RETRIES {
+                                hit_hidden_barrier = true;
+                            }
+                        } else if !dedup_blocked {
+                            if !*blocks_leading_period
+                                && steps.get(*next).is_some_and(|step| {
+                                    matches!(step, ExtglobStep::Separator { .. })
+                                })
+                            {
+                                queue_extglob_continuation(program, state, *next + 1, path_index);
+                            }
+                            let component_local =
+                                extglob_star_component_local(steps, pattern_index, options);
+                            if TRACK_RETRIES {
+                                if let Some((retry_start, _)) = first_retryable_star {
+                                    if pattern_index != retry_start {
+                                        earlier_retryable_star_overwritten = true;
+                                    }
+                                } else if !component_local || !options.root_component_wildcards {
+                                    first_retryable_star = Some((pattern_index, path_index));
+                                }
+                            }
+                            remember_crossing_star(
+                                &mut crossing_star,
+                                has_star.then_some((
+                                    CrossingStar {
+                                        resume: star_pattern_index,
+                                        consumed: star_path_index,
+                                        memo_index: star_memo_index,
+                                        blocks_leading_period: star_blocks_leading_period,
+                                    },
+                                    star_component_local,
+                                )),
+                                component_local,
+                            );
+                            star_pattern_index = *next;
+                            star_path_index = path_index;
+                            if TRACK_RETRIES && dedup_stars {
+                                star_memo_index = program.memo_state_index(pattern_index);
+                            }
+                            star_component_local = component_local;
+                            star_blocks_leading_period = *blocks_leading_period;
+                            has_star = true;
+                            pattern_index = *next;
+                            continue;
+                        }
+                    }
+                    ExtglobStep::UnclosedGroup { byte: b'*' } => {
+                        if TRACK_RETRIES {
+                            max_star_step = max_star_step.max(pattern_index);
+                        }
+                        let dedup_blocked = if TRACK_RETRIES && dedup_stars {
+                            let memo_index = program.memo_state_index(pattern_index);
+                            let blocked = !(pattern_index == start
+                                && path_index == start_path_index)
+                                && !state.failed.insert(memo_index, path_index);
+                            #[cfg(test)]
+                            if !blocked {
+                                EXTGLOB_MEMOIZED_STAR_VISITS
+                                    .with(|count| count.set(count.get() + 1));
+                            }
+                            blocked
+                        } else {
+                            false
+                        };
+                        if !dedup_blocked {
+                            let component_local =
+                                extglob_wildcard_component_local(steps, pattern_index, options);
+                            if TRACK_RETRIES {
+                                if let Some((retry_start, _)) = first_retryable_star {
+                                    if pattern_index != retry_start {
+                                        earlier_retryable_star_overwritten = true;
+                                    }
+                                } else if !component_local || !options.root_component_wildcards {
+                                    first_retryable_star = Some((pattern_index, path_index));
+                                }
+                            }
+                            remember_crossing_star(
+                                &mut crossing_star,
+                                has_star.then_some((
+                                    CrossingStar {
+                                        resume: star_pattern_index,
+                                        consumed: star_path_index,
+                                        memo_index: star_memo_index,
+                                        blocks_leading_period: star_blocks_leading_period,
+                                    },
+                                    star_component_local,
+                                )),
+                                component_local,
+                            );
+                            star_pattern_index = pattern_index + 1;
+                            star_path_index = path_index;
+                            if TRACK_RETRIES && dedup_stars {
+                                star_memo_index = program.memo_state_index(pattern_index);
+                            }
+                            star_component_local = component_local;
+                            star_blocks_leading_period = true;
+                            has_star = true;
+                            pattern_index += 1;
+                            continue;
+                        }
+                    }
+                    ExtglobStep::Any | ExtglobStep::UnclosedGroup { byte: b'?' } => {
+                        if path.get(path_index).is_some_and(|&byte| {
+                            (!extglob_wildcard_component_local(steps, pattern_index, options)
+                                || !is_separator(byte))
+                                && (options.match_hidden
+                                    || byte != b'.'
+                                    || !at_component_start(path, path_index, options))
+                        }) {
+                            pattern_index += 1;
+                            path_index += 1;
+                            continue;
+                        }
+                        // The wildcard arm falling through leaves `?` readable as
+                        // an ordinary byte, which only a literal `?` can match.
+                        if path.get(path_index).is_some_and(|&actual| {
+                            bytes_equal(b'?', actual, options.case_insensitive)
+                        }) {
+                            pattern_index += 1;
+                            path_index += 1;
+                            continue;
+                        }
+                    }
+                    ExtglobStep::Class { class, next } => {
+                        if path.get(path_index).is_some_and(|&byte| {
+                            (!extglob_wildcard_component_local(steps, pattern_index, options)
+                                || !is_separator(byte))
+                                && (options.match_hidden
+                                    || byte != b'.'
+                                    || !at_component_start(path, path_index, options))
+                                && class.matches(byte, options.case_insensitive)
+                        }) {
+                            pattern_index = *next;
+                            path_index += 1;
+                            continue;
+                        }
+                    }
+                    ExtglobStep::Escape { escaped } => {
+                        if path.get(path_index).is_some_and(|&byte| {
+                            bytes_equal(*escaped, byte, options.case_insensitive)
+                        }) {
+                            pattern_index += 2;
+                            path_index += 1;
+                            continue;
+                        }
+                    }
+                    ExtglobStep::Separator { .. } => {
+                        if path
+                            .get(path_index)
+                            .is_some_and(|&actual| is_separator(actual))
+                        {
+                            pattern_index += 1;
+                            path_index += 1;
+                            continue;
+                        }
+                        // A candidate may end in front of the separator of a
+                        // trailing `/**`, as `x/**` accepts `x` (#422).
+                        if path_index == path.len()
+                            && program.trailing_globstar_separator == Some(pattern_index)
+                        {
+                            return true;
+                        }
+                    }
+                    ExtglobStep::Byte(expected) | ExtglobStep::UnclosedGroup { byte: expected } => {
+                        if path.get(path_index).is_some_and(|&actual| {
+                            bytes_equal(*expected, actual, options.case_insensitive)
+                        }) {
+                            pattern_index += 1;
+                            path_index += 1;
+                            continue;
+                        }
+                    }
+                    ExtglobStep::NoMatch => {}
+                }
+            }
+        }
+
+        if has_star && star_path_index < path.len() {
+            let mut can_consume =
+                extglob_star_can_consume(path, star_path_index, options, star_component_local);
+            let mut dedup_stopped = false;
+            if can_consume && TRACK_RETRIES && dedup_stars {
+                if !state.failed.insert(star_memo_index, star_path_index + 1) {
+                    can_consume = false;
+                    dedup_stopped = true;
+                } else {
+                    #[cfg(test)]
+                    EXTGLOB_MEMOIZED_STAR_VISITS.with(|count| count.set(count.get() + 1));
+                }
+            }
+            if !can_consume {
+                if TRACK_RETRIES && !dedup_stopped {
+                    if star_stops_before_hidden_component(path, star_path_index, options) {
+                        hit_hidden_barrier = true;
+                    }
+                    if star_component_local && is_separator(path[star_path_index]) {
+                        hit_separator_barrier = true;
+                    }
+                }
+                if let Some(previous) = crossing_star.take() {
+                    star_pattern_index = previous.resume;
+                    star_path_index = previous.consumed;
+                    star_memo_index = previous.memo_index;
+                    star_component_local = false;
+                    star_blocks_leading_period = previous.blocks_leading_period;
+                    rewound_crossing_star = true;
+                    dedup_stopped = false;
+                    can_consume = star_path_index < path.len()
+                        && extglob_star_can_consume(path, star_path_index, options, false);
+                    if can_consume && TRACK_RETRIES && dedup_stars {
+                        if !state.failed.insert(star_memo_index, star_path_index + 1) {
+                            can_consume = false;
+                            dedup_stopped = true;
+                        } else {
+                            #[cfg(test)]
+                            EXTGLOB_MEMOIZED_STAR_VISITS.with(|count| count.set(count.get() + 1));
+                        }
+                    }
+                }
+            }
+            if !can_consume {
+                if dedup_stopped {
+                    break;
+                }
+                if star_stops_before_hidden_component(path, star_path_index, options) {
+                    if TRACK_RETRIES {
+                        hit_hidden_barrier = true;
+                    }
+                    if star_blocks_leading_period {
+                        break;
+                    }
+                }
+                if TRACK_RETRIES && star_component_local && is_separator(path[star_path_index]) {
+                    hit_separator_barrier = true;
+                }
+                pattern_index = star_pattern_index;
+                path_index = star_path_index;
+                has_star = false;
+                continue;
+            }
+            let consumed = path[star_path_index];
+            pattern_index = star_pattern_index;
+            star_path_index += 1;
+            if !star_component_local
+                && star_blocks_leading_period
+                && !options.match_hidden
+                && is_separator(consumed)
+                && path.get(star_path_index) == Some(&b'.')
+            {
+                if TRACK_RETRIES {
+                    hit_hidden_barrier = true;
+                }
+                break;
+            }
+            path_index = star_path_index;
+            continue;
+        }
+        break;
+    }
+
+    if path_index == path.len() && pattern_index == steps.len() {
+        return true;
+    }
+    if TRACK_RETRIES
+        && !dedup_stars
+        && earlier_retryable_star_overwritten
+        && (hit_hidden_barrier || hit_separator_barrier)
+        && let Some((star_start, star_start_path)) = first_retryable_star
+        && {
+            let retry = extglob_retryable_star_segment(steps, star_start, max_star_step, options);
+            (hit_hidden_barrier && retry.explicit_dot)
+                || (hit_separator_barrier && retry.crossing_wildcard_before_local_star)
+        }
+    {
+        state.deferred_retries.push(DeferredMemoRetry {
+            star_start,
+            star_start_path,
+            already_marked: star_start == start && star_start_path == start_path_index,
+            monotonic_group: monotonic_range.map(|range| (monotonic_group_index, range)),
+        });
+    }
+    false
+}
+
+/// Runs one memoized outer-star segment task after the latest-star fast path
+/// hit a hidden-component or separator barrier behind an overwritten star.
+#[allow(clippy::too_many_arguments)]
+fn match_extglob_task_memoized(
+    program: &CompiledExtglob,
+    path: &[u8],
+    start: usize,
+    start_path_index: usize,
+    monotonic_group: Option<(usize, (usize, usize))>,
+    options: PatternOptions,
+    state: &mut ExtglobMatchState<'_>,
+) -> bool {
+    let steps = &program.steps;
+    let mut pattern_index = start;
+    let mut path_index = start_path_index;
+
+    while path_index < path.len() || pattern_index < steps.len() {
+        if pattern_index >= steps.len() {
+            return false;
+        }
+        let leading_period_blocked = !options.match_hidden
+            && path.get(path_index) == Some(&b'.')
+            && at_component_start(path, path_index, options)
+            && match &steps[pattern_index] {
                 ExtglobStep::Group(group) => {
                     !extglob_group_allows_literal_leading_period(&program.groups[*group])
                 }
                 ExtglobStep::UnclosedGroup { .. } => true,
                 _ => false,
             };
-            if leading_period_is_forbidden
-                && !options.match_hidden
-                && path.get(path_index) == Some(&b'.')
-                && at_component_start(path, path_index, options)
-            {
+        if leading_period_blocked {
+            return false;
+        }
+        match &steps[pattern_index] {
+            ExtglobStep::Group(group) => {
+                let group = &program.groups[*group];
+                let already_expanded = monotonic_group.is_some_and(|(g, (lo, hi))| {
+                    g == pattern_index && (lo..=hi).contains(&path_index)
+                });
+                let should_expand = !already_expanded
+                    && ((pattern_index == start && path_index == start_path_index)
+                        || state
+                            .failed
+                            .insert(program.memo_state_index(pattern_index), path_index));
+                if should_expand {
+                    queue_extglob_group(program, group, path, path_index, options, state);
+                }
                 return false;
             }
-            match &steps[pattern_index] {
-                ExtglobStep::Group(group) => {
-                    let group = &program.groups[*group];
-                    let should_expand = match group.entry_memo {
-                        GroupEntryMemo::None => true,
-                        GroupEntryMemo::Monotonic => {
-                            if monotonic_range.is_some_and(|(_, hi)| path_index == hi) {
-                                false
-                            } else {
-                                monotonic_range = Some((
-                                    monotonic_range.map_or(path_index, |(lo, _)| lo),
-                                    path_index,
-                                ));
-                                true
-                            }
-                        }
-                        GroupEntryMemo::MonotonicOrCrossingStar if !rewound_crossing_star => {
-                            if monotonic_range.is_some_and(|(_, hi)| path_index == hi) {
-                                false
-                            } else {
-                                monotonic_range = Some((
-                                    monotonic_range.map_or(path_index, |(lo, _)| lo),
-                                    path_index,
-                                ));
-                                true
-                            }
-                        }
-                        GroupEntryMemo::MonotonicOrCrossingStar => {
-                            !monotonic_range.is_some_and(|(lo, hi)| (lo..=hi).contains(&path_index))
-                                && ((pattern_index == start && path_index == start_path_index)
-                                    || state.failed.insert(
-                                        program.memo_state_index(pattern_index),
-                                        path_index,
-                                    ))
-                        }
-                        GroupEntryMemo::Paged => {
-                            (pattern_index == start && path_index == start_path_index)
-                                || state
-                                    .failed
-                                    .insert(program.memo_state_index(pattern_index), path_index)
-                        }
-                    };
-                    if should_expand {
-                        queue_extglob_group(program, group, path, path_index, options, state);
-                    }
-                    // The group's continuations are queued; this branch
-                    // then backtracks through the preceding star like any
-                    // failed step, below.
+            ExtglobStep::Star {
+                next,
+                blocks_leading_period,
+                memoize_tail,
+            } => {
+                let memo_index = program.memo_state_index(pattern_index);
+                if !(pattern_index == start && path_index == start_path_index)
+                    && !state.failed.insert(memo_index, path_index)
+                {
+                    return false;
                 }
-                ExtglobStep::Star {
-                    next,
-                    blocks_leading_period,
-                } => {
-                    let blocked = *blocks_leading_period
-                        && !options.match_hidden
-                        && path.get(path_index) == Some(&b'.')
-                        && at_component_start(path, path_index, options);
-                    if !blocked {
-                        if !*blocks_leading_period
-                            && steps
-                                .get(*next)
-                                .is_some_and(|step| matches!(step, ExtglobStep::Byte(byte) if is_separator(*byte)))
-                        {
-                            queue_extglob_continuation(
-                                program,
-                                state,
-                                *next + 1,
-                                path_index,
-                            );
-                        }
-                        let component_local =
-                            extglob_star_component_local(steps, pattern_index, options);
-                        remember_crossing_star(
-                            &mut crossing_star,
-                            has_star.then_some((
-                                star_pattern_index,
-                                star_path_index,
-                                star_component_local,
-                            )),
-                            component_local,
-                        );
-                        star_pattern_index = *next;
-                        star_path_index = path_index;
-                        star_component_local = component_local;
-                        has_star = true;
-                        pattern_index = *next;
-                        continue;
-                    }
-                }
-                ExtglobStep::UnclosedGroup { byte: b'*' } => {
-                    let component_local =
-                        extglob_wildcard_component_local(steps, pattern_index, options);
-                    remember_crossing_star(
-                        &mut crossing_star,
-                        has_star.then_some((
-                            star_pattern_index,
-                            star_path_index,
-                            star_component_local,
-                        )),
-                        component_local,
+                #[cfg(test)]
+                EXTGLOB_MEMOIZED_STAR_VISITS.with(|count| count.set(count.get() + 1));
+                if !*memoize_tail {
+                    debug_assert!(
+                        pattern_index != start || path_index != start_path_index,
+                        "handoff star must not be the retry entry star"
                     );
-                    star_pattern_index = pattern_index + 1;
-                    star_path_index = path_index;
-                    star_component_local = component_local;
-                    has_star = true;
-                    pattern_index += 1;
-                    continue;
-                }
-                ExtglobStep::Any | ExtglobStep::UnclosedGroup { byte: b'?' } => {
-                    if path.get(path_index).is_some_and(|&byte| {
-                        (!extglob_wildcard_component_local(steps, pattern_index, options)
-                            || !is_separator(byte))
-                            && (options.match_hidden
-                                || byte != b'.'
-                                || !at_component_start(path, path_index, options))
-                    }) {
-                        pattern_index += 1;
-                        path_index += 1;
-                        continue;
-                    }
-                    // The wildcard arm falling through leaves `?` readable as
-                    // an ordinary byte, which only a literal `?` can match.
-                    if path
-                        .get(path_index)
-                        .is_some_and(|&actual| bytes_equal(b'?', actual, options.case_insensitive))
+                    state.handoff_pending.push((pattern_index, path_index));
+                    #[cfg(test)]
                     {
-                        pattern_index += 1;
-                        path_index += 1;
-                        continue;
+                        *state.pending_peak = (*state.pending_peak).max(
+                            state.pending.len()
+                                + state.handoff_pending.len()
+                                + state.memo_pending.len(),
+                        );
                     }
+                    return false;
                 }
-                ExtglobStep::Class { class, next } => {
-                    if path.get(path_index).is_some_and(|&byte| {
-                        (!extglob_wildcard_component_local(steps, pattern_index, options)
-                            || !is_separator(byte))
-                            && (options.match_hidden
-                                || byte != b'.'
-                                || !at_component_start(path, path_index, options))
-                            && class.matches(byte, options.case_insensitive)
-                    }) {
-                        pattern_index = *next;
-                        path_index += 1;
-                        continue;
-                    }
+                if *blocks_leading_period
+                    && star_stops_before_hidden_component(path, path_index, options)
+                {
+                    return false;
                 }
-                ExtglobStep::Escape { escaped } => {
-                    if path
-                        .get(path_index)
-                        .is_some_and(|&byte| bytes_equal(*escaped, byte, options.case_insensitive))
+                if !*blocks_leading_period
+                    && (path_index == 0 || is_separator(path[path_index - 1]))
+                    && steps
+                        .get(*next)
+                        .is_some_and(|step| matches!(step, ExtglobStep::Separator { .. }))
+                {
+                    queue_extglob_continuation(program, state, *next + 1, path_index);
+                }
+                let component_local = extglob_star_component_local(steps, pattern_index, options);
+                if path_index < path.len()
+                    && extglob_star_can_consume(path, path_index, options, component_local)
+                {
+                    let next_path = path_index + 1;
+                    if !(*blocks_leading_period
+                        && star_stops_before_hidden_component(path, next_path, options))
                     {
-                        pattern_index += 2;
-                        path_index += 1;
-                        continue;
+                        queue_extglob_memo_continuation(program, state, pattern_index, next_path);
                     }
                 }
-                ExtglobStep::Byte(expected) | ExtglobStep::UnclosedGroup { byte: expected } => {
-                    if path.get(path_index).is_some_and(|&actual| {
-                        bytes_equal(*expected, actual, options.case_insensitive)
-                    }) {
-                        pattern_index += 1;
-                        path_index += 1;
-                        continue;
-                    }
-                    // A candidate may end in front of the separator of a
-                    // trailing `/**`, as `x/**` accepts `x` (#422).
-                    if path_index == path.len()
-                        && program.trailing_globstar_separator == Some(pattern_index)
-                    {
-                        return true;
-                    }
-                }
-                ExtglobStep::NoMatch => {}
-            }
-        }
-
-        if has_star
-            && star_path_index < path.len()
-            && !extglob_star_can_consume(path, star_path_index, options, star_component_local)
-            && let Some((resume, consumed)) = crossing_star.take()
-        {
-            star_pattern_index = resume;
-            star_path_index = consumed;
-            star_component_local = false;
-            rewound_crossing_star = true;
-        }
-        if has_star && star_path_index < path.len() {
-            if !extglob_star_can_consume(path, star_path_index, options, star_component_local) {
-                pattern_index = star_pattern_index;
-                path_index = star_path_index;
-                has_star = false;
+                pattern_index = *next;
                 continue;
             }
-            pattern_index = star_pattern_index;
-            star_path_index += 1;
-            path_index = star_path_index;
-            continue;
+            ExtglobStep::UnclosedGroup { byte: b'*' } => {
+                let memo_index = program.memo_state_index(pattern_index);
+                if !(pattern_index == start && path_index == start_path_index)
+                    && !state.failed.insert(memo_index, path_index)
+                {
+                    return false;
+                }
+                #[cfg(test)]
+                EXTGLOB_MEMOIZED_STAR_VISITS.with(|count| count.set(count.get() + 1));
+                let component_local =
+                    extglob_wildcard_component_local(steps, pattern_index, options);
+                if path_index < path.len()
+                    && extglob_star_can_consume(path, path_index, options, component_local)
+                {
+                    let next_path = path_index + 1;
+                    if !star_stops_before_hidden_component(path, next_path, options) {
+                        queue_extglob_memo_continuation(program, state, pattern_index, next_path);
+                    }
+                }
+                pattern_index += 1;
+                continue;
+            }
+            ExtglobStep::Any | ExtglobStep::UnclosedGroup { byte: b'?' } => {
+                if path.get(path_index).is_some_and(|&byte| {
+                    (!extglob_wildcard_component_local(steps, pattern_index, options)
+                        || !is_separator(byte))
+                        && (options.match_hidden
+                            || byte != b'.'
+                            || !at_component_start(path, path_index, options))
+                }) || path
+                    .get(path_index)
+                    .is_some_and(|&actual| bytes_equal(b'?', actual, options.case_insensitive))
+                {
+                    pattern_index += 1;
+                    path_index += 1;
+                    continue;
+                }
+                return false;
+            }
+            ExtglobStep::Class { class, next } => {
+                if path.get(path_index).is_some_and(|&byte| {
+                    (!extglob_wildcard_component_local(steps, pattern_index, options)
+                        || !is_separator(byte))
+                        && (options.match_hidden
+                            || byte != b'.'
+                            || !at_component_start(path, path_index, options))
+                        && class.matches(byte, options.case_insensitive)
+                }) {
+                    pattern_index = *next;
+                    path_index += 1;
+                    continue;
+                }
+                return false;
+            }
+            ExtglobStep::Escape { escaped } => {
+                if path
+                    .get(path_index)
+                    .is_some_and(|&byte| bytes_equal(*escaped, byte, options.case_insensitive))
+                {
+                    pattern_index += 2;
+                    path_index += 1;
+                    continue;
+                }
+                return false;
+            }
+            ExtglobStep::Separator { .. } => {
+                if path
+                    .get(path_index)
+                    .is_some_and(|&actual| is_separator(actual))
+                {
+                    pattern_index += 1;
+                    path_index += 1;
+                    continue;
+                }
+                return path_index == path.len()
+                    && program.trailing_globstar_separator == Some(pattern_index);
+            }
+            ExtglobStep::Byte(expected) | ExtglobStep::UnclosedGroup { byte: expected } => {
+                if path
+                    .get(path_index)
+                    .is_some_and(|&actual| bytes_equal(*expected, actual, options.case_insensitive))
+                {
+                    pattern_index += 1;
+                    path_index += 1;
+                    continue;
+                }
+                return false;
+            }
+            ExtglobStep::NoMatch => return false,
         }
-        return false;
     }
     true
 }
 
+fn queue_extglob_memo_continuation(
+    program: &CompiledExtglob,
+    state: &mut ExtglobMatchState<'_>,
+    start: usize,
+    path_index: usize,
+) {
+    if state
+        .failed
+        .insert(program.memo_state_index(start), path_index)
+    {
+        state.memo_pending.push((start, path_index));
+        #[cfg(test)]
+        {
+            *state.pending_peak =
+                (*state.pending_peak).max(state.pending.len() + state.memo_pending.len());
+        }
+    }
+}
+
 /// Updates the crossing-star backtrack point when a new star replaces
-/// `previous`, given as `(pattern resume, path consumed, component-local)`.
+/// `previous`.
 ///
 /// A new crossing star supersedes every earlier star. A new component-local
 /// star keeps the latest crossing star as the fallback for the separator it
 /// cannot consume.
 fn remember_crossing_star(
-    crossing_star: &mut Option<(usize, usize)>,
-    previous: Option<(usize, usize, bool)>,
+    crossing_star: &mut Option<CrossingStar>,
+    previous: Option<(CrossingStar, bool)>,
     component_local: bool,
 ) {
     if !component_local {
         *crossing_star = None;
-    } else if let Some((resume, consumed, false)) = previous {
-        *crossing_star = Some((resume, consumed));
+    } else if let Some((previous, false)) = previous {
+        *crossing_star = Some(previous);
     }
 }
 
@@ -7773,7 +9139,7 @@ fn extglob_star_component_local(
 /// bounds nothing, exactly as in the token engine.
 fn extglob_star_run_is_whole_component(steps: &[ExtglobStep], start: usize, end: usize) -> bool {
     let is_separator_step =
-        |index: usize| matches!(steps.get(index), Some(ExtglobStep::Byte(b'/')));
+        |index: usize| matches!(steps.get(index), Some(ExtglobStep::Separator { .. }));
     (start == 0 || is_separator_step(start - 1)) && (end == steps.len() || is_separator_step(end))
 }
 
@@ -8087,7 +9453,10 @@ fn matching_extglob_repetition_ends(
                         }
                         sweep
                             .inject_start(sweep_state, at_component_start(path, absolute, options));
-                        if sweep.accepts(sweep_state) {
+                        if sweep.accepts_at(
+                            sweep_state,
+                            star_stops_before_hidden_component(path, absolute, options),
+                        ) {
                             visit(state.visited, matched_base, offset);
                         }
                     } else {
@@ -8120,6 +9489,80 @@ fn matching_extglob_repetition_ends(
                 state.sweep_states.len(),
                 "prepared repetition sweeps must align with injected variable-width alternatives"
             );
+            // If the component-local first iteration matched zero bytes (e.g.
+            // an empty arm or `*` at offset 0), a later non-local iteration can
+            // also start right at offset 0.
+            if offset == 0 && first_iteration_apart && visited(state.visited, matched_base, 0) {
+                let mut sweep_index = 0;
+                for alternative in group.matched_alternatives() {
+                    if let Some(width) = alternative.width {
+                        if width == 0 {
+                            continue;
+                        }
+                        let Some(end) = absolute.checked_add(width) else {
+                            continue;
+                        };
+                        if end <= component_end
+                            && match_extglob_alternative_exact(
+                                alternative,
+                                &path[absolute..end],
+                                at_component_start(path, absolute, options),
+                                options,
+                                later_root_local,
+                            )
+                        {
+                            let reached = end - path_index;
+                            visit(state.visited, reachable_base, reached);
+                            visit(state.visited, matched_base, reached);
+                        }
+                        continue;
+                    }
+                    let mut has_fallback = false;
+                    for compiled in &alternative.compiled {
+                        if let Some(sweep) = &compiled.sweep {
+                            let sweep_state = &mut state.sweep_states[sweep_index];
+                            sweep_index += 1;
+                            sweep.inject_start(
+                                sweep_state,
+                                at_component_start(path, absolute, options),
+                            );
+                            if sweep.accepts_at(
+                                sweep_state,
+                                star_stops_before_hidden_component(path, absolute, options),
+                            ) {
+                                visit(state.visited, matched_base, 0);
+                            }
+                        } else {
+                            has_fallback = true;
+                        }
+                    }
+                    if has_fallback {
+                        state.candidate_ends.clear();
+                        matching_extglob_alternative_ends(
+                            alternative,
+                            AlternativeSpan {
+                                path,
+                                start: absolute,
+                                end_limit: component_end,
+                                root_component_local: later_root_local,
+                            },
+                            options,
+                            state.prefix_sweep_state,
+                            state.candidate_ends,
+                        );
+                        for &end in state.candidate_ends.iter() {
+                            let reached = end - path_index;
+                            visit(state.visited, reachable_base, reached);
+                            visit(state.visited, matched_base, reached);
+                        }
+                    }
+                }
+                debug_assert_eq!(
+                    sweep_index,
+                    state.sweep_states.len(),
+                    "prepared repetition sweeps must align with injected variable-width alternatives"
+                );
+            }
         }
 
         if absolute == component_end {
@@ -8138,7 +9581,10 @@ fn matching_extglob_repetition_ends(
                 let alternative_options =
                     extglob_alternative_options(path, absolute, options, later_root_local);
                 if sweep.advance(sweep_state, byte, starts_component, alternative_options)
-                    && sweep.accepts(sweep_state)
+                    && sweep.accepts_at(
+                        sweep_state,
+                        star_stops_before_hidden_component(path, absolute + 1, options),
+                    )
                 {
                     visit(state.visited, reachable_base, offset + 1);
                     visit(state.visited, matched_base, offset + 1);
@@ -8233,7 +9679,31 @@ fn matching_extglob_alternative_ends(
                 output,
             );
         } else {
+            let elided_tokens = match compiled.tokens.as_slice() {
+                [prefix @ .., Token::Separator, Token::RecursiveStar] => Some(prefix),
+                _ => None,
+            };
+            let blocks_hidden_end = matches!(
+                compiled.tokens.last(),
+                Some(Token::Star | Token::RecursiveStar)
+            );
+            let elided_blocks_hidden_end = elided_tokens.is_some_and(|prefix| {
+                matches!(prefix.last(), Some(Token::Star | Token::RecursiveStar))
+            });
             for end in path_index..=component_end {
+                if blocks_hidden_end && star_stops_before_hidden_component(path, end, options) {
+                    if let Some(prefix) = elided_tokens
+                        && !elided_blocks_hidden_end
+                        && Pattern::matches_general(
+                            prefix,
+                            &path[path_index..end],
+                            alternative_options,
+                        )
+                    {
+                        output.push(end);
+                    }
+                    continue;
+                }
                 if Pattern::match_alternatives(
                     std::slice::from_ref(compiled),
                     alternative_options,
@@ -8338,13 +9808,15 @@ mod tests {
     use super::LiteralSuffix;
     use super::{
         AlternativeFastPath, ComponentBounds, ExtglobStep, FailedStates, FastPath, IrBudget,
-        Pattern, PatternOptions, Prefilter, ProvenanceBudget, SweepEngine, Token,
-        WalkerPathViability, extglob_closing_scanned_bytes, extglob_closing_table_len,
-        extglob_failed_len, extglob_failed_stats, extglob_group_expansions, extglob_pending_peak,
-        extglob_scratch_capacities, positive_extglob_scratch_capacities,
-        reset_extglob_closing_scanned_bytes, reset_unconditional_brace_scanned_bytes,
-        scratch_capacities, sweep_is_deferred, unconditional_brace_peak,
-        unconditional_brace_scanned_bytes,
+        Pattern, PatternOptions, PositiveExtglobMatcher, PositiveExtglobState, Prefilter,
+        ProvenanceBudget, SweepEngine, Token, WalkerPathViability, extglob_closing_scanned_bytes,
+        extglob_closing_table_len, extglob_failed_len, extglob_failed_stats,
+        extglob_group_expansions, extglob_memoized_star_fallbacks, extglob_memoized_star_visits,
+        extglob_pending_peak, extglob_scratch_capacities, positive_extglob_scratch_capacities,
+        reset_extglob_closing_scanned_bytes, reset_extglob_memoized_star_fallbacks,
+        reset_scoped_suffix_set_scan_stats, reset_unconditional_brace_scanned_bytes,
+        scoped_suffix_set_scan_stats, scratch_capacities, sweep_is_deferred,
+        unconditional_brace_peak, unconditional_brace_scanned_bytes,
     };
 
     fn compile(pattern: &str) -> Pattern {
@@ -10190,7 +11662,8 @@ mod tests {
                 .steps[0],
             ExtglobStep::Star {
                 next: 2,
-                blocks_leading_period: false
+                blocks_leading_period: false,
+                ..
             }
         ));
 
@@ -10203,7 +11676,8 @@ mod tests {
                 .steps[0],
             ExtglobStep::Star {
                 next: 3,
-                blocks_leading_period: true
+                blocks_leading_period: true,
+                ..
             }
         ));
         assert!(!ordinary.is_match(".hidden/foo"));
@@ -10217,7 +11691,8 @@ mod tests {
                 .steps[0],
             ExtglobStep::Star {
                 next: 4,
-                blocks_leading_period: false
+                blocks_leading_period: false,
+                ..
             }
         ));
         assert!(longer.is_match(".h"));
@@ -13318,6 +14793,657 @@ mod tests {
                 "{source} against {candidate}: engines disagree"
             );
         }
+    }
+
+    #[test]
+    fn scoped_suffix_set_nested_prefixes_and_shared_suffixes() {
+        let options = PatternOptions::default()
+            .braces(true)
+            .recursive_double_star(true);
+        let pattern = Pattern::compile("{a,a\\/.b}/**/*.{rs,ts}", options).expect("compiles");
+        assert!(matches!(
+            pattern.alternative_fast_path.as_deref(),
+            Some(AlternativeFastPath::ScopedSuffixSet(_))
+        ));
+        for (path, expected) in [
+            ("a/.b/x.rs", true),
+            ("a/.b/dir/x.ts", true),
+            ("a/.c/x.rs", false),
+            ("a/x.rs", true),
+            ("a/.b/.c/x.rs", false),
+            ("a/.b/.rs", false),
+        ] {
+            assert_eq!(pattern.is_match_glob_path(path), expected, "path {path:?}");
+            assert!(pattern.engines_agree(path), "engines disagree on {path:?}");
+        }
+
+        // Shared suffixes where a shorter suffix leaves a hidden component in
+        // the middle while a longer suffix absorbs it (`{src,lib}/**/*.{gz,tar.gz}`).
+        let shared_ext = Pattern::compile("{src,lib}/**/*.{gz,tar.gz}", options).expect("compiles");
+        assert!(matches!(
+            shared_ext.alternative_fast_path.as_deref(),
+            Some(AlternativeFastPath::ScopedSuffixSet(_))
+        ));
+        for (path, expected) in [
+            ("src/a.gz", true),
+            ("src/a.tar.gz", true),
+            ("lib/sub/pkg.tar.gz", true),
+            ("src/.gz", false),
+            ("src/.tar.gz", false),
+            ("src/.hidden/a.tar.gz", false),
+            ("lib/a.zip", false),
+        ] {
+            assert_eq!(
+                shared_ext.is_match_glob_path(path),
+                expected,
+                "shared_ext path {path:?}"
+            );
+            assert!(
+                shared_ext.engines_agree(path),
+                "shared_ext engines disagree on {path:?}"
+            );
+        }
+
+        // Longer literal suffix absorbing a hidden component that blocked a
+        // shorter suffix (`{src,lib}/**/*{z,p\/.h.z}`).
+        let hidden_absorbing_suffix =
+            Pattern::compile(r"{src,lib}/**/*{z,p\/.h.z}", options).expect("compiles");
+        assert!(matches!(
+            hidden_absorbing_suffix.alternative_fast_path.as_deref(),
+            Some(AlternativeFastPath::ScopedSuffixSet(_))
+        ));
+        for (path, expected) in [
+            ("src/p/.h.z", true),
+            ("lib/sub/p/.h.z", true),
+            ("src/q/.h.z", false),
+            ("src/.hidden/p/.h.z", false),
+        ] {
+            assert_eq!(
+                hidden_absorbing_suffix.is_match_glob_path(path),
+                expected,
+                "hidden_absorbing_suffix path {path:?}"
+            );
+            assert!(
+                hidden_absorbing_suffix.engines_agree(path),
+                "hidden_absorbing_suffix engines disagree on {path:?}"
+            );
+        }
+
+        // Case-insensitive nested prefixes and shared suffixes.
+        let ci = Pattern::compile("{a,a\\/.B}/**/*.{RS,ts}", options.case_insensitive(true))
+            .expect("compiles");
+        assert!(ci.is_match_glob_path("A/.b/x.rs"));
+        assert!(!ci.is_match_glob_path("A/.c/x.rs"));
+        assert!(ci.engines_agree("A/.b/x.rs"));
+
+        // Spill path beyond SCOPED_SUFFIX_INLINE_PREFIXES (16 nested prefixes).
+        let mut prefixes = Vec::new();
+        let mut current = String::from("p");
+        prefixes.push(current.clone());
+        for i in 0..20 {
+            current.push_str(&format!("\\/.h{i}"));
+            prefixes.push(current.clone());
+        }
+        let spill_source = format!("{{{}}}/**/*.{{rs,ts}}", prefixes.join(","));
+        let spill = Pattern::compile(&spill_source, options).expect("spill pattern compiles");
+        assert!(matches!(
+            spill.alternative_fast_path.as_deref(),
+            Some(AlternativeFastPath::ScopedSuffixSet(_))
+        ));
+        let deep_path = format!(
+            "p/{}/leaf.rs",
+            (0..20)
+                .map(|i| format!(".h{i}"))
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        assert!(spill.is_match_glob_path(&deep_path));
+        assert!(spill.engines_agree(&deep_path));
+        let deep_miss = format!("{deep_path}.nope");
+        assert!(!spill.is_match_glob_path(&deep_miss));
+        assert!(spill.engines_agree(&deep_miss));
+
+        // Short-circuit scan bounds: non-matching suffix stops at shortest
+        // prefix without walking deeper nested prefixes, and a clean single-
+        // start match stops at the shortest matching suffix without scanning
+        // deeper suffix branches.
+        let shared =
+            Pattern::compile("{z,a,a\\/b\\/c\\/d}/**/*.{ts,rs,foo.rs}", options).expect("compiles");
+        reset_scoped_suffix_set_scan_stats();
+        assert!(!shared.is_match_glob_path("a/b/c/d/file.txt"));
+        let (prefix_steps, suffix_steps, hidden_bytes) = scoped_suffix_set_scan_stats();
+        assert_eq!(
+            prefix_steps, 1,
+            "suffix miss must abort after shortest prefix"
+        );
+        assert!(suffix_steps <= 2, "suffix miss must fail quickly");
+        assert_eq!(
+            hidden_bytes, 0,
+            "suffix miss must not scan for hidden components"
+        );
+
+        reset_scoped_suffix_set_scan_stats();
+        let long_mid = format!("a/{}bar.foo.rs", "x/".repeat(64));
+        assert!(shared.is_match_glob_path(&long_mid));
+        let (prefix_steps, suffix_steps, _) = scoped_suffix_set_scan_stats();
+        assert_eq!(prefix_steps, 1, "clean match must stop at shortest prefix");
+        assert_eq!(
+            suffix_steps, 3,
+            "clean single-start match must return at `.rs` without walking `.foo.rs`"
+        );
+    }
+
+    #[test]
+    fn extglob_outer_star_backtrack_and_group_hidden_stop_guard() {
+        let options = PatternOptions::walker();
+
+        // Outer-star and group-star dotfile backtracking parity with plain patterns.
+        for (extglob_src, plain_src, candidates) in [
+            ("*.@(x)", "*.x", &["a/.x", "a/b.x", ".x", "b.x"][..]),
+            ("a*.@(x)", "a*.x", &["a/.x", "a/b.x", "a..x", "ab/.x"][..]),
+            (
+                "@(a*).@(x)",
+                "a*.x",
+                &["a/.x", "a/b.x", "a..x", "ab/.x"][..],
+            ),
+            (
+                "*?.*@(x)",
+                "*?.*x",
+                &["a.b/.c.x", "a.b/c.x", "a.b/.x", "a.b/.xx", "a/.x"][..],
+            ),
+            (
+                "*?.*.@(rs|keep.rs)",
+                "*?.*.{rs,keep.rs}",
+                &["dir.name/.keep.rs", "dir.name/.rs", "dir.name/file.rs"][..],
+            ),
+            (
+                "dir/*?.*.@(x)*",
+                "dir/*?.*.x*",
+                &["dir/a.b/.x.x", "dir/a.b/file.x", "dir/a.b/.y"][..],
+            ),
+            (
+                "*?.*@(*).x",
+                "*?.**.x",
+                &["a.b/.y/.x", "a.b/y/.x", "a.b/y/z.x", "a.b/.x"][..],
+            ),
+            (
+                "**/.a*/.a/@(.a)",
+                "**/.a*/.a/.a",
+                &[
+                    "a.a/.a/.a",
+                    ".a/.a/.a",
+                    "dir/.a/.a/.a",
+                    "dir/a.a/.a/.a",
+                    ".h/.a/.a/.a",
+                    "dir/.h/.a/.a/.a",
+                ][..],
+            ),
+            (
+                "x/**/.a*/.a/@(.a)",
+                "x/**/.a*/.a/.a",
+                &[
+                    "x/a.a/.a/.a",
+                    "x/.a/.a/.a",
+                    "x/dir/.a/.a/.a",
+                    "x/.h/.a/.a/.a",
+                ][..],
+            ),
+            (r"a\/@(*)", r"a\/*", &["a/x/y", "a/x"][..]),
+            (
+                "**/?.*.*@(txt)",
+                "**/?.*.*txt",
+                &["a.//.conf.txt", "a/.conf.txt", "a/b.c.txt"][..],
+            ),
+            ("**/?@(txt)", "**/?txt", &["a//txt", "a/btxt", "/txt"][..]),
+        ] {
+            let extglob = Pattern::compile(extglob_src, options).expect("extglob compiles");
+            let plain = Pattern::compile(plain_src, options).expect("plain compiles");
+            for &path in candidates {
+                assert_eq!(
+                    extglob.is_match(path),
+                    plain.is_match(path),
+                    "is_match mismatch: {extglob_src} vs {plain_src} on {path:?}"
+                );
+                assert_eq!(
+                    extglob.is_match_path(path),
+                    plain.is_match_path(path),
+                    "is_match_path mismatch: {extglob_src} vs {plain_src} on {path:?}"
+                );
+                assert_eq!(
+                    extglob.is_match_glob_path(path),
+                    plain.is_match_glob_path(path),
+                    "is_match_glob_path mismatch: {extglob_src} vs {plain_src} on {path:?}"
+                );
+                assert!(
+                    extglob.engines_agree(path),
+                    "engines disagree for {extglob_src} on {path:?}"
+                );
+            }
+        }
+
+        // Memoized `**/` retries must hand off only on component boundaries.
+        let globstar_retry = Pattern::compile("**/.a*/.a/@(.a)", options).expect("compiles");
+        for (path, expected) in [
+            ("a.a/.a/.a", false),
+            (".a/.a/.a", true),
+            ("dir/.a/.a/.a", true),
+            ("dir/a.a/.a/.a", false),
+            (".h/.a/.a/.a", false),
+            ("dir/.h/.a/.a/.a", false),
+        ] {
+            assert_eq!(
+                globstar_retry.is_match_glob_path(path),
+                expected,
+                "is_match_glob_path **/.a*/.a/@(.a) on {path:?}"
+            );
+            assert!(globstar_retry.engines_agree(path));
+        }
+
+        // Preserve exact `main` behavior for separator-absorbing literal-dot
+        // arms and trailing-elided globstar repetition arms.
+        let hidden_config = Pattern::compile("@(.config/**)/settings", options).expect("compiles");
+        for path in [".config/settings", ".config/apps/settings"] {
+            assert!(hidden_config.is_match(path), "is_match {path:?}");
+            assert!(hidden_config.is_match_path(path), "is_match_path {path:?}");
+            assert!(
+                hidden_config.is_match_glob_path(path),
+                "is_match_glob_path {path:?}"
+            );
+            assert!(hidden_config.engines_agree(path));
+        }
+        assert!(!hidden_config.is_match_glob_path(".config/.hidden/settings"));
+
+        // `+(a/**|/).x*` has `.` right behind the group (`bounds.ends = false`),
+        // so `a/**` ends in an ordinary star run and must reject `"a/.x"` just
+        // like `+(a/**|/).x` and `a/**.x*`, while accepting `"a//.x"` via the
+        // `/` arm. With `/` behind the group (`+(a/**|/)/.x*`), `a/**` absorbs
+        // the separator into `a/**/` and accepts `"a/.x"`.
+        for src in ["+(a/**|/).x", "+(a/**|/).x*"] {
+            let pat = Pattern::compile(src, options).expect("compiles");
+            assert!(!pat.is_match("a/.x"), "{src} must reject a/.x");
+            assert!(pat.is_match("a//.x"), "{src} must accept a//.x");
+            assert!(pat.is_match("a/b.x"), "{src} must accept a/b.x");
+            assert!(pat.engines_agree("a/.x"));
+            assert!(pat.engines_agree("a//.x"));
+            assert!(pat.engines_agree("a/b.x"));
+        }
+        for src in ["+(a/**|/)/.x", "+(a/**|/)/.x*"] {
+            let pat = Pattern::compile(src, options).expect("compiles");
+            assert!(pat.is_match("a/.x"), "{src} must accept a/.x");
+            assert!(pat.is_match_path("a/.x"), "{src} must accept a/.x");
+            assert!(pat.is_match_glob_path("a/.x"), "{src} must accept a/.x");
+            assert!(pat.engines_agree("a/.x"));
+        }
+
+        let elided_globstar = Pattern::compile("*+(dir?/**|.f)", options).expect("compiles");
+        assert!(elided_globstar.is_match("dir/.f"));
+        assert!(elided_globstar.engines_agree("dir/.f"));
+        assert!(elided_globstar.is_match_path("dir/.f"));
+        assert!(!elided_globstar.is_match_glob_path("dir/.f"));
+
+        // Non-retryable patterns stay on the latest-star fast path (0 memoized
+        // star fallbacks); retryable hidden-dot patterns invoke it cleanly.
+        for (src, path) in [
+            ("*.@(x)", "a/.x"),
+            ("a*.@(x)", "a/.x"),
+            ("dir/*/*.@(x)", "dir/a/.x"),
+        ] {
+            let pattern = Pattern::compile(src, options).expect("compiles");
+            let program = pattern.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("extglob program");
+            assert!(!program.has_retryable_star_segment);
+            reset_extglob_memoized_star_fallbacks();
+            assert!(!pattern.is_match(path));
+            assert_eq!(
+                extglob_memoized_star_fallbacks(),
+                0,
+                "{src} should not invoke memoized star fallback"
+            );
+        }
+        for common_src in ["**/*.@(js|ts)", "*(ab|xy)*", "+(*/**)/y*"] {
+            let pattern = Pattern::compile(common_src, options).expect("compiles");
+            let program = pattern.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("extglob program");
+            assert!(
+                !program.has_retryable_star_segment,
+                "{common_src} must stay on the non-retryable fast path"
+            );
+        }
+
+        // Escaped `\/` is a literal slash, not a separator, so a group right
+        // behind it is not component-local under `is_match_path`.
+        let escaped_slash_group = Pattern::compile(r"a\/@(*/)*x", options).expect("compiles");
+        assert!(escaped_slash_group.is_match_path("a/b/c/x"));
+        assert!(escaped_slash_group.is_match_path("a/b/c/d/x"));
+        assert!(!escaped_slash_group.is_match_path("a/b/c/x/y"));
+        assert!(escaped_slash_group.engines_agree("a/b/c/x"));
+
+        // Zero-width first iterations inside component-local repetitions seed
+        // later non-local iterations at offset 0 in both NFA and interpreter.
+        for (src, candidate, expected_path) in [
+            ("src/+(|*.txt)", "src/dir/file.txt", true),
+            ("src/+(|*.txt)*", "src/dir/file.txt", true),
+            ("a/@(a/|?/)*(a/|*)?", "a/a//a", true),
+            ("a/+(a/|?/)*(a/|*)?", "a/a//a", true),
+        ] {
+            let compiled = Pattern::compile(src, options).expect("compiles");
+            assert_eq!(
+                compiled.is_match_path(candidate),
+                expected_path,
+                "is_match_path mismatch for {src} on {candidate:?}"
+            );
+            assert!(
+                compiled.engines_agree(candidate),
+                "engines disagree for {src} on {candidate:?}"
+            );
+        }
+
+        // `**/` matches `Token::RecursivePrefix` and does not make a following
+        // wildcard component-local under `is_match_path` (while `**/!(x)` keeps
+        // its #393 component-local negation rule).
+        let globstar_q = Pattern::compile("**/?.*.*@(txt)", options).expect("compiles");
+        assert!(globstar_q.is_match("a.//.conf.txt"));
+        assert!(globstar_q.is_match_path("a.//.conf.txt"));
+        assert!(!globstar_q.is_match_glob_path("a.//.conf.txt"));
+        assert!(globstar_q.engines_agree("a.//.conf.txt"));
+
+        let globstar_q_short = Pattern::compile("**/?@(txt)", options).expect("compiles");
+        assert!(globstar_q_short.is_match("a//txt"));
+        assert!(globstar_q_short.is_match_path("a//txt"));
+        assert!(!globstar_q_short.is_match_glob_path("a//txt"));
+        assert!(globstar_q_short.engines_agree("a//txt"));
+
+        let globstar_neg = Pattern::compile("**/!(x)", options).expect("compiles");
+        assert!(!globstar_neg.is_match_path("a/b/x"));
+        assert!(globstar_neg.is_match_path("a/b/y"));
+        assert!(globstar_neg.engines_agree("a/b/x"));
+
+        // A literal backslash in a pattern (`escape(false)`) is never a
+        // pattern-side separator, even on Windows (ADR-0005).
+        let no_escape = PatternOptions::walker().escape(false);
+        let lit_bs_group = Pattern::compile(r"dir\?(tmp)*.rs", no_escape).expect("compiles");
+        let lit_bs_plain = Pattern::compile(r"dir\*.rs", no_escape).expect("compiles");
+        assert!(
+            !lit_bs_group.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("extglob program")
+                .groups[0]
+                .component_local,
+            "literal backslash must not mark following group component-local"
+        );
+        assert!(lit_bs_group.is_match_path(r"dir\sub/file.rs"));
+        for candidate in [r"dir\sub/file.rs", r"dir\tmp/file.rs", r"dir\file.rs"] {
+            assert_eq!(
+                lit_bs_group.is_match_path(candidate),
+                lit_bs_plain.is_match_path(candidate),
+                "escape(false) backslash parity on {candidate:?}"
+            );
+            assert!(lit_bs_group.engines_agree(candidate));
+        }
+
+        // Preserve ADR-0020 syntactic boundary rules: an extglob group starts
+        // at a component boundary only when its operator follows `/` or pattern
+        // start in source, never dynamically behind a preceding `)`.
+        for (src, rejected, accepted) in [
+            ("?(tmp)@(**/)file", "file", "a/file"),
+            ("@(src/)@(**/)file", "src/file", "src/a/file"),
+            ("@(**/)@(**/)file", "file", "a/file"),
+        ] {
+            let pat = Pattern::compile(src, options).expect("compiles");
+            assert!(!pat.is_match(rejected), "{src} is_match({rejected:?})");
+            assert!(
+                !pat.is_match_path(rejected),
+                "{src} is_match_path({rejected:?})"
+            );
+            assert!(
+                !pat.is_match_glob_path(rejected),
+                "{src} is_match_glob_path({rejected:?})"
+            );
+            assert!(pat.engines_agree(rejected));
+            assert!(pat.is_match(accepted), "{src} is_match({accepted:?})");
+            assert!(
+                pat.is_match_path(accepted),
+                "{src} is_match_path({accepted:?})"
+            );
+            assert!(
+                pat.is_match_glob_path(accepted),
+                "{src} is_match_glob_path({accepted:?})"
+            );
+            assert!(pat.engines_agree(accepted));
+        }
+
+        // Preserve the 1.0 `is_match_path` contract (`docs/compatibility-guide.md`):
+        // only a wildcard or group syntactically right after `/` is
+        // component-local; a wildcard after `)` may cross `/` again.
+        for (src, candidate) in [
+            ("src/?(tmp)*.rs", "src/sub/file.rs"),
+            ("@(dir/)*?.*", "dir/a.b/c/.d"),
+            ("dir/@(|tmp)*x", "dir/a/x"),
+        ] {
+            let pat = Pattern::compile(src, options).expect("compiles");
+            assert!(
+                pat.is_match_path(candidate),
+                "{src} must match {candidate:?} under is_match_path"
+            );
+            assert!(pat.engines_agree(candidate));
+        }
+
+        // When `match_hidden` is enabled and `component_wildcards` is off
+        // (`is_match`), neither barrier can fire so retryable star patterns
+        // stay on the non-retryable fast path.
+        let hidden_ok =
+            Pattern::compile("*?.*.@(rs|ts)", options.match_hidden(true)).expect("compiles");
+        reset_extglob_memoized_star_fallbacks();
+        assert!(!hidden_ok.is_match("dir/path.rs"));
+        assert!(hidden_ok.is_match("dir/a.b.rs"));
+        assert!(hidden_ok.is_match("dir.name/.rs"));
+        assert_eq!(extglob_memoized_star_fallbacks(), 0);
+
+        let retryable = Pattern::compile("*?.*.@(rs|keep.rs)", options).expect("compiles");
+        reset_extglob_memoized_star_fallbacks();
+        assert!(retryable.is_match("dir.name/.keep.rs"));
+        assert!(
+            extglob_memoized_star_fallbacks() > 0,
+            "retryable hidden-dot pattern must use memoized star fallback"
+        );
+
+        // Tail handoffs from `match_extglob_task_memoized` share visited star
+        // states in `state.failed`, keeping repeated `.` matches strictly linear.
+        let dot_repeat = Pattern::compile("*?.*@(x)", options).expect("compiles");
+        for repeats in [1024_usize, 4096] {
+            let candidate = format!("{}/.y", "a.".repeat(repeats));
+            reset_extglob_memoized_star_fallbacks();
+            assert!(!dot_repeat.is_match(&candidate));
+            assert!(
+                extglob_memoized_star_fallbacks() > 0,
+                "dot_repeat({repeats}) must exercise memoized star fallback"
+            );
+            let max_linear_visits = 3 * (candidate.len() + 1);
+            assert!(
+                extglob_memoized_star_visits() <= max_linear_visits,
+                "tail handoffs must share visited star states linearly for n={repeats}: {} > {max_linear_visits}",
+                extglob_memoized_star_visits()
+            );
+        }
+
+        // Zero-width star fallthroughs inside `match_extglob_task_memoized`
+        // must memoize each `(star, path_index)` state once and hand off
+        // non-retryable tails back to the linear latest-star fast path.
+        let chain_src = format!("*?.*{}@(x)", "a*".repeat(480));
+        let chain_path = format!("a.{}/.z", "a".repeat(960));
+        let chain = Pattern::compile(&chain_src, options).expect("chain compiles");
+        reset_extglob_memoized_star_fallbacks();
+        assert!(!chain.is_match(&chain_path));
+        assert!(
+            extglob_memoized_star_fallbacks() > 0,
+            "chain must exercise memoized star fallback"
+        );
+        let max_handoff_visits = 3 * (chain_path.len() + 1);
+        assert!(
+            extglob_memoized_star_visits() <= max_handoff_visits,
+            "non-retryable tail must hand off cleanly: {} > {max_handoff_visits}",
+            extglob_memoized_star_visits()
+        );
+
+        // Even when a trailing `?.*` keeps every intermediate `a*` star inside
+        // the memoized prefix, each `(star, path_index)` pair is visited once.
+        let bounded_src = format!("*?.*{}?.*@(x)", "a*".repeat(64));
+        let bounded_path = format!("a.{}.b/.z", "a".repeat(128));
+        let bounded = Pattern::compile(&bounded_src, options).expect("bounded chain compiles");
+        reset_extglob_memoized_star_fallbacks();
+        assert!(!bounded.is_match(&bounded_path));
+        assert!(
+            extglob_memoized_star_fallbacks() > 0,
+            "bounded chain must exercise memoized star fallback"
+        );
+        let max_bounded_visits = 67 * (bounded_path.len() + 1);
+        assert!(
+            extglob_memoized_star_visits() <= max_bounded_visits,
+            "memoized star visits must stay polynomial: {} > {max_bounded_visits}",
+            extglob_memoized_star_visits()
+        );
+
+        // Lazy fallback row initialization keeps long retryable star chains
+        // fast when no retry fires.
+        let long_retryable_src = format!("{}@(x)", "*?.".repeat(256));
+        let long_retryable = Pattern::compile(&long_retryable_src, options).expect("compiles");
+        let long_prog = long_retryable.alternatives[0]
+            .extglob
+            .as_ref()
+            .expect("extglob program");
+        assert!(long_prog.has_retryable_star_segment);
+        assert!(
+            long_prog.fast_memo_state_count <= 4,
+            "fast_memo_state_count should stay O(groups), got {}",
+            long_prog.fast_memo_state_count
+        );
+        assert!(!long_retryable.is_match("f"));
+
+        // Both `SweepEngine::Wide` (>63 positions) and the true non-sweep
+        // fallback (`compiled.sweep.is_none()`) must block stopping an arm's
+        // trailing `*` immediately before a hidden component.
+        let wide_arm = format!("*?.*@({}*).x", "?".repeat(65));
+        let wide_pattern = Pattern::compile(&wide_arm, options).expect("wide compiles");
+        let wide_path = format!("a.b/{}/.x", "z".repeat(65));
+        let wide_ok_path = format!("a.b/{}/ok.x", "z".repeat(65));
+        assert!(
+            wide_pattern.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("extglob program")
+                .groups[0]
+                .alternatives[0]
+                .compiled[0]
+                .sweep
+                .is_some(),
+            "65-`?` arm compiles to SweepEngine::Wide"
+        );
+        assert!(!wide_pattern.is_match(&wide_path));
+        assert!(wide_pattern.is_match(&wide_ok_path));
+        assert!(wide_pattern.engines_agree(&wide_path));
+        assert!(wide_pattern.engines_agree(&wide_ok_path));
+
+        let mut non_sweep_pattern = wide_pattern.clone();
+        non_sweep_pattern.strip_engines(true, true, true);
+        assert!(
+            non_sweep_pattern.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("extglob program")
+                .groups[0]
+                .alternatives[0]
+                .compiled[0]
+                .sweep
+                .is_none(),
+            "stripped pattern must exercise the non-sweep arm fallback"
+        );
+        assert!(!non_sweep_pattern.is_match(&wide_path));
+        assert!(non_sweep_pattern.is_match(&wide_ok_path));
+
+        // 64 outer-star segments run iteratively on a 256 KiB stack without
+        // overflowing native stack frames (both accept and full-exhaustion reject).
+        let deep_src = format!("{}@(x)", "*?.".repeat(64));
+        let deep_match = format!("{}/.x", "a.".repeat(64));
+        let deep_miss = format!("{}/.y", "a.".repeat(64));
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let pattern = Pattern::compile(&deep_src, options).expect("deep compiles");
+                assert!(pattern.is_match(&deep_match));
+                assert!(!pattern.is_match(&deep_miss));
+            })
+            .expect("spawn small-stack thread");
+        handle.join().expect("small-stack thread must not overflow");
+    }
+
+    #[test]
+    fn extglob_separators_keep_escaped_slashes_literal() {
+        let options = PatternOptions::walker();
+
+        let pos = Pattern::compile("src/@(foo|bar).rs", options).expect("compiles");
+        let pos_prog = pos.alternatives[0]
+            .extglob
+            .as_ref()
+            .expect("extglob program");
+        assert_eq!(
+            pos_prog.steps[3],
+            ExtglobStep::Separator {
+                recursive_prefix: false
+            }
+        );
+        assert!(pos_prog.positive_nfa.as_ref().is_some_and(|nfa| {
+            nfa.states.iter().any(|state| {
+                matches!(
+                    state,
+                    PositiveExtglobState::Consume {
+                        matcher: PositiveExtglobMatcher::GroupSeparator,
+                        ..
+                    }
+                )
+            })
+        }));
+        assert!(pos.is_match("src/foo.rs"));
+        assert!(pos.engines_agree("src/foo.rs"));
+        assert_eq!(pos.is_match(r"src\foo.rs"), cfg!(windows));
+        assert!(pos.engines_agree(r"src\foo.rs"));
+
+        let neg = Pattern::compile("src/!(foo).rs", options).expect("compiles");
+        let neg_prog = neg.alternatives[0]
+            .extglob
+            .as_ref()
+            .expect("extglob program");
+        assert_eq!(
+            neg_prog.steps[3],
+            ExtglobStep::Separator {
+                recursive_prefix: false
+            }
+        );
+        assert!(neg.is_match("src/bar.rs"));
+        assert!(!neg.is_match("src/foo.rs"));
+        assert_eq!(neg.is_match(r"src\bar.rs"), cfg!(windows));
+        assert!(!neg.is_match(r"src\foo.rs"));
+
+        let escaped = Pattern::compile(r"src\/@(foo|bar).rs", options).expect("compiles");
+        let escaped_prog = escaped.alternatives[0]
+            .extglob
+            .as_ref()
+            .expect("extglob program");
+        assert_eq!(escaped_prog.steps[3], ExtglobStep::Escape { escaped: b'/' });
+        assert!(escaped.is_match("src/foo.rs"));
+        assert!(!escaped.is_match(r"src\foo.rs"));
+        assert!(escaped.engines_agree("src/foo.rs"));
+        assert!(escaped.engines_agree(r"src\foo.rs"));
+
+        // Preserve `#393` component-local negation behind `**/`.
+        let neg_after_globstar = Pattern::compile("**/!(x)", options).expect("compiles");
+        assert!(!neg_after_globstar.is_match_path("src/dir/x"));
+        assert!(!neg_after_globstar.is_match_path("src/x"));
+        assert!(neg_after_globstar.is_match_path("src/dir/y"));
     }
 }
 
