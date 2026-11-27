@@ -101,10 +101,10 @@
   },
   "speed": {
     "measured": {
-      "date": "2026-09-04",
-      "machine": "Apple M1 Pro",
-      "ferralk": "0.12.0",
-      "revision": "261df0d",
+      "date": "2026-11-27",
+      "machine": "Apple M1",
+      "ferralk": "1.2.1",
+      "revision": "b42514dcedbfc374bba581335fe7ef7469655562",
       "files": 53601,
       "sources": 2600,
       "threads": 4,
@@ -114,32 +114,44 @@
       {
         "id": "roots",
         "unit": "ms",
-        "ferralk": 4.32,
+        "ferralk": 7.38,
         "rows": [
-          { "id": "ignore", "label": "ignore", "value": 7.61, "ratio": 1.76 },
-          { "id": "zlob", "label": "zlob", "value": 22.08, "ratio": 5.11 },
-          { "id": "jwalk", "label": "jwalk + globset", "value": 23.3, "ratio": 5.39 }
+          { "id": "ignore", "label": "ignore", "value": 21.41, "ratio": 2.9 },
+          { "id": "zlob", "label": "zlob", "value": 31.6, "ratio": 4.28 },
+          { "id": "jwalk", "label": "jwalk + globset", "value": 53.17, "ratio": 7.2 }
         ]
       },
       {
         "id": "tree",
         "unit": "ms",
-        "ferralk": 20.83,
+        "ferralk": 33.87,
         "rows": [
-          { "id": "jwalk", "label": "jwalk + globset", "value": 23.15, "ratio": 1.11 },
-          { "id": "zlob", "label": "zlob", "value": 30.09, "ratio": 1.44 },
-          { "id": "ignore", "label": "ignore", "value": 38.07, "ratio": 1.83 }
+          { "id": "jwalk", "label": "jwalk + globset", "value": 44.18, "ratio": 1.3 },
+          { "id": "zlob", "label": "zlob", "value": 43.17, "ratio": 1.27 },
+          { "id": "ignore", "label": "ignore", "value": 69.52, "ratio": 2.05 }
         ]
       },
       {
         "id": "match",
         "unit": "ns",
-        "ferralk": 11,
+        "ferralk": 19,
         "rows": [
-          { "id": "zlob", "label": "zlob", "value": 35, "ratio": 3.18 },
-          { "id": "globset", "label": "globset", "value": 38, "ratio": 3.45 },
-          { "id": "fast-glob", "label": "fast-glob", "value": 99, "ratio": 9 }
+          { "id": "zlob", "label": "zlob", "value": 40, "ratio": 2.11 },
+          { "id": "globset", "label": "globset", "value": 53, "ratio": 2.79 },
+          { "id": "fast-glob", "label": "fast-glob", "value": 195, "ratio": 10.26 }
         ]
+      },
+      {
+        "id": "any",
+        "unit": "ns/path",
+        "ferralk": 47.4,
+        "rows": [{ "id": "globset", "label": "GlobSet", "value": 93, "ratio": 1.96 }]
+      },
+      {
+        "id": "all",
+        "unit": "ns/path",
+        "ferralk": 43.9,
+        "rows": [{ "id": "globset", "label": "GlobSet", "value": 331.4, "ratio": 7.55 }]
       }
     ]
   }

@@ -12,6 +12,13 @@ request whose walk executes more instructions than its merge base by more than
 a documented margin. [Deferred follow-up](external-release-gates.md) records the
 same distinction for releases.
 
+The [current library comparison](#current-library-comparison) supplies the
+homepage and README figures. The
+[matched revision comparison](#matched-revision-comparison)
+measures how Ferralk itself changed on the same runners. The
+[November workloads](#workloads-behind-the-november-optimizations) isolate
+the changes to glob lists, parallel scheduling, and Git-ignore rules.
+
 ## The lanes
 
 | Lane | What it measures | Where | Gating |
@@ -276,6 +283,314 @@ The engine-comparison measurements in the next section were taken with:
 | Threads | 4 for every parallel arm, so the arms are comparable rather than a reading of `available_parallelism` |
 | Cache | Warm: each fixture is written immediately before its measurements |
 | Method | Criterion point estimate; the thread-count sweep is the median of three full runs |
+
+## Current library comparison
+
+The [publication benchmark](https://github.com/sebastian-software/ferralk/actions/runs/46036804386) measures
+Ferralk on `main` alongside the locked comparison libraries. Its
+[workflow](https://github.com/sebastian-software/ferralk/blob/1f2145c2a562b575bff3f59d9d93a341f406d640/.github/workflows/zlob-benchmark.yml)
+pins the measured commit and records the commands. The run artifact contains
+the environment and raw outputs, including the individual walker fixtures,
+zlob traversal and ablation, and pattern compilation. The independent
+[Linux comparison](https://github.com/sebastian-software/ferralk/actions/runs/46036615952) measures the same commit
+on GitHub-hosted Ubuntu 26.04 x64 with four vCPUs, using the portable backend
+and zlob.
+
+### Runner and measurement method
+
+| | |
+| --- | --- |
+| Date | 2026-11-27 |
+| Host | Apple M1, GitHub Actions VM with 3 vCPUs and 7 GiB RAM |
+| OS | macOS 26.7.2 (25G332), arm64 |
+| Benchmark revision | `b42514dcedbfc374bba581335fe7ef7469655562` on `main` |
+| Ferralk version | 1.2.1, the workspace version at that revision, including changes after the release tag |
+| Toolchains | Rust 1.99.1, Criterion 0.8.2, Zig 0.16.0 and Xcode libclang, Node.js 26.8.1 and npm 11.19.0 |
+| Rust baselines | `ignore` 0.4.34, `globset` 0.4.21, `fast-glob` 1.1.2, `walkdir` 2.5.0, `jwalk` 0.9.0, `globwalk` 0.9.1, `wax` 0.7.0, zlob 1.6.5 |
+| Threads | 4 for every parallel arm in the main walker tables |
+| Cache | Warm fixture, reused by all arms within each invocation |
+| Fixture | 53,601 files, 2,600 TypeScript sources under `src/` and `packages/`, with 400 top-level and 200 nested dependency packages and one `.gitignore` |
+
+The runner exposes 3 vCPUs, so the four-thread arms can oversubscribe it.
+Each engine table comes from one Criterion invocation. The walker harness
+checks that every applicable arm returns 7,400 matches unscoped and 2,600
+scoped, then measures time per search. Matcher compilation happens outside
+the match loop. The zlob matcher uses the same paths in a separate invocation
+on the same runner. The tables report Criterion medians. The raw output also
+reports standard deviation. Compare within a table and workload. The CI runner
+and the September machine differ, so these measurements do not isolate a
+release-to-release speedup. The [matched comparison](#matched-revision-comparison)
+uses the same runner for each revision.
+
+### macOS portable backend
+
+| Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
+| --- | ---: | ---: |
+| ferralk, serial | 200.72 ms | 14.42 ms |
+| ferralk, 4 threads | 33.87 ms | 7.38 ms |
+| `ignore` serial + `globset` | 68.13 ms | 72.65 ms |
+| `walkdir` serial + `globset` | 68.84 ms | 69.15 ms |
+| `jwalk` serial + `globset` | 74.23 ms | 78.22 ms |
+| `jwalk`, 4 threads + `globset` | 44.18 ms | 53.17 ms |
+| `globwalk` serial | 70.63 ms | 67.01 ms |
+| `wax` serial | 91.58 ms | 18.18 ms |
+| `ignore` parallel + overrides | 69.52 ms | 69.50 ms |
+| `ignore` parallel + hand-pruned subtree | — | 21.41 ms |
+| zlob, 4 threads | 43.17 ms | 31.60 ms |
+
+### macOS native backend
+
+Only Ferralk switches backend. The comparison libraries run as before, in the
+same invocation as the macOS-native Ferralk arm.
+
+| Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
+| --- | ---: | ---: |
+| ferralk, serial | 48.62 ms | 8.00 ms |
+| ferralk, 4 threads | 35.31 ms | 5.49 ms |
+| `ignore` serial + `globset` | 80.57 ms | 74.46 ms |
+| `walkdir` serial + `globset` | 73.40 ms | 73.64 ms |
+| `jwalk` serial + `globset` | 74.46 ms | 78.21 ms |
+| `jwalk`, 4 threads + `globset` | 52.64 ms | 40.10 ms |
+| `globwalk` serial | 83.79 ms | 69.74 ms |
+| `wax` serial | 94.88 ms | 17.23 ms |
+| `ignore` parallel + overrides | 48.56 ms | 76.83 ms |
+| `ignore` parallel + hand-pruned subtree | — | 24.11 ms |
+| zlob, 4 threads | 27.67 ms | 35.34 ms |
+
+### Linux portable backend
+
+| Arm | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
+| --- | ---: | ---: |
+| ferralk, serial | 13.97 ms | 2.23 ms |
+| ferralk, 4 threads | 6.27 ms | 1.12 ms |
+| `ignore` serial + `globset` | 24.11 ms | 24.01 ms |
+| `walkdir` serial + `globset` | 22.60 ms | 22.41 ms |
+| `jwalk` serial + `globset` | 30.29 ms | 30.12 ms |
+| `jwalk`, 4 threads + `globset` | 21.95 ms | 21.57 ms |
+| `globwalk` serial | 26.66 ms | 26.09 ms |
+| `wax` serial | 47.87 ms | 5.98 ms |
+| `ignore` parallel + overrides | 13.05 ms | 13.39 ms |
+| `ignore` parallel + hand-pruned subtree | — | 4.19 ms |
+| zlob, 4 threads | 4.73 ms | 6.43 ms |
+
+### Covering excludes and Git ignores
+
+These arms return the same 2,600 matches as the scoped query.
+
+| Backend | Exclude, serial | Exclude, 4 threads | Gitignore, 4 threads |
+| --- | ---: | ---: | ---: |
+| macOS portable | 9.49 ms | 5.34 ms | 5.84 ms |
+| macOS native | 8.16 ms | 5.09 ms | 5.90 ms |
+| Linux portable | 2.31 ms | 1.15 ms | 1.13 ms |
+
+### Portable thread sweep on macOS CI
+
+Unscoped walker medians and ranges across three runs. The spread shows how
+much the same workload can vary on this VM. It includes the one-thread
+Ferralk run at 144.04 ms. Use the matched revision runs below to judge changes
+over time.
+
+| Threads | Ferralk | zlob |
+| --- | ---: | ---: |
+| 1 | 52.79 ms (51.07–144.04) | 49.82 ms (42.98–53.03) |
+| 2 | 35.00 ms (30.53–37.01) | 29.74 ms (28.33–31.24) |
+| 4 | 30.54 ms (27.29–44.33) | 27.25 ms (23.09–44.83) |
+| 8 | 32.78 ms (29.09–47.09) | 27.83 ms (24.58–28.09) |
+| Available, 3 | 37.52 ms (31.57–39.25) | 36.88 ms (35.84–38.78) |
+
+### Compiled path matching
+
+Rust matcher and zlob timings for the same patterns and paths. `fast-glob`
+here is the interpreted Rust crate.
+
+| Case | ferralk | zlob | `globset` | `fast-glob` | `wax` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `common` matching | 19 ns | 40 ns | 53 ns | 195 ns | 51 ns |
+| `common` non-matching | 7 ns | 3 ns | 52 ns | 205 ns | 65 ns |
+| `long_path` matching | 15 ns | 105 ns | 285 ns | 886 ns | 294 ns |
+| `long_path` non-matching | 6 ns | 4 ns | 299 ns | 929 ns | 245 ns |
+| `backtracking` non-matching | 19 ns | 56 ns | 157 ns | 468 ns | 131 ns |
+
+### Pattern sets
+
+Each iteration checks the same 64 paths. Keyed globs have a literal extension,
+component, or prefix that Ferralk can index. Unkeyed globs contain a literal
+with a wildcard on both sides. The table divides each median by the number of
+paths to show the time per path.
+
+| Per path | 10 globs | 100 globs | 1,000 globs |
+| --- | ---: | ---: | ---: |
+| keyed, any match, loop of `Pattern`s | 91.1 ns | 1108.7 ns | 7903.7 ns |
+| keyed, any match, `PatternSet` | 33.5 ns | 56.1 ns | 47.4 ns |
+| keyed, any match, `GlobSet` | 98.1 ns | 87.1 ns | 93.0 ns |
+| keyed, all matches, `PatternSet` | 35.7 ns | 45.7 ns | 43.9 ns |
+| keyed, all matches, `GlobSet` | 120.7 ns | 139.6 ns | 331.4 ns |
+| unkeyed, any match, loop of `Pattern`s | 126.1 ns | 961.8 ns | 12565.9 ns |
+| unkeyed, any match, `PatternSet` | 125.1 ns | 1175.8 ns | 14387.4 ns |
+| unkeyed, any match, `GlobSet` | 34.3 ns | 34.6 ns | 32.2 ns |
+| unkeyed, all matches, `PatternSet` | 138.3 ns | 1106.6 ns | 13029.0 ns |
+| unkeyed, all matches, `GlobSet` | 56.0 ns | 101.9 ns | 502.0 ns |
+
+### Node.js comparison
+
+The locked [Node.js harness](../tools/bench/node) recreates the same tree shape
+and checks the same match counts. Walker values are medians of ten
+order-rotated samples. Matcher values are medians of fifteen order-rotated
+samples. The raw output includes both quartiles. The Node.js packages have
+different APIs and semantics, and these runs did not go through a Ferralk Node
+binding. Direct and transitive versions are in the
+[Node.js lockfile](../tools/bench/node/package-lock.json).
+
+| Node.js walker | `**/*.{ts,tsx}` | `{src,packages}/**/*.{ts,tsx}` |
+| --- | ---: | ---: |
+| `node:fs` sync | 318.61 ms | 39.51 ms |
+| `node:fs` async | 463.71 ms | 86.77 ms |
+| `glob` sync | 128.57 ms | 19.07 ms |
+| `glob` async | 106.62 ms | 15.85 ms |
+| `fast-glob` sync | 157.61 ms | 19.76 ms |
+| `fast-glob` async | 145.29 ms | 25.16 ms |
+| `tinyglobby` sync | 127.07 ms | 17.87 ms |
+| `tinyglobby` async | 84.93 ms | 10.51 ms |
+| `fdir` + `picomatch` sync | 111.31 ms | 114.00 ms |
+| `fdir` + `picomatch` async | 78.91 ms | 70.92 ms |
+
+| Compiled Node.js matcher | Common match | Common reject | Long match | Long reject | Adversarial reject |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `picomatch` | 114.6 ns | 132.4 ns | 587.3 ns | 425.4 ns | 473037.9 ns |
+| `micromatch` | 100.1 ns | 125.8 ns | 504.4 ns | 433.0 ns | 517008.8 ns |
+| `minimatch` | 284.9 ns | 297.6 ns | 929.7 ns | 709.1 ns | 482201.7 ns |
+
+## Matched revision comparison
+
+A separate [revision comparison](https://github.com/sebastian-software/ferralk/actions/runs/46038874380) measures three
+Ferralk revisions in the same job on each platform. The
+[workflow](https://github.com/sebastian-software/ferralk/blob/b9d082b0ff92171166c33b0bfc483b4a03b1fc1a/.github/workflows/zlob-benchmark.yml)
+builds all three revisions with Rust 1.99.1 before measuring. It uses the
+checked-in harness and locked dependencies at each revision. The walker
+queries and match counts are identical. Each round rotates which revision
+runs first, and the walkers use four threads and a warm fixture.
+
+- September benchmark revision [`261df0d`](https://github.com/sebastian-software/ferralk/commit/261df0d65f6bcf5e12a88462e8529f89c779460d).
+- Released [`v1.2.1`](https://github.com/sebastian-software/ferralk/releases/tag/v1.2.1) at `8d048be`.
+- Measured `main` at [`b42514d`](https://github.com/sebastian-software/ferralk/commit/b42514dcedbfc374bba581335fe7ef7469655562).
+
+Values are medians of three Criterion medians, followed by the observed
+range. Percentage columns show the median of the three within-round ratios
+minus one. Negative values mean `main` took less time. Matcher times are
+rounded to whole nanoseconds by the raw Criterion output. These comparisons
+cover the homepage fixture and common matcher case on these runners.
+
+### macOS arm64
+
+| Workload | September | v1.2.1 | `main` | vs. September | vs. v1.2.1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Portable unscoped (ms) | 37.71 (29.73–40.37) | 40.15 (38.20–44.58) | 35.61 (34.73–38.31) | -5.1% | -11.3% |
+| Portable scoped (ms) | 6.84 (5.83–7.86) | 7.16 (6.38–8.14) | 6.62 (5.05–7.13) | -13.3% | -18.7% |
+| Native unscoped (ms) | 32.83 (31.29–37.55) | 35.03 (35.00–35.27) | 32.86 (31.11–34.53) | -0.6% | -6.8% |
+| Native scoped (ms) | 6.06 (5.14–6.54) | 5.48 (5.16–6.27) | 5.50 (4.95–6.16) | -5.7% | -1.7% |
+| Common matching (ns) | 17 (15–18) | 17 (17–18) | 18 (16–20) | +6.7% | 0.0% |
+| Common non-matching (ns) | 5 (5–6) | 5 (4–5) | 6 (5–6) | 0.0% | +20.0% |
+
+### Linux x64
+
+GitHub Actions reported an Intel Xeon Platinum 8370C with four vCPUs for this
+comparison.
+
+| Workload | September | v1.2.1 | `main` | vs. September | vs. v1.2.1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Portable unscoped (ms) | 9.67 (9.59–9.99) | 9.72 (9.66–9.99) | 9.71 (9.62–9.79) | -0.5% | -0.4% |
+| Portable scoped (ms) | 1.71 (1.70–1.71) | 1.69 (1.69–1.70) | 1.70 (1.70–1.71) | +0.1% | +0.4% |
+| Common matching (ns) | 14 (14–14) | 13 (13–13) | 14 (14–14) | 0.0% | +7.7% |
+| Common non-matching (ns) | 3 (3–3) | 3 (3–3) | 4 (4–4) | +33.3% | +33.3% |
+
+Compared with `v1.2.1`, the portable walker took less time on the macOS
+runner in the median paired comparison. The observed ranges overlap. Both
+Linux walker changes were below one percent. The common matcher rejection
+was slower than `v1.2.1` on both runners in the paired medians. A change of one
+whole nanosecond in this report can represent a smaller underlying difference.
+
+## Workloads behind the November optimizations
+
+The [targeted comparison](https://github.com/sebastian-software/ferralk/actions/runs/46040779507) measures `v1.2.1`
+and `main` in three rounds on one GitHub-hosted Ubuntu 26.04 x64 runner
+(AMD EPYC 9V45, four vCPUs) using Rust 1.99.1. The
+[workflow](https://github.com/sebastian-software/ferralk/blob/b5868ebbbf612a6711e9fe0d3cc69fcd5ac599ae/.github/workflows/zlob-benchmark.yml)
+records the commands and preserves the full-resolution Criterion estimates.
+The matcher also measures [`767cf69`](https://github.com/sebastian-software/ferralk/commit/767cf69fbbb088713919fbc5b00e738df9263dc3),
+the last revision before [#521](https://github.com/sebastian-software/ferralk/pull/521). Values are medians
+followed by the range across rounds. Changes use the median of paired ratios.
+
+### Compiled globs and brace catalogs
+
+One compiled glob against one path measures single-pattern overhead. The
+brace workloads filter 1,024 paths with a compiled expression and keep
+matching semantics fixed across revisions.
+
+| Workload | v1.2.1 | Before #521 | `main` | vs. v1.2.1 | vs. before #521 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Common match (ns) | 7.23 (7.17–7.58) | 7.77 (7.67–8.04) | 8.22 (8.10–8.30) | +12.0% | +5.5% |
+| Common rejection (ns) | 2.42 (2.38–2.44) | 2.54 (2.53–2.60) | 2.75 (2.71–2.79) | +13.9% | +6.9% |
+| Recursive terminal rejection (ns) | 2.39 (2.30–2.43) | 2.39 (2.38–2.42) | 2.95 (2.92–3.03) | +24.7% | +23.7% |
+| One TypeScript brace glob, 1,024 paths (µs) | 14.03 (13.42–17.25) | 13.41 (13.27–13.60) | 11.79 (11.40–11.86) | -16.0% | -11.6% |
+| Scoped TypeScript brace glob, 1,024 paths (µs) | 38.51 (37.34–39.71) | 38.67 (38.33–38.98) | 31.59 (30.77–32.07) | -19.2% | -17.7% |
+
+The higher-resolution run confirms the common matcher slowdown on this
+runner. Both common cases already took longer before #521, and each took
+slightly longer again after it. The recursive terminal rejection changed
+mainly at #521. A point for inspection is the fast-path dispatch. After #521
+it retrieves literals from the shared token slice, including on paths that
+reject on the final byte. This run locates the change by revision and does
+not isolate the cost of the token access itself.
+Follow the investigation in [#523](https://github.com/sebastian-software/ferralk/issues/523).
+
+### Pattern sets and walking
+
+The pattern-set rows use lists of 1,000 globs and 64 paths per iteration.
+Keyed globs exercise the literal index. Unkeyed globs measure the cost of
+trying patterns without such an index. The repository rows exercise
+parallel collection and streaming. The flat-root fixture exercises
+[#515](https://github.com/sebastian-software/ferralk/pull/515) by giving each root 32 files and no child
+directories to feed the worker queues.
+
+| Workload | v1.2.1 | `main` | Change |
+| --- | ---: | ---: | ---: |
+| Keyed, any match (µs) | 3.36 (3.25–3.40) | 1.91 (1.86–2.11) | -42.7% |
+| Keyed, all matches (µs) | 3.49 (3.47–3.65) | 2.05 (2.00–2.16) | -40.9% |
+| Unkeyed, any match (µs) | 607.38 (588.77–622.21) | 590.63 (588.60–594.39) | -3.1% |
+| Unkeyed, all matches (µs) | 624.06 (622.44–649.67) | 606.82 (602.26–609.03) | -2.8% |
+| Repository tree, collect on four threads (ms) | 8.30 (8.28–8.62) | 8.53 (8.52–8.64) | +2.6% |
+| Repository tree, stream on four threads (ms) | 10.19 (10.16–10.66) | 10.60 (10.30–10.60) | +4.0% |
+| 128 flat roots, serial (ms) | 2.16 (2.06–2.23) | 2.17 (2.16–2.22) | +0.2% |
+| 128 flat roots, four threads (ms) | 2.23 (2.17–2.24) | 0.93 (0.92–0.93) | -58.4% |
+| Nested ignore walk, four threads (ms) | 1.46 (1.42–1.52) | 1.50 (1.47–1.52) | +4.6% |
+
+The complete repository walk and nested ignore walk took a few percent
+longer on this runner, with overlapping ranges. The portable repository
+walk was within one percent on the Intel runner above. The four-thread
+flat-root improvement appeared in all three rounds on the AMD runner.
+
+### Git-ignore rule evaluation
+
+The nested ignore walk above times a full traversal with nested rules and
+negation. Its configuration leaves case folding and Unicode precomposition
+off. The isolated rule test runs case-sensitive ASCII paths and then the
+same paths with both Git options enabled. That configuration exercises the
+ASCII normalization bypass and case-folded gates changed in
+[#518](https://github.com/sebastian-software/ferralk/pull/518). It does not measure normalization of non-ASCII
+names or predict total walk time.
+
+| Rules evaluated (ns/verdict) | v1.2.1 | `main` | Change |
+| --- | ---: | ---: | ---: |
+| `case-sensitive`, 1 rule | 2.10 (2.00–2.40) | 2.60 (2.50–3.00) | +30.0% |
+| `case-sensitive`, 10 rules | 29.20 (29.00–29.50) | 33.50 (33.40–33.70) | +14.4% |
+| `case-sensitive`, 120 rules | 383.00 (380.00–383.50) | 388.50 (384.80–389.10) | +1.6% |
+| `ignoreCase+precomposeUnicode`, 1 rule | 2.00 (2.00–2.00) | 2.50 (2.50–2.50) | +25.0% |
+| `ignoreCase+precomposeUnicode`, 10 rules | 222.00 (211.70–225.80) | 59.60 (59.10–60.20) | -73.2% |
+| `ignoreCase+precomposeUnicode`, 120 rules | 2934.90 (2888.80–2993.60) | 588.70 (585.60–592.50) | -80.0% |
+
+The retained-memory bounds, stat-call fusion, and deferred-error handling
+are separate properties. The timing tables do not measure peak memory,
+syscall counts, or error-heavy traversal.
 
 ## Engine comparison, repository shape
 

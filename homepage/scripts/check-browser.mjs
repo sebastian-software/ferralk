@@ -130,6 +130,11 @@ async function verifyChart(page) {
   await chart.locator(".mono-tip[data-show]").waitFor();
   assert.match(await chart.locator(".mono-tip").textContent(), /as long as Ferralk/);
   assert.doesNotMatch(await chart.textContent(), /NaN|Infinity|undefined/);
+
+  for (const name of ["Check a glob list", "List matching globs"]) {
+    await chart.getByRole("button", { name, exact: true }).click();
+    await chart.getByRole("listitem", { name: /^GlobSet, Rust:/ }).waitFor();
+  }
 }
 async function verifyHomepageMenu(page, origin) {
   await page.setViewportSize({ width: 390, height: 844 });

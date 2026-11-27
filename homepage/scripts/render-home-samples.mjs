@@ -59,22 +59,22 @@ const query = (id) => walk.queries.find((entry) => entry.id === id);
 assert.equal(query("scoped")?.errors.length, 0, "The scoped walk should never open pgdata.");
 assert.equal(query("unscoped")?.errors.length, 1, "The broad walk should report pgdata.");
 
-// The speed comparison: the published M1 Pro tables, as times relative to
+// The speed comparison: the current published tables, as times relative to
 // Ferralk within the same table.
 const evidence = await readFile(repository("docs/benchmark-evidence.md"), "utf8");
-const expanded = evidence.split("## Expanded library comparison on this machine, ")[1];
-assert(expanded, "The expanded library comparison is missing.");
-const date = /^(\d{4}-\d{2}-\d{2})/.exec(expanded)?.[1];
+const comparison = evidence.split(/^## Current library comparison\n/m)[1]?.split(/^## /m)[0];
+assert(comparison, "The current library comparison is missing.");
 const hostRow = (name) => {
   const prefix = `| ${name} | `;
-  const row = expanded
+  const row = comparison
     .split("\n")
     .find((line) => line.startsWith(prefix))
     ?.slice(prefix.length, -2);
   assert(row, `The benchmark host table has no ${name} row.`);
   return row;
 };
-const machine = /Apple M\d[^,]*/.exec(hostRow("Host"))?.[0];
+const date = /^\d{4}-\d{2}-\d{2}$/.exec(hostRow("Date"))?.[0];
+const machine = hostRow("Host").split(",")[0];
 const measuredVersion = /^(\S+),/.exec(hostRow("Ferralk version"))?.[1];
 const revision = /`([0-9a-f]{7,})`/.exec(hostRow("Benchmark revision"))?.[1];
 assert(date && machine && measuredVersion && revision, "The benchmark host table is incomplete.");
@@ -84,8 +84,8 @@ assert(fixture && threads, "The benchmark fixture or thread count is missing.");
 const count = (text) => Number(text.replaceAll(",", ""));
 
 /** A Markdown table under a heading, as rows of plain cells. */
-function table(heading, text = expanded) {
-  const section = text.split(`${heading}\n`)[1];
+function table(heading) {
+  const section = comparison.split(`${heading}\n`)[1];
   assert(section, `The benchmark evidence has no "${heading}" section.`);
   const lines = section.split("\n");
   const start = lines.findIndex((line) => line.startsWith("|"));
@@ -107,15 +107,15 @@ const nanoseconds = (cell) => {
   assert(value, `Not a time in nanoseconds: ${cell}`);
   return Number(value);
 };
-const portable = table("### Portable backend");
+const portable = table("### macOS portable backend");
 const arm = (name) => {
   const row = portable.find(([label]) => label === name);
   assert(row, `The portable table has no "${name}" row.`);
   return row;
 };
-const matcherRows = table("### Matcher refresh");
+const matcherRows = table("### Compiled path matching");
 const matcherHeader = (() => {
-  const section = expanded.split("### Matcher refresh\n")[1] ?? "";
+  const section = comparison.split("### Compiled path matching\n")[1] ?? "";
   const line = section.split("\n").find((entry) => entry.startsWith("| Case"));
   assert(line, "The matcher table has no header.");
   return line
@@ -152,6 +152,18 @@ const commonCase = {
   path: /let common_matching = "([^"]+)";/.exec(matcherBench)?.[1],
 };
 assert(commonCase.pattern && commonCase.path, "The matcher benchmark's common case moved.");
+const patternSets = table("### Pattern sets");
+function indexedGlobs(id, operation) {
+  const timeFor = (set) => {
+    const row = patternSets.find(([label]) => label === `keyed, ${operation}, ${set}`);
+    assert(row, `The pattern-set table has no row for ${set}, ${operation}.`);
+    return nanoseconds(row[3]);
+  };
+  return task({ id, unit: "ns/path", own: timeFor("PatternSet") }, [
+    { id: "globset", label: "GlobSet", value: timeFor("GlobSet") },
+  ]);
+}
+
 const speed = {
   measured: {
     date,
@@ -187,6 +199,8 @@ const speed = {
       { id: "globset", label: "globset", value: common("globset") },
       { id: "fast-glob", label: "fast-glob", value: common("fast-glob") },
     ]),
+    indexedGlobs("any", "any match"),
+    indexedGlobs("all", "all matches"),
   ],
 };
 
