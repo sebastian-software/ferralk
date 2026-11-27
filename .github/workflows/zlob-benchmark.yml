@@ -56,7 +56,8 @@ jobs:
               --no-run --message-format json |
               python3 -c 'import json, sys
           executables = [event["executable"] for event in map(json.loads, sys.stdin)
-                         if event.get("executable")]
+                         if event.get("executable")
+                         and ({"bench", "lib"} & set(event.get("target", {}).get("kind", [])))]
           assert len(executables) == 1, executables
           print(executables[0])' > "$RUNNER_TEMP/$label-$name.bin"
           }
