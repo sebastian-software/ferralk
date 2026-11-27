@@ -178,6 +178,7 @@ fn walker(c: &mut Criterion) {
     bench_caller_matching(c, "large/", &large);
     bench_caller_matching(c, "mini/", &mini);
     bench_multi_root(c, &roots);
+    bench_many_flat_roots(c);
 }
 
 /// Git-ignore rule evaluation as the cost, rather than directory count.
@@ -315,6 +316,35 @@ fn bench_covering_exclude(c: &mut Criterion, group: &str, fixture: &Fixture) {
 /// The difference is thread-pool startup: three walkers start three pools over
 /// the same work. Both arms produce the same entries, so what is being measured
 /// is only how many times the walk pays for its threads.
+fn bench_many_flat_roots(c: &mut Criterion) {
+    const ROOTS: usize = 128;
+    let fixture = Fixture::new(ROOTS, 1, 32);
+    let roots: Vec<_> = (0..ROOTS)
+        .map(|index| fixture.root.join(format!("branch-{index}/depth-0")))
+        .collect();
+    let walk = |threads| {
+        let mut walker = Walker::new(&roots[0]).threads(threads);
+        for root in &roots[1..] {
+            walker = walker.add_root(root).expect("benchmark root is valid");
+        }
+        walker
+            .collect()
+            .expect("benchmark walk succeeds")
+            .entries()
+            .len()
+    };
+    assert_eq!(walk(1), fixture.files);
+    assert_eq!(walk(4), fixture.files);
+
+    // Each root has files but no child directories to feed the worker queues.
+    c.bench_function(&format!("{LANE}/many_flat_roots/serial"), |benchmark| {
+        benchmark.iter(|| black_box(walk(1)))
+    });
+    c.bench_function(&format!("{LANE}/many_flat_roots/parallel"), |benchmark| {
+        benchmark.iter(|| black_box(walk(4)))
+    });
+}
+
 fn bench_multi_root(c: &mut Criterion, roots: &[Fixture]) {
     let paths = roots
         .iter()

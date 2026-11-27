@@ -23,15 +23,9 @@ the pattern can reach. Filenames stay raw bytes and native `Path` values from
 the first directory read to the last match, so nothing is lost to a UTF-8
 conversion.
 
-On the repository-shaped fixture in the
-[benchmark snapshot](#local-benchmark-snapshot) below it is the fastest arm
-measured: ahead of `ignore`, `jwalk`, `walkdir`, `globwalk` and `wax`, and
-level with or ahead of the Zig library it learned from. The same comparison on
-Linux CI puts the margin wider — 2.1x over the next-fastest arm on the
-unscoped query and 3.4x on the scoped one — and there Ferralk walking
-*serially* still beats four-thread `jwalk`. One tree shape and a warm cache,
-which the snapshot states: a reproducible measurement rather than a claim to
-be the fastest walker everywhere.
+The [benchmark snapshot](#benchmark-snapshot) compares the walker and
+matcher with other libraries on a warm repository-shaped fixture. It includes
+both a search through every folder and a search restricted to named folders.
 
 It is published as two crates, so a consumer that only needs matching does not
 pay for traversal dependencies:
@@ -51,11 +45,8 @@ compatible with zlob and deliberately has no C ABI.
   only roots that can match, so `node_modules` is never opened. Ferralk works
   that out from the pattern. With `ignore`, the same saving needs a
   hand-written `filter_entry`, and passing the globs as overrides alone still
-  reads the whole tree. On the 53,601-file fixture in the
-  [benchmark snapshot](#local-benchmark-snapshot) below, that is 4.32 ms
-  against 7.61 ms for hand-pruned `ignore` — and Ferralk walking *serially*
-  still beats parallel `ignore` with the globs as overrides, because not
-  opening a directory beats opening it on four threads.
+  reads the whole tree. The [benchmark snapshot](#benchmark-snapshot) reports
+both approaches on the same fixture.
 - **Sized for the machine, not for the core count.** A warm walk is filesystem
   metadata work: profiled on macOS, 95% of it is `openat`, `getdirentries64`,
   and `close`, and a raw C walker issuing the same syscalls is no faster. What
@@ -230,74 +221,79 @@ excludes), `early_stop`, and `keep_going` (errors that do not end the walk).
 The [usage guide](docs/usage.md) starts with a table of every default and the
 switch that changes it.
 
-## Local benchmark snapshot
+## Benchmark snapshot
 
-This snapshot was refreshed on 2026-09-04 on a MacBook Pro with an Apple M1
-Pro, 10 cores, 32 GB RAM, macOS 26.6.2, Rust 1.97.1, and Node.js 26.8.1. Each
-lane was run on its own on an idle machine rather than chained behind the
-others, which matters more than it sounds: an earlier chained refresh on this
-same host and commit read roughly 60% slower across every arm. It is a local
-comparison, not a portable promise. Lower is better.
+Measured on 2026-11-27 on a GitHub-hosted macOS 26.7.2 arm64 VM
+(Apple M1, 3 vCPUs, 7 GiB RAM) at [`b42514d`](https://github.com/sebastian-software/ferralk/commit/b42514dcedbfc374bba581335fe7ef7469655562)
+on `main`. The workspace version was 1.2.1. This revision includes changes
+after the 1.2.1 release tag. Lower times are better.
 
-Reading it in one line: Ferralk walks the unscoped query in 20.83 ms against
-23.15 ms for the next-fastest Rust arm, and the scoped query in 4.32 ms
-against 7.61 ms for `ignore` with hand-written pruning — the second gap is the
-structural one, because it comes from never opening `node_modules` rather than
-from opening it faster.
+On this runner, portable Ferralk took 33.87 ms for the unscoped query and
+7.38 ms for the scoped query. In the same run, four-thread `jwalk` with
+`globset` took 44.18 ms unscoped, and `ignore` with hand-written pruning took
+21.41 ms scoped.
 
-The two zlob versions in this README are deliberate: the semantic oracle stays
-frozen at 1.6.3, the source commit recorded in
-[NOTICE](https://github.com/sebastian-software/ferralk/blob/main/NOTICE) and
-[ADR-0007](docs/adr/0007-differential-corpus-and-dev-time-oracle.md), so the
-corpus never moves under an upstream release, while the rows below measure the
-latest release, 1.6.5, because a speed comparison is only useful against what a
-consumer would install today.
+The zlob comparison uses 1.6.5. The frozen semantic reference still uses 1.6.3,
+as recorded in [NOTICE](https://github.com/sebastian-software/ferralk/blob/main/NOTICE)
+and [ADR-0007](docs/adr/0007-differential-corpus-and-dev-time-oracle.md).
 
-Matcher values use the common `src/**/*.rs` syntax. The Rust and zlob rows are
-Criterion point estimates; the Node.js rows are medians of fifteen
-order-rotated samples, each containing 100,000 matches.
+The matcher uses `src/**/*.rs`. The Rust and zlob figures are Criterion
+medians. The Node.js figures are medians of fifteen order-rotated samples,
+each containing 100,000 matches.
 
 | Matcher | Match | Non-match |
 | --- | ---: | ---: |
-| Ferralk (compiled) | **11 ns** | 3 ns |
-| zlob 1.6.5 (compiled) | 35 ns | **2 ns** |
-| `globset` (compiled) | 38 ns | 37 ns |
-| `fast-glob` (interpreted) | 99 ns | 109 ns |
-| `wax` (compiled) | 32 ns | 31 ns |
-| `picomatch` 4.0.7 (compiled, Node.js) | 75.0 ns | 85.4 ns |
-| `micromatch` 4.0.8 (compiled, Node.js) | 71.7 ns | 84.5 ns |
-| `minimatch` 10.2.6 (compiled, Node.js) | 207.0 ns | 191.9 ns |
+| Ferralk (compiled) | 19 ns | 7 ns |
+| zlob 1.6.5 (compiled) | 40 ns | 3 ns |
+| `globset` (compiled) | 53 ns | 52 ns |
+| `fast-glob` (interpreted Rust crate) | 195 ns | 205 ns |
+| `wax` (compiled) | 51 ns | 65 ns |
+| `picomatch` (compiled, Node.js) | 114.6 ns | 132.4 ns |
+| `micromatch` (compiled, Node.js) | 100.1 ns | 125.8 ns |
+| `minimatch` (compiled, Node.js) | 284.9 ns | 297.6 ns |
 
-The walker fixture contains 53,601 files. An **unscoped** query such as
-`**/*.{ts,tsx}` can match anywhere, so every walker must inspect the complete
-tree. A **scoped** query such as `{src,packages}/**/*.{ts,tsx}` names the only
-roots that can match. Ferralk can therefore skip the rest of the tree,
-especially `node_modules`, directly from the pattern.
+The walker fixture is a warm 53,601-file tree. The unscoped query
+`**/*.{ts,tsx}` can match anywhere. The scoped query
+`{src,packages}/**/*.{ts,tsx}` lets Ferralk skip folders outside its named
+roots. The four-thread arms ran on the same 3-vCPU runner.
 
 | Walker | Unscoped, 7,400 matches | Scoped, 2,600 matches |
 | --- | ---: | ---: |
-| Ferralk portable, 4 threads | 20.83 ms | 4.32 ms |
-| zlob 1.6.5, same portable run | 30.09 ms | 22.08 ms |
-| Ferralk macOS-native, 4 threads | **20.83 ms** | **3.68 ms** |
-| zlob 1.6.5, same native run | 21.45 ms | 22.32 ms |
-| Node.js `node:fs` sync | 201.53 ms | 26.42 ms |
-| `glob` 13.0.6 async | 35.12 ms | 6.34 ms |
-| `fast-glob` 3.3.3 async | 41.14 ms | 6.62 ms |
-| `tinyglobby` 0.2.17 async | 36.14 ms | 7.14 ms |
-| `fdir` 6.5.0 + `picomatch` async | 35.12 ms | 31.39 ms |
+| Ferralk portable, 4 threads | 33.87 ms | 7.38 ms |
+| `jwalk` + `globset`, 4 threads, same portable run | 44.18 ms | 53.17 ms |
+| `ignore`, 4 threads, hand-pruned, same portable run | — | 21.41 ms |
+| zlob 1.6.5, same portable run | 43.17 ms | 31.60 ms |
+| Ferralk macOS-native, 4 threads | 35.31 ms | 5.49 ms |
+| zlob 1.6.5, same native run | 27.67 ms | 35.34 ms |
+| `node:fs` sync | 318.61 ms | 39.51 ms |
+| `glob` async | 106.62 ms | 15.85 ms |
+| `fast-glob` async | 145.29 ms | 25.16 ms |
+| `tinyglobby` async | 84.93 ms | 10.51 ms |
+| `fdir` + `picomatch` async | 78.91 ms | 70.92 ms |
 
-The Rust walker rows are Criterion point estimates; the Node.js rows are
-medians of ten order-rotated samples. The APIs and estimators are not identical,
-so these are same-host context rather than a universal ranking. zlob appears
-twice to keep each Rust comparison inside one invocation; against the native
-backend the two engines are level on the unscoped query, and the wider portable
-margin is what reading directories through `std::fs` costs. See
-[benchmark evidence](docs/benchmark-evidence.md) for the complete tables,
-exact commands, sampling details, semantic differences, and limitations.
+The Rust walker rows are Criterion medians. The Node.js rows are medians of
+ten order-rotated samples on the same runner. The APIs and estimators differ.
+See the [benchmark evidence](docs/benchmark-evidence.md#current-library-comparison)
+for the full macOS and Linux tables, commands, raw results, and limitations.
+The [matched revision comparison](docs/benchmark-evidence.md#matched-revision-comparison)
+measures the September revision, `v1.2.1`, and `main` on the same runners.
 
-For the same comparison on real repositories instead of fixtures — including the
-`ignore`-with-hand-pruning arm the RFC's question really turns on — see
-[Palamedes adoption](docs/palamedes-adoption.md).
+### Match against a list of globs
+
+Ferralk's `PatternSet` and Rust's `globset::GlobSet` checked the same 64 paths
+against 1,000 globs with indexable literals on the macOS runner above.
+The sets were compiled before timing. The figures are per path.
+
+| Workload | Ferralk `PatternSet` | `GlobSet` |
+| --- | ---: | ---: |
+| Check whether any glob matches | 47.4 ns | 93.0 ns |
+| Report every matching glob | 43.9 ns | 331.4 ns |
+
+The [full pattern-set comparison](docs/benchmark-evidence.md#pattern-sets)
+covers shorter lists and patterns that Ferralk cannot index.
+
+For measurements on real repositories, including `ignore` with hand-written
+pruning, see [Palamedes adoption](docs/palamedes-adoption.md).
 
 ## Documentation
 

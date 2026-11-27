@@ -12,9 +12,9 @@ import { samples } from "./home-data";
    docs/benchmark-evidence.md via app/data/home-samples.json. */
 
 const { speed } = samples;
-type TaskId = "match" | "roots" | "tree";
-const isTask = (value: string): value is TaskId =>
-  value === "match" || value === "roots" || value === "tree";
+const ORDER = ["roots", "tree", "match", "any", "all"] as const;
+type TaskId = (typeof ORDER)[number];
+const isTask = (value: string): value is TaskId => ORDER.some((taskId) => taskId === value);
 
 const threads = `${String(speed.measured.threads)} threads`;
 /** The task in words, and what each tool is, in the order of the toggles. */
@@ -34,8 +34,17 @@ const TASKS: Record<TaskId, { label: string; phrase: string; own: string }> = {
     phrase: "checking one path against a pattern",
     own: "Rust",
   },
+  any: {
+    label: "Check a glob list",
+    phrase: "checking whether any glob matches a path",
+    own: "PatternSet",
+  },
+  all: {
+    label: "List matching globs",
+    phrase: "reporting every glob that matches a path",
+    own: "PatternSet",
+  },
 };
-const ORDER: TaskId[] = ["roots", "tree", "match"];
 const SUBS: Record<TaskId, Record<string, string>> = {
   roots: {
     ignore: `Rust, ${threads}, pruning written by hand`,
@@ -48,6 +57,8 @@ const SUBS: Record<TaskId, Record<string, string>> = {
     ignore: `Rust, ${threads}, globs as overrides`,
   },
   match: { zlob: "Zig", globset: "Rust", "fast-glob": "Rust" },
+  any: { globset: "Rust" },
+  all: { globset: "Rust" },
 };
 
 function task(id: TaskId) {

@@ -78,9 +78,9 @@ function Conditions() {
     <>
       <h3>How this was measured</h3>
       <p>
-        Recorded on {measuredOn} on an {measured.machine}, with Ferralk {measured.ferralk} at
-        revision {measured.revision}: the latest published run. The current release has not been
-        measured with this profile yet.
+        Recorded on {measuredOn} on a GitHub Actions runner ({measured.machine}). Ferralk was
+        measured at revision <code>{measured.revision.slice(0, 7)}</code> on <code>main</code>{" "}
+        (workspace version {measured.ferralk}).
       </p>
       <p>
         A generated project of {measured.files.toLocaleString("en-US")} files,{" "}
@@ -90,8 +90,9 @@ function Conditions() {
       </p>
       <p>
         The matcher figure checks <code>{measured.matcher.path}</code> against{" "}
-        <code>{measured.matcher.pattern}</code>, compiled in advance. With the macOS-native
-        directory reader, Ferralk and zlob come out level on the search through every folder.
+        <code>{measured.matcher.pattern}</code>, compiled in advance. The walker figures use the
+        portable backend. The glob-list figures are per path, from 64 paths checked against 1,000
+        patterns with indexable literals.
       </p>
     </>
   );
@@ -102,7 +103,7 @@ export function Speed() {
     <MonoSection
       id="speed"
       title="Less walking shows up in the time."
-      standfirst="Where the pattern names its folders, Ferralk finished well ahead of ignore, zlob and jwalk in the published run. Where every folder has to be read, it still came first, by a smaller margin."
+      standfirst="When a glob names the folders it can match, Ferralk can skip the rest. A full-tree search measures what happens when every folder has to be read."
     >
       <MonoPassage
         note={{
@@ -117,9 +118,8 @@ export function Speed() {
         </p>
       </MonoPassage>
       <p>
-        The chart compares the same searches over the same project: a few thousand sources beside a
-        large <code>node_modules</code>. Switch between a search that names its folders, a search
-        through every folder, and matching a single path.
+        Compare searches over the same project, a few thousand sources beside a large
+        <code>node_modules</code>, or switch to matching paths against one glob or a list of globs.
       </p>
       <MonoWide>
         <SpeedComparison
@@ -127,7 +127,9 @@ export function Speed() {
             <p>
               The published comparison also covers walkdir, globwalk, wax, Linux and the
               macOS-native backend.{" "}
-              <Link to="/evidence/benchmarks/">Every arm, its command and its limits</Link>
+              <Link to="/evidence/benchmarks/#current-library-comparison">
+                Every arm, its command and its limits
+              </Link>
             </p>
           }
           conditions={<Conditions />}

@@ -5631,6 +5631,12 @@ mod tests {
     #[test]
     #[ignore = "measurement, not a verdict"]
     fn rule_engine_cost() {
+        measure_rule_engine_cost("case-sensitive", false);
+        // The same ASCII fixture exercises the normalization bypass and case-folded gates.
+        measure_rule_engine_cost("ignoreCase+precomposeUnicode", true);
+    }
+
+    fn measure_rule_engine_cost(mode: &str, ignore_case: bool) {
         use std::time::Instant;
 
         let root = PathBuf::from("/fixture");
@@ -5647,19 +5653,22 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
-            let mut ours = RuleSetBuilder::new(&root, false, false);
+            let mut ours = RuleSetBuilder::new(&root, ignore_case, ignore_case);
             for line in &lines {
                 ours.add_line(line);
             }
             let ours = ours.build();
 
             let mut theirs = ignore::gitignore::GitignoreBuilder::new(&root);
+            theirs
+                .case_insensitive(ignore_case)
+                .expect("case option is valid");
             for line in &lines {
                 let _ = theirs.add_line(None, line);
             }
             let theirs = theirs.build().expect("the previous engine builds");
 
-            let rounds = 200;
+            let rounds = 5_000;
             let mut scratch = IgnoreMatchScratch::default();
             let start = Instant::now();
             for _ in 0..rounds {
@@ -5682,7 +5691,7 @@ mod tests {
             let theirs_ns = start.elapsed().as_nanos() as f64 / (rounds * candidates.len()) as f64;
 
             println!(
-                "{count:>3} rules: ours {ours_ns:6.1} ns/verdict   previous engine {theirs_ns:6.1} ns/verdict"
+                "{mode}, {count:>3} rules: ours {ours_ns:6.1} ns/verdict   previous engine {theirs_ns:6.1} ns/verdict"
             );
         }
     }
