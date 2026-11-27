@@ -77,10 +77,11 @@ fn compiled_patterns_stay_within_their_retained_size() {
     let _ = retained(|| Pattern::compile("warm/*.{a,b}", PatternOptions::walker()));
     let _ = retained(|| walker(&["warm"]));
 
-    let cases: [(&str, u64, u64); 7] = [
+    let cases: [(&str, u64, u64); 8] = [
         // (pattern, ceiling, retained before #405)
-        ("src/lib.rs", 1_024, 2_019),
-        ("**/*.rs", 1_024, 4_063),
+        ("src/lib.rs", 512, 2_019),
+        ("**/*.rs", 512, 4_063),
+        ("dir/**", 512, 719),
         ("docs/*.md", 2 * 1_024, 8_168),
         ("**/node_modules/**", 2 * 1_024, 4_190),
         ("src/**/*.@(ts|tsx|js)", 5 * 1_024, 5_923),
@@ -127,6 +128,33 @@ fn compiled_patterns_stay_within_their_retained_size() {
         four_roots <= one_root + 32 * 1_024,
         "four roots retain {four_roots} bytes against {one_root} for one \
          (5,785,483 before #405)"
+    );
+
+    // Multi-arm literal and deterministic brace expansions avoid duplicate
+    // raw/prefilter/fast-path literal storage and uncompacted `Vec` capacity
+    // (#493): both fit comfortably within the 40 MiB retained-byte budget.
+    let large_literal = format!("{}{}", "{a,b}".repeat(11), "z".repeat(6_000));
+    let literal_bytes = retained(|| {
+        Pattern::compile(&large_literal, PatternOptions::walker())
+            .expect("2,048 x 6 KB literal expansion compiles within 40 MiB")
+    });
+    assert!(
+        literal_bytes <= 20 * 1_024 * 1_024,
+        "2,048 x 6 KB literal brace expansion retains {literal_bytes} bytes (exceeded 40 MiB before #493)"
+    );
+    let large_det = format!(
+        "{}{}{}",
+        "{a,b}".repeat(11),
+        "?".repeat(256),
+        "z".repeat(1_500)
+    );
+    let det_bytes = retained(|| {
+        Pattern::compile(&large_det, PatternOptions::walker())
+            .expect("2,048 x (256 `?` + 1.5 KB) deterministic expansion compiles within 40 MiB")
+    });
+    assert!(
+        det_bytes <= 30 * 1_024 * 1_024,
+        "2,048 x (256 `?` + 1.5 KB) deterministic brace expansion retains {det_bytes} bytes (43,821,056 before #493)"
     );
 }
 

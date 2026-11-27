@@ -189,7 +189,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     ffi::OsStr,
     fmt,
@@ -209,7 +209,7 @@ use sweep::{SweepEngine, SweepState};
 /// A compiled glob pattern.
 #[derive(Debug, Clone)]
 pub struct Pattern {
-    alternatives: Vec<CompiledAlternative>,
+    alternatives: Box<[CompiledAlternative]>,
     alternative_fast_path: Option<Box<AlternativeFastPath>>,
     /// The list-filter routes of [`Pattern::is_match_path`], or `None` when
     /// every alternative answers it exactly like [`Pattern::is_match`].
@@ -217,6 +217,9 @@ pub struct Pattern {
     walker_path_viability: WalkerPathViability,
     walker_path_problem_offset: Option<usize>,
     options: PatternOptions,
+    /// Precomputed at compile time so path entry points skip scanning every
+    /// alternative for a leading `./` on every call.
+    has_leading_dot_slash: bool,
 }
 
 /// How the alternatives answer the list-filter entry point
@@ -247,17 +250,18 @@ struct PathFilter {
 
 impl PathFilter {
     fn is_program(alternative: &CompiledAlternative, options: PatternOptions) -> bool {
-        options.extglob && alternative.extglob.is_some() && !alternative.raw.starts_with(b"./")
+        options.extglob && alternative.extglob.is_some() && !alternative.starts_with_dot_slash
     }
 
-    fn compile(
+    fn compile<'a>(
         alternatives: &[CompiledAlternative],
+        raw_source: impl Fn(usize) -> &'a [u8],
         options: PatternOptions,
         budget: &mut IrBudget,
         defer_sweeps: bool,
     ) -> Result<Option<Self>, PatternError> {
         let needs_copy = |alternative: &CompiledAlternative| {
-            alternative.raw.starts_with(b"./")
+            alternative.starts_with_dot_slash
                 || alternative.tokens.windows(2).any(|tokens| {
                     matches!(
                         tokens,
@@ -294,6 +298,7 @@ impl PathFilter {
                     .compiled
                     .push(Pattern::compile_path_filter_alternative(
                         alternative,
+                        raw_source(index),
                         options,
                         budget,
                         defer_sweeps,
@@ -793,7 +798,7 @@ impl Pattern {
             // Every expanded alternative compiles to exactly one, so the
             // pattern keeps no spare capacity.
             let mut alternatives = Vec::with_capacity(expanded.len());
-            for alternative in expanded {
+            for alternative in &expanded {
                 // The path entry points ignore one leading `./` on every
                 // expanded alternative, not only at the start of the source,
                 // so the walker analysis reads each alternative's prefix the
@@ -811,7 +816,13 @@ impl Pattern {
                     defer_sweeps,
                 )?);
             }
-            return Self::from_alternatives(alternatives, options, budget, defer_sweeps);
+            return Self::from_alternatives(
+                alternatives,
+                |index| expanded[index].bytes.as_slice(),
+                options,
+                budget,
+                defer_sweeps,
+            );
         }
         let alternative = Self::compile_single_alternative(
             pattern,
@@ -823,7 +834,7 @@ impl Pattern {
             bounds,
             false,
         )?;
-        Self::from_alternatives(vec![alternative], options, budget, false)
+        Self::from_alternatives(vec![alternative], |_| pattern, options, budget, false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -961,20 +972,11 @@ impl Pattern {
             walker_source_provenance,
             leading_dot_is_normalized,
         )?;
-        if defer_sweeps {
-            ensure_retained_alternative_bytes(pattern.len(), &tokens, budget)?;
-        }
+        let tokens = tokens.into_boxed_slice();
+        ensure_retained_alternative_bytes(&tokens, budget)?;
         let fast_path = FastPath::compile(&tokens, options);
         let prefilter = Prefilter::compile(&tokens);
-        if defer_sweeps {
-            charge_retained_alternative_bytes(
-                pattern.len(),
-                &tokens,
-                &fast_path,
-                &prefilter,
-                budget,
-            )?;
-        }
+        charge_retained_alternative_bytes(&tokens, &fast_path, &prefilter, budget)?;
         let sweep = if defer_sweeps {
             None
         } else {
@@ -992,7 +994,7 @@ impl Pattern {
         let walker_path_shape = walker_path.finish();
         Ok(CompiledAlternative {
             extglob,
-            raw: pattern.to_vec(),
+            starts_with_dot_slash: pattern.starts_with(b"./"),
             fast_path,
             prefilter,
             sweep,
@@ -1041,7 +1043,7 @@ impl Pattern {
     #[must_use]
     pub fn is_match(&self, path: impl AsRef<[u8]>) -> bool {
         let path = path.as_ref();
-        if let [alternative] = self.alternatives.as_slice()
+        if let [alternative] = &*self.alternatives
             && (!self.options.extglob || alternative.extglob.is_none())
             && let Some(fast_path) = &alternative.fast_path
         {
@@ -1132,7 +1134,7 @@ impl Pattern {
                 // pays per byte and the memoized engine per visited state.
                 !alternative
                     .prefilter
-                    .rejects(path, options.case_insensitive)
+                    .rejects(&alternative.tokens, path, options.case_insensitive)
                     && if let Some(sweep) = &alternative.sweep {
                         sweep.is_match(path, options)
                     } else {
@@ -1310,17 +1312,14 @@ impl Pattern {
             root_component_wildcards: true,
             ..self.options
         };
-        if self
-            .alternatives
-            .iter()
-            .any(|alternative| alternative.raw.starts_with(b"./"))
+        if self.has_leading_dot_slash
             && let Some(filter) = &self.path_filter
         {
             // The `./` alternatives need their stripped copies; every other
             // route answers under this policy exactly as below.
             return filter.is_match(&self.alternatives, options, options, path);
         }
-        if let [alternative] = self.alternatives.as_slice()
+        if let [alternative] = &*self.alternatives
             && (!options.extglob || alternative.extglob.is_none())
             && let Some(fast_path) = &alternative.fast_path
             && fast_path.supports_component_wildcards()
@@ -1345,13 +1344,10 @@ impl Pattern {
     #[must_use]
     pub fn is_match_crossing_path(&self, path: impl AsRef<[u8]>) -> bool {
         let path = without_leading_dot_slash(path.as_ref());
-        // The copies exist whenever an alternative has the prefix, so asking
-        // for them first spares most patterns the scan over alternatives.
-        if let Some(filter) = &self.path_filter
-            && self
-                .alternatives
-                .iter()
-                .any(|alternative| alternative.raw.starts_with(b"./"))
+        // The copies exist whenever an alternative has the prefix, and
+        // `has_leading_dot_slash` is precomputed at compile time.
+        if self.has_leading_dot_slash
+            && let Some(filter) = &self.path_filter
         {
             // The path-filter copies differ from the alternatives only by the
             // removed prefix. Their fast paths are the literal and
@@ -1481,23 +1477,29 @@ impl Pattern {
         filter.is_match(&self.alternatives, component, self.options, path)
     }
 
-    fn from_alternatives(
+    fn from_alternatives<'a>(
         alternatives: Vec<CompiledAlternative>,
+        raw_source: impl Fn(usize) -> &'a [u8],
         options: PatternOptions,
         budget: &mut IrBudget,
         defer_sweeps: bool,
     ) -> Result<Self, PatternError> {
+        let has_leading_dot_slash = alternatives
+            .iter()
+            .any(|alternative| alternative.starts_with_dot_slash);
         let alternative_fast_path =
             AlternativeFastPath::compile(&alternatives, options, budget)?.map(Box::new);
         let path_filter =
-            PathFilter::compile(&alternatives, options, budget, defer_sweeps)?.map(Box::new);
+            PathFilter::compile(&alternatives, raw_source, options, budget, defer_sweeps)?
+                .map(Box::new);
         Ok(Self {
-            alternatives,
+            alternatives: alternatives.into_boxed_slice(),
             alternative_fast_path,
             path_filter,
             walker_path_viability: WalkerPathViability::Viable,
             walker_path_problem_offset: None,
             options,
+            has_leading_dot_slash,
         })
     }
 
@@ -1571,15 +1573,16 @@ impl Pattern {
 
     fn compile_path_filter_alternative(
         alternative: &CompiledAlternative,
+        raw_source: &[u8],
         options: PatternOptions,
         budget: &mut IrBudget,
         defer_sweeps: bool,
     ) -> Result<CompiledAlternative, PatternError> {
         let leading_dot_slash = has_leading_dot_slash_prefix(alternative);
         let source_raw = if leading_dot_slash {
-            &alternative.raw[2..]
+            &raw_source[2..]
         } else {
-            alternative.raw.as_slice()
+            raw_source
         };
         let source_tokens = if leading_dot_slash {
             &alternative.tokens[2..]
@@ -1587,11 +1590,8 @@ impl Pattern {
             &alternative.tokens
         };
         budget.charge(source_tokens.len(), 0)?;
-        if defer_sweeps {
-            ensure_retained_alternative_bytes(source_raw.len(), source_tokens, budget)?;
-        }
-        let raw = source_raw.to_vec();
-        let tokens = source_tokens.to_vec();
+        ensure_retained_alternative_bytes(source_tokens, budget)?;
+        let tokens = source_tokens.to_vec().into_boxed_slice();
         let fast_path = if !leading_dot_slash {
             alternative
                 .fast_path
@@ -1609,11 +1609,20 @@ impl Pattern {
             .filter(FastPath::supports_component_wildcards)
         };
         let prefilter = Prefilter::compile(&tokens);
-        if defer_sweeps {
-            charge_retained_alternative_bytes(raw.len(), &tokens, &fast_path, &prefilter, budget)?;
-        }
-        let mut provenance_budget = ProvenanceBudget::new();
-        let extglob = compile_extglob(&raw, options, budget, &mut provenance_budget, None, false)?;
+        charge_retained_alternative_bytes(&tokens, &fast_path, &prefilter, budget)?;
+        let extglob = if options.extglob && alternative.extglob.is_some() {
+            let mut provenance_budget = ProvenanceBudget::new();
+            compile_extglob(
+                source_raw,
+                options,
+                budget,
+                &mut provenance_budget,
+                None,
+                false,
+            )?
+        } else {
+            None
+        };
         let sweep = if defer_sweeps {
             None
         } else {
@@ -1633,7 +1642,7 @@ impl Pattern {
         };
         Ok(CompiledAlternative {
             extglob,
-            raw,
+            starts_with_dot_slash: source_raw.starts_with(b"./"),
             fast_path,
             prefilter,
             sweep,
@@ -2457,12 +2466,12 @@ fn ends_component_at(pattern: &[u8], end: usize, bounds: ComponentBounds) -> boo
 /// It is constructed only during [`Pattern::compile`]. Matching borrows it;
 /// per-call memoization remains outside this IR in [`FailedStates`].
 struct CompiledAlternative {
-    raw: Vec<u8>,
+    starts_with_dot_slash: bool,
     fast_path: Option<FastPath>,
-    tokens: Vec<Token>,
+    tokens: Box<[Token]>,
     /// The compiled extglob program, present exactly when this alternative
     /// carries extglob syntax and the option is on. Matching borrows it; the
-    /// interpreter used to re-derive all of it from `raw` on every call.
+    /// interpreter used to re-derive all of it from raw source on every call.
     extglob: Option<Box<CompiledExtglob>>,
     /// Necessary conditions on a candidate, read off `tokens` at compile time
     /// and checked before the general engine runs. See [`Prefilter`].
@@ -2540,8 +2549,9 @@ impl CompiledAlternative {
     }
 }
 
-/// Owned heap bytes held by a `Vec<Token>`, including the `Vec` backing
-/// array and any owned literal or character-class member buffers.
+/// Owned heap bytes held by a compacted `Box<[Token]>`, including the backing
+/// slice and the allocated capacity of any owned literal or character-class
+/// member buffers.
 fn cloned_tokens_retained_bytes(tokens: &[Token]) -> usize {
     tokens
         .len()
@@ -2550,10 +2560,11 @@ fn cloned_tokens_retained_bytes(tokens: &[Token]) -> usize {
             tokens
                 .iter()
                 .map(|token| match token {
-                    Token::Literal(literal) => literal.len(),
-                    Token::Class(class) => {
-                        class.members.len().saturating_mul(size_of::<ClassMember>())
-                    }
+                    Token::Literal(literal) => literal.capacity(),
+                    Token::Class(class) => class
+                        .members
+                        .capacity()
+                        .saturating_mul(size_of::<ClassMember>()),
                     _ => 0,
                 })
                 .sum::<usize>(),
@@ -2561,30 +2572,26 @@ fn cloned_tokens_retained_bytes(tokens: &[Token]) -> usize {
 }
 
 fn ensure_retained_alternative_bytes(
-    raw_len: usize,
     tokens: &[Token],
     budget: &IrBudget,
 ) -> Result<(), PatternError> {
-    let bytes = size_of::<CompiledAlternative>()
-        .saturating_add(raw_len)
-        .saturating_add(cloned_tokens_retained_bytes(tokens));
+    let bytes =
+        size_of::<CompiledAlternative>().saturating_add(cloned_tokens_retained_bytes(tokens));
     budget.ensure_retained_bytes(bytes, 0)
 }
 
-/// Charges owned heap storage retained by one multi-alternative brace arm
-/// (`CompiledAlternative`, `raw`, `tokens`, `fast_path`, and `prefilter`)
-/// against the dedicated [`MAX_RETAINED_PATTERN_BYTES`] (40 MiB) ceiling so
-/// retained memory is strictly bounded without stealing [`IrBudget`] units
-/// from sweep-backed alternatives (#495).
+/// Charges owned heap storage retained by one compiled alternative
+/// (`CompiledAlternative`, `tokens`, `fast_path`, and `prefilter`) against the
+/// dedicated [`MAX_RETAINED_PATTERN_BYTES`] (40 MiB) ceiling so retained memory
+/// is strictly bounded without stealing [`IrBudget`] units from sweep-backed
+/// alternatives (#495).
 fn charge_retained_alternative_bytes(
-    raw_len: usize,
     tokens: &[Token],
     fast_path: &Option<FastPath>,
     prefilter: &Prefilter,
     budget: &mut IrBudget,
 ) -> Result<(), PatternError> {
     let bytes = size_of::<CompiledAlternative>()
-        .saturating_add(raw_len)
         .saturating_add(cloned_tokens_retained_bytes(tokens))
         .saturating_add(fast_path.as_ref().map_or(0, FastPath::retained_bytes))
         .saturating_add(prefilter.retained_bytes());
@@ -2592,8 +2599,8 @@ fn charge_retained_alternative_bytes(
 }
 
 fn has_leading_dot_slash_prefix(alternative: &CompiledAlternative) -> bool {
-    alternative.raw.starts_with(b"./")
-        && matches!(alternative.tokens.as_slice(), [Token::Literal(dot), Token::Separator, ..] if dot == b".")
+    alternative.starts_with_dot_slash
+        && matches!(&*alternative.tokens, [Token::Literal(dot), Token::Separator, ..] if dot == b".")
 }
 
 /// Compiles the Shift-And engine where the alternative would use it.
@@ -2730,11 +2737,14 @@ fn sweep_is_deferred(alternative: &CompiledAlternative) -> bool {
 /// fixed end, yet every match contains `node_modules`. See [`InteriorLiteral`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Prefilter {
-    /// Bytes every match starts with, one per byte of the leading
-    /// `Literal`/`Separator` run.
-    prefix: Vec<u8>,
-    /// Bytes every match ends with, one per byte of the trailing run.
-    suffix: Vec<u8>,
+    /// Leading `Literal`/`Separator` token count every match starts with.
+    leading_tokens: usize,
+    /// Byte length of `tokens[..leading_tokens]`.
+    prefix_len: usize,
+    /// Trailing `Literal`/`Separator` token count every match ends with.
+    trailing_tokens: usize,
+    /// Byte length of `tokens[tokens.len() - trailing_tokens..]`.
+    suffix_len: usize,
     /// Bytes the pattern consumes even when every star consumes nothing.
     min_length: usize,
     /// The longest fixed run strictly between the leading and trailing runs,
@@ -2783,15 +2793,12 @@ impl Eq for InteriorLiteral {}
 
 impl Prefilter {
     fn retained_bytes(&self) -> usize {
-        self.prefix
-            .len()
-            .saturating_add(self.suffix.len())
-            .saturating_add(self.interior.as_ref().map_or(0, |interior| {
-                size_of::<InteriorLiteral>().saturating_add(interior.0.needle().len())
-            }))
+        self.interior.as_ref().map_or(0, |interior| {
+            size_of::<InteriorLiteral>().saturating_add(interior.0.needle().len())
+        })
     }
 
-    fn compile(tokens: &[Token]) -> Self {
+    fn fixed_run_bounds(tokens: &[Token]) -> (usize, usize, bool) {
         // `dir/**` matches `dir`, so the separator before a terminal `**` is
         // the one token that may consume nothing.
         let elidable_separator = tokens.len() >= 2
@@ -2805,37 +2812,72 @@ impl Prefilter {
             leading -= 1;
         }
         let trailing = tokens.iter().rev().take_while(fixed).count();
+        (leading, trailing, elidable_separator)
+    }
+
+    fn compile(tokens: &[Token]) -> Self {
+        let (leading_tokens, trailing_tokens, elidable_separator) = Self::fixed_run_bounds(tokens);
+        let prefix_len = run_byte_len(&tokens[..leading_tokens]);
+        let suffix_len = run_byte_len(&tokens[tokens.len() - trailing_tokens..]);
         let min_length =
             tokens.iter().map(token_min_length).sum::<usize>() - usize::from(elidable_separator);
         let prefilter = Self {
-            prefix: run_bytes(&tokens[..leading]),
-            suffix: run_bytes(&tokens[tokens.len() - trailing..]),
+            leading_tokens,
+            prefix_len,
+            trailing_tokens,
+            suffix_len,
             min_length,
-            interior: interior_literal(tokens, leading, trailing, elidable_separator)
+            interior: interior_literal(tokens, leading_tokens, trailing_tokens, elidable_separator)
                 .map(|needle| Box::new(InteriorLiteral(memmem::Finder::new(&needle).into_owned()))),
         };
         debug_assert!(
-            prefilter.min_length >= prefilter.prefix.len()
-                && prefilter.min_length >= prefilter.suffix.len(),
+            prefilter.min_length >= prefilter.prefix_len
+                && prefilter.min_length >= prefilter.suffix_len,
             "the fixed runs are part of what the minimum length counts"
         );
         prefilter
     }
 
+    #[cfg(test)]
+    fn prefix_bytes(&self, tokens: &[Token]) -> Vec<u8> {
+        run_bytes(&tokens[..self.leading_tokens])
+    }
+
+    #[cfg(test)]
+    fn suffix_bytes(&self, tokens: &[Token]) -> Vec<u8> {
+        run_bytes(&tokens[tokens.len() - self.trailing_tokens..])
+    }
+
     /// Whether `path` fails a condition every match satisfies. A `true` here is
     /// a rejection the engine would have reached the slow way.
-    fn rejects(&self, path: &[u8], case_insensitive: bool) -> bool {
+    fn rejects(&self, tokens: &[Token], path: &[u8], case_insensitive: bool) -> bool {
         if path.len() < self.min_length {
             return true;
         }
-        let tail = path.len() - self.suffix.len();
-        !run_matches(&self.prefix, &path[..self.prefix.len()], case_insensitive)
-            || !run_matches(&self.suffix, &path[tail..], case_insensitive)
-            || !case_insensitive
-                && self
-                    .interior
-                    .as_ref()
-                    .is_some_and(|interior| interior.0.find(path).is_none())
+        if self.leading_tokens != 0
+            && !run_matches_tokens(
+                &tokens[..self.leading_tokens],
+                &path[..self.prefix_len],
+                case_insensitive,
+            )
+        {
+            return true;
+        }
+        if self.trailing_tokens != 0 {
+            let tail = path.len() - self.suffix_len;
+            if !run_matches_tokens(
+                &tokens[tokens.len() - self.trailing_tokens..],
+                &path[tail..],
+                case_insensitive,
+            ) {
+                return true;
+            }
+        }
+        !case_insensitive
+            && self
+                .interior
+                .as_ref()
+                .is_some_and(|interior| interior.0.find(path).is_none())
     }
 }
 
@@ -2886,9 +2928,20 @@ fn keep_longer_run(best: &mut Option<Vec<u8>>, run: &mut Vec<u8>) {
     }
 }
 
+/// Total candidate bytes consumed by a run of `Literal`/`Separator` tokens.
+fn run_byte_len(run: &[Token]) -> usize {
+    run.iter()
+        .map(|token| match token {
+            Token::Literal(literal) => literal.len(),
+            Token::Separator => 1,
+            _ => unreachable!("fixed prefilter run only contains Literal and Separator tokens"),
+        })
+        .sum()
+}
+
 /// Bytes a run of `Literal`/`Separator` tokens spells out, with a separator
-/// written as `/`. Any other token in `run` would be a caller bug and is
-/// counted as nothing, which keeps the run shorter and the filter weaker.
+/// written as `/`.
+#[cfg(test)]
 fn run_bytes(run: &[Token]) -> Vec<u8> {
     fn bytes(token: &Token) -> &[u8] {
         match token {
@@ -2911,32 +2964,44 @@ fn token_min_length(token: &Token) -> usize {
     }
 }
 
-fn run_matches(expected: &[u8], actual: &[u8], case_insensitive: bool) -> bool {
-    expected
-        .iter()
-        .zip(actual)
-        .all(|(&expected, &actual)| run_byte_matches(expected, actual, case_insensitive))
-}
-
-/// Whether one byte of a fixed run is satisfied by the candidate's byte.
-///
-/// A `Separator` token contributes `/` and accepts whatever the platform calls
-/// a separator, which is what the engine's separator arm does. A literal `/` --
-/// only reachable through an escape -- is then accepted a little more widely
-/// than the engine accepts it, on Windows only. Being more permissive is the
-/// safe direction for a filter that may only reject.
-fn run_byte_matches(expected: u8, actual: u8, case_insensitive: bool) -> bool {
-    if is_separator(expected) {
-        is_separator(actual)
-    } else {
-        bytes_equal(expected, actual, case_insensitive)
+fn run_matches_tokens(run: &[Token], mut actual: &[u8], case_insensitive: bool) -> bool {
+    for token in run {
+        match token {
+            Token::Literal(literal) => {
+                let (head, rest) = actual.split_at(literal.len());
+                let matched = if case_insensitive {
+                    literal
+                        .iter()
+                        .zip(head)
+                        .all(|(&expected, &byte)| expected.eq_ignore_ascii_case(&byte))
+                } else {
+                    head == literal.as_slice()
+                };
+                if !matched {
+                    return false;
+                }
+                actual = rest;
+            }
+            Token::Separator => {
+                let Some((&first, rest)) = actual.split_first() else {
+                    return false;
+                };
+                if !is_separator(first) {
+                    return false;
+                }
+                actual = rest;
+            }
+            _ => unreachable!("fixed prefilter run only contains Literal and Separator tokens"),
+        }
     }
+    true
 }
 
 /// The suffix representation selected once while compiling a fast path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LiteralSuffix {
-    Plain(Vec<u8>),
+    /// Borrows the trailing `Token::Literal` bytes directly from `tokens`.
+    Plain,
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     Packed16(Box<suffix_word::PreparedSuffix16>),
 }
@@ -2944,34 +3009,38 @@ enum LiteralSuffix {
 impl LiteralSuffix {
     fn retained_bytes(&self) -> usize {
         match self {
-            Self::Plain(bytes) => bytes.len(),
+            Self::Plain => 0,
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             Self::Packed16(_) => size_of::<suffix_word::PreparedSuffix16>(),
         }
     }
 
-    fn new(suffix: Vec<u8>, case_insensitive: bool) -> Self {
+    fn new(suffix: &[u8], case_insensitive: bool) -> Self {
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-        let _ = case_insensitive;
+        let _ = (suffix, case_insensitive);
 
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-        if !case_insensitive && let Some(prepared) = suffix_word::PreparedSuffix16::new(&suffix) {
+        if !case_insensitive && let Some(prepared) = suffix_word::PreparedSuffix16::new(suffix) {
             return Self::Packed16(Box::new(prepared));
         }
 
-        Self::Plain(suffix)
+        Self::Plain
     }
 
-    fn strip_from<'a>(&self, path: &'a [u8], case_insensitive: bool) -> Option<&'a [u8]> {
+    fn strip_from<'a>(
+        &self,
+        path: &'a [u8],
+        literal: &[u8],
+        case_insensitive: bool,
+    ) -> Option<&'a [u8]> {
         match self {
-            Self::Plain(suffix) => strip_literal_suffix(path, suffix, case_insensitive),
+            Self::Plain => strip_literal_suffix(path, literal, case_insensitive),
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             Self::Packed16(suffix) => {
                 if !case_insensitive && let Some(matches) = suffix.matches(path) {
                     return matches.then_some(&path[..path.len() - suffix.len()]);
                 }
-                let bytes = suffix.bytes();
-                strip_literal_suffix(path, &bytes[16 - suffix.len()..], case_insensitive)
+                strip_literal_suffix(path, literal, case_insensitive)
             }
         }
     }
@@ -3046,8 +3115,8 @@ struct ScopedSuffixSet {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AffixTrie {
-    nodes: Vec<AffixNode>,
-    edges: Vec<AffixEdge>,
+    nodes: Box<[AffixNode]>,
+    edges: Box<[AffixEdge]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3081,7 +3150,7 @@ impl SuffixSet {
             let Some(fast_path) = alternative.fast_path.as_ref() else {
                 return Ok(None);
             };
-            let (kind, suffix) = match (fast_path, alternative.tokens.as_slice()) {
+            let (kind, suffix) = match (fast_path, &*alternative.tokens) {
                 (FastPath::StarSuffix { .. }, [Token::Star, Token::Literal(suffix)]) => {
                     (SuffixSetKind::Star, suffix)
                 }
@@ -3148,8 +3217,10 @@ impl ScopedSuffixSet {
         case_insensitive: bool,
         budget: &mut IrBudget,
     ) -> Result<Option<Self>, PatternError> {
-        let mut prefixes = Vec::new();
-        let mut suffixes = Vec::new();
+        let mut prefixes: Vec<&[u8]> = Vec::new();
+        let mut prefix_ids: HashMap<LiteralKey<'_>, usize> = HashMap::new();
+        let mut suffixes: Vec<&[u8]> = Vec::new();
+        let mut suffix_ids: HashMap<LiteralKey<'_>, usize> = HashMap::new();
         let mut pairs = Vec::with_capacity(alternatives.len());
         for alternative in alternatives {
             let Some(fast_path) = alternative.fast_path.as_ref() else {
@@ -3164,16 +3235,35 @@ impl ScopedSuffixSet {
                     Token::Star,
                     Token::Literal(suffix),
                 ],
-            ) = (fast_path, alternative.tokens.as_slice())
+            ) = (fast_path, &*alternative.tokens)
             else {
                 return Ok(None);
             };
-            let prefix = literal_index(&mut prefixes, prefix, case_insensitive);
-            let suffix = literal_index(&mut suffixes, suffix, case_insensitive);
-            if !pairs.contains(&(prefix, suffix)) {
-                pairs.push((prefix, suffix));
-            }
+            let prefix_id = *prefix_ids
+                .entry(LiteralKey {
+                    bytes: prefix,
+                    case_insensitive,
+                })
+                .or_insert_with(|| {
+                    let id = prefixes.len();
+                    prefixes.push(prefix.as_slice());
+                    id
+                });
+            let suffix_id = *suffix_ids
+                .entry(LiteralKey {
+                    bytes: suffix,
+                    case_insensitive,
+                })
+                .or_insert_with(|| {
+                    let id = suffixes.len();
+                    suffixes.push(suffix.as_slice());
+                    id
+                });
+            pairs.push((prefix_id, suffix_id));
         }
+
+        pairs.sort_unstable();
+        pairs.dedup();
 
         // Independent tries would otherwise accept a combination the source
         // never named, such as `lib/**/*.ts` from
@@ -3646,22 +3736,41 @@ fn scoped_suffix_set_scan_stats() -> (usize, usize, usize) {
     SCOPED_SUFFIX_SET_SCAN_STATS.with(std::cell::Cell::get)
 }
 
-fn literal_index<'a>(
-    literals: &mut Vec<&'a [u8]>,
-    literal: &'a [u8],
+/// Borrowed slice key with optional ASCII case folding for O(1) literal
+/// deduplication during [`ScopedSuffixSet::compile`].
+struct LiteralKey<'a> {
+    bytes: &'a [u8],
     case_insensitive: bool,
-) -> usize {
-    if let Some(index) = literals.iter().position(|existing| {
-        existing.len() == literal.len()
-            && existing
-                .iter()
-                .zip(literal)
-                .all(|(&left, &right)| bytes_equal(left, right, case_insensitive))
-    }) {
-        return index;
+}
+
+impl PartialEq for LiteralKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        debug_assert_eq!(self.case_insensitive, other.case_insensitive);
+        self.bytes.len() == other.bytes.len()
+            && if self.case_insensitive {
+                self.bytes
+                    .iter()
+                    .zip(other.bytes)
+                    .all(|(&left, &right)| left.eq_ignore_ascii_case(&right))
+            } else {
+                self.bytes == other.bytes
+            }
     }
-    literals.push(literal);
-    literals.len() - 1
+}
+
+impl Eq for LiteralKey<'_> {}
+
+impl Hash for LiteralKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        if self.case_insensitive {
+            state.write_usize(self.bytes.len());
+            for &byte in self.bytes {
+                state.write_u8(byte.to_ascii_lowercase());
+            }
+        } else {
+            self.bytes.hash(state);
+        }
+    }
 }
 
 impl AffixTrie {
@@ -3709,7 +3818,15 @@ impl AffixTrie {
                 terminal: node.terminal,
             });
         }
-        Ok(Self { nodes, edges })
+        let trie_bytes = nodes
+            .len()
+            .saturating_mul(size_of::<AffixNode>())
+            .saturating_add(edges.len().saturating_mul(size_of::<AffixEdge>()));
+        budget.charge_retained_bytes(trie_bytes, 0)?;
+        Ok(Self {
+            nodes: nodes.into_boxed_slice(),
+            edges: edges.into_boxed_slice(),
+        })
     }
 
     fn insert(
@@ -3763,28 +3880,20 @@ enum FastPath {
     LiteralTokens,
     DeterministicTokens,
     Star,
-    PrefixStar {
-        prefix: Vec<u8>,
-    },
+    PrefixStar,
     StarSuffix {
         suffix: LiteralSuffix,
     },
-    InfixStar {
-        prefix: Vec<u8>,
-        suffix: Vec<u8>,
-    },
+    InfixStar,
     StaticStar {
         star_index: usize,
     },
-    RecursiveTerminalPrefix {
-        prefix: Vec<u8>,
-    },
+    RecursiveTerminalPrefix,
     RecursiveSuffix {
         suffix: LiteralSuffix,
         suffix_last: u8,
     },
     RecursivePrefixSuffix {
-        prefix: Vec<u8>,
         suffix: LiteralSuffix,
         suffix_last: u8,
     },
@@ -3811,21 +3920,16 @@ impl FastPath {
         }
         match tokens {
             [Token::Star] => return Some(Self::Star),
-            [Token::Literal(prefix), Token::Star] => {
-                return Some(Self::PrefixStar {
-                    prefix: prefix.clone(),
-                });
+            [Token::Literal(_), Token::Star] => {
+                return Some(Self::PrefixStar);
             }
             [Token::Star, Token::Literal(suffix)] => {
                 return Some(Self::StarSuffix {
-                    suffix: LiteralSuffix::new(suffix.clone(), options.case_insensitive),
+                    suffix: LiteralSuffix::new(suffix, options.case_insensitive),
                 });
             }
-            [Token::Literal(prefix), Token::Star, Token::Literal(suffix)] => {
-                return Some(Self::InfixStar {
-                    prefix: prefix.clone(),
-                    suffix: suffix.clone(),
-                });
+            [Token::Literal(_), Token::Star, Token::Literal(_)] => {
+                return Some(Self::InfixStar);
             }
             _ => {}
         }
@@ -3837,24 +3941,17 @@ impl FastPath {
         {
             return Some(Self::StaticStar { star_index });
         }
-        if let [
-            Token::Literal(prefix),
-            Token::Separator,
-            Token::RecursiveStar,
-        ] = tokens
-        {
-            return Some(Self::RecursiveTerminalPrefix {
-                prefix: prefix.clone(),
-            });
+        if let [Token::Literal(_), Token::Separator, Token::RecursiveStar] = tokens {
+            return Some(Self::RecursiveTerminalPrefix);
         }
         if let [Token::RecursivePrefix, Token::Star, Token::Literal(suffix)] = tokens {
             return Some(Self::RecursiveSuffix {
-                suffix: LiteralSuffix::new(suffix.clone(), options.case_insensitive),
+                suffix: LiteralSuffix::new(suffix, options.case_insensitive),
                 suffix_last: *suffix.last().expect("literal token is non-empty"),
             });
         }
         let [
-            Token::Literal(prefix),
+            Token::Literal(_),
             Token::Separator,
             Token::RecursivePrefix,
             Token::Star,
@@ -3864,8 +3961,7 @@ impl FastPath {
             return None;
         };
         Some(Self::RecursivePrefixSuffix {
-            prefix: prefix.clone(),
-            suffix: LiteralSuffix::new(suffix.clone(), options.case_insensitive),
+            suffix: LiteralSuffix::new(suffix, options.case_insensitive),
             suffix_last: *suffix.last().expect("literal token is non-empty"),
         })
     }
@@ -3876,6 +3972,7 @@ impl FastPath {
             Self::LiteralTokens
                 | Self::DeterministicTokens
                 | Self::StarSuffix { .. }
+                | Self::RecursiveTerminalPrefix
                 | Self::RecursiveSuffix { .. }
                 | Self::RecursivePrefixSuffix { .. }
         )
@@ -3886,15 +3983,13 @@ impl FastPath {
             Self::LiteralTokens
             | Self::DeterministicTokens
             | Self::Star
-            | Self::StaticStar { .. } => 0,
-            Self::PrefixStar { prefix } | Self::RecursiveTerminalPrefix { prefix } => prefix.len(),
-            Self::StarSuffix { suffix } | Self::RecursiveSuffix { suffix, .. } => {
-                suffix.retained_bytes()
-            }
-            Self::InfixStar { prefix, suffix } => prefix.len().saturating_add(suffix.len()),
-            Self::RecursivePrefixSuffix { prefix, suffix, .. } => {
-                prefix.len().saturating_add(suffix.retained_bytes())
-            }
+            | Self::PrefixStar
+            | Self::InfixStar
+            | Self::StaticStar { .. }
+            | Self::RecursiveTerminalPrefix => 0,
+            Self::StarSuffix { suffix }
+            | Self::RecursiveSuffix { suffix, .. }
+            | Self::RecursivePrefixSuffix { suffix, .. } => suffix.retained_bytes(),
         }
     }
 
@@ -3997,7 +4092,10 @@ impl FastPath {
                         options.candidate_starts_component,
                     )
             }
-            Self::PrefixStar { prefix } => {
+            Self::PrefixStar => {
+                let [Token::Literal(prefix), Token::Star] = tokens else {
+                    unreachable!("PrefixStar fast path only compiles from `[Literal, Star]`");
+                };
                 let Some(variable) = strip_literal_prefix(path, prefix, options.case_insensitive)
                 else {
                     return false;
@@ -4011,7 +4109,11 @@ impl FastPath {
                     )
             }
             Self::StarSuffix { suffix } => {
-                let Some(variable) = suffix.strip_from(path, options.case_insensitive) else {
+                let [Token::Star, Token::Literal(literal)] = tokens else {
+                    unreachable!("StarSuffix fast path only compiles from `[Star, Literal]`");
+                };
+                let Some(variable) = suffix.strip_from(path, literal, options.case_insensitive)
+                else {
                     return false;
                 };
                 // The leading star is component-local only in a
@@ -4035,7 +4137,12 @@ impl FastPath {
                         options.candidate_starts_component,
                     )
             }
-            Self::InfixStar { prefix, suffix } => {
+            Self::InfixStar => {
+                let [Token::Literal(prefix), Token::Star, Token::Literal(suffix)] = tokens else {
+                    unreachable!(
+                        "InfixStar fast path only compiles from `[Literal, Star, Literal]`"
+                    );
+                };
                 let Some(remainder) = strip_literal_prefix(path, prefix, options.case_insensitive)
                 else {
                     return false;
@@ -4081,7 +4188,17 @@ impl FastPath {
                         options.candidate_starts_component,
                     )
             }
-            Self::RecursiveTerminalPrefix { prefix } => {
+            Self::RecursiveTerminalPrefix => {
+                let [
+                    Token::Literal(prefix),
+                    Token::Separator,
+                    Token::RecursiveStar,
+                ] = tokens
+                else {
+                    unreachable!(
+                        "RecursiveTerminalPrefix fast path only compiles from `[Literal, Separator, RecursiveStar]`"
+                    );
+                };
                 let Some(remainder) = strip_literal_prefix(path, prefix, options.case_insensitive)
                 else {
                     return false;
@@ -4100,13 +4217,19 @@ impl FastPath {
                 suffix,
                 suffix_last,
             } => {
+                let [Token::RecursivePrefix, Token::Star, Token::Literal(literal)] = tokens else {
+                    unreachable!(
+                        "RecursiveSuffix fast path only compiles from `[RecursivePrefix, Star, Literal]`"
+                    );
+                };
                 let Some(&path_last) = path.last() else {
                     return false;
                 };
                 if !bytes_equal(*suffix_last, path_last, options.case_insensitive) {
                     return false;
                 }
-                let Some(variable) = suffix.strip_from(path, options.case_insensitive) else {
+                let Some(variable) = suffix.strip_from(path, literal, options.case_insensitive)
+                else {
                     return false;
                 };
                 if star_stops_before_hidden_component(path, variable.len(), options) {
@@ -4121,17 +4244,29 @@ impl FastPath {
                     )
             }
             Self::RecursivePrefixSuffix {
-                prefix,
                 suffix,
                 suffix_last,
             } => {
+                let [
+                    Token::Literal(prefix),
+                    Token::Separator,
+                    Token::RecursivePrefix,
+                    Token::Star,
+                    Token::Literal(literal),
+                ] = tokens
+                else {
+                    unreachable!(
+                        "RecursivePrefixSuffix fast path only compiles from `[Literal, Separator, RecursivePrefix, Star, Literal]`"
+                    );
+                };
                 let Some(&path_last) = path.last() else {
                     return false;
                 };
                 if !bytes_equal(*suffix_last, path_last, options.case_insensitive) {
                     return false;
                 }
-                let Some(prefix_and_variable) = suffix.strip_from(path, options.case_insensitive)
+                let Some(prefix_and_variable) =
+                    suffix.strip_from(path, literal, options.case_insensitive)
                 else {
                     return false;
                 };
@@ -4462,6 +4597,7 @@ fn parse_class(
                     negated,
                     members: {
                         members.extend(class_members(values));
+                        members.shrink_to_fit();
                         members
                     },
                 },
@@ -7951,7 +8087,7 @@ fn alternative_is_globstar(alternative: &ExtglobAlternative) -> bool {
     alternative
         .compiled
         .iter()
-        .any(|compiled| matches!(compiled.tokens.as_slice(), [Token::RecursiveStar]))
+        .any(|compiled| matches!(&*compiled.tokens, [Token::RecursiveStar]))
 }
 
 /// The step offset of the separator in front of a trailing whole-component
@@ -10426,7 +10562,7 @@ fn matching_extglob_alternative_ends(
                 output,
             );
         } else {
-            let elided_tokens = match compiled.tokens.as_slice() {
+            let elided_tokens = match &*compiled.tokens {
                 [prefix @ .., Token::Separator, Token::RecursiveStar] => Some(prefix),
                 _ => None,
             };
@@ -10581,16 +10717,16 @@ mod tests {
     #[test]
     fn apple_silicon_only_packs_short_case_sensitive_suffixes() {
         assert!(matches!(
-            LiteralSuffix::new(b".ts".to_vec(), false),
+            LiteralSuffix::new(b".ts", false),
             LiteralSuffix::Packed16(_)
         ));
         assert!(matches!(
-            LiteralSuffix::new(b".ts".to_vec(), true),
-            LiteralSuffix::Plain(_)
+            LiteralSuffix::new(b".ts", true),
+            LiteralSuffix::Plain
         ));
         assert!(matches!(
-            LiteralSuffix::new(vec![b'x'; 17], false),
-            LiteralSuffix::Plain(_)
+            LiteralSuffix::new(&[b'x'; 17], false),
+            LiteralSuffix::Plain
         ));
     }
 
@@ -13156,7 +13292,7 @@ mod tests {
         let fast = Pattern::compile("Src/**", options).expect("pattern compiles");
         assert!(matches!(
             fast.alternatives[0].fast_path,
-            Some(FastPath::RecursiveTerminalPrefix { .. })
+            Some(FastPath::RecursiveTerminalPrefix)
         ));
         let mut general = fast.clone();
         general.alternatives[0].fast_path = None;
@@ -13248,7 +13384,7 @@ mod tests {
         let fast = Pattern::compile("Src*.rs", options).expect("pattern compiles");
         assert!(matches!(
             fast.alternatives[0].fast_path,
-            Some(FastPath::InfixStar { .. })
+            Some(FastPath::InfixStar)
         ));
         let mut general = fast.clone();
         general.alternatives[0].fast_path = None;
@@ -14731,27 +14867,38 @@ mod tests {
         let recursive = PatternOptions::default().recursive_double_star(true);
         let terminal = Pattern::compile("ab/**", recursive).expect("terminal pattern compiles");
         let prefilter = &terminal.alternatives[0].prefilter;
+        let tokens = &terminal.alternatives[0].tokens;
         assert_eq!(
-            prefilter.prefix, b"ab",
+            prefilter.prefix_bytes(tokens),
+            b"ab",
             "the elidable separator is left off"
         );
-        assert_eq!(prefilter.suffix, b"", "a trailing run cannot hold a `**`");
+        assert_eq!(
+            prefilter.suffix_bytes(tokens),
+            b"",
+            "a trailing run cannot hold a `**`"
+        );
         assert_eq!(prefilter.min_length, 2, "the separator is not counted");
-        assert!(!prefilter.rejects(b"ab", false), "`ab/**` accepts `ab`");
+        assert!(
+            !prefilter.rejects(tokens, b"ab", false),
+            "`ab/**` accepts `ab`"
+        );
 
         // A separator anywhere else is an ordinary byte of the fixed run.
         let inner = Pattern::compile("ab/**/cd", recursive).expect("inner pattern compiles");
         let prefilter = &inner.alternatives[0].prefilter;
-        assert_eq!(prefilter.prefix, b"ab/");
-        assert_eq!(prefilter.suffix, b"cd");
+        let tokens = &inner.alternatives[0].tokens;
+        assert_eq!(prefilter.prefix_bytes(tokens), b"ab/");
+        assert_eq!(prefilter.suffix_bytes(tokens), b"cd");
         assert_eq!(prefilter.min_length, 5);
 
         // Stars are worth nothing, every other token its own bytes.
         let mixed = Pattern::compile("a?[bc]*d", PatternOptions::default())
             .expect("mixed pattern compiles");
         let prefilter = &mixed.alternatives[0].prefilter;
-        assert_eq!(prefilter.prefix, b"a");
-        assert_eq!(prefilter.suffix, b"d");
+        let tokens = &mixed.alternatives[0].tokens;
+        assert_eq!(prefilter.prefix_bytes(tokens), b"a");
+        assert_eq!(prefilter.suffix_bytes(tokens), b"d");
         assert_eq!(prefilter.min_length, 4);
     }
 
@@ -14812,11 +14959,12 @@ mod tests {
 
         let excluded = Pattern::compile("**/node_modules/**", recursive).unwrap();
         let prefilter = &excluded.alternatives[0].prefilter;
-        assert!(prefilter.rejects(b"src/lib/index.js", false));
-        assert!(!prefilter.rejects(b"a/node_modules/b", false));
-        assert!(!prefilter.rejects(b"node_modules", false));
+        let tokens = &excluded.alternatives[0].tokens;
+        assert!(prefilter.rejects(tokens, b"src/lib/index.js", false));
+        assert!(!prefilter.rejects(tokens, b"a/node_modules/b", false));
+        assert!(!prefilter.rejects(tokens, b"node_modules", false));
         // Folding has no `memmem` form, so the search stands aside.
-        assert!(!prefilter.rejects(b"a/NODE_MODULES/b", true));
+        assert!(!prefilter.rejects(tokens, b"a/NODE_MODULES/b", true));
     }
 
     /// The prefilter may only reject what the engines behind it reject, over
@@ -15110,7 +15258,7 @@ mod tests {
         // A starred fast path that also answers under the component policy
         // wins every top-level dispatch, so its engine is not built there.
         let options = PatternOptions::walker();
-        for source in ["*.rs", "**/*.rs", "src/**/*.rs"] {
+        for source in ["*.rs", "**/*.rs", "src/**/*.rs", "dir/**"] {
             let pattern = Pattern::compile(source, options).unwrap();
             let alternative = &pattern.alternatives[0];
             assert!(
@@ -15126,7 +15274,18 @@ mod tests {
             let mut sweep_only = pattern.clone();
             sweep_only.strip_engines(true, false, false);
             assert!(sweep_only.alternatives[0].sweep.is_some());
-            for path in ["lib.rs", "src/lib.rs", "src/.x.rs", "src/lib.ts"] {
+            for path in [
+                "lib.rs",
+                "src/lib.rs",
+                "src/.x.rs",
+                "src/lib.ts",
+                "dir",
+                "dir/",
+                "dir/a",
+                "dir/.hidden",
+                "dir/a/.hidden",
+                "dira",
+            ] {
                 assert!(pattern.engines_agree(path), "{source} against {path}");
             }
         }
@@ -15465,7 +15624,7 @@ mod tests {
                 .expect("pattern compiles")
                 .alternatives
                 .into_iter()
-                .map(|alternative| alternative.tokens)
+                .map(|alternative| alternative.tokens.to_vec())
                 .collect::<Vec<_>>()
         };
         let literal = |bytes: &[u8]| Token::Literal(bytes.to_vec());
@@ -15533,7 +15692,7 @@ mod tests {
         // With the option off every run is ordinary, whatever its position.
         let ordinary = Pattern::compile("**/x", PatternOptions::default()).unwrap();
         assert_eq!(
-            ordinary.alternatives[0].tokens,
+            &*ordinary.alternatives[0].tokens,
             [Token::Star, Token::Star, Token::Separator, literal(b"x")]
         );
     }
@@ -15553,7 +15712,7 @@ mod tests {
             program.groups[0]
                 .alternatives
                 .iter()
-                .map(|alternative| alternative.compiled[0].tokens.clone())
+                .map(|alternative| alternative.compiled[0].tokens.to_vec())
                 .collect::<Vec<_>>()
         };
         assert_eq!(alternative_tokens("@(**)/y")[0], [Token::RecursiveStar]);
@@ -17145,6 +17304,247 @@ mod tests {
             unclosed_with_extglob.as_bytes(),
             true
         ));
+    }
+
+    #[test]
+    fn has_leading_dot_slash_is_precomputed_across_single_and_brace_patterns() {
+        let options = PatternOptions::walker();
+        for (source, expected) in [
+            ("src/**/*.rs", false),
+            ("{src,lib}/**/*.{rs,ts}", false),
+            ("./src/**/*.rs", true),
+            ("{src,./lib}/**/*.rs", true),
+            ("{./a,./b}/file.txt", true),
+            (".hidden/**", false),
+        ] {
+            let pattern = Pattern::compile(source, options).expect("pattern compiles");
+            assert_eq!(
+                pattern.has_leading_dot_slash, expected,
+                "unexpected has_leading_dot_slash for {source:?}"
+            );
+            for path in [
+                "src/lib.rs",
+                "./src/lib.rs",
+                "lib/mod.rs",
+                "./lib/mod.rs",
+                "a/file.txt",
+                "./a/file.txt",
+                ".hidden/x",
+            ] {
+                assert!(
+                    pattern.engines_agree(path),
+                    "{source:?} engines disagreed on {path:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recursive_terminal_prefix_fast_path_agrees_across_all_options_and_entry_points() {
+        let patterns = [
+            "dir/**",
+            "./dir/**",
+            ".hidden/**",
+            "Dir/**",
+            r"a\/b/**",
+            "/**",
+            "{dir/**,other/**}",
+            "{./dir/**,other/**}",
+        ];
+        let candidates = [
+            "",
+            "dir",
+            "dir/",
+            "dir/a",
+            "dir/a/b",
+            "dir/.hidden",
+            "dir/a/.hidden",
+            "dir/a.b",
+            "dir//a",
+            "dir//.hidden",
+            "dira",
+            "dira/b",
+            "./dir",
+            "./dir/",
+            "./dir/a",
+            "./dir/.hidden",
+            "DIR",
+            "DIR/A",
+            "DIR/.HIDDEN",
+            ".hidden",
+            ".hidden/",
+            ".hidden/a",
+            ".hidden/.b",
+            "a/b",
+            "a/b/c",
+            "a/b/.c",
+            "/",
+            "/a",
+            "/.hidden",
+            "other",
+            "other/x",
+            "other/.x",
+            r"dir\a",
+            r"dir\.hidden",
+        ];
+        for match_hidden in [false, true] {
+            for case_insensitive in [false, true] {
+                for escape in [false, true] {
+                    let options = PatternOptions::walker()
+                        .match_hidden(match_hidden)
+                        .case_insensitive(case_insensitive)
+                        .escape(escape);
+                    for source in patterns {
+                        let pattern = Pattern::compile(source, options).expect("pattern compiles");
+                        if source == "dir/**" {
+                            assert!(matches!(
+                                pattern.alternatives[0].fast_path,
+                                Some(FastPath::RecursiveTerminalPrefix)
+                            ));
+                            assert!(
+                                pattern.alternatives[0]
+                                    .fast_path
+                                    .as_ref()
+                                    .is_some_and(FastPath::supports_component_wildcards)
+                            );
+                            assert!(pattern.alternatives[0].sweep.is_none());
+                        }
+                        if source == "./dir/**" {
+                            let filter = pattern
+                                .path_filter
+                                .as_ref()
+                                .expect("./dir/** builds a stripped path_filter copy");
+                            assert!(matches!(
+                                filter.compiled[0].fast_path,
+                                Some(FastPath::RecursiveTerminalPrefix)
+                            ));
+                            assert!(filter.compiled[0].sweep.is_none());
+                        }
+                        for candidate in candidates {
+                            assert!(
+                                pattern.engines_agree(candidate),
+                                "{source:?} against {candidate:?} under {options:?}"
+                            );
+                            // Also verify `is_match_crossing_path` matches the stripped oracle.
+                            let mut oracle = pattern.clone();
+                            oracle.strip_engines(true, true, true);
+                            assert_eq!(
+                                pattern.is_match_crossing_path(candidate),
+                                oracle.is_match_crossing_path(candidate),
+                                "is_match_crossing_path mismatch: {source:?} against {candidate:?} under {options:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn literal_and_deterministic_brace_expansions_avoid_duplicate_retention_within_budget() {
+        // Without duplicate raw/prefilter/fast-path literal copies, 2,048 × ~6 KB
+        // (~12.6 MB) compiles and matches cleanly well below the 40 MiB ceiling.
+        let large_literal = format!("{}{}", "{a,b}".repeat(11), "z".repeat(6_000));
+        let compiled_literal = Pattern::compile(&large_literal, PatternOptions::walker())
+            .expect("2,048 x 6 KB literal brace expansion must compile within 40 MiB");
+        assert_eq!(compiled_literal.alternatives.len(), 2_048);
+        assert!(matches!(
+            compiled_literal.alternatives[0].fast_path,
+            Some(FastPath::LiteralTokens)
+        ));
+        let hit = format!("{}{}", "b".repeat(11), "z".repeat(6_000));
+        let miss = format!("{}{}y", "b".repeat(11), "z".repeat(5_999));
+        assert!(compiled_literal.is_match(&hit));
+        assert!(compiled_literal.is_match_glob_path(&hit));
+        assert!(!compiled_literal.is_match(&miss));
+        assert!(compiled_literal.engines_agree(&hit));
+        assert!(compiled_literal.engines_agree(&miss));
+
+        // 2,048 × (256 `?` + 1,500 literal bytes): `tokens` is compacted to
+        // `Box<[Token]>` and `Token::Literal` has exact capacity so no spare
+        // `Vec` doubling capacity bypasses `IrBudget`.
+        let large_det = format!(
+            "{}{}{}",
+            "{a,b}".repeat(11),
+            "?".repeat(256),
+            "z".repeat(1_500)
+        );
+        let compiled_det = Pattern::compile(&large_det, PatternOptions::walker())
+            .expect("2,048 x (256 `?` + 1.5 KB) deterministic expansion compiles within 40 MiB");
+        assert_eq!(compiled_det.alternatives.len(), 2_048);
+        assert!(matches!(
+            compiled_det.alternatives[0].fast_path,
+            Some(FastPath::DeterministicTokens)
+        ));
+        for alternative in &compiled_det.alternatives {
+            for token in &alternative.tokens {
+                if let Token::Literal(literal) = token {
+                    assert_eq!(literal.capacity(), literal.len());
+                }
+            }
+        }
+        let det_hit = format!("{}{}{}", "a".repeat(11), "x".repeat(256), "z".repeat(1_500));
+        let det_miss = format!("{}{}{}", "a".repeat(11), "x".repeat(255), "z".repeat(1_500));
+        assert!(compiled_det.is_match(&det_hit));
+        assert!(!compiled_det.is_match(&det_miss));
+        assert!(compiled_det.engines_agree(&det_hit));
+
+        // Even a single-alternative literal exceeding 40 MiB is rejected under
+        // the unified retained-byte ceiling.
+        let single_huge = "a".repeat(super::MAX_RETAINED_PATTERN_BYTES + 1);
+        assert_eq!(
+            Pattern::compile(&single_huge, PatternOptions::default())
+                .unwrap_err()
+                .message(),
+            super::TOO_MUCH_COMPILED_IR
+        );
+    }
+
+    #[test]
+    fn scoped_suffix_set_compiles_4096_arms_in_near_linear_time() {
+        let prefixes: Vec<String> = (0..64).map(|i| format!("pkg{i:02}")).collect();
+        let suffixes: Vec<String> = (0..64).map(|i| format!("ext{i:02}")).collect();
+        let source = format!("{{{}}}/**/*.{{{}}}", prefixes.join(","), suffixes.join(","));
+
+        for case_insensitive in [false, true] {
+            let options = PatternOptions::walker().case_insensitive(case_insensitive);
+            let pattern = Pattern::compile(&source, options).expect("4096-arm scoped set compiles");
+            assert_eq!(pattern.alternatives.len(), 4_096);
+            assert!(
+                matches!(
+                    pattern.alternative_fast_path.as_deref(),
+                    Some(AlternativeFastPath::ScopedSuffixSet(_))
+                ),
+                "4,096-arm cross product must install ScopedSuffixSet (case_insensitive={case_insensitive})"
+            );
+            assert!(pattern.is_match_glob_path("pkg00/a/b/file.ext00"));
+            assert!(pattern.is_match_glob_path("pkg63/deep/file.ext63"));
+            assert!(!pattern.is_match_glob_path("pkg64/deep/file.ext63"));
+            assert!(!pattern.is_match_glob_path("pkg00/deep/file.ext64"));
+            assert_eq!(
+                pattern.is_match_glob_path("PKG31/SUB/FILE.EXT42"),
+                case_insensitive
+            );
+            assert!(pattern.engines_agree("pkg31/sub/file.ext42"));
+            assert!(pattern.engines_agree("PKG31/SUB/FILE.EXT42"));
+            assert!(pattern.engines_agree("pkg31/.hidden/file.ext42"));
+        }
+
+        // Case-insensitive duplicate collapse inside `ScopedSuffixSet::compile`
+        // must still recognize a complete cross product.
+        let dup_folded = Pattern::compile(
+            "{src,SRC,lib}/**/*.{rs,RS,ts}",
+            PatternOptions::walker().case_insensitive(true),
+        )
+        .expect("folded duplicate scoped set compiles");
+        assert!(matches!(
+            dup_folded.alternative_fast_path.as_deref(),
+            Some(AlternativeFastPath::ScopedSuffixSet(_))
+        ));
+        assert!(dup_folded.is_match_glob_path("SRC/a/b.RS"));
+        assert!(dup_folded.is_match_glob_path("lib/a/b.TS"));
+        assert!(!dup_folded.is_match_glob_path("docs/a/b.rs"));
+        assert!(dup_folded.engines_agree("SRC/a/b.RS"));
     }
 }
 

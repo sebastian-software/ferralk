@@ -16,7 +16,7 @@ use std::{
 
 use ferralk::{
     Verdict, Walker,
-    ferralk_glob::{Pattern, PatternOptions},
+    ferralk_glob::{Pattern, PatternOptions, PatternSet},
 };
 
 const ENTRIES_PER_DIRECTORY: usize = 64;
@@ -429,6 +429,43 @@ fn hot_paths_keep_their_allocation_floors() {
     assert_eq!(
         mixed_wide_allocs.count_total, mixed_narrow_allocs.count_total,
         "mixed wide + narrow repetition groups must not evict retained wide sweep buffers"
+    );
+
+    // Warm `PatternSet` queries must not allocate on repeated components
+    // (inline or spilled dedup via component `a`) or >256-byte uppercase folded
+    // candidates (#493).
+    let mut set_globs: Vec<String> = (0..16).map(|index| format!("**/a/tag{index}_*")).collect();
+    set_globs.push("**/a/any_*".to_string());
+    set_globs.push("docs_*".to_string());
+    set_globs.push("**/*_tail".to_string());
+    let folded_set = PatternSet::new(&set_globs, PatternOptions::walker().case_insensitive(true))
+        .expect("compile PatternSet allocation fixture");
+    let repeated_path = format!("{}miss", "a/".repeat(200));
+    let long_upper_hit = format!("DOCS_{}/A/TAG9_FILE", "X".repeat(400));
+    let long_upper_miss = format!("OTHER_{}/MISS", "Y".repeat(400));
+    let mut set_matches = Vec::with_capacity(32);
+    // Warm up thread-local seen/fold buffers once.
+    assert!(!folded_set.is_match_glob_path(&repeated_path));
+    folded_set.matches_glob_path_into(&repeated_path, &mut set_matches);
+    assert!(set_matches.is_empty());
+    assert!(folded_set.is_match_glob_path(&long_upper_hit));
+    folded_set.matches_glob_path_into(&long_upper_hit, &mut set_matches);
+    assert!(!set_matches.is_empty());
+    assert!(!folded_set.is_match_glob_path(&long_upper_miss));
+    let pattern_set_allocs = allocation_counter::measure(|| {
+        for _ in 0..500 {
+            black_box(folded_set.is_match_glob_path(black_box(repeated_path.as_str())));
+            folded_set.matches_glob_path_into(black_box(repeated_path.as_str()), &mut set_matches);
+            black_box(set_matches.len());
+            black_box(folded_set.is_match_glob_path(black_box(long_upper_hit.as_str())));
+            folded_set.matches_glob_path_into(black_box(long_upper_hit.as_str()), &mut set_matches);
+            black_box(set_matches.len());
+            black_box(folded_set.is_match_glob_path(black_box(long_upper_miss.as_str())));
+        }
+    });
+    assert_eq!(
+        pattern_set_allocs.count_total, 0,
+        "warm PatternSet repeated-component and >256-byte uppercase folded matches must not allocate"
     );
 
     let small = Fixture::plain(1);
