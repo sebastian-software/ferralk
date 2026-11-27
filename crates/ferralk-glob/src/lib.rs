@@ -246,14 +246,16 @@ struct PathFilter {
 }
 
 impl PathFilter {
+    fn is_program(alternative: &CompiledAlternative, options: PatternOptions) -> bool {
+        options.extglob && alternative.extglob.is_some() && !alternative.raw.starts_with(b"./")
+    }
+
     fn compile(
         alternatives: &[CompiledAlternative],
         options: PatternOptions,
         budget: &mut IrBudget,
+        defer_sweeps: bool,
     ) -> Result<Option<Self>, PatternError> {
-        let is_program = |alternative: &CompiledAlternative| {
-            options.extglob && alternative.extglob.is_some() && !alternative.raw.starts_with(b"./")
-        };
         let needs_copy = |alternative: &CompiledAlternative| {
             alternative.raw.starts_with(b"./")
                 || alternative.tokens.windows(2).any(|tokens| {
@@ -265,8 +267,11 @@ impl PathFilter {
         };
         let plain_needs_copy = alternatives
             .iter()
-            .any(|alternative| !is_program(alternative) && needs_copy(alternative));
-        let programs = alternatives.iter().filter(|item| is_program(item)).count();
+            .any(|alternative| !Self::is_program(alternative, options) && needs_copy(alternative));
+        let programs = alternatives
+            .iter()
+            .filter(|item| Self::is_program(item, options))
+            .count();
         let plain = alternatives.len() - programs;
         // Sized up front: the filter lives as long as the pattern.
         let (copies, whole) = if plain_needs_copy {
@@ -280,7 +285,7 @@ impl PathFilter {
             whole: Vec::with_capacity(whole),
         };
         for (index, alternative) in alternatives.iter().enumerate() {
-            if is_program(alternative) {
+            if Self::is_program(alternative, options) {
                 filter.programs.push(index);
             } else if plain_needs_copy {
                 // A second compiled copy of the alternative, so it costs the
@@ -291,6 +296,7 @@ impl PathFilter {
                         alternative,
                         options,
                         budget,
+                        defer_sweeps,
                     )?);
             } else {
                 filter.whole.push(index);
@@ -697,6 +703,9 @@ impl Pattern {
         let (viability, offset) = walker_path_analysis(&compiled.alternatives, &mut budget)?;
         compiled.walker_path_viability = viability;
         compiled.walker_path_problem_offset = offset;
+        if compiled.alternatives.len() > 1 {
+            compiled.populate_deferred_sweeps(&mut budget)?;
+        }
         compiled.release_compile_state();
         Ok(compiled)
     }
@@ -747,6 +756,7 @@ impl Pattern {
     /// extglob group's alternatives recurse again, so one budget threaded down
     /// is what makes the total observable at all: each call on its own looks
     /// small.
+    #[allow(clippy::too_many_arguments)]
     fn compile_within(
         pattern: &[u8],
         options: PatternOptions,
@@ -774,6 +784,12 @@ impl Pattern {
                 provenance_budget,
             )?;
             ensure_brace_compiled_ir_lower_bound(&expanded, parse_options, budget)?;
+            // Multi-alternative brace expansions defer optional `SweepEngine`
+            // tables until mandatory tokens, `PathFilter` copies, and
+            // `walker_path_analysis` have been charged, so optional sweeps
+            // cannot starve mandatory IR and can fall back to the token
+            // matcher once the remaining `IrBudget` is exhausted.
+            let defer_sweeps = expanded.len() > 1;
             // Every expanded alternative compiles to exactly one, so the
             // pattern keeps no spare capacity.
             let mut alternatives = Vec::with_capacity(expanded.len());
@@ -784,7 +800,7 @@ impl Pattern {
                 // same way (#395).
                 let leading_dot_is_normalized =
                     leading_dot_is_normalized || alternative.bytes.starts_with(b"./");
-                let compiled = Self::compile_within(
+                alternatives.push(Self::compile_single_alternative(
                     &alternative.bytes,
                     parse_options,
                     budget,
@@ -792,11 +808,35 @@ impl Pattern {
                     alternative.source_provenance.as_ref(),
                     leading_dot_is_normalized,
                     bounds,
-                )?;
-                alternatives.extend(compiled.alternatives);
+                    defer_sweeps,
+                )?);
             }
-            return Self::from_alternatives(alternatives, options, budget);
+            return Self::from_alternatives(alternatives, options, budget, defer_sweeps);
         }
+        let alternative = Self::compile_single_alternative(
+            pattern,
+            options,
+            budget,
+            provenance_budget,
+            walker_source_provenance,
+            leading_dot_is_normalized,
+            bounds,
+            false,
+        )?;
+        Self::from_alternatives(vec![alternative], options, budget, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compile_single_alternative(
+        pattern: &[u8],
+        options: PatternOptions,
+        budget: &mut IrBudget,
+        provenance_budget: &mut ProvenanceBudget,
+        walker_source_provenance: Option<&SourceProvenance>,
+        leading_dot_is_normalized: bool,
+        bounds: ComponentBounds,
+        defer_sweeps: bool,
+    ) -> Result<CompiledAlternative, PatternError> {
         let mut tokens = Vec::new();
         let mut literals = Vec::new();
         // Keep the walker-only path shape beside the token build. In
@@ -921,29 +961,44 @@ impl Pattern {
             walker_source_provenance,
             leading_dot_is_normalized,
         )?;
+        if defer_sweeps {
+            ensure_retained_alternative_bytes(pattern.len(), &tokens, budget)?;
+        }
         let fast_path = FastPath::compile(&tokens, options);
-        let sweep = compile_sweep(
-            &tokens,
-            &fast_path,
-            extglob.as_deref(),
-            options,
-            budget,
-            None,
-        )?;
+        let prefilter = Prefilter::compile(&tokens);
+        if defer_sweeps {
+            charge_retained_alternative_bytes(
+                pattern.len(),
+                &tokens,
+                &fast_path,
+                &prefilter,
+                budget,
+            )?;
+        }
+        let sweep = if defer_sweeps {
+            None
+        } else {
+            compile_sweep(
+                &tokens,
+                &fast_path,
+                extglob.as_deref(),
+                options,
+                budget,
+                None,
+                false,
+                false,
+            )?
+        };
         let walker_path_shape = walker_path.finish();
-        Self::from_alternatives(
-            vec![CompiledAlternative {
-                extglob,
-                raw: pattern.to_vec(),
-                fast_path,
-                prefilter: Prefilter::compile(&tokens),
-                sweep,
-                tokens,
-                walker_path_shape,
-            }],
-            options,
-            budget,
-        )
+        Ok(CompiledAlternative {
+            extglob,
+            raw: pattern.to_vec(),
+            fast_path,
+            prefilter,
+            sweep,
+            tokens,
+            walker_path_shape,
+        })
     }
 
     /// Reports whether a pattern is syntactically valid without retaining it.
@@ -990,7 +1045,7 @@ impl Pattern {
             && (!self.options.extglob || alternative.extglob.is_none())
             && let Some(fast_path) = &alternative.fast_path
         {
-            return fast_path.is_match(path, self.options);
+            return fast_path.is_match(&alternative.tokens, path, self.options);
         }
         if let Some(fast_path) = &self.alternative_fast_path {
             return fast_path.is_match(path, self.options, &self.alternatives);
@@ -1069,7 +1124,7 @@ impl Pattern {
             } else if let Some(fast_path) = &alternative.fast_path
                 && (!options.component_wildcards || fast_path.supports_component_wildcards())
             {
-                fast_path.is_match(path, options)
+                fast_path.is_match(&alternative.tokens, path, options)
             } else {
                 // Neither engine consults the pattern's fixed ends before it
                 // walks the candidate, so a candidate that cannot possibly
@@ -1270,7 +1325,7 @@ impl Pattern {
             && let Some(fast_path) = &alternative.fast_path
             && fast_path.supports_component_wildcards()
         {
-            return fast_path.is_match(path, options);
+            return fast_path.is_match(&alternative.tokens, path, options);
         }
         if let Some(fast_path) = &self.alternative_fast_path {
             return fast_path.is_match(path, options, &self.alternatives);
@@ -1430,10 +1485,12 @@ impl Pattern {
         alternatives: Vec<CompiledAlternative>,
         options: PatternOptions,
         budget: &mut IrBudget,
+        defer_sweeps: bool,
     ) -> Result<Self, PatternError> {
         let alternative_fast_path =
             AlternativeFastPath::compile(&alternatives, options, budget)?.map(Box::new);
-        let path_filter = PathFilter::compile(&alternatives, options, budget)?.map(Box::new);
+        let path_filter =
+            PathFilter::compile(&alternatives, options, budget, defer_sweeps)?.map(Box::new);
         Ok(Self {
             alternatives,
             alternative_fast_path,
@@ -1444,50 +1501,141 @@ impl Pattern {
         })
     }
 
+    fn populate_deferred_sweeps(&mut self, budget: &mut IrBudget) -> Result<(), PatternError> {
+        let parse_options = PatternOptions {
+            braces: false,
+            ..self.options
+        };
+        // Pass 1: build sweeps for top-level alternatives first, skipping
+        // `FastPath` arms that already answer every entry point without
+        // deducting their unused tables from `budget` (#495).
+        for alternative in &mut self.alternatives {
+            alternative.sweep = compile_sweep(
+                &alternative.tokens,
+                &alternative.fast_path,
+                alternative.extglob.as_deref(),
+                parse_options,
+                budget,
+                None,
+                false,
+                true,
+            )?;
+        }
+        // Pass 2: populate `PathFilter` copies, sharing `Arc`-backed tables
+        // for unchanged tokens at zero budget cost before spending any
+        // remaining budget on copies that need their own engine.
+        let Some(filter) = self.path_filter.as_deref_mut() else {
+            return Ok(());
+        };
+        if filter.compiled.is_empty() {
+            return Ok(());
+        }
+        let mut originals = self
+            .alternatives
+            .iter()
+            .filter(|alternative| !PathFilter::is_program(alternative, self.options));
+        for copy in &mut filter.compiled {
+            let original = originals
+                .next()
+                .expect("every path-filter copy corresponds to one non-program alternative");
+            let reuses_original_tokens = !has_leading_dot_slash_prefix(original);
+            let built = original.sweep.as_ref().filter(|_| reuses_original_tokens);
+            copy.sweep = if let Some(built) = built {
+                Some(built.clone())
+            } else if copy
+                .fast_path
+                .as_ref()
+                .is_some_and(FastPath::supports_component_wildcards)
+                || (reuses_original_tokens && !sweep_is_deferred(original))
+            {
+                // Either `copy` already answers every entry point with its
+                // complete `FastPath` (never allocating a sweep), or `original`
+                // has the same tokens and already needs no sweep / fell back.
+                None
+            } else {
+                compile_sweep(
+                    &copy.tokens,
+                    &copy.fast_path,
+                    copy.extglob.as_deref(),
+                    parse_options,
+                    budget,
+                    None,
+                    false,
+                    true,
+                )?
+            };
+        }
+        debug_assert!(originals.next().is_none());
+        Ok(())
+    }
+
     fn compile_path_filter_alternative(
         alternative: &CompiledAlternative,
         options: PatternOptions,
         budget: &mut IrBudget,
+        defer_sweeps: bool,
     ) -> Result<CompiledAlternative, PatternError> {
-        let leading_dot_slash = alternative.raw.starts_with(b"./")
-            && matches!(alternative.tokens.as_slice(), [Token::Literal(dot), Token::Separator, ..] if dot == b".");
-        let raw = if leading_dot_slash {
-            alternative.raw[2..].to_vec()
+        let leading_dot_slash = has_leading_dot_slash_prefix(alternative);
+        let source_raw = if leading_dot_slash {
+            &alternative.raw[2..]
         } else {
-            alternative.raw.clone()
+            alternative.raw.as_slice()
         };
         let source_tokens = if leading_dot_slash {
             &alternative.tokens[2..]
         } else {
             &alternative.tokens
         };
+        budget.charge(source_tokens.len(), 0)?;
+        if defer_sweeps {
+            ensure_retained_alternative_bytes(source_raw.len(), source_tokens, budget)?;
+        }
+        let raw = source_raw.to_vec();
         let tokens = source_tokens.to_vec();
-        let fast_path = FastPath::compile(
-            &tokens,
-            PatternOptions {
-                component_wildcards: true,
-                ..options
-            },
-        );
-        budget.charge(tokens.len(), 0)?;
+        let fast_path = if !leading_dot_slash {
+            alternative
+                .fast_path
+                .as_ref()
+                .filter(|fast_path| fast_path.supports_component_wildcards())
+                .cloned()
+        } else {
+            FastPath::compile(
+                &tokens,
+                PatternOptions {
+                    component_wildcards: false,
+                    ..options
+                },
+            )
+            .filter(FastPath::supports_component_wildcards)
+        };
+        let prefilter = Prefilter::compile(&tokens);
+        if defer_sweeps {
+            charge_retained_alternative_bytes(raw.len(), &tokens, &fast_path, &prefilter, budget)?;
+        }
         let mut provenance_budget = ProvenanceBudget::new();
         let extglob = compile_extglob(&raw, options, budget, &mut provenance_budget, None, false)?;
-        // Without a removed `./` the copy has its original's tokens, and the
-        // same tokens under the same options build the same engine.
-        let built = alternative.sweep.as_ref().filter(|_| !leading_dot_slash);
-        let sweep = compile_sweep(
-            &tokens,
-            &fast_path,
-            extglob.as_deref(),
-            options,
-            budget,
-            built,
-        )?;
+        let sweep = if defer_sweeps {
+            None
+        } else {
+            // Without a removed `./` the copy has its original's tokens, and
+            // the same tokens under the same options build the same engine.
+            let built = alternative.sweep.as_ref().filter(|_| !leading_dot_slash);
+            compile_sweep(
+                &tokens,
+                &fast_path,
+                extglob.as_deref(),
+                options,
+                budget,
+                built,
+                !leading_dot_slash,
+                false,
+            )?
+        };
         Ok(CompiledAlternative {
             extglob,
             raw,
             fast_path,
-            prefilter: Prefilter::compile(&tokens),
+            prefilter,
             sweep,
             tokens,
             walker_path_shape: alternative.walker_path_shape.clone(),
@@ -1903,6 +2051,11 @@ impl StarWork<'_> {
 /// Visited-matrix words a thread keeps between calls. 8 Ki words is 64 KiB and
 /// holds 512 Ki token/path states — past any realistic path — while stopping
 /// one huge candidate from pinning memory on a worker thread for good.
+/// Maximum retained wide extglob repetition sweep slots kept across calls on
+/// one thread so a single huge wide-arm repetition never leaves thousands of
+/// heap-backed wide states behind.
+const RETAINED_WIDE_SWEEP_SLOTS: usize = 64;
+
 const RETAINED_SCRATCH_WORDS: usize = 8 * 1024;
 
 thread_local! {
@@ -2387,6 +2540,62 @@ impl CompiledAlternative {
     }
 }
 
+/// Owned heap bytes held by a `Vec<Token>`, including the `Vec` backing
+/// array and any owned literal or character-class member buffers.
+fn cloned_tokens_retained_bytes(tokens: &[Token]) -> usize {
+    tokens
+        .len()
+        .saturating_mul(size_of::<Token>())
+        .saturating_add(
+            tokens
+                .iter()
+                .map(|token| match token {
+                    Token::Literal(literal) => literal.len(),
+                    Token::Class(class) => {
+                        class.members.len().saturating_mul(size_of::<ClassMember>())
+                    }
+                    _ => 0,
+                })
+                .sum::<usize>(),
+        )
+}
+
+fn ensure_retained_alternative_bytes(
+    raw_len: usize,
+    tokens: &[Token],
+    budget: &IrBudget,
+) -> Result<(), PatternError> {
+    let bytes = size_of::<CompiledAlternative>()
+        .saturating_add(raw_len)
+        .saturating_add(cloned_tokens_retained_bytes(tokens));
+    budget.ensure_retained_bytes(bytes, 0)
+}
+
+/// Charges owned heap storage retained by one multi-alternative brace arm
+/// (`CompiledAlternative`, `raw`, `tokens`, `fast_path`, and `prefilter`)
+/// against the dedicated [`MAX_RETAINED_PATTERN_BYTES`] (40 MiB) ceiling so
+/// retained memory is strictly bounded without stealing [`IrBudget`] units
+/// from sweep-backed alternatives (#495).
+fn charge_retained_alternative_bytes(
+    raw_len: usize,
+    tokens: &[Token],
+    fast_path: &Option<FastPath>,
+    prefilter: &Prefilter,
+    budget: &mut IrBudget,
+) -> Result<(), PatternError> {
+    let bytes = size_of::<CompiledAlternative>()
+        .saturating_add(raw_len)
+        .saturating_add(cloned_tokens_retained_bytes(tokens))
+        .saturating_add(fast_path.as_ref().map_or(0, FastPath::retained_bytes))
+        .saturating_add(prefilter.retained_bytes());
+    budget.charge_retained_bytes(bytes, 0)
+}
+
+fn has_leading_dot_slash_prefix(alternative: &CompiledAlternative) -> bool {
+    alternative.raw.starts_with(b"./")
+        && matches!(alternative.tokens.as_slice(), [Token::Literal(dot), Token::Separator, ..] if dot == b".")
+}
+
 /// Compiles the Shift-And engine where the alternative would use it.
 ///
 /// An extglob program keeps its own interpreter, and the literal and
@@ -2402,8 +2611,19 @@ impl CompiledAlternative {
 /// general path under some option profile and gets its engine here.
 ///
 /// `built` is an engine already compiled from these very tokens under these
-/// options. It is shared instead of building a second copy of its tables,
-/// and charged as if it were built, so the budget does not depend on it.
+/// options (`reuses_original_tokens`). Its `Arc`-backed tables are shared
+/// instead of allocating a second copy, so the shared tables are not charged to
+/// `budget` a second time. Likewise, when `reuses_original_tokens` is true and
+/// the original alternative already paid for a deferred sweep on the same
+/// tokens, the path-filter copy does not pay for those tables a second time.
+///
+/// When `allow_sweep_fallback` is true (multi-alternative brace expansions
+/// populated after mandatory IR), a complete fast path neither builds a
+/// `SweepEngine` nor deducts unused sweep tables from the shared `budget`
+/// (still rejecting any single arm whose own sweep exceeds
+/// `MAX_COMPILED_IR_UNITS`), so fast-path arms cannot starve sweep-backed
+/// sibling arms regardless of brace order (#495).
+#[allow(clippy::too_many_arguments)]
 fn compile_sweep(
     tokens: &[Token],
     fast_path: &Option<FastPath>,
@@ -2411,11 +2631,13 @@ fn compile_sweep(
     options: PatternOptions,
     budget: &mut IrBudget,
     built: Option<&SweepEngine>,
+    reuses_original_tokens: bool,
+    allow_sweep_fallback: bool,
 ) -> Result<Option<SweepEngine>, PatternError> {
     if extglob.is_some()
         || matches!(
             fast_path,
-            Some(FastPath::LiteralTokens(_) | FastPath::DeterministicTokens(_))
+            Some(FastPath::LiteralTokens | FastPath::DeterministicTokens)
         )
     {
         return Ok(None);
@@ -2424,12 +2646,44 @@ fn compile_sweep(
         .as_ref()
         .is_some_and(FastPath::supports_component_wildcards)
     {
+        if reuses_original_tokens {
+            return Ok(None);
+        }
+        if allow_sweep_fallback {
+            // Fast path answers every entry point and never allocates a
+            // `SweepEngine`; validate the single-arm ceiling without deducting
+            // from the shared budget so sibling arms keep their sweeps.
+            SweepEngine::charge(tokens, &mut IrBudget::new())?;
+            return Ok(None);
+        }
         SweepEngine::charge(tokens, budget)?;
         return Ok(None);
     }
     if let Some(built) = built {
-        SweepEngine::charge(tokens, budget)?;
         return Ok(Some(built.clone()));
+    }
+    if allow_sweep_fallback {
+        let sweep_bytes = SweepEngine::retained_bytes_for(tokens)?;
+        if sweep_bytes > budget.remaining_retained_bytes {
+            SweepEngine::charge(tokens, &mut IrBudget::new())?;
+            return Ok(None);
+        }
+        let saved_units = budget.remaining;
+        return match SweepEngine::compile(tokens, options, budget) {
+            Ok(Some(sweep)) => {
+                budget.remaining_retained_bytes -= sweep_bytes;
+                Ok(Some(sweep))
+            }
+            Ok(None) => Ok(None),
+            Err(error)
+                if error.message() == TOO_MUCH_COMPILED_IR
+                    && SweepEngine::charge(tokens, &mut IrBudget::new()).is_ok() =>
+            {
+                budget.remaining = saved_units;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        };
     }
     SweepEngine::compile(tokens, options, budget)
 }
@@ -2443,7 +2697,7 @@ fn sweep_is_deferred(alternative: &CompiledAlternative) -> bool {
             fast_path.supports_component_wildcards()
                 && !matches!(
                     fast_path,
-                    FastPath::LiteralTokens(_) | FastPath::DeterministicTokens(_)
+                    FastPath::LiteralTokens | FastPath::DeterministicTokens
                 )
         })
 }
@@ -2528,6 +2782,15 @@ impl PartialEq for InteriorLiteral {
 impl Eq for InteriorLiteral {}
 
 impl Prefilter {
+    fn retained_bytes(&self) -> usize {
+        self.prefix
+            .len()
+            .saturating_add(self.suffix.len())
+            .saturating_add(self.interior.as_ref().map_or(0, |interior| {
+                size_of::<InteriorLiteral>().saturating_add(interior.0.needle().len())
+            }))
+    }
+
     fn compile(tokens: &[Token]) -> Self {
         // `dir/**` matches `dir`, so the separator before a terminal `**` is
         // the one token that may consume nothing.
@@ -2679,6 +2942,14 @@ enum LiteralSuffix {
 }
 
 impl LiteralSuffix {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Plain(bytes) => bytes.len(),
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            Self::Packed16(_) => size_of::<suffix_word::PreparedSuffix16>(),
+        }
+    }
+
     fn new(suffix: Vec<u8>, case_insensitive: bool) -> Self {
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         let _ = case_insensitive;
@@ -2742,11 +3013,11 @@ impl AlternativeFastPath {
         match self {
             Self::SuffixSet(set) => set.is_match(path, options),
             Self::ScopedSuffixSet(set) => {
-                alternatives
-                    .first()
-                    .and_then(|alternative| alternative.fast_path.as_ref())
-                    .is_some_and(|fast_path| fast_path.is_match(path, options))
-                    || set.is_match(path, options)
+                alternatives.first().is_some_and(|alternative| {
+                    alternative.fast_path.as_ref().is_some_and(|fast_path| {
+                        fast_path.is_match(&alternative.tokens, path, options)
+                    })
+                }) || set.is_match(path, options)
             }
         }
     }
@@ -3489,8 +3760,8 @@ impl AffixTrie {
 /// other pattern on the corpus-tested general path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FastPath {
-    LiteralTokens(Vec<Token>),
-    DeterministicTokens(Vec<Token>),
+    LiteralTokens,
+    DeterministicTokens,
     Star,
     PrefixStar {
         prefix: Vec<u8>,
@@ -3503,8 +3774,7 @@ enum FastPath {
         suffix: Vec<u8>,
     },
     StaticStar {
-        prefix: Vec<Token>,
-        suffix: Vec<Token>,
+        star_index: usize,
     },
     RecursiveTerminalPrefix {
         prefix: Vec<u8>,
@@ -3526,7 +3796,7 @@ impl FastPath {
             .iter()
             .all(|token| matches!(token, Token::Literal(_) | Token::Separator))
         {
-            return Some(Self::LiteralTokens(tokens.to_vec()));
+            return Some(Self::LiteralTokens);
         }
         if tokens.iter().all(|token| {
             matches!(
@@ -3534,7 +3804,7 @@ impl FastPath {
                 Token::Literal(_) | Token::Separator | Token::Any | Token::Class(_)
             )
         }) {
-            return Some(Self::DeterministicTokens(tokens.to_vec()));
+            return Some(Self::DeterministicTokens);
         }
         if options.component_wildcards {
             return None;
@@ -3565,10 +3835,7 @@ impl FastPath {
                 index == star_index || matches!(token, Token::Literal(_) | Token::Separator)
             })
         {
-            return Some(Self::StaticStar {
-                prefix: tokens[..star_index].to_vec(),
-                suffix: tokens[star_index + 1..].to_vec(),
-            });
+            return Some(Self::StaticStar { star_index });
         }
         if let [
             Token::Literal(prefix),
@@ -3606,17 +3873,34 @@ impl FastPath {
     fn supports_component_wildcards(&self) -> bool {
         matches!(
             self,
-            Self::LiteralTokens(_)
-                | Self::DeterministicTokens(_)
+            Self::LiteralTokens
+                | Self::DeterministicTokens
                 | Self::StarSuffix { .. }
                 | Self::RecursiveSuffix { .. }
                 | Self::RecursivePrefixSuffix { .. }
         )
     }
 
-    fn is_match(&self, path: &[u8], options: PatternOptions) -> bool {
+    fn retained_bytes(&self) -> usize {
         match self {
-            Self::LiteralTokens(tokens) => {
+            Self::LiteralTokens
+            | Self::DeterministicTokens
+            | Self::Star
+            | Self::StaticStar { .. } => 0,
+            Self::PrefixStar { prefix } | Self::RecursiveTerminalPrefix { prefix } => prefix.len(),
+            Self::StarSuffix { suffix } | Self::RecursiveSuffix { suffix, .. } => {
+                suffix.retained_bytes()
+            }
+            Self::InfixStar { prefix, suffix } => prefix.len().saturating_add(suffix.len()),
+            Self::RecursivePrefixSuffix { prefix, suffix, .. } => {
+                prefix.len().saturating_add(suffix.retained_bytes())
+            }
+        }
+    }
+
+    fn is_match(&self, tokens: &[Token], path: &[u8], options: PatternOptions) -> bool {
+        match self {
+            Self::LiteralTokens => {
                 let mut path_index = 0;
                 for token in tokens {
                     match token {
@@ -3643,7 +3927,7 @@ impl FastPath {
                 }
                 path_index == path.len()
             }
-            Self::DeterministicTokens(tokens) => {
+            Self::DeterministicTokens => {
                 let mut path_index = 0;
                 for (token_index, token) in tokens.iter().enumerate() {
                     match token {
@@ -3774,7 +4058,9 @@ impl FastPath {
                         options.candidate_starts_component,
                     )
             }
-            Self::StaticStar { prefix, suffix } => {
+            Self::StaticStar { star_index } => {
+                let prefix = &tokens[..*star_index];
+                let suffix = &tokens[*star_index + 1..];
                 let Some(variable_start) = match_static_prefix(prefix, path, options) else {
                     return false;
                 };
@@ -4920,14 +5206,23 @@ const MAX_COMPILED_IR_UNITS: usize = 1 << 20;
 /// The one message the compiled-size ceiling reports.
 const TOO_MUCH_COMPILED_IR: &str = "pattern compiles to too much";
 
+/// Retained heap-byte ceiling for one multi-alternative compiled pattern
+/// (40 MiB, matching the documented compiled-size ceiling in
+/// `docs/compatibility-guide.md`). Enforced alongside [`MAX_COMPILED_IR_UNITS`]
+/// so retained literal/prefilter/token storage is bounded without stealing IR
+/// unit budget from sweep-backed alternatives (#495).
+const MAX_RETAINED_PATTERN_BYTES: usize = 40 * 1024 * 1024;
+
 struct IrBudget {
     remaining: usize,
+    remaining_retained_bytes: usize,
 }
 
 impl IrBudget {
     const fn new() -> Self {
         Self {
             remaining: MAX_COMPILED_IR_UNITS,
+            remaining_retained_bytes: MAX_RETAINED_PATTERN_BYTES,
         }
     }
 
@@ -4961,6 +5256,30 @@ impl IrBudget {
                 offset,
                 message: TOO_MUCH_COMPILED_IR,
             })
+        }
+    }
+
+    fn ensure_retained_bytes(&self, bytes: usize, offset: usize) -> Result<(), PatternError> {
+        if bytes <= self.remaining_retained_bytes {
+            Ok(())
+        } else {
+            Err(PatternError {
+                offset,
+                message: TOO_MUCH_COMPILED_IR,
+            })
+        }
+    }
+
+    fn charge_retained_bytes(&mut self, bytes: usize, offset: usize) -> Result<(), PatternError> {
+        match self.remaining_retained_bytes.checked_sub(bytes) {
+            Some(remaining) => {
+                self.remaining_retained_bytes = remaining;
+                Ok(())
+            }
+            None => Err(PatternError {
+                offset,
+                message: TOO_MUCH_COMPILED_IR,
+            }),
         }
     }
 }
@@ -5574,6 +5893,8 @@ fn unconditional_compiled_units(pattern: &[u8], options: PatternOptions) -> Opti
     let mut question_marks = 0_usize;
     let mut has_extglob = false;
     let mut open_braces = std::collections::VecDeque::new();
+    let mut saw_unclosed_class = false;
+    let mut skip_class_until = 0_usize;
     #[cfg(test)]
     let mut peak = 0_usize;
     #[cfg(test)]
@@ -5593,6 +5914,27 @@ fn unconditional_compiled_units(pattern: &[u8], options: PatternOptions) -> Opti
             }
             index += usize::from(index + 1 < pattern.len()) + 1;
             continue;
+        }
+        if !saw_unclosed_class && index >= skip_class_until && pattern[index] == b'[' {
+            if let Some((next, has_unescaped_brace, skipped_closing_braces)) =
+                scan_class_end(pattern, index, options.escape)
+            {
+                if !has_unescaped_brace {
+                    remaining_closing_braces -= skipped_closing_braces;
+                    while open_braces.len() > remaining_closing_braces {
+                        open_braces.pop_front();
+                    }
+                    index = next;
+                    continue;
+                }
+                // Braces expand before character classes are parsed, so a class
+                // holding an unescaped `{` or `}` must still be scanned for
+                // brace nesting, while suppressing nested `[` rescans until its
+                // closing `]` keeps worst-case scanning strictly O(N).
+                skip_class_until = next;
+            } else {
+                saw_unclosed_class = true;
+            }
         }
         if remaining_closing_braces > 0 {
             match pattern[index] {
@@ -6013,6 +6355,9 @@ enum PositiveExtglobState {
     Epsilon {
         targets: Vec<usize>,
         blocks_leading_period: bool,
+        /// A whole-component recursive prefix arm (`**/`, `****/`) inside a
+        /// repeated group may only be entered at a component start (ADR-0020).
+        requires_component_start: bool,
     },
     Consume {
         matcher: PositiveExtglobMatcher,
@@ -6112,6 +6457,10 @@ struct ExtglobAlternative {
     /// Byte width when every token consumes a fixed count, which lets the scan
     /// over candidate end offsets visit one offset instead of the component.
     width: Option<usize>,
+    /// Precomputed at compile time: whether any compiled arm starts with a
+    /// whole-component recursive prefix (`**/`, `****/`) and must therefore
+    /// only start at a component boundary (ADR-0020, #495).
+    requires_component_start: bool,
     /// Whether [`ExtglobGroup::through_separator`] holds this alternative
     /// with the separator behind the group, which the matchers use instead.
     /// The alternative itself stays for the compile-time analyses, which
@@ -6168,10 +6517,22 @@ struct ExtglobGroup {
     /// separator are one `**/`, which may stand for no directory at all, so
     /// `@(**)/y` matches `y` as `**/y` does, and which leaves no trailing
     /// `/**` for the path to stop in front of, so `@(a/**)/**` refuses `a` as
-    /// `a/**/**` does. Such an alternative can only be the last iteration of
-    /// a repetition. Empty for a negated group, which consumes what its
-    /// alternatives reject rather than their text.
+    /// `a/**/**` does. In a repetition (`*(…)`, `+(…)`), the same compiled
+    /// `**/` form also runs as a non-final iteration so `*(**|.h)/x` and
+    /// `+(a/**|.h)/x` can hand off at a component boundary to a later literal
+    /// dot iteration while still refusing mid-component handoff (`a.h/x`)
+    /// (#495). Empty for a negated group, which consumes what its alternatives
+    /// reject rather than their text.
     through_separator: Vec<ExtglobAlternative>,
+    /// Precomputed at compile time: whether every matching arm is a
+    /// [`Self::through_separator`] arm ending in `Token::RecursivePrefix` whose
+    /// match language is closed under repetition (such as `+(**)/x`,
+    /// `*(**|****)/x`, or `+(<32x a/>**)/z` when no arm can match a hidden
+    /// component under `match_hidden: false`). Because any later iteration is
+    /// already absorbed by the first iteration's trailing `**/`, repeating only
+    /// such arms needs neither the repetition bitmap nor an NFA loop-back edge
+    /// (#495).
+    idempotent_through_separator: bool,
     /// Deduplication strategy for arrivals at `self.start`.
     entry_memo: GroupEntryMemo,
 }
@@ -6190,6 +6551,18 @@ impl ExtglobGroup {
         self.alternatives
             .iter()
             .filter(|alternative| !alternative.absorbed_by_separator)
+    }
+
+    /// Every alternative that may run as an iteration of a repeated group,
+    /// tagged with whether it comes from [`Self::through_separator`].
+    fn repetition_alternatives(&self) -> impl Iterator<Item = (&ExtglobAlternative, bool)> {
+        self.matched_alternatives()
+            .map(|alternative| (alternative, false))
+            .chain(
+                self.through_separator
+                    .iter()
+                    .map(|alternative| (alternative, true)),
+            )
     }
 
     /// Whether the interpreter matches the first iteration on its own, which
@@ -6231,6 +6604,43 @@ impl ExtglobGroup {
         }
         path.len()
     }
+}
+
+/// Whether `tokens` could match a path component starting with `.` under any
+/// component-wildcard policy (`is_match` or `is_match_glob_path`).
+fn tokens_can_match_hidden_component(tokens: &[Token], case_insensitive: bool) -> bool {
+    let mut may_start_component = true;
+    for token in tokens {
+        match token {
+            Token::Literal(literal) => {
+                if (may_start_component && literal.starts_with(b"."))
+                    || literal
+                        .windows(2)
+                        .any(|pair| is_separator(pair[0]) && pair[1] == b'.')
+                {
+                    return true;
+                }
+                may_start_component = literal.last().is_some_and(|&byte| is_separator(byte));
+            }
+            Token::Separator | Token::RecursivePrefix => {
+                may_start_component = true;
+            }
+            Token::Class(class) => {
+                if may_start_component && class.matches(b'.', case_insensitive) {
+                    return true;
+                }
+                may_start_component = class.matches(b'/', case_insensitive)
+                    || (cfg!(windows) && class.matches(b'\\', case_insensitive));
+            }
+            Token::Any | Token::Star | Token::RecursiveStar => {
+                // Under `match_hidden: false` wildcards never consume a leading
+                // `.`, but under `is_match` (`component_wildcards: false`) they
+                // may consume a separator so the next token starts a component.
+                may_start_component = true;
+            }
+        }
+    }
+    false
 }
 
 impl PositiveExtglobNfa {
@@ -6426,11 +6836,13 @@ impl PositiveExtglobNfa {
                 PositiveExtglobState::Epsilon {
                     targets,
                     blocks_leading_period,
+                    requires_component_start,
                 } => {
-                    if *blocks_leading_period
-                        && !options.match_hidden
-                        && at_component_start
-                        && byte == Some(b'.')
+                    if (*requires_component_start && !at_component_start)
+                        || (*blocks_leading_period
+                            && !options.match_hidden
+                            && at_component_start
+                            && byte == Some(b'.'))
                     {
                         continue;
                     }
@@ -6584,10 +6996,22 @@ impl PositiveExtglobBuilder<'_> {
             PositiveExtglobState::Epsilon {
                 targets,
                 blocks_leading_period,
+                requires_component_start: false,
             },
             edge_count,
         )
         .map(Some)
+    }
+
+    fn epsilon_at_component_start(&mut self, target: usize) -> Result<usize, PatternError> {
+        self.push(
+            PositiveExtglobState::Epsilon {
+                targets: vec![target],
+                blocks_leading_period: false,
+                requires_component_start: true,
+            },
+            1,
+        )
     }
 
     /// Compiles `group` in front of `rest`. `behind_separator` is the state
@@ -6630,39 +7054,57 @@ impl PositiveExtglobBuilder<'_> {
                 self.epsilon(alternatives, blocks_leading_period)
             }
             ExtglobKind::ZeroOrMore | ExtglobKind::OneOrMore => {
+                if group.idempotent_through_separator {
+                    let mut entry = if let Some(behind_separator) = behind_separator {
+                        self.through_separator(group, behind_separator, group.component_local)?
+                    } else {
+                        Vec::new()
+                    };
+                    if group.kind == ExtglobKind::ZeroOrMore {
+                        entry.push(rest);
+                    }
+                    return self.epsilon(entry, blocks_leading_period);
+                }
                 let hub = self.push(
                     PositiveExtglobState::Epsilon {
                         targets: Vec::new(),
                         blocks_leading_period: false,
+                        requires_component_start: false,
                     },
                     0,
                 )?;
+                // A `through_separator` alternative may either leave the loop
+                // behind the outer separator (final iteration, #422) or return
+                // to `hub` for a further iteration such as a literal `.h` arm
+                // (#495).
+                let after_through = behind_separator
+                    .map(|behind| self.epsilon(vec![hub, behind], false))
+                    .transpose()?
+                    .flatten();
                 // Only the first iteration stands where the group does; a
                 // later one follows the previous iteration's text, so its
                 // root wildcard gets a copy that is not component-local.
-                let later = self.alternatives(group, hub, false)?;
-                let mut first = if group.first_iteration_differs() {
-                    self.alternatives(group, hub, true)?
+                let mut later = self.alternatives(group, hub, false)?;
+                if let Some(after_through) = after_through {
+                    later.extend(self.through_separator(group, after_through, false)?);
+                }
+                let first = if group.first_iteration_differs() {
+                    let mut first = self.alternatives(group, hub, true)?;
+                    if let Some(after_through) = after_through {
+                        first.extend(self.through_separator(group, after_through, true)?);
+                    }
+                    first
                 } else {
                     later.clone()
                 };
                 let mut loop_targets = later;
                 loop_targets.push(rest);
-                // An alternative that takes the separator along can only be the
-                // last iteration, so it leaves the loop behind the separator (#422).
-                if let Some(behind_separator) = behind_separator {
-                    first.extend(self.through_separator(
-                        group,
-                        behind_separator,
-                        group.first_iteration_differs(),
-                    )?);
-                    loop_targets.extend(self.through_separator(group, behind_separator, false)?);
-                }
                 let edge_count = loop_targets.len();
                 self.budget.charge(edge_count, 0)?;
                 self.states[hub] = PositiveExtglobState::Epsilon {
                     targets: loop_targets,
                     blocks_leading_period: false,
+                    requires_component_start: false,
                 };
                 if group.kind == ExtglobKind::ZeroOrMore {
                     let mut entry = first;
@@ -6708,8 +7150,13 @@ impl PositiveExtglobBuilder<'_> {
     ) -> Result<Vec<usize>, PatternError> {
         let mut starts = Vec::new();
         for alternative in alternatives {
-            for alternative in &alternative.compiled {
-                if let Some(start) = self.tokens(&alternative.tokens, next, root_component_local)? {
+            for compiled in &alternative.compiled {
+                if let Some(mut start) =
+                    self.tokens(&compiled.tokens, next, root_component_local)?
+                {
+                    if alternative_starts_with_recursive_prefix(&compiled.tokens) {
+                        start = self.epsilon_at_component_start(start)?;
+                    }
                     starts.push(start);
                 }
             }
@@ -7355,6 +7802,20 @@ fn compile_extglob_step(
                 )
             })
         });
+        let idempotent_through_separator = !through_separator.is_empty()
+            && alternatives
+                .iter()
+                .all(|alternative| alternative.absorbed_by_separator)
+            && through_separator.iter().all(|alternative| {
+                alternative.compiled.iter().all(|compiled| {
+                    matches!(compiled.tokens.last(), Some(Token::RecursivePrefix))
+                        && (options.match_hidden
+                            || !tokens_can_match_hidden_component(
+                                &compiled.tokens,
+                                options.case_insensitive,
+                            ))
+                })
+            });
         groups.push(ExtglobGroup {
             kind,
             alternatives,
@@ -7371,6 +7832,7 @@ fn compile_extglob_step(
             spans_components,
             root_wildcard,
             through_separator,
+            idempotent_through_separator,
             entry_memo: GroupEntryMemo::None,
         });
         return Ok(ExtglobStep::Group(groups.len() - 1));
@@ -7443,7 +7905,7 @@ fn compile_extglob_alternative(
         root_component_wildcards: false,
         ..options
     };
-    let mut compiled = Pattern::compile_within(
+    let mut compiled = vec![Pattern::compile_single_alternative(
         alternative,
         options,
         budget,
@@ -7451,8 +7913,8 @@ fn compile_extglob_alternative(
         walker_source_provenance,
         leading_dot_is_normalized,
         bounds,
-    )?
-    .alternatives;
+        false,
+    )?];
     // An arm's prefix scan runs the engine whatever fast path the arm has,
     // so the engine deferred for a top-level alternative is built here. The
     // compile already charged it.
@@ -7462,9 +7924,13 @@ fn compile_extglob_alternative(
         }
     }
     let width = fixed_token_width(&compiled);
+    let requires_component_start = compiled
+        .iter()
+        .any(|compiled| alternative_starts_with_recursive_prefix(&compiled.tokens));
     Ok(ExtglobAlternative {
         compiled,
         width,
+        requires_component_start,
         absorbed_by_separator: false,
     })
 }
@@ -7558,12 +8024,68 @@ fn fixed_token_width(alternatives: &[CompiledAlternative]) -> Option<usize> {
     Some(width)
 }
 
+/// Scans the character class starting at `start`, mirroring [`parse_class`]
+/// closing rules without allocating. Returns
+/// `(next, has_unescaped_brace, raw_closing_braces)` when closed, or `None`
+/// when the class is unclosed or ends in a trailing escape.
+fn scan_class_end(pattern: &[u8], start: usize, escapes: bool) -> Option<(usize, bool, usize)> {
+    let mut index = start + 1;
+    let mut has_unescaped_brace = false;
+    let mut raw_closing_braces = 0_usize;
+    if pattern
+        .get(index)
+        .is_some_and(|byte| matches!(byte, b'!' | b'^'))
+    {
+        index += 1;
+    }
+    if pattern.get(index) == Some(&b']') {
+        index += 1;
+    }
+    while let Some(&byte) = pattern.get(index) {
+        if byte == b']' {
+            return Some((index + 1, has_unescaped_brace, raw_closing_braces));
+        }
+        if byte == b'[' && pattern.get(index + 1) == Some(&b':') {
+            let name_start = index + 2;
+            let search_end = pattern.len().min(name_start + MAX_POSIX_CLASS_NAME_LEN + 2);
+            if let Some(posix_end) = memmem::find(&pattern[name_start..search_end], b":]")
+                && parse_posix_class(&pattern[name_start..name_start + posix_end]).is_some()
+            {
+                index = name_start + posix_end + 2;
+                continue;
+            }
+        }
+        if byte == b'\\' && escapes {
+            let &escaped = pattern.get(index + 1)?;
+            raw_closing_braces += usize::from(escaped == b'}');
+            index += 2;
+        } else {
+            has_unescaped_brace |= matches!(byte, b'{' | b'}');
+            raw_closing_braces += usize::from(byte == b'}');
+            index += 1;
+        }
+    }
+    None
+}
+
 fn contains_extglob(pattern: &[u8], escapes: bool) -> bool {
     let mut index = 0;
+    let mut saw_unclosed_class = false;
     while index + 1 < pattern.len() {
         if escapes && pattern[index] == b'\\' {
             index += 2;
             continue;
+        }
+        if !saw_unclosed_class && pattern[index] == b'[' {
+            if let Some((next, _, _)) = scan_class_end(pattern, index, escapes) {
+                index = next;
+                continue;
+            }
+            // Once an unclosed `[` has scanned to the end without a matching
+            // `]`, no later `[` can close over an extglob opener either (only a
+            // lowercase POSIX `[:name:]` class could close, which cannot hold
+            // an extglob opener). Stopping retries keeps malformed inputs O(N).
+            saw_unclosed_class = true;
         }
         if detect_extglob_at(pattern, index).is_some() {
             return true;
@@ -7880,8 +8402,12 @@ struct ExtglobScratch {
     candidate_ends: Vec<usize>,
     /// Negated groups mark rejected offsets here before queuing the rest.
     excluded: Vec<bool>,
-    /// One reusable Shift-And state per sweep-enabled repetition alternative.
-    sweep_states: Vec<SweepState>,
+    /// Reusable Shift-And registers for narrow repetition alternatives.
+    narrow_sweeps: Vec<u64>,
+    /// Reusable heap-backed Shift-And states for wide repetition alternatives,
+    /// kept separate from `narrow_sweeps` so mixed narrow/wide groups never
+    /// evict retained wide buffers (#495).
+    wide_sweeps: Vec<SweepState>,
     /// The two word rows used while a wide ordinary-group alternative reports
     /// all matching prefix ends. Narrow alternatives need no retained state.
     prefix_sweep_state: Option<SweepState>,
@@ -7911,7 +8437,10 @@ struct ExtglobMatchState<'scratch> {
     ends: &'scratch mut Vec<usize>,
     candidate_ends: &'scratch mut Vec<usize>,
     excluded: &'scratch mut Vec<bool>,
-    sweep_states: &'scratch mut Vec<SweepState>,
+    narrow_sweeps: &'scratch mut Vec<u64>,
+    wide_sweeps: &'scratch mut Vec<SweepState>,
+    max_narrow_sweeps: usize,
+    max_wide_sweeps: usize,
     prefix_sweep_state: &'scratch mut Option<SweepState>,
 }
 
@@ -7923,12 +8452,38 @@ thread_local! {
     #[cfg(test)]
     static EXTGLOB_MEMOIZED_STAR_VISITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    static EXTGLOB_REPETITION_SWEEP_STEPS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    static EXTGLOB_SWEEP_CLEANUP_SCANS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 fn reset_extglob_memoized_star_fallbacks() {
     EXTGLOB_MEMOIZED_STAR_FALLBACKS.with(|count| count.set(0));
     EXTGLOB_MEMOIZED_STAR_VISITS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn reset_extglob_repetition_sweep_steps() {
+    EXTGLOB_REPETITION_SWEEP_STEPS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn extglob_repetition_sweep_steps() -> usize {
+    EXTGLOB_REPETITION_SWEEP_STEPS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_extglob_sweep_cleanup_scans() {
+    EXTGLOB_SWEEP_CLEANUP_SCANS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn extglob_sweep_cleanup_scans() -> usize {
+    EXTGLOB_SWEEP_CLEANUP_SCANS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -7965,7 +8520,7 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
     }
     EXTGLOB_SCRATCH.with(|cell| match cell.try_borrow_mut() {
         Ok(mut scratch) => {
-            let matched = {
+            let (matched, max_narrow_sweeps, max_wide_sweeps) = {
                 let ExtglobScratch {
                     visited,
                     failed,
@@ -7984,7 +8539,8 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                     ends,
                     candidate_ends,
                     excluded,
-                    sweep_states,
+                    narrow_sweeps,
+                    wide_sweeps,
                     prefix_sweep_state,
                 } = &mut *scratch;
                 let use_retries = program.has_retryable_star_segment
@@ -8000,7 +8556,6 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                 ends.clear();
                 candidate_ends.clear();
                 excluded.clear();
-                sweep_states.clear();
                 #[cfg(test)]
                 {
                     *failed_page_count = 0;
@@ -8029,10 +8584,14 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                     ends,
                     candidate_ends,
                     excluded,
-                    sweep_states,
+                    narrow_sweeps,
+                    wide_sweeps,
+                    max_narrow_sweeps: 0,
+                    max_wide_sweeps: 0,
                     prefix_sweep_state,
                 };
-                match_extglob_from(program, path, 0, 0, options, &mut state)
+                let matched = match_extglob_from(program, path, 0, 0, options, &mut state);
+                (matched, state.max_narrow_sweeps, state.max_wide_sweeps)
             };
             scratch.visited.clear();
             if scratch.visited.capacity() > RETAINED_SCRATCH_WORDS {
@@ -8076,9 +8635,35 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
             if scratch.excluded.capacity() > RETAINED_SCRATCH_WORDS {
                 scratch.excluded.shrink_to(RETAINED_SCRATCH_WORDS);
             }
-            scratch.sweep_states.clear();
-            if scratch.sweep_states.capacity() > RETAINED_SCRATCH_WORDS {
-                scratch.sweep_states.shrink_to(RETAINED_SCRATCH_WORDS);
+            // Keep narrow and wide repetition sweep buffers retained separately
+            // across calls so mixed narrow/wide groups never evict wide buffers,
+            // while matches without repetitions skip cleanup completely (#495).
+            if max_narrow_sweeps > 0 && scratch.narrow_sweeps.capacity() > RETAINED_SCRATCH_WORDS {
+                scratch.narrow_sweeps.truncate(RETAINED_SCRATCH_WORDS);
+                scratch.narrow_sweeps.shrink_to(RETAINED_SCRATCH_WORDS);
+            }
+            if max_wide_sweeps > 0 {
+                if scratch.wide_sweeps.len() > RETAINED_WIDE_SWEEP_SLOTS {
+                    scratch.wide_sweeps.truncate(RETAINED_WIDE_SWEEP_SLOTS);
+                }
+                if scratch.wide_sweeps.capacity() > RETAINED_WIDE_SWEEP_SLOTS {
+                    scratch.wide_sweeps.shrink_to(RETAINED_WIDE_SWEEP_SLOTS);
+                }
+                #[cfg(test)]
+                EXTGLOB_SWEEP_CLEANUP_SCANS
+                    .with(|count| count.set(count.get() + scratch.wide_sweeps.len()));
+                // Enforce a single combined word budget across every retained
+                // wide sweep slot so distinct wide patterns cannot accumulate
+                // megabytes of pinned buffers on one thread (#495).
+                let mut retained_words = 0_usize;
+                for state in &mut scratch.wide_sweeps {
+                    let words = SweepEngine::retained_state_capacity(state);
+                    if retained_words.saturating_add(words) > RETAINED_SCRATCH_WORDS {
+                        *state = SweepState::Narrow(0);
+                    } else {
+                        retained_words += words;
+                    }
+                }
             }
             if scratch.prefix_sweep_state.as_ref().is_some_and(|state| {
                 SweepEngine::state_exceeds_retained_words(state, RETAINED_SCRATCH_WORDS)
@@ -8107,7 +8692,8 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                 ends,
                 candidate_ends,
                 excluded,
-                sweep_states,
+                narrow_sweeps,
+                wide_sweeps,
                 prefix_sweep_state,
             } = &mut scratch;
             let mut state = ExtglobMatchState {
@@ -8131,7 +8717,10 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                 ends,
                 candidate_ends,
                 excluded,
-                sweep_states,
+                narrow_sweeps,
+                wide_sweeps,
+                max_narrow_sweeps: 0,
+                max_wide_sweeps: 0,
                 prefix_sweep_state,
             };
             match_extglob_from(program, path, 0, 0, options, &mut state)
@@ -8153,7 +8742,7 @@ fn extglob_scratch_capacities() -> (usize, usize, usize, usize, usize, usize, us
             scratch.ends.capacity(),
             scratch.candidate_ends.capacity(),
             scratch.excluded.capacity(),
-            scratch.sweep_states.capacity(),
+            scratch.narrow_sweeps.capacity() + scratch.wide_sweeps.capacity(),
             scratch
                 .prefix_sweep_state
                 .as_ref()
@@ -9216,9 +9805,7 @@ fn queue_extglob_group(
                 state.ends,
             );
             queue_extglob_continuations(program, state, group.rest);
-            queue_extglob_through_separator(
-                program, group, path, path_index, false, options, state,
-            );
+            queue_extglob_through_separator(program, group, path, path_index, options, state);
         }
         ExtglobKind::Optional => {
             queue_extglob_continuation(program, state, group.rest, path_index);
@@ -9231,20 +9818,30 @@ fn queue_extglob_group(
                 state.ends,
             );
             queue_extglob_continuations(program, state, group.rest);
-            queue_extglob_through_separator(
-                program, group, path, path_index, false, options, state,
-            );
+            queue_extglob_through_separator(program, group, path, path_index, options, state);
         }
         ExtglobKind::ZeroOrMore => {
             queue_extglob_continuation(program, state, group.rest, path_index);
-            matching_extglob_repetition_ends(group, path, path_index, options, state);
-            queue_extglob_continuations(program, state, group.rest);
-            queue_extglob_through_separator(program, group, path, path_index, true, options, state);
+            if group.idempotent_through_separator {
+                queue_extglob_through_separator(program, group, path, path_index, options, state);
+            } else {
+                matching_extglob_repetition_ends(group, path, path_index, options, state);
+                queue_extglob_continuations(program, state, group.rest);
+                if !group.through_separator.is_empty() {
+                    queue_extglob_through_separator_ends(program, state, group.rest + 1);
+                }
+            }
         }
         ExtglobKind::OneOrMore => {
-            matching_extglob_repetition_ends(group, path, path_index, options, state);
-            queue_extglob_continuations(program, state, group.rest);
-            queue_extglob_through_separator(program, group, path, path_index, true, options, state);
+            if group.idempotent_through_separator {
+                queue_extglob_through_separator(program, group, path, path_index, options, state);
+            } else {
+                matching_extglob_repetition_ends(group, path, path_index, options, state);
+                queue_extglob_continuations(program, state, group.rest);
+                if !group.through_separator.is_empty() {
+                    queue_extglob_through_separator_ends(program, state, group.rest + 1);
+                }
+            }
         }
         ExtglobKind::Negated => {
             let stop_limit = negated_extglob_stop_limit(
@@ -9291,54 +9888,52 @@ fn queue_extglob_continuations(
 }
 
 /// Queues the continuations of the alternatives in
-/// [`ExtglobGroup::through_separator`], which resume behind the separator
-/// after the group (#422).
+/// [`ExtglobGroup::through_separator`] for single-iteration groups (`@()`,
+/// `?()`), resuming behind the separator after the group (#422).
 ///
-/// For a repetition such an alternative can only be the last iteration. It
-/// starts where the group starts or where an earlier iteration ended, which
-/// `state.ends` holds once [`matching_extglob_repetition_ends`] ran. A later
-/// iteration follows that iteration's text, so its root wildcard is read as
-/// the repetition reads it.
+/// Repeated groups (`*()`, `+()`) compute both regular and `through_separator`
+/// ends in one shared pass inside [`matching_extglob_repetition_ends`] and
+/// queue the latter through [`queue_extglob_through_separator_ends`] so a
+/// repetition with many reachable offsets never restarts the `through_separator`
+/// sweep quadratically (#495).
 fn queue_extglob_through_separator(
     program: &CompiledExtglob,
     group: &ExtglobGroup,
     path: &[u8],
     path_index: usize,
-    repeated: bool,
     options: PatternOptions,
     state: &mut ExtglobMatchState<'_>,
 ) {
     if group.through_separator.is_empty() {
         return;
     }
-    let resume = group.rest + 1;
-    let later_root_local = group.later_iteration_root_local(options);
-    let starts = if repeated { 1 + state.ends.len() } else { 1 };
-    for start_index in 0..starts {
-        let (start, root_component_local) = match start_index.checked_sub(1) {
-            None => (path_index, group.component_local),
-            Some(end_index) => (state.ends[end_index], later_root_local),
-        };
-        let span = AlternativeSpan {
-            path,
-            start,
-            end_limit: group.alternative_end_limit(path, start, options),
-            root_component_local,
-        };
-        state.candidate_ends.clear();
-        for alternative in &group.through_separator {
-            matching_extglob_alternative_ends(
-                alternative,
-                span,
-                options,
-                state.prefix_sweep_state,
-                state.candidate_ends,
-            );
-        }
-        for index in 0..state.candidate_ends.len() {
-            let end = state.candidate_ends[index];
-            queue_extglob_continuation(program, state, resume, end);
-        }
+    let span = AlternativeSpan {
+        path,
+        start: path_index,
+        end_limit: group.alternative_end_limit(path, path_index, options),
+        root_component_local: group.component_local,
+    };
+    state.candidate_ends.clear();
+    for alternative in &group.through_separator {
+        matching_extglob_alternative_ends(
+            alternative,
+            span,
+            options,
+            state.prefix_sweep_state,
+            state.candidate_ends,
+        );
+    }
+    queue_extglob_through_separator_ends(program, state, group.rest + 1);
+}
+
+fn queue_extglob_through_separator_ends(
+    program: &CompiledExtglob,
+    state: &mut ExtglobMatchState<'_>,
+    resume: usize,
+) {
+    for index in 0..state.candidate_ends.len() {
+        let end = state.candidate_ends[index];
+        queue_extglob_continuation(program, state, resume, end);
     }
 }
 
@@ -9385,12 +9980,19 @@ fn matching_extglob_group_ends(
     output.dedup();
 }
 
+/// Whether entering `alternative` inside a repetition requires the current
+/// offset to start a path component.
+///
 /// All offsets reachable after one or more repetitions of `group`.
 ///
-/// Variable-width alternatives run as streaming sweeps. Whenever a prior
-/// match reaches the current offset, their initial boundary is injected into
-/// the live state. This evaluates every possible partition in one candidate
-/// pass instead of rematching every suffix from every reached offset.
+/// Variable-width alternatives run as streaming sweeps — including any
+/// [`ExtglobGroup::through_separator`] alternatives, whose end offsets are
+/// returned in `state.candidate_ends` so callers can queue them behind the
+/// outer separator without restarting a separate sweep per reached offset
+/// (#495). Whenever a prior match reaches the current offset, their initial
+/// boundary is injected into the live state. This evaluates every possible
+/// partition in one candidate pass instead of rematching every suffix from
+/// every reached offset.
 fn matching_extglob_repetition_ends(
     group: &ExtglobGroup,
     path: &[u8],
@@ -9411,8 +10013,24 @@ fn matching_extglob_repetition_ends(
     state.visited.clear();
     let reachable_base = push_visited(state.visited, position_count);
     let matched_base = push_visited(state.visited, position_count);
+    let through_sep_base =
+        (!group.through_separator.is_empty()).then(|| push_visited(state.visited, position_count));
+    #[cfg(test)]
+    let mut sweep_steps = 0_usize;
     visit(state.visited, reachable_base, 0);
-    prepare_extglob_sweeps(group, state.sweep_states);
+    let mut max_reachable = 0_usize;
+    let (narrow_count, wide_count) =
+        prepare_extglob_sweeps(group, state.narrow_sweeps, state.wide_sweeps);
+    state.max_narrow_sweeps = state.max_narrow_sweeps.max(narrow_count);
+    state.max_wide_sweeps = state.max_wide_sweeps.max(wide_count);
+    let mut starts_component = at_component_start(path, path_index, options);
+    let mut later_options = PatternOptions {
+        braces: false,
+        extglob: false,
+        candidate_starts_component: starts_component,
+        candidate_root_component_wildcard: later_root_local,
+        ..options
+    };
     for offset in 0..position_count {
         let absolute = path_index + offset;
         let root_component_local = if offset == 0 {
@@ -9421,8 +10039,11 @@ fn matching_extglob_repetition_ends(
             later_root_local
         };
         if visited(state.visited, reachable_base, offset) {
-            let mut sweep_index = 0;
-            for alternative in group.matched_alternatives() {
+            let before_hidden =
+                !options.match_hidden && starts_component && path.get(absolute) == Some(&b'.');
+            let mut narrow_index = 0;
+            let mut wide_index = 0;
+            for (alternative, is_through_separator) in group.repetition_alternatives() {
                 if let Some(width) = alternative.width {
                     let Some(end) = absolute.checked_add(width) else {
                         continue;
@@ -9431,35 +10052,51 @@ fn matching_extglob_repetition_ends(
                         && match_extglob_alternative_exact(
                             alternative,
                             &path[absolute..end],
-                            at_component_start(path, absolute, options),
+                            starts_component,
                             options,
                             root_component_local,
                         )
                     {
                         let reached = end - path_index;
                         visit(state.visited, reachable_base, reached);
+                        max_reachable = max_reachable.max(reached);
                         visit(state.visited, matched_base, reached);
                     }
                     continue;
                 }
+                let blocked_mid_component =
+                    !starts_component && alternative.requires_component_start;
                 let enumerate_apart = offset == 0 && first_iteration_apart;
-                let mut has_fallback = enumerate_apart;
+                let mut has_fallback = enumerate_apart && !blocked_mid_component;
                 for compiled in &alternative.compiled {
                     if let Some(sweep) = &compiled.sweep {
-                        let sweep_state = &mut state.sweep_states[sweep_index];
-                        sweep_index += 1;
-                        if enumerate_apart {
-                            continue;
+                        let accepted = if sweep.is_wide() {
+                            let sweep_state = &mut state.wide_sweeps[wide_index];
+                            wide_index += 1;
+                            if enumerate_apart || blocked_mid_component {
+                                continue;
+                            }
+                            sweep.inject_start(sweep_state, starts_component);
+                            sweep.accepts_at(sweep_state, before_hidden)
+                        } else {
+                            let sweep_state = &mut state.narrow_sweeps[narrow_index];
+                            narrow_index += 1;
+                            if enumerate_apart || blocked_mid_component {
+                                continue;
+                            }
+                            sweep.inject_start_narrow(sweep_state, starts_component);
+                            sweep.accepts_at_narrow(*sweep_state, before_hidden)
+                        };
+                        if accepted {
+                            if let Some(through_sep_base) =
+                                through_sep_base.filter(|_| is_through_separator)
+                            {
+                                visit(state.visited, through_sep_base, offset);
+                            } else {
+                                visit(state.visited, matched_base, offset);
+                            }
                         }
-                        sweep
-                            .inject_start(sweep_state, at_component_start(path, absolute, options));
-                        if sweep.accepts_at(
-                            sweep_state,
-                            star_stops_before_hidden_component(path, absolute, options),
-                        ) {
-                            visit(state.visited, matched_base, offset);
-                        }
-                    } else {
+                    } else if !blocked_mid_component {
                         has_fallback = true;
                     }
                 }
@@ -9477,24 +10114,38 @@ fn matching_extglob_repetition_ends(
                         state.prefix_sweep_state,
                         state.candidate_ends,
                     );
+                    #[cfg(test)]
+                    {
+                        sweep_steps += component_end - absolute;
+                    }
                     for &end in state.candidate_ends.iter() {
                         let reached = end - path_index;
                         visit(state.visited, reachable_base, reached);
-                        visit(state.visited, matched_base, reached);
+                        max_reachable = max_reachable.max(reached);
+                        if let Some(through_sep_base) =
+                            through_sep_base.filter(|_| is_through_separator)
+                        {
+                            visit(state.visited, through_sep_base, reached);
+                        } else {
+                            visit(state.visited, matched_base, reached);
+                        }
                     }
                 }
             }
             debug_assert_eq!(
-                sweep_index,
-                state.sweep_states.len(),
+                (narrow_index, wide_index),
+                (narrow_count, wide_count),
                 "prepared repetition sweeps must align with injected variable-width alternatives"
             );
             // If the component-local first iteration matched zero bytes (e.g.
-            // an empty arm or `*` at offset 0), a later non-local iteration can
-            // also start right at offset 0.
-            if offset == 0 && first_iteration_apart && visited(state.visited, matched_base, 0) {
-                let mut sweep_index = 0;
-                for alternative in group.matched_alternatives() {
+            // an empty arm, `*`, or `**/` at offset 0), a later non-local
+            // iteration can also start right at offset 0.
+            let matched_zero_at_start = visited(state.visited, matched_base, 0)
+                || through_sep_base.is_some_and(|base| visited(state.visited, base, 0));
+            if offset == 0 && first_iteration_apart && matched_zero_at_start {
+                let mut narrow_index = 0;
+                let mut wide_index = 0;
+                for (alternative, is_through_separator) in group.repetition_alternatives() {
                     if let Some(width) = alternative.width {
                         if width == 0 {
                             continue;
@@ -9506,33 +10157,50 @@ fn matching_extglob_repetition_ends(
                             && match_extglob_alternative_exact(
                                 alternative,
                                 &path[absolute..end],
-                                at_component_start(path, absolute, options),
+                                starts_component,
                                 options,
                                 later_root_local,
                             )
                         {
                             let reached = end - path_index;
                             visit(state.visited, reachable_base, reached);
+                            max_reachable = max_reachable.max(reached);
                             visit(state.visited, matched_base, reached);
                         }
                         continue;
                     }
+                    let blocked_mid_component =
+                        !starts_component && alternative.requires_component_start;
                     let mut has_fallback = false;
                     for compiled in &alternative.compiled {
                         if let Some(sweep) = &compiled.sweep {
-                            let sweep_state = &mut state.sweep_states[sweep_index];
-                            sweep_index += 1;
-                            sweep.inject_start(
-                                sweep_state,
-                                at_component_start(path, absolute, options),
-                            );
-                            if sweep.accepts_at(
-                                sweep_state,
-                                star_stops_before_hidden_component(path, absolute, options),
-                            ) {
-                                visit(state.visited, matched_base, 0);
+                            let accepted = if sweep.is_wide() {
+                                let sweep_state = &mut state.wide_sweeps[wide_index];
+                                wide_index += 1;
+                                if blocked_mid_component {
+                                    continue;
+                                }
+                                sweep.inject_start(sweep_state, starts_component);
+                                sweep.accepts_at(sweep_state, before_hidden)
+                            } else {
+                                let sweep_state = &mut state.narrow_sweeps[narrow_index];
+                                narrow_index += 1;
+                                if blocked_mid_component {
+                                    continue;
+                                }
+                                sweep.inject_start_narrow(sweep_state, starts_component);
+                                sweep.accepts_at_narrow(*sweep_state, before_hidden)
+                            };
+                            if accepted {
+                                if let Some(through_sep_base) =
+                                    through_sep_base.filter(|_| is_through_separator)
+                                {
+                                    visit(state.visited, through_sep_base, 0);
+                                } else {
+                                    visit(state.visited, matched_base, 0);
+                                }
                             }
-                        } else {
+                        } else if !blocked_mid_component {
                             has_fallback = true;
                         }
                     }
@@ -9550,16 +10218,27 @@ fn matching_extglob_repetition_ends(
                             state.prefix_sweep_state,
                             state.candidate_ends,
                         );
+                        #[cfg(test)]
+                        {
+                            sweep_steps += component_end - absolute;
+                        }
                         for &end in state.candidate_ends.iter() {
                             let reached = end - path_index;
                             visit(state.visited, reachable_base, reached);
-                            visit(state.visited, matched_base, reached);
+                            max_reachable = max_reachable.max(reached);
+                            if let Some(through_sep_base) =
+                                through_sep_base.filter(|_| is_through_separator)
+                            {
+                                visit(state.visited, through_sep_base, reached);
+                            } else {
+                                visit(state.visited, matched_base, reached);
+                            }
                         }
                     }
                 }
                 debug_assert_eq!(
-                    sweep_index,
-                    state.sweep_states.len(),
+                    (narrow_index, wide_index),
+                    (narrow_count, wide_count),
                     "prepared repetition sweeps must align with injected variable-width alternatives"
                 );
             }
@@ -9569,58 +10248,126 @@ fn matching_extglob_repetition_ends(
             break;
         }
         let byte = path[absolute];
-        let starts_component = at_component_start(path, absolute, options);
-        let mut sweep_index = 0;
-        for alternative in group.matched_alternatives() {
+        let next_starts_component = is_separator(byte);
+        let before_hidden_next =
+            !options.match_hidden && next_starts_component && path.get(absolute + 1) == Some(&b'.');
+        later_options.candidate_starts_component = starts_component;
+        let mut narrow_index = 0;
+        let mut wide_index = 0;
+        let mut any_sweep_active = false;
+        for (alternative, is_through_separator) in group.repetition_alternatives() {
             for compiled in &alternative.compiled {
                 let Some(sweep) = &compiled.sweep else {
                     continue;
                 };
-                let sweep_state = &mut state.sweep_states[sweep_index];
-                sweep_index += 1;
-                let alternative_options =
-                    extglob_alternative_options(path, absolute, options, later_root_local);
-                if sweep.advance(sweep_state, byte, starts_component, alternative_options)
-                    && sweep.accepts_at(
-                        sweep_state,
-                        star_stops_before_hidden_component(path, absolute + 1, options),
-                    )
-                {
-                    visit(state.visited, reachable_base, offset + 1);
-                    visit(state.visited, matched_base, offset + 1);
+                let accepted = if sweep.is_wide() {
+                    let sweep_state = &mut state.wide_sweeps[wide_index];
+                    wide_index += 1;
+                    if sweep_state.is_empty() {
+                        continue;
+                    }
+                    #[cfg(test)]
+                    {
+                        sweep_steps += 1;
+                    }
+                    if !sweep.advance(sweep_state, byte, starts_component, later_options) {
+                        continue;
+                    }
+                    any_sweep_active = true;
+                    sweep.accepts_at(sweep_state, before_hidden_next)
+                } else {
+                    let sweep_state = &mut state.narrow_sweeps[narrow_index];
+                    narrow_index += 1;
+                    if *sweep_state == 0 {
+                        continue;
+                    }
+                    #[cfg(test)]
+                    {
+                        sweep_steps += 1;
+                    }
+                    if !sweep.advance_narrow(sweep_state, byte, starts_component, later_options) {
+                        continue;
+                    }
+                    any_sweep_active = true;
+                    sweep.accepts_at_narrow(*sweep_state, before_hidden_next)
+                };
+                if accepted {
+                    let reached = offset + 1;
+                    visit(state.visited, reachable_base, reached);
+                    max_reachable = max_reachable.max(reached);
+                    // `through_separator` arms already absorbed the outer `/`
+                    // (and their trailing `RecursivePrefix` consumes any
+                    // further separator directly), so they only queue behind
+                    // the separator (`through_sep_base`), avoiding a dead
+                    // `group.rest` memo row (#495).
+                    if let Some(through_sep_base) =
+                        through_sep_base.filter(|_| is_through_separator)
+                    {
+                        visit(state.visited, through_sep_base, reached);
+                    } else {
+                        visit(state.visited, matched_base, reached);
+                    }
                 }
             }
         }
         debug_assert_eq!(
-            sweep_index,
-            state.sweep_states.len(),
+            (narrow_index, wide_index),
+            (narrow_count, wide_count),
             "prepared repetition sweep count must match the advance loop"
         );
+        if !any_sweep_active && max_reachable <= offset {
+            break;
+        }
+        starts_component = next_starts_component;
     }
+    #[cfg(test)]
+    EXTGLOB_REPETITION_SWEEP_STEPS.with(|count| count.set(count.get() + sweep_steps));
     state.ends.clear();
     state.ends.extend(
-        (0..position_count)
+        (0..=max_reachable)
             .filter(|&offset| visited(state.visited, matched_base, offset))
             .map(|offset| path_index + offset),
     );
+    state.candidate_ends.clear();
+    if let Some(through_sep_base) = through_sep_base {
+        state.candidate_ends.extend(
+            (0..=max_reachable)
+                .filter(|&offset| visited(state.visited, through_sep_base, offset))
+                .map(|offset| path_index + offset),
+        );
+    }
 }
 
-fn prepare_extglob_sweeps(group: &ExtglobGroup, states: &mut Vec<SweepState>) {
-    let mut count = 0;
-    for alternative in group.matched_alternatives() {
+fn prepare_extglob_sweeps(
+    group: &ExtglobGroup,
+    narrow: &mut Vec<u64>,
+    wide: &mut Vec<SweepState>,
+) -> (usize, usize) {
+    let mut narrow_count = 0;
+    let mut wide_count = 0;
+    for (alternative, _) in group.repetition_alternatives() {
         for compiled in &alternative.compiled {
             let Some(sweep) = &compiled.sweep else {
                 continue;
             };
-            if let Some(state) = states.get_mut(count) {
-                sweep.reset_state(state);
+            if sweep.is_wide() {
+                if let Some(state) = wide.get_mut(wide_count) {
+                    sweep.reset_state(state);
+                } else {
+                    wide.push(sweep.empty_state());
+                }
+                wide_count += 1;
             } else {
-                states.push(sweep.empty_state());
+                if let Some(slot) = narrow.get_mut(narrow_count) {
+                    *slot = 0;
+                } else {
+                    narrow.push(0);
+                }
+                narrow_count += 1;
             }
-            count += 1;
         }
     }
-    states.truncate(count);
+    (narrow_count, wide_count)
 }
 
 /// Where one match of a group alternative starts and how far it may reach.
@@ -10879,10 +11626,12 @@ mod tests {
 
         // A separator before a wildcard makes the pattern carry a second
         // compiled copy for the path-filter reading, which costs the budget a
-        // second time. The same pattern without one compiles.
+        // second time (512 × 1,101 = 563,712 fits; 2 × 512 × 1,102 = 1,128,448
+        // exceeds `MAX_COMPILED_IR_UNITS`). The same pattern without one
+        // compiles.
         let braces = PatternOptions::default().braces(true);
-        let single = format!("{}{}", "{a,b}".repeat(9), "?".repeat(700));
-        let doubled = format!("{}/{}", "{a,b}".repeat(9), "?".repeat(700));
+        let single = format!("{}{}", "{a,b}".repeat(9), "?".repeat(1_100));
+        let doubled = format!("{}/{}", "{a,b}".repeat(9), "?".repeat(1_100));
         assert!(Pattern::compile(&single, braces).is_ok());
         assert_eq!(
             Pattern::compile(&doubled, braces).unwrap_err().message(),
@@ -12441,7 +13190,7 @@ mod tests {
         let fast = Pattern::compile("Src/Readme", options).expect("pattern compiles");
         assert!(matches!(
             fast.alternatives[0].fast_path,
-            Some(FastPath::LiteralTokens(_))
+            Some(FastPath::LiteralTokens)
         ));
         let mut general = fast.clone();
         general.alternatives[0].fast_path = None;
@@ -12467,7 +13216,7 @@ mod tests {
         let fast = Pattern::compile("src/[ab]?.[Rr][Ss]", options).expect("pattern compiles");
         assert!(matches!(
             fast.alternatives[0].fast_path,
-            Some(FastPath::DeterministicTokens(_))
+            Some(FastPath::DeterministicTokens)
         ));
         let mut general = fast.clone();
         general.alternatives[0].fast_path = None;
@@ -13155,7 +13904,7 @@ mod tests {
         assert!(fast.path_filter.as_ref().is_some_and(|filter| {
             matches!(
                 filter.compiled[0].fast_path,
-                Some(FastPath::DeterministicTokens(_))
+                Some(FastPath::DeterministicTokens)
             )
         }));
         let mut general = fast.clone();
@@ -13651,11 +14400,26 @@ mod tests {
         fn reference(pattern: &[u8], options: PatternOptions) -> (usize, bool) {
             let mut question_marks = 0_usize;
             let mut has_extglob = false;
+            let mut saw_unclosed_class = false;
+            let mut skip_class_until = 0_usize;
             let mut index = 0;
             while index < pattern.len() {
                 if options.escape && pattern[index] == b'\\' {
                     index += usize::from(index + 1 < pattern.len()) + 1;
                     continue;
+                }
+                if !saw_unclosed_class && index >= skip_class_until && pattern[index] == b'[' {
+                    if let Some((next, has_unescaped_brace, _)) =
+                        super::scan_class_end(pattern, index, options.escape)
+                    {
+                        if !has_unescaped_brace {
+                            index = next;
+                            continue;
+                        }
+                        skip_class_until = next;
+                    } else {
+                        saw_unclosed_class = true;
+                    }
                 }
                 if pattern[index] == b'{'
                     && let Some(close) = super::matching_brace(pattern, index, options.escape)
@@ -13692,6 +14456,11 @@ mod tests {
             r"{?{?\}",
             r"}\\{?",
             "{{{??@(a){?}?",
+            "[@(]",
+            "[?@(]",
+            "{a,b}[@(]",
+            "a[@(b)",
+            "{a,b}[}]",
         ];
         for escape in [false, true] {
             for extglob in [false, true] {
@@ -13705,6 +14474,57 @@ mod tests {
                 }
             }
         }
+
+        // Twelve `{a,b}` groups + 260 literals + `[@(]` must not trip the
+        // extglob IR lower-bound guard because `@(` lives inside a closed
+        // bracket class (#495).
+        let braced_class = format!("{}{}[@(]", "{a,b}".repeat(12), "x".repeat(260));
+        let compiled = Pattern::compile(&braced_class, PatternOptions::walker())
+            .expect("closed bracket class with `@(` must not charge extglob IR");
+        let accept = format!("{}{}@", "a".repeat(12), "x".repeat(260));
+        let reject = format!("{}{}z", "a".repeat(12), "x".repeat(260));
+        assert!(compiled.is_match(&accept));
+        assert!(!compiled.is_match(&reject));
+
+        // Classes containing thousands of literal `[` bytes plus escaped or
+        // unescaped braces must scan linearly in `unconditional_compiled_units`.
+        let many_open_escaped_brace = format!("[{}\\{{]", "[".repeat(16_000));
+        reset_unconditional_brace_scanned_bytes();
+        assert_eq!(
+            super::unconditional_compiled_units(
+                many_open_escaped_brace.as_bytes(),
+                PatternOptions::walker()
+            ),
+            Some((0, false))
+        );
+        assert!(
+            unconditional_brace_scanned_bytes() <= 16,
+            "escaped brace inside class must be skipped in one jump: {}",
+            unconditional_brace_scanned_bytes()
+        );
+        let compiled_escaped = Pattern::compile(&many_open_escaped_brace, PatternOptions::walker())
+            .expect("large class with escaped brace compiles");
+        assert!(compiled_escaped.is_match("{"));
+        assert!(compiled_escaped.is_match("["));
+
+        let many_open_unescaped_brace = format!("[{}{{a,b}}]", "[".repeat(16_000));
+        reset_unconditional_brace_scanned_bytes();
+        assert_eq!(
+            super::unconditional_compiled_units(
+                many_open_unescaped_brace.as_bytes(),
+                PatternOptions::walker()
+            ),
+            Some((0, false))
+        );
+        assert!(
+            unconditional_brace_scanned_bytes() <= many_open_unescaped_brace.len(),
+            "unescaped brace inside class must not trigger nested `[` rescans"
+        );
+        let compiled_unescaped =
+            Pattern::compile(&many_open_unescaped_brace, PatternOptions::walker())
+                .expect("large class with unescaped brace compiles");
+        assert!(compiled_unescaped.is_match("a"));
+        assert!(compiled_unescaped.is_match("b"));
     }
 
     #[test]
@@ -15444,6 +16264,887 @@ mod tests {
         assert!(!neg_after_globstar.is_match_path("src/dir/x"));
         assert!(!neg_after_globstar.is_match_path("src/x"));
         assert!(neg_after_globstar.is_match_path("src/dir/y"));
+    }
+
+    #[test]
+    fn extglob_escaped_separator_before_group_matches_plain_locality() {
+        let escaped_opts = PatternOptions::walker();
+        let raw_opts = PatternOptions::walker().escape(false);
+
+        // POSIX escaped slash: `a\/@(*)` matches `a\/*` under all entry points.
+        for (options, expected_local, candidates) in [
+            (
+                escaped_opts,
+                false,
+                &["a/x", "a/x/y", r"a\/x", r"a\/x/y"][..],
+            ),
+            (raw_opts, true, &["a/x", "a/x/y", r"a\/x", r"a\/x/y"][..]),
+        ] {
+            let group = Pattern::compile(r"a\/@(*)", options).expect("group compiles");
+            let plain = Pattern::compile(r"a\/*", options).expect("plain compiles");
+            let prog = group.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("extglob program");
+            assert_eq!(prog.groups[0].component_local, expected_local);
+            for &path in candidates {
+                assert_eq!(
+                    group.is_match(path),
+                    plain.is_match(path),
+                    "is_match {path:?} {options:?}"
+                );
+                assert_eq!(
+                    group.is_match_path(path),
+                    plain.is_match_path(path),
+                    "is_match_path {path:?} {options:?}"
+                );
+                assert_eq!(
+                    group.is_match_glob_path(path),
+                    plain.is_match_glob_path(path),
+                    "is_match_glob_path {path:?} {options:?}"
+                );
+                assert!(group.engines_agree(path), "engines_agree {path:?}");
+            }
+            // Specifically pin `a\/@(*)` on `"a/x/y"` under `is_match_path`.
+            if options.escape {
+                assert!(group.is_match_path("a/x/y"));
+                assert!(!group.is_match_glob_path("a/x/y"));
+            } else {
+                assert!(group.is_match_path(r"a\/x"));
+                assert!(!group.is_match_path(r"a\/x/y"));
+            }
+        }
+
+        // Negated group behind escaped slash vs real slash.
+        let neg_escaped = Pattern::compile(r"a\/!(z)", escaped_opts).expect("compiles");
+        assert!(
+            !neg_escaped.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("program")
+                .groups[0]
+                .component_local
+        );
+        assert!(neg_escaped.is_match_path("a/x/y"));
+        assert!(!neg_escaped.is_match_glob_path("a/x/y"));
+        assert!(neg_escaped.engines_agree("a/x/y"));
+
+        let neg_raw = Pattern::compile(r"a\/!(z)", raw_opts).expect("compiles");
+        assert!(
+            neg_raw.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("program")
+                .groups[0]
+                .component_local
+        );
+        assert!(neg_raw.is_match_path(r"a\/x"));
+        assert!(!neg_raw.is_match_path(r"a\/x/y"));
+        assert!(neg_raw.engines_agree(r"a\/x/y"));
+
+        // Escaped backslash followed by an unescaped slash IS a separator.
+        let escaped_bs_then_slash = Pattern::compile(r"a\\/@(*)", escaped_opts).expect("compiles");
+        assert!(
+            escaped_bs_then_slash.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("program")
+                .groups[0]
+                .component_local
+        );
+        assert!(escaped_bs_then_slash.is_match_path(r"a\/x"));
+        assert!(!escaped_bs_then_slash.is_match_path(r"a\/x/y"));
+        assert!(escaped_bs_then_slash.engines_agree(r"a\/x/y"));
+
+        // Escaped backslash (`a\\@(*)`) vs `a\\*` on Windows-style paths: never
+        // marks the following group component-local on any platform.
+        for options in [escaped_opts, raw_opts] {
+            let group = Pattern::compile(r"a\\@(*)", options).expect("group compiles");
+            let plain = Pattern::compile(r"a\\*", options).expect("plain compiles");
+            let prog = group.alternatives[0]
+                .extglob
+                .as_ref()
+                .expect("extglob program");
+            assert!(!prog.groups[0].component_local);
+            for path in [r"a\x", r"a\x\y", r"a\\x", r"a\\x\y", r"a\x/y"] {
+                assert_eq!(
+                    group.is_match(path),
+                    plain.is_match(path),
+                    "is_match {path:?} {options:?}"
+                );
+                assert_eq!(
+                    group.is_match_path(path),
+                    plain.is_match_path(path),
+                    "is_match_path {path:?} {options:?}"
+                );
+                assert_eq!(
+                    group.is_match_glob_path(path),
+                    plain.is_match_glob_path(path),
+                    "is_match_glob_path {path:?} {options:?}"
+                );
+                assert!(group.engines_agree(path), "engines_agree {path:?}");
+            }
+            if options.escape {
+                assert!(group.is_match_path(r"a\x\y"));
+            } else {
+                assert!(group.is_match_path(r"a\\x\y"));
+            }
+        }
+    }
+
+    #[test]
+    fn extglob_repeated_globstar_before_separator_hands_off_to_later_iterations() {
+        let options = PatternOptions::walker();
+        let assert_both_engines = |src: &str, path: &str, expected: bool| {
+            let pat = Pattern::compile(src, options).expect("pattern compiles");
+            assert_eq!(
+                [
+                    pat.is_match(path),
+                    pat.is_match_path(path),
+                    pat.is_match_glob_path(path),
+                ],
+                [expected; 3],
+                "{src} against {path:?}"
+            );
+            assert!(
+                pat.engines_agree(path),
+                "engines disagree: {src} on {path:?}"
+            );
+        };
+
+        // `*(**|.h)/x` and `*(**|.h)/x*` (NFA and interpreter).
+        for src in ["*(**|.h)/x", "*(**|.h)/x*"] {
+            for (path, expected) in [
+                ("x", true),
+                ("/x", true),
+                ("a/x", true),
+                ("a/b/x", true),
+                (".h/x", true),
+                ("a/.h/x", true),
+                ("a/b/.h/x", true),
+                // `.h` ends mid-component (or before `/`), so a leading `**/`
+                // arm cannot start right after `.h`.
+                (".h/b/x", false),
+                ("a/.h/b/x", false),
+                ("a/.hx/x", false),
+                (".h/.h/x", false),
+                (".a/x", false),
+                ("a/.b/x", false),
+                (".a/.h/x", false),
+                ("a/.h/.b/x", false),
+                (".a.h/x", false),
+                ("a/.b.h/x", false),
+                // `"a.h"` is an ordinary non-hidden directory, so `**/x` accepts it.
+                ("a.h/x", true),
+            ] {
+                assert_both_engines(src, path, expected);
+            }
+        }
+
+        // `+(**|.h)/x` and `+(**|.h)/x*`: 1 iteration of `**` + `/` = `**/x`,
+        // which also accepts `"x"` per #422 (`+(**)/a` against `"a"`).
+        for src in ["+(**|.h)/x", "+(**|.h)/x*"] {
+            for (path, expected) in [
+                ("x", true),
+                ("/x", true),
+                ("a/x", true),
+                ("a/b/x", true),
+                (".h/x", true),
+                ("a/.h/x", true),
+                ("a/b/.h/x", true),
+                (".h/b/x", false),
+                ("a/.h/b/x", false),
+                ("a/.hx/x", false),
+                (".a/x", false),
+                ("a/.b/x", false),
+                (".a/.h/x", false),
+                (".a.h/x", false),
+                ("a/.b.h/x", false),
+            ] {
+                assert_both_engines(src, path, expected);
+            }
+        }
+
+        // Leading-`**/` arms inside repeated groups may only start at a
+        // component boundary (ADR-0020): `+(**|.git)/config` must reject
+        // `"repo/.github/config"` and `"repo/.git/.git/config"`, while
+        // `+(**|.git/)/config` accepts `"repo/.git/.git/config"` because
+        // `.git/` ends at a separator.
+        for src in ["+(**|.git)/config", "+(**|.git)/config*"] {
+            assert_both_engines(src, "repo/.git/config", true);
+            assert_both_engines(src, "repo/.github/config", false);
+            assert_both_engines(src, "repo/.git/.git/config", false);
+            assert_both_engines(src, ".git/config", true);
+            assert_both_engines(src, ".github/config", false);
+        }
+        for src in ["+(**|.git/)/config", "+(**|.git/)/config*"] {
+            assert_both_engines(src, "repo/.git/config", true);
+            assert_both_engines(src, "repo/.git/.git/config", true);
+            assert_both_engines(src, "repo/.git/sub/config", true);
+            assert_both_engines(src, "repo/.github/config", false);
+        }
+        // Regular (non-`through_separator`) arms starting with `**/` must also
+        // obey the component-start guard inside repetitions (`#495`).
+        for src in ["+(**|.git|**/a)/config", "+(**|.git|**/a)/config*"] {
+            assert_both_engines(src, "repo/.github/a/config", false);
+            assert_both_engines(src, "repo/.git/a/config", false);
+            assert_both_engines(src, "repo/.git/config", true);
+            assert_both_engines(src, "repo/a/config", true);
+        }
+        for src in ["+(**|.git/|**/a)/config", "+(**|.git/|**/a)/config*"] {
+            assert_both_engines(src, "repo/.git/a/config", true);
+            assert_both_engines(src, "repo/.github/a/config", false);
+        }
+        for src in ["+(**|.h?)/config", "+(**|.h?)/config*"] {
+            let pat = Pattern::compile(src, options).expect("compiles");
+            // Under `is_match`, `.h?` can consume `.h/` and land at a component
+            // start; under `is_match_glob_path`, `?` stays inside one component.
+            assert!(pat.is_match(".h/b/config"));
+            assert!(!pat.is_match_glob_path(".h/b/config"));
+            assert!(!pat.is_match(".hxb/config"));
+            assert!(!pat.is_match_glob_path(".hxb/config"));
+            assert!(pat.engines_agree(".h/b/config"));
+            assert!(pat.engines_agree(".hxb/config"));
+        }
+
+        // `+(a/**|.h)/x` and `+(a/**|.h)/x*` (and `*(a/**|.h)/x`).
+        for src in ["+(a/**|.h)/x", "+(a/**|.h)/x*"] {
+            for (path, expected) in [
+                ("x", false),
+                ("/x", false),
+                ("a/x", true),
+                ("a/b/x", true),
+                (".h/x", true),
+                ("a/.h/x", true),
+                ("a/b/.h/x", true),
+                ("a/b/c/.h/x", true),
+                ("a/.h/b/x", false),
+                ("a.h/x", false),
+                ("a/.b.h/x", false),
+                ("a/.b/x", false),
+                (".a/.h/x", false),
+            ] {
+                assert_both_engines(src, path, expected);
+            }
+        }
+        for src in ["*(a/**|.h)/x", "*(a/**|.h)/x*"] {
+            assert_both_engines(src, "/x", true);
+            assert_both_engines(src, "x", false);
+            assert_both_engines(src, "a/.h/x", true);
+            assert_both_engines(src, "a/b/.h/x", true);
+            assert_both_engines(src, "a.h/x", false);
+        }
+
+        // `+(**)/a` and `+(****|.h)/x` preserve whole-component boundaries.
+        for src in ["+(**)/a", "+(**)/a*"] {
+            assert_both_engines(src, "a", true);
+            assert_both_engines(src, "b/c/a", true);
+            assert_both_engines(src, "xa", false);
+            assert_both_engines(src, ".h/a", false);
+        }
+        for src in ["+(****|.h)/x", "+(****|.h)/x*"] {
+            assert_both_engines(src, "a/.h/x", true);
+            assert_both_engines(src, "a/b/.h/x", true);
+            assert_both_engines(src, ".a.h/x", false);
+            assert_both_engines(src, "a/.b.h/x", false);
+        }
+
+        // Trailing `/**` still refuses bare `"a"` on `+(a/**)/**` (as `a/**/**` does).
+        for src in ["+(a/**)/**", "+(a/**)/**/*"] {
+            let pat = Pattern::compile(src, options).expect("compiles");
+            assert!(!pat.is_match_glob_path("a"), "{src} must reject bare a");
+            assert!(pat.engines_agree("a"));
+        }
+        assert_both_engines("+(a/**|.h)/**", "a", false);
+        assert_both_engines("+(a/**|.h)/**", "a/.h", true);
+        assert_both_engines("+(a/**|.h)/**", "a/b/.h", true);
+        assert_both_engines("+(a/**|.h)/**", "a/.b", false);
+
+        // Component-local first iteration (`first_iteration_apart`) under `is_match_path`:
+        // first iteration's `*` stays in one component, later iteration's `*` crosses.
+        for src in ["dir/+(*.rs/**|.h)/x", "dir/+(*.rs/**|.h)/x*"] {
+            let pat = Pattern::compile(src, options).expect("compiles");
+            assert!(pat.is_match_path("dir/b.rs/.h/x"));
+            assert!(!pat.is_match_path("dir/a/b.rs/.h/x"));
+            assert!(pat.is_match("dir/a/b.rs/.h/x"));
+            assert!(!pat.is_match_glob_path("dir/a/b.rs/.h/x"));
+            assert!(pat.engines_agree("dir/b.rs/.h/x"));
+            assert!(pat.engines_agree("dir/a/b.rs/.h/x"));
+        }
+        for src in ["dir/+(a/|*.rs/**|.h)/x", "dir/+(a/|*.rs/**|.h)/x*"] {
+            let pat = Pattern::compile(src, options).expect("compiles");
+            assert!(pat.is_match_path("dir/a/b/c.rs/.h/x"));
+            assert!(!pat.is_match_glob_path("dir/a/b/c.rs/.h/x"));
+            assert!(pat.engines_agree("dir/a/b/c.rs/.h/x"));
+        }
+        for src in ["dir/+(**|.h|*.rs)/x", "dir/+(**|.h|*.rs)/x*"] {
+            let pat = Pattern::compile(src, options).expect("compiles");
+            assert!(pat.is_match_path("dir/a/b.rs/x"));
+            assert!(pat.is_match_glob_path("dir/a/.h/x"));
+            assert!(pat.engines_agree("dir/a/b.rs/x"));
+            assert!(pat.engines_agree("dir/a/.h/x"));
+        }
+    }
+
+    #[test]
+    fn extglob_repeated_through_separator_stays_linear() {
+        let options = PatternOptions::walker();
+
+        for (src, path) in [
+            ("+(*/**)/y*", format!("dir/{}", "x".repeat(4_000))),
+            ("+(*/**)/y*", format!("dir/{}", "x".repeat(8_000))),
+            ("+(*/**)/y*", format!("dir/{}", "x/".repeat(2_000))),
+            ("+(*/**|x)/y*", format!("dir/{}", "x".repeat(4_000))),
+            ("dir/+(*/**|x)/y*", format!("dir/{}", "x".repeat(4_000))),
+        ] {
+            let pat = Pattern::compile(src, options).expect("compiles");
+            assert!(
+                pat.alternatives[0]
+                    .extglob
+                    .as_ref()
+                    .expect("program")
+                    .positive_nfa
+                    .is_none(),
+                "{src} must run the interpreter"
+            );
+            for name in ["is_match", "is_match_path", "is_match_glob_path"] {
+                super::reset_extglob_repetition_sweep_steps();
+                let matched = match name {
+                    "is_match" => pat.is_match(&path),
+                    "is_match_path" => pat.is_match_path(&path),
+                    "is_match_glob_path" => pat.is_match_glob_path(&path),
+                    _ => unreachable!(),
+                };
+                assert!(!matched, "{src} {name}");
+                let steps = super::extglob_repetition_sweep_steps();
+                assert!(
+                    steps <= 3 * path.len(),
+                    "{src} {name}: {steps} sweep steps for {} bytes (must stay linear)",
+                    path.len()
+                );
+            }
+        }
+
+        // A dead wide sweep inside `matching_extglob_repetition_ends` must
+        // stop advancing immediately instead of stepping across the rest of a
+        // long nonmatching path, and its `SweepState::Wide` buffer must stay
+        // retained across calls when below the retention cap. Using a leading
+        // `.` keeps this `through_separator` repetition non-idempotent under
+        // `match_hidden: false` so it runs the repetition sweep.
+        let wide_src = format!("+(.{}/**)/z*", "a".repeat(4_095));
+        let wide_pat = Pattern::compile(&wide_src, options).expect("wide compiles");
+        let nonmatch = format!("b{}", "x".repeat(4_096));
+        super::reset_extglob_repetition_sweep_steps();
+        assert!(!wide_pat.is_match(&nonmatch));
+        assert_eq!(
+            super::extglob_repetition_sweep_steps(),
+            1,
+            "dead wide sweep must exit after the first mismatching byte"
+        );
+        let retained_wide = super::EXTGLOB_SCRATCH.with(|cell| {
+            cell.borrow()
+                .wide_sweeps
+                .first()
+                .map_or(0, SweepEngine::retained_state_capacity)
+        });
+        assert!(
+            retained_wide > 0,
+            "wide repetition sweep state must be retained across calls"
+        );
+        assert!(!wide_pat.is_match(&nonmatch));
+        let retained_wide_after = super::EXTGLOB_SCRATCH.with(|cell| {
+            cell.borrow()
+                .wide_sweeps
+                .first()
+                .map_or(0, SweepEngine::retained_state_capacity)
+        });
+        assert_eq!(retained_wide_after, retained_wide);
+
+        // Running a huge-arm repetition must bound retained sweep slots, and
+        // subsequent non-repetition matches (`a@(b)x*`) must skip sweep cleanup
+        // completely.
+        let many_arms = (0..4_000)
+            .map(|i| format!("a{i}*"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let huge_rep =
+            Pattern::compile(format!("+({many_arms})y*"), options).expect("4000-arm rep compiles");
+        assert!(!huge_rep.is_match("zzz"));
+        let non_rep = Pattern::compile("a@(b)x*", options).expect("non-rep compiles");
+        super::reset_extglob_sweep_cleanup_scans();
+        assert!(non_rep.is_match("abx"));
+        assert!(!non_rep.is_match("acy"));
+        assert_eq!(
+            super::extglob_sweep_cleanup_scans(),
+            0,
+            "matches without repetition sweeps must skip sweep cleanup"
+        );
+
+        // Exceeding `RETAINED_WIDE_SWEEP_SLOTS` (64) with actual wide arms
+        // (`> 64` positions each) must truncate retained `wide_sweeps` back to
+        // at most `RETAINED_WIDE_SWEEP_SLOTS`.
+        let seventy_wide_arms = (0..70)
+            .map(|i| format!("{}a{i}*", "b".repeat(70)))
+            .collect::<Vec<_>>()
+            .join("|");
+        let seventy_wide = Pattern::compile(format!("+({seventy_wide_arms})y*"), options)
+            .expect("70 wide arms compile");
+        assert!(!seventy_wide.is_match("zzz"));
+        let wide_slots_after_seventy =
+            super::EXTGLOB_SCRATCH.with(|cell| cell.borrow().wide_sweeps.len());
+        assert!(
+            wide_slots_after_seventy <= super::RETAINED_WIDE_SWEEP_SLOTS,
+            "retained wide sweep slots must stay capped after 70 wide arms: {wide_slots_after_seventy}"
+        );
+
+        // Idempotent `through_separator` repetitions (`+(**)/x*`,
+        // `*(**|****)/x*`, `+(a/a/.../a/**)/z*`) bypass both the interpreter
+        // repetition bitmap and the NFA loop-back edge, while arms that can
+        // explicitly match a hidden component under `match_hidden: false` keep
+        // the loop-back so repeated hidden prefixes still match (#495).
+        let fifty_dirs = format!("a/{}x", "b/".repeat(50));
+        for src in ["+(**)/x*", "*(**)/x*", "+(**|****)/x*"] {
+            let pat = Pattern::compile(src, options).expect("sole globstar compiles");
+            super::reset_extglob_repetition_sweep_steps();
+            assert!(pat.is_match_glob_path(&fifty_dirs));
+            assert_eq!(
+                super::extglob_repetition_sweep_steps(),
+                0,
+                "{src} must bypass the multi-pass repetition bitmap"
+            );
+            assert!(pat.engines_agree(&fifty_dirs));
+        }
+
+        let deep_a_pat = format!("+({}**)/z*", "a/".repeat(32));
+        let deep_a_path = format!("{}z", "a/".repeat(250));
+        let deep_a = Pattern::compile(&deep_a_pat, options).expect("deep visible /** compiles");
+        super::reset_extglob_repetition_sweep_steps();
+        assert!(deep_a.is_match_glob_path(&deep_a_path));
+        assert_eq!(
+            super::extglob_repetition_sweep_steps(),
+            0,
+            "visible through_separator repetition must bypass the multi-pass repetition bitmap"
+        );
+        assert!(deep_a.engines_agree(&deep_a_path));
+        let deep_a_hidden = format!("{}a/.h/z", "a/".repeat(32));
+        assert!(!deep_a.is_match_glob_path(&deep_a_hidden));
+        assert!(deep_a.engines_agree(&deep_a_hidden));
+
+        // Hidden-component `through_separator` arms must keep the loop-back
+        // when `match_hidden: false` so second iterations can match `.h/`.
+        for (src, accept, reject) in [
+            ("+(.h/**)/z", ".h/.h/z", ".h/.x/z"),
+            ("+(a/.h/**)/z", "a/.h/a/.h/z", "a/.h/.h/z"),
+            (r"+(a\/.h/**)/z", "a/.h/a/.h/z", "a/.h/.x/z"),
+            ("+(?.h/**)/z", "/.h//.h/z", "/.h/.x/z"),
+            ("+(a[!x].h/**)/z", "a/.h/a/.h/z", "a/.h/.x/z"),
+        ] {
+            let pat = Pattern::compile(src, options).expect("hidden through_separator compiles");
+            assert!(
+                pat.is_match(accept),
+                "{src} must accept repeated hidden prefix {accept:?}"
+            );
+            assert!(!pat.is_match(reject), "{src} must reject {reject:?}");
+            assert!(pat.engines_agree(accept), "{src} engines_agree({accept:?})");
+            assert!(pat.engines_agree(reject), "{src} engines_agree({reject:?})");
+        }
+        // Leading `[.]` and `*.h` (which blocks stopping before a leading `.`)
+        // cannot match a hidden period under `match_hidden: false`, and all
+        // engines agree.
+        for (src, path) in [("+([.]h/**)/z", ".h/.h/z"), ("+(*.h/**)/z", "a/.h/a/.h/z")] {
+            let pat = Pattern::compile(src, options).expect("compiles");
+            assert!(!pat.is_match(path), "{src} must reject {path:?}");
+            assert!(pat.engines_agree(path), "{src} engines_agree({path:?})");
+        }
+
+        // Separate patterns populating different `wide_sweeps` slots with large
+        // wide arms must stay within one combined `RETAINED_SCRATCH_WORDS`
+        // budget on the thread (`#495`).
+        let small_wide = format!("{}*", "a".repeat(64));
+        let large_wide = format!("{}*", "b".repeat(20_000));
+        for slot in 0..64 {
+            let mut arms: Vec<&str> = std::iter::repeat_n(small_wide.as_str(), slot).collect();
+            arms.push(large_wide.as_str());
+            let pat = Pattern::compile(format!("+({})z*", arms.join("|")), options)
+                .expect("wide pattern compiles");
+            assert!(!pat.is_match("nope"));
+        }
+        let total_retained_wide_words: usize = super::EXTGLOB_SCRATCH.with(|cell| {
+            cell.borrow()
+                .wide_sweeps
+                .iter()
+                .map(SweepEngine::retained_state_capacity)
+                .sum()
+        });
+        assert!(
+            total_retained_wide_words <= super::RETAINED_SCRATCH_WORDS,
+            "combined retained wide sweep words must stay within budget: {total_retained_wide_words}"
+        );
+    }
+
+    #[test]
+    fn contains_extglob_skips_closed_bracket_classes() {
+        let walker = PatternOptions::walker();
+        let no_escape = PatternOptions::walker().escape(false);
+
+        // Closed bracket classes containing extglob-like bytes must not
+        // trigger `CompiledExtglob`.
+        for (src, options, matching, non_matching) in [
+            ("*.[@(]", walker, "foo.@", "foo.a"),
+            ("src/[@(]/foo", walker, "src/(/foo", "src/a/foo"),
+            ("[!@(]", walker, "x", "@"),
+            ("[^@(]", walker, "x", "("),
+            ("[]@(]", walker, "]", "x"),
+            ("[!]@(]", walker, "x", "]"),
+            ("[!(a)]", walker, "x", "a"),
+            ("src/[a-z@(]/*.rs", walker, "src/@/lib.rs", "src/A/lib.rs"),
+            ("[[:alpha:]@(]", walker, "z", "9"),
+            (r"[\]@(a)]", walker, "]", "x"),
+            (r"\[@(a)]", no_escape, r"\@", r"\x"),
+        ] {
+            assert!(
+                !super::contains_extglob(src.as_bytes(), options.escape),
+                "{src:?} ({options:?}) should not detect extglob"
+            );
+            let pat = Pattern::compile(src, options).expect("compiles");
+            assert!(
+                pat.alternatives[0].extglob.is_none(),
+                "{src:?} should not compile an extglob program"
+            );
+            assert!(pat.is_match(matching), "{src:?} should match {matching:?}");
+            assert!(
+                !pat.is_match(non_matching),
+                "{src:?} should reject {non_matching:?}"
+            );
+            assert!(pat.engines_agree(matching));
+            assert!(pat.engines_agree(non_matching));
+        }
+
+        // Unclosed `[` or real extglobs outside a class must still be detected.
+        for (src, escapes) in [
+            ("a[@(b)", true),
+            ("a[@(b)", false),
+            (r"\[@(a)", true),
+            (r"\[@(a)", false),
+            (r"\[@(a)]", true),
+            ("[a]@(b)", true),
+            ("[a-z]@(foo|bar)", true),
+            ("[[:alpha:]]@(a)", true),
+            (r"[\]@(a)", false),
+            (r"[\]@(a)", true),
+            (r"a[\\]@(b)", true),
+            ("[]@(a)", true),
+        ] {
+            assert!(
+                super::contains_extglob(src.as_bytes(), escapes),
+                "{src:?} (escape={escapes}) must detect extglob"
+            );
+        }
+
+        for (src, options, matching, non_matching) in [
+            (r"\[@(a)", walker, "[a", "[b"),
+            (r"\[@(a)]", walker, "[a]", "[b]"),
+            ("[a]@(b)", walker, "ab", "ac"),
+            ("[a-z]@(foo|bar)", walker, "xbar", "xbaz"),
+            ("[[:alpha:]]@(a)", walker, "za", "9a"),
+            (r"[\]@(a)", no_escape, r"\a", r"\b"),
+            (r"a[\\]@(b)", walker, r"a\b", r"a\c"),
+        ] {
+            let pat = Pattern::compile(src, options).expect("compiles");
+            assert!(
+                pat.alternatives[0].extglob.is_some(),
+                "{src:?} must compile an extglob program"
+            );
+            assert!(pat.is_match(matching), "{src:?} should match {matching:?}");
+            assert!(
+                !pat.is_match(non_matching),
+                "{src:?} should reject {non_matching:?}"
+            );
+            assert!(pat.engines_agree(matching));
+            assert!(pat.engines_agree(non_matching));
+        }
+
+        // Twelve `{a,b}` groups + `*` + 90 literals + `/[@(]` moves from
+        // `CompiledExtglob` to plain `PathFilter` copies that share their
+        // `Arc`-backed wide sweep tables; `compile_sweep` must not double-
+        // charge those shared tables (#495).
+        let braced_wide_class = format!("{}*{}/[@(]", "{a,b}".repeat(12), "x".repeat(90));
+        let wide_compiled = Pattern::compile(&braced_wide_class, PatternOptions::walker())
+            .expect("shared PathFilter wide sweeps must not double-charge IR budget");
+        assert!(
+            wide_compiled
+                .alternatives
+                .iter()
+                .all(|alternative| alternative.extglob.is_none()),
+            "braced bracket class with `@(` must not compile extglob programs"
+        );
+        let wide_accept = format!("{}x{}/@", "a".repeat(12), "x".repeat(90));
+        let wide_reject = format!("{}x{}/z", "a".repeat(12), "x".repeat(90));
+        assert!(wide_compiled.is_match(&wide_accept));
+        assert!(wide_compiled.is_match_path(&wide_accept));
+        assert!(wide_compiled.is_match_glob_path(&wide_accept));
+        assert!(!wide_compiled.is_match(&wide_reject));
+        assert!(!wide_compiled.is_match_path(&wide_reject));
+        assert!(!wide_compiled.is_match_glob_path(&wide_reject));
+        assert!(wide_compiled.engines_agree(&wide_accept));
+        assert!(wide_compiled.engines_agree(&wide_reject));
+
+        // Even when the optional wide sweep tables alone would exceed the
+        // remaining `IrBudget` (4096 alternatives × ~205-byte wide sweeps),
+        // `compile_sweep` degrades cleanly to the token matcher instead of
+        // rejecting the valid pattern (#495).
+        let braced_huge_wide_class = format!("{}*{}/[@(]", "{a,b}".repeat(12), "x".repeat(190));
+        let huge_wide_compiled =
+            Pattern::compile(&braced_huge_wide_class, PatternOptions::walker())
+                .expect("optional wide sweep overflow must fall back to token matcher");
+        assert!(
+            huge_wide_compiled
+                .alternatives
+                .iter()
+                .all(|alternative| alternative.extglob.is_none()),
+            "braced 190-literal bracket class must not compile extglob programs"
+        );
+        assert!(
+            huge_wide_compiled
+                .alternatives
+                .last()
+                .expect("4096 alternatives")
+                .sweep
+                .is_none(),
+            "tail alternatives beyond IrBudget must fall back to the token matcher"
+        );
+        for prefix in ["a".repeat(12), "b".repeat(12)] {
+            let huge_accept = format!("{prefix}x{}/@", "x".repeat(190));
+            let huge_reject = format!("{prefix}x{}/z", "x".repeat(190));
+            assert!(huge_wide_compiled.is_match(&huge_accept));
+            assert!(huge_wide_compiled.is_match_path(&huge_accept));
+            assert!(huge_wide_compiled.is_match_glob_path(&huge_accept));
+            assert!(!huge_wide_compiled.is_match(&huge_reject));
+            assert!(!huge_wide_compiled.is_match_path(&huge_reject));
+            assert!(!huge_wide_compiled.is_match_glob_path(&huge_reject));
+            assert!(huge_wide_compiled.engines_agree(&huge_accept));
+            assert!(huge_wide_compiled.engines_agree(&huge_reject));
+        }
+
+        // Complete `FastPath` arms (`StarSuffix`) in a multi-arm brace
+        // expansion never allocate a `SweepEngine`, so they must not deduct
+        // unused sweep budget and starve sweep-backed sibling arms regardless
+        // of branch order (#495).
+        let star_suffix_arm = format!("*{}{}", "{a,b}".repeat(11), "r".repeat(500));
+        let sweep_arm = format!("{}[xy]*", "?*".repeat(1_000));
+        let fast_first = Pattern::compile(
+            format!("{{{star_suffix_arm},{sweep_arm}}}"),
+            PatternOptions::walker(),
+        )
+        .expect("fast-path-first brace pattern compiles");
+        let sweep_first = Pattern::compile(
+            format!("{{{sweep_arm},{star_suffix_arm}}}"),
+            PatternOptions::walker(),
+        )
+        .expect("sweep-first brace pattern compiles");
+        assert!(
+            fast_first
+                .alternatives
+                .last()
+                .expect("sweep arm")
+                .sweep
+                .is_some(),
+            "sweep arm must retain its SweepEngine when StarSuffix arms come first"
+        );
+        assert!(
+            sweep_first
+                .alternatives
+                .first()
+                .expect("sweep arm")
+                .sweep
+                .is_some(),
+            "sweep arm must retain its SweepEngine when it comes first"
+        );
+        let reject_2k_a = "a".repeat(2_000);
+        assert!(!fast_first.is_match(&reject_2k_a));
+        assert!(!sweep_first.is_match(&reject_2k_a));
+        let accept_sweep = format!("{}x", "a".repeat(1_000));
+        assert!(fast_first.is_match(&accept_sweep));
+        assert!(sweep_first.is_match(&accept_sweep));
+        assert!(fast_first.engines_agree(&accept_sweep));
+        assert!(sweep_first.engines_agree(&accept_sweep));
+
+        // Same branch-order guarantee through `PathFilter` copies when the
+        // sweep arm has a leading `./` prefix (`is_match_path`, #495).
+        let dotted_sweep_arm = format!("./{sweep_arm}");
+        let dotted_fast_first = Pattern::compile(
+            format!("{{{star_suffix_arm},{dotted_sweep_arm}}}"),
+            PatternOptions::walker(),
+        )
+        .expect("dotted fast-path-first brace pattern compiles");
+        let dotted_sweep_first = Pattern::compile(
+            format!("{{{dotted_sweep_arm},{star_suffix_arm}}}"),
+            PatternOptions::walker(),
+        )
+        .expect("dotted sweep-first brace pattern compiles");
+        assert!(
+            dotted_fast_first
+                .path_filter
+                .as_ref()
+                .expect("path_filter exists")
+                .compiled
+                .last()
+                .expect("dotted sweep copy")
+                .sweep
+                .is_some(),
+            "dotted sweep arm copy must retain its SweepEngine when StarSuffix arms come first"
+        );
+        assert!(
+            dotted_sweep_first
+                .path_filter
+                .as_ref()
+                .expect("path_filter exists")
+                .compiled
+                .first()
+                .expect("dotted sweep copy")
+                .sweep
+                .is_some(),
+            "dotted sweep arm copy must retain its SweepEngine when it comes first"
+        );
+        assert!(!dotted_fast_first.is_match_path(&reject_2k_a));
+        assert!(!dotted_sweep_first.is_match_path(&reject_2k_a));
+        assert!(dotted_fast_first.is_match_path(&accept_sweep));
+        assert!(dotted_sweep_first.is_match_path(&accept_sweep));
+        assert!(dotted_fast_first.engines_agree(&accept_sweep));
+        assert!(dotted_sweep_first.engines_agree(&accept_sweep));
+
+        // Dedicated 40 MiB retained-byte budget rejects oversized multi-arm
+        // literal/prefilter expansions without stealing `IrBudget` sweep units
+        // from sweep-backed arms, while zero-copy `FastPath::{LiteralTokens,
+        // DeterministicTokens, StaticStar}` avoid doubling `Vec<Token>` memory
+        // (#495).
+        let huge_star_suffix =
+            format!("{{./anchor,*{}{}}}", "{a,b}".repeat(11), "r".repeat(12_000));
+        assert_eq!(
+            Pattern::compile(&huge_star_suffix, PatternOptions::walker())
+                .unwrap_err()
+                .message(),
+            super::TOO_MUCH_COMPILED_IR
+        );
+        let huge_plain_literal = format!(
+            "{{./anchor,}}{}*a*{}[x]",
+            "{a,b}".repeat(11),
+            "z".repeat(6_000)
+        );
+        assert_eq!(
+            Pattern::compile(&huge_plain_literal, PatternOptions::walker())
+                .unwrap_err()
+                .message(),
+            super::TOO_MUCH_COMPILED_IR
+        );
+
+        // Zero-copy `DeterministicTokens` and `StaticStar` stay within 40 MiB
+        // and compile cleanly.
+        let det_braces = format!("{}{}[x]", "{a,b}".repeat(12), "ab?".repeat(80));
+        let det_compiled = Pattern::compile(&det_braces, PatternOptions::walker())
+            .expect("zero-copy DeterministicTokens brace pattern compiles within 40 MiB");
+        assert!(matches!(
+            det_compiled.alternatives[0].fast_path,
+            Some(FastPath::DeterministicTokens)
+        ));
+        let det_accept = format!("{}{}x", "b".repeat(12), "abc".repeat(80));
+        assert!(det_compiled.is_match(&det_accept));
+        assert!(det_compiled.engines_agree(&det_accept));
+
+        let static_star_braces = format!("{}*a{}", "{a,b}".repeat(12), "/a".repeat(110));
+        let static_star_compiled = Pattern::compile(&static_star_braces, PatternOptions::walker())
+            .expect("zero-copy StaticStar brace pattern compiles within 40 MiB");
+        assert!(matches!(
+            static_star_compiled.alternatives[0].fast_path,
+            Some(FastPath::StaticStar { .. })
+        ));
+        let static_star_accept = format!("{}xa{}", "b".repeat(12), "/a".repeat(110));
+        assert!(static_star_compiled.is_match(&static_star_accept));
+        assert!(static_star_compiled.engines_agree(&static_star_accept));
+
+        // Sweep-backed brace arms keep 100% of their `IrBudget` sweep units
+        // (neither `{a,b}×12 + a*×55 + [x]` nor `{a,b}×11 * z×350 * a*×10 [xy]?`
+        // loses any `SweepEngine`, #495).
+        let braced_sweeps_src = format!("{}{}[x]", "{a,b}".repeat(12), "a*".repeat(55));
+        let braced_sweeps = Pattern::compile(&braced_sweeps_src, PatternOptions::walker())
+            .expect("4096 sweep-backed arms compile");
+        assert_eq!(braced_sweeps.alternatives.len(), 4_096);
+        assert!(
+            braced_sweeps
+                .alternatives
+                .iter()
+                .all(|alternative| alternative.sweep.is_some()),
+            "every sweep-backed arm (including the last `bbbbbbbbbbbb` arm) must keep its SweepEngine"
+        );
+        let tail_reject = format!("{}{}y", "b".repeat(12), "a".repeat(10_000));
+        assert!(!braced_sweeps.is_match(&tail_reject));
+        let tail_accept = format!("{}{}x", "b".repeat(12), "a".repeat(60));
+        assert!(braced_sweeps.is_match(&tail_accept));
+        assert!(braced_sweeps.engines_agree(&tail_accept));
+
+        let wide_sweeps_src = format!(
+            "{}*{}*{}[xy]?",
+            "{a,b}".repeat(11),
+            "z".repeat(350),
+            "a*".repeat(10)
+        );
+        let wide_sweeps = Pattern::compile(&wide_sweeps_src, PatternOptions::walker())
+            .expect("2048 wide sweep-backed arms compile");
+        assert_eq!(wide_sweeps.alternatives.len(), 2_048);
+        assert!(
+            wide_sweeps
+                .alternatives
+                .iter()
+                .all(|alternative| alternative.sweep.is_some()),
+            "all 2,048 wide sweep-backed arms must keep their SweepEngine"
+        );
+        let wide_sweeps_reject = format!(
+            "{}{}{}bb",
+            "b".repeat(11),
+            "z".repeat(350),
+            "a".repeat(1_000)
+        );
+        assert!(!wide_sweeps.is_match(&wide_sweeps_reject));
+        let wide_sweeps_accept =
+            format!("{}{}{}xb", "b".repeat(11), "z".repeat(350), "a".repeat(10));
+        assert!(wide_sweeps.is_match(&wide_sweeps_accept));
+        assert!(wide_sweeps.engines_agree(&wide_sweeps_accept));
+
+        // Escaped `\}` bytes inside a skipped bracket class must be subtracted
+        // from `remaining_closing_braces` so subsequent unmatched `{` bytes do
+        // not overflow `MAX_UNCONDITIONAL_BRACE_DEPTH` and disable the pre-
+        // expansion IR lower-bound rejection (#495).
+        let escaped_close_class = format!(
+            "{}[{}]{}@(x){}",
+            "{a,b}".repeat(9),
+            r"\}".repeat(1_026),
+            "{".repeat(1_026),
+            "a".repeat(50_000)
+        );
+        let parse_options = PatternOptions {
+            braces: false,
+            ..PatternOptions::walker()
+        };
+        assert_eq!(
+            super::unconditional_compiled_units(escaped_close_class.as_bytes(), parse_options),
+            Some((0, true)),
+            "skipped escaped `\\}}` bytes must not leave phantom remaining closing braces"
+        );
+        assert_eq!(
+            Pattern::compile(&escaped_close_class, PatternOptions::walker())
+                .unwrap_err()
+                .message(),
+            super::TOO_MUCH_COMPILED_IR
+        );
+
+        // Many unclosed `[` bytes must still scan in linear time.
+        let unclosed_many = "[".repeat(20_000);
+        assert!(!super::contains_extglob(unclosed_many.as_bytes(), true));
+        let unclosed_with_extglob = format!("{unclosed_many}@(a)");
+        assert!(super::contains_extglob(
+            unclosed_with_extglob.as_bytes(),
+            true
+        ));
     }
 }
 

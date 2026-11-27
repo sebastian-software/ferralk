@@ -129,7 +129,23 @@ column!(u8, u16, u32, u64);
 /// the current candidate offset.
 pub(crate) enum SweepState {
     Narrow(u64),
-    Wide { state: Vec<u64>, next: Vec<u64> },
+    Wide {
+        state: Vec<u64>,
+        next: Vec<u64>,
+        active: bool,
+    },
+}
+
+impl SweepState {
+    /// Whether no boundary bit is currently live, so advancing this sweep on
+    /// another byte is a no-op until a fresh start is injected.
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            Self::Narrow(value) => *value == 0,
+            Self::Wide { active, .. } => !*active,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +231,32 @@ impl SweepEngine {
         } else {
             budget.charge(NARROW_IR_UNITS, 0)
         }
+    }
+
+    /// Retained heap bytes one compiled [`SweepEngine`] for `tokens` owns.
+    pub(crate) fn retained_bytes_for(tokens: &[Token]) -> Result<usize, PatternError> {
+        let position_count = position_count(tokens)?;
+        if position_count > MAX_NARROW_POSITIONS {
+            let word_count = (position_count + 1).div_ceil(u64::BITS as usize);
+            let words = word_count
+                .checked_mul(256 + 9)
+                .ok_or_else(|| PatternError::new(0, TOO_MUCH_COMPILED_IR))?;
+            let bytes = words
+                .checked_mul(size_of::<u64>())
+                .ok_or_else(|| PatternError::new(0, TOO_MUCH_COMPILED_IR))?;
+            return size_of::<WideSweepEngine>()
+                .checked_add(bytes)
+                .ok_or_else(|| PatternError::new(0, TOO_MUCH_COMPILED_IR));
+        }
+        Ok(if position_count < u8::BITS as usize {
+            size_of::<NarrowSweepEngine<u8>>()
+        } else if position_count < u16::BITS as usize {
+            size_of::<NarrowSweepEngine<u16>>()
+        } else if position_count < u32::BITS as usize {
+            size_of::<NarrowSweepEngine<u32>>()
+        } else {
+            size_of::<NarrowSweepEngine<u64>>()
+        })
     }
 
     /// Builds the engine [`Self::charge`] has already paid for.
@@ -429,31 +471,39 @@ impl SweepEngine {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn retained_state_capacity(state: &SweepState) -> usize {
         match state {
             SweepState::Narrow(_) => 0,
-            SweepState::Wide { state, next } => state.capacity() + next.capacity(),
+            SweepState::Wide { state, next, .. } => state.capacity() + next.capacity(),
         }
     }
 
     pub(crate) fn state_exceeds_retained_words(state: &SweepState, limit: usize) -> bool {
         match state {
             SweepState::Narrow(_) => false,
-            SweepState::Wide { state, next } => state.capacity() > limit || next.capacity() > limit,
+            SweepState::Wide { state, next, .. } => {
+                state.capacity() > limit || next.capacity() > limit
+            }
         }
+    }
+
+    #[inline]
+    pub(crate) fn is_wide(&self) -> bool {
+        matches!(self, Self::Wide(_))
     }
 
     pub(crate) fn empty_state(&self) -> SweepState {
         dispatch!(self, _engine => SweepState::Narrow(0), engine => SweepState::Wide {
             state: vec![0; engine.stars.len()],
             next: vec![0; engine.stars.len()],
+            active: false,
         })
     }
 
     /// Clears a retained state for another pass through this engine. A state
-    /// with a different representation or width belongs to another engine and
-    /// is replaced once; steady-state extglob repetitions keep their buffers.
+    /// with a different representation belongs to another engine and is
+    /// replaced once; steady-state extglob repetitions reuse their buffers in
+    /// place.
     pub(crate) fn reset_state(&self, state: &mut SweepState) {
         dispatch!(self, _engine => match state {
             SweepState::Narrow(value) => *value = 0,
@@ -462,11 +512,16 @@ impl SweepEngine {
             SweepState::Wide {
                 state: current,
                 next,
-            } if current.len() == engine.stars.len() && next.len() == engine.stars.len() => {
-                current.fill(0);
-                next.fill(0);
+                active,
+            } => {
+                let len = engine.stars.len();
+                current.clear();
+                current.resize(len, 0);
+                next.clear();
+                next.resize(len, 0);
+                *active = false;
             }
-            SweepState::Wide { .. } | SweepState::Narrow(_) => *state = self.empty_state(),
+            SweepState::Narrow(_) => *state = self.empty_state(),
         })
     }
 
@@ -479,7 +534,7 @@ impl SweepEngine {
             };
             *state |= engine.initial(starts_component);
         }, engine => {
-            let SweepState::Wide { state, .. } = state else {
+            let SweepState::Wide { state, active, .. } = state else {
                 unreachable!("a sweep state belongs to its engine");
             };
             let initial = if starts_component {
@@ -490,6 +545,7 @@ impl SweepEngine {
             for (state, initial) in state.iter_mut().zip(initial) {
                 *state |= *initial;
             }
+            *active = true;
         })
     }
 
@@ -507,11 +563,54 @@ impl SweepEngine {
             *state = engine.advance(*state, byte, at_component_start, options);
             *state != 0
         }, engine => {
-            let SweepState::Wide { state, next } = state else {
+            let SweepState::Wide { state, next, active } = state else {
                 unreachable!("a sweep state belongs to its engine");
             };
-            engine.advance(state, next, byte, at_component_start, options)
+            let live = engine.advance(state, next, byte, at_component_start, options);
+            *active = live;
+            live
         })
+    }
+
+    /// Adds the start boundary to a narrow sweep register.
+    #[inline]
+    pub(crate) fn inject_start_narrow(&self, state: &mut u64, starts_component: bool) {
+        dispatch!(
+            self,
+            engine => {
+                *state |= engine.initial(starts_component);
+            },
+            _engine => unreachable!("narrow helper called on wide sweep")
+        );
+    }
+
+    /// Advances a narrow sweep register by one byte.
+    #[inline]
+    pub(crate) fn advance_narrow(
+        &self,
+        state: &mut u64,
+        byte: u8,
+        at_component_start: bool,
+        options: PatternOptions,
+    ) -> bool {
+        dispatch!(
+            self,
+            engine => {
+                *state = engine.advance(*state, byte, at_component_start, options);
+                *state != 0
+            },
+            _engine => unreachable!("narrow helper called on wide sweep")
+        )
+    }
+
+    /// Whether a narrow sweep register accepts at the current candidate position.
+    #[inline]
+    pub(crate) fn accepts_at_narrow(&self, state: u64, before_hidden: bool) -> bool {
+        dispatch!(
+            self,
+            engine => engine.accepts_state(state, before_hidden),
+            _engine => unreachable!("narrow helper called on wide sweep")
+        )
     }
 
     pub(crate) fn accepts(&self, state: &SweepState) -> bool {
