@@ -393,7 +393,10 @@ impl SweepEngine {
             let state = retained_wide.get_or_insert_with(|| self.empty_state());
             self.reset_state(state);
             self.inject_start(state, options.candidate_starts_component);
-            if self.accepts(state) {
+            let before_hidden = !options.match_hidden
+                && options.candidate_starts_component
+                && path.first() == Some(&b'.');
+            if self.accepts_at(state, before_hidden) {
                 output.push(base);
             }
             let mut at_component_start = options.candidate_starts_component;
@@ -401,10 +404,13 @@ impl SweepEngine {
                 if !self.advance(state, byte, at_component_start, options) {
                     break;
                 }
-                if self.accepts(state) {
+                at_component_start = is_separator(byte);
+                let before_hidden = !options.match_hidden
+                    && at_component_start
+                    && path.get(offset + 1) == Some(&b'.');
+                if self.accepts_at(state, before_hidden) {
                     output.push(base + offset + 1);
                 }
-                at_component_start = is_separator(byte);
             }
         })
     }
@@ -509,19 +515,37 @@ impl SweepEngine {
     }
 
     pub(crate) fn accepts(&self, state: &SweepState) -> bool {
+        self.accepts_at(state, false)
+    }
+
+    /// Whether `state` accepts at the current candidate position.
+    ///
+    /// When `before_hidden` is `true` (a component-leading `.` follows under
+    /// `match_hidden: false`), accepting states that only arrive via a trailing
+    /// ordinary or recursive star are masked out so the group cannot hand off a
+    /// hidden period to a following literal.
+    pub(crate) fn accepts_at(&self, state: &SweepState, before_hidden: bool) -> bool {
         dispatch!(self, engine => {
             let SweepState::Narrow(state) = state else {
                 unreachable!("a sweep state belongs to its engine");
             };
-            state & engine.accept != 0
+            engine.accepts_state(*state, before_hidden)
         }, engine => {
             let SweepState::Wide { state, .. } = state else {
                 unreachable!("a sweep state belongs to its engine");
             };
-            state
-                .iter()
-                .zip(&engine.accept)
-                .any(|(state, accept)| state & accept != 0)
+            if before_hidden {
+                state
+                    .iter()
+                    .zip(&engine.accept)
+                    .zip(&engine.dot_stop_block)
+                    .any(|((state, accept), dot_stop)| state & (accept & !dot_stop) != 0)
+            } else {
+                state
+                    .iter()
+                    .zip(&engine.accept)
+                    .any(|(state, accept)| state & accept != 0)
+            }
         })
     }
 }
@@ -571,6 +595,15 @@ impl<C: Column> NarrowSweepEngine<C> {
         state & self.accept != 0
     }
 
+    fn accepts_state(&self, state: u64, before_hidden: bool) -> bool {
+        let accept = if before_hidden {
+            self.accept & !self.dot_stop_block
+        } else {
+            self.accept
+        };
+        state & accept != 0
+    }
+
     /// [`SweepEngine::matching_prefix_ends`] for this width.
     fn matching_prefix_ends(
         &self,
@@ -580,7 +613,10 @@ impl<C: Column> NarrowSweepEngine<C> {
         output: &mut Vec<usize>,
     ) {
         let mut state = self.initial(options.candidate_starts_component);
-        if state & self.accept != 0 {
+        let before_hidden = !options.match_hidden
+            && options.candidate_starts_component
+            && path.first() == Some(&b'.');
+        if self.accepts_state(state, before_hidden) {
             output.push(base);
         }
         let mut at_component_start = options.candidate_starts_component;
@@ -589,10 +625,12 @@ impl<C: Column> NarrowSweepEngine<C> {
             if state == 0 {
                 break;
             }
-            if state & self.accept != 0 {
+            at_component_start = is_separator(byte);
+            let before_hidden =
+                !options.match_hidden && at_component_start && path.get(offset + 1) == Some(&b'.');
+            if self.accepts_state(state, before_hidden) {
                 output.push(base + offset + 1);
             }
-            at_component_start = is_separator(byte);
         }
     }
 
