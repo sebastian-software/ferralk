@@ -1,68 +1,112 @@
-name: zlob comparison
-
-# Manual context, never a gate. The zlob benches need Zig to build the pinned
-# oracle, so they stay off the pull-request path. Medians land in the job
-# summary and as an artifact, the same shape the walker wall-time lane uses.
+name: Ferralk optimization coverage
 
 on:
   workflow_dispatch:
     inputs:
       reason:
-        description: Why this manual zlob comparison is being run.
+        description: Why this benchmark is being run.
         required: true
         type: string
 
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  benchmarks:
-    runs-on: ubuntu-latest
+  compare:
+    name: Optimized workloads and matcher precision (Ubuntu)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.16.0
-      # See walker-bench.yml: a restored criterion directory can silence the
-      # measurement while the step still exits zero.
-      - name: Measure against zlob 1.6.5
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare and build the three revisions
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf target/criterion
-          cargo bench --locked -p bench --features zlob-oracle,thread-sweep \
-            --bench walker_palamedes --bench walker_zlob --bench matcher_zlob -- \
-            --warm-up-time 1 --measurement-time 5 --sample-size 20 \
-            --output-format bencher | tee zlob-comparison.txt
-      - name: Check that the comparison actually measured something
+          rustup toolchain install 1.99.1 --profile minimal
+          mkdir -p results
+          {
+            date -u +%FT%TZ
+            uname -a
+            cat /etc/os-release
+            lscpu
+            rustc +1.99.1 -vV
+          } > results/environment.txt
+          for entry in \
+            release:8d048bebba60a5e27e8e9bc25922fc1fe439755a \
+            pre521:767cf69fbbb088713919fbc5b00e738df9263dc3 \
+            main:b42514dcedbfc374bba581335fe7ef7469655562; do
+            label="${entry%%:*}"
+            revision="${entry#*:}"
+            git worktree add --detach "$RUNNER_TEMP/$label" "$revision"
+            printf '%s %s\n' "$label" "$revision" >> results/revisions.txt
+          done
+          for label in release main; do
+            cp tools/bench/benches/walker.rs "$RUNNER_TEMP/$label/tools/bench/benches/walker.rs"
+          done
+          cp crates/ferralk/src/ignore_rules.rs "$RUNNER_TEMP/main/crates/ferralk/src/ignore_rules.rs"
+          python3 scripts/benchmark-comparison.py "$RUNNER_TEMP/release" "$RUNNER_TEMP/main"
+
+          compile() {
+            local label="$1" name="$2"
+            shift 2
+            cargo +1.99.1 "$@" --locked --manifest-path "$RUNNER_TEMP/$label/Cargo.toml" \
+              --no-run --message-format json |
+              python3 -c 'import json, sys
+          executables = [event["executable"] for event in map(json.loads, sys.stdin)
+                         if event.get("executable")]
+          assert len(executables) == 1, executables
+          print(executables[0])' > "$RUNNER_TEMP/$label-$name.bin"
+          }
+          for label in release pre521 main; do
+            compile "$label" matcher bench -p bench --bench matcher
+            if [[ "$label" != pre521 ]]; then
+              compile "$label" walker bench -p bench --bench walker
+              compile "$label" pattern-set bench -p bench --bench pattern_set
+              compile "$label" rules test -p ferralk --release --lib
+            fi
+          done
+      - name: Measure changed workloads back to back
         shell: bash
         run: |
-          if ! grep -q 'ns/iter' zlob-comparison.txt; then
-            echo "::error::the zlob comparison produced no measurements"
-            exit 1
-          fi
-      - name: Publish the medians
-        if: always()
-        run: |
-          {
-            echo '### zlob 1.6.5 comparison'
-            echo
-            echo '| Benchmark | ns/iter | +/- |'
-            echo '| --- | ---: | ---: |'
-            sed -n 's/^test \(.*\) \.\.\. bench: *\([0-9,]*\) ns\/iter (+\/- \([0-9,]*\))$/| `\1` | \2 | \3 |/p' \
-              zlob-comparison.txt
-            echo
-            echo 'Shared runner, warm page cache. Context, not a gate.'
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload the raw measurements
+          set -euo pipefail
+          measure() {
+            local repetition="$1" label="$2" workload="$3" filter="$4" expected="$5"
+            local executable
+            executable=$(cat "$RUNNER_TEMP/$label-$workload.bin")
+            export CRITERION_HOME="$PWD/results/$repetition-$label-$workload"
+            "$executable" --bench "$filter" --warm-up-time 1 --measurement-time 3 \
+              --sample-size 20 --output-format bencher --noplot |
+              tee "results/$repetition-$label-$workload.txt"
+            [[ "$(grep -c 'ns/iter' "results/$repetition-$label-$workload.txt")" == "$expected" ]]
+          }
+          for repetition in 1 2 3; do
+            case "$repetition" in
+              1) order=(release pre521 main) ;;
+              2) order=(pre521 main release) ;;
+              3) order=(main release pre521) ;;
+            esac
+            for label in "${order[@]}"; do
+              measure "$repetition" "$label" matcher \
+                '^(common/ferralk_compiled/(matching|non_matching)|recursive_terminal/ferralk_compiled/non_matching|node_pattern_set/list/(brace|scoped_brace)/1024_paths)$' 5
+            done
+            for label in "${order[@]}"; do
+              if [[ "$label" == pre521 ]]; then continue; fi
+              measure "$repetition" "$label" pattern-set \
+                '^pattern_set/(keyed|unkeyed)/(is_match|matches)/pattern_set/1000$' 4
+              measure "$repetition" "$label" walker \
+                '^walker/(repository/unscoped/(parallel|stream_parallel)|gitignore_rules/parallel|many_flat_roots/(serial|parallel))$' 5
+              "$(cat "$RUNNER_TEMP/$label-rules.bin")" --ignored --nocapture rule_engine_cost |
+                tee "results/$repetition-$label-rules.txt"
+              [[ "$(grep -c 'ns/verdict' "results/$repetition-$label-rules.txt")" == 6 ]]
+            done
+          done
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: zlob-comparison
-          path: zlob-comparison.txt
-          if-no-files-found: warn
+          name: optimized-workloads
+          path: results/
+          if-no-files-found: error
