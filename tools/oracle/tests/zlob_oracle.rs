@@ -18,13 +18,13 @@ const EXPECTED_REPLAYED: usize = 645;
 const EXPECTED_REPLAYED: usize = 647;
 // The #447 and #499 fast-glob regressions belong to the secondary oracle, the
 // fourteen #488 escaped-bracket, thirty-eight #494 casefolded/POSIX, and three
-// #492 folded-gate ignore cases belong to the Git oracle, and #483 added four
+// #492 folded-gate ignore cases belong to the Git oracle, #483 added four
 // match_glob_path cases, two POSIX-only separator cases, and four Windows-only
-// separator cases.
+// separator cases, and #495 added twenty-one match_glob_path extglob cases.
 #[cfg(not(windows))]
-const EXPECTED_SKIPPED: usize = 457;
+const EXPECTED_SKIPPED: usize = 478;
 #[cfg(windows)]
-const EXPECTED_SKIPPED: usize = 455;
+const EXPECTED_SKIPPED: usize = 476;
 
 /// Cases the zlob 1.6.3 Rust API cannot express, counted by reason.
 #[derive(Default)]

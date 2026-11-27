@@ -1010,6 +1010,38 @@ mod tests {
     }
 
     #[test]
+    fn bracket_classes_holding_extglob_bytes_stay_keyed() {
+        let globs = ["src/[@(]/foo", "src/[a-z@(]/*.rs", "[@(]/*.toml"];
+        let options = PatternOptions::walker();
+        let set = PatternSet::new(globs, options).expect("the globs are valid");
+        let patterns = globs
+            .iter()
+            .map(|glob| Pattern::compile(glob, options).expect("valid"))
+            .collect::<Vec<_>>();
+        assert!(
+            set.always.is_empty(),
+            "patterns whose extglob-like bytes live inside `[...]` must stay indexed: {:?}",
+            set.always
+        );
+        assert_eq!(set.exact.components.len(), 1);
+        assert_eq!(set.exact.extensions.len(), 2);
+        for path in [
+            "src/@/foo",
+            "src/(/foo",
+            "src/a/foo",
+            "src/@/lib.rs",
+            "src/a/lib.rs",
+            "src/A/lib.rs",
+            "@/Cargo.toml",
+            "(/Cargo.toml",
+            "a/Cargo.toml",
+        ] {
+            let shown = || format!("{path:?}");
+            assert_set_agrees(&set, &patterns, path.as_bytes(), &shown);
+        }
+    }
+
+    #[test]
     fn compile_errors_name_the_failed_glob() {
         let error = PatternSet::new(["*.rs", "*.md", "[a-"], PatternOptions::walker())
             .expect_err("the class is never closed");

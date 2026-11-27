@@ -330,6 +330,107 @@ fn hot_paths_keep_their_allocation_floors() {
         "warm deep nested-prefix ScopedSuffixSet spill matches must not allocate"
     );
 
+    let narrow_rep = Pattern::compile("+(a/**)/z*", PatternOptions::walker())
+        .expect("compile narrow repeated extglob pattern");
+    let wide_rep_src = format!("+({}/**|c)/z*", "a".repeat(80));
+    let wide_rep = Pattern::compile(&wide_rep_src, PatternOptions::walker())
+        .expect("compile wide repeated extglob pattern");
+    let wide_rep_accept = format!("{}/sub/z1", "a".repeat(80));
+    let wide_rep_reject = format!("b{}", "x".repeat(120));
+    assert!(narrow_rep.is_match("a/sub/z1"));
+    assert!(!narrow_rep.is_match(&wide_rep_reject));
+    assert!(wide_rep.is_match(&wide_rep_accept));
+    assert!(!wide_rep.is_match(&wide_rep_reject));
+    let narrow_rep_matcher = allocation_counter::measure(|| {
+        for _ in 0..1_000 {
+            black_box(narrow_rep.is_match(black_box(wide_rep_reject.as_str())));
+        }
+    });
+    // Warm the wide sweep slot once after the narrow baseline, then verify
+    // steady-state wide matches allocate no more than the narrow baseline
+    // (zero per-call `SweepState::Wide` allocations).
+    assert!(!wide_rep.is_match(&wide_rep_reject));
+    let wide_rep_matcher = allocation_counter::measure(|| {
+        for _ in 0..1_000 {
+            black_box(wide_rep.is_match(black_box(wide_rep_reject.as_str())));
+        }
+    });
+    assert_eq!(
+        wide_rep_matcher.count_total, narrow_rep_matcher.count_total,
+        "warm wide repeated extglob nonmatching calls must reuse SweepState buffers without extra allocations"
+    );
+
+    // Accepting `+(a/**)/z*` on `"a/z"` must not queue a dead `group.rest`
+    // separator continuation and therefore allocates no more than `@(a/**)/z*`.
+    let single_through =
+        Pattern::compile("@(a/**)/z*", PatternOptions::walker()).expect("compile single through");
+    assert!(single_through.is_match("a/z"));
+    assert!(narrow_rep.is_match("a/z"));
+    let single_through_allocs = allocation_counter::measure(|| {
+        for _ in 0..1_000 {
+            black_box(single_through.is_match(black_box("a/z")));
+        }
+    });
+    let rep_through_allocs = allocation_counter::measure(|| {
+        for _ in 0..1_000 {
+            black_box(narrow_rep.is_match(black_box("a/z")));
+        }
+    });
+    assert_eq!(
+        rep_through_allocs.count_total, single_through_allocs.count_total,
+        "accepting `+(a/**)/z*` must not allocate an extra memo row for `group.rest`"
+    );
+
+    // 65 narrow repetition arms must stay in retained `narrow_sweeps` without
+    // growing and shrinking on every call.
+    let sixty_five_arms = (0..65)
+        .map(|i| format!("a{i}*"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let wide_narrow_rep =
+        Pattern::compile(format!("+({sixty_five_arms})y*"), PatternOptions::walker())
+            .expect("compile 65-arm narrow repetition");
+    assert!(!wide_narrow_rep.is_match("zzz"));
+    let sixty_five_allocs = allocation_counter::measure(|| {
+        for _ in 0..1_000 {
+            black_box(wide_narrow_rep.is_match(black_box("zzz")));
+        }
+    });
+    assert_eq!(
+        sixty_five_allocs.count_total, narrow_rep_matcher.count_total,
+        "65 narrow repetition arms must reuse `narrow_sweeps` without per-call reallocations"
+    );
+
+    // Mixed wide + narrow repetition groups must keep `wide_sweeps` separate
+    // from `narrow_sweeps` so the second group never evicts the first group's
+    // retained wide buffers. Using `|c` keeps the first group non-idempotent so
+    // it actually populates `wide_sweeps` in `matching_extglob_repetition_ends`.
+    let mixed_narrow = Pattern::compile("+(a/**|c)/+(b*)z*", PatternOptions::walker())
+        .expect("compile narrow mixed repetition");
+    let mixed_wide = Pattern::compile(
+        format!("+({}/**|c)/+(b*)z*", "a".repeat(80)),
+        PatternOptions::walker(),
+    )
+    .expect("compile wide+narrow mixed repetition");
+    let mixed_wide_path = format!("{}/bz", "a".repeat(80));
+    assert!(mixed_narrow.is_match("a/bz"));
+    assert!(mixed_wide.is_match(&mixed_wide_path));
+    let mixed_narrow_allocs = allocation_counter::measure(|| {
+        for _ in 0..1_000 {
+            black_box(mixed_narrow.is_match(black_box("a/bz")));
+        }
+    });
+    assert!(mixed_wide.is_match(&mixed_wide_path));
+    let mixed_wide_allocs = allocation_counter::measure(|| {
+        for _ in 0..1_000 {
+            black_box(mixed_wide.is_match(black_box(mixed_wide_path.as_str())));
+        }
+    });
+    assert_eq!(
+        mixed_wide_allocs.count_total, mixed_narrow_allocs.count_total,
+        "mixed wide + narrow repetition groups must not evict retained wide sweep buffers"
+    );
+
     let small = Fixture::plain(1);
     let large = Fixture::plain(2);
     let plain_small = count_skipping_walk(&small.root, false);
