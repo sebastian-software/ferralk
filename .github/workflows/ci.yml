@@ -407,7 +407,7 @@ jobs:
           # cannot quietly stop describing the tree.
           declare -A audited=(
             [crates/ferralk/src/linux_native.rs]='ADR-0010 getdents64 backend, behind the native-linux feature'
-            [crates/ferralk/src/macos_native.rs]='ADR-0010 getattrlistbulk backend, behind the native-macos feature'
+            [crates/ferralk/src/macos_native.rs]='ADR-0010 getdirentries64 backend, behind the native-macos feature'
             [crates/ferralk/src/native_parity.rs]='cfg(test) fixtures that build trees through libc for the native parity models'
             [crates/ferralk/src/thread_budget.rs]='one sysctlbyname query for the Apple Silicon performance-cluster width'
             [crates/ferralk/tests/parallel_allocation_regression.rs]='counting GlobalAlloc, test target only'

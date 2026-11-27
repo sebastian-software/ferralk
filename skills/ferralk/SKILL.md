@@ -121,6 +121,7 @@ These compile and return a plausible, wrong result:
   does `path_bytes()`. Use `entry.relative_path()` for matching or printing
   relative paths.
 - Directories are returned unless `files_only(true)`; the root never is.
+- Mount and filesystem boundaries are crossed unless `WalkOptions::same_file_system(true)` is set; with it enabled, descent stays on each root's filesystem (Unix device number, Windows volume serial) and a selected boundary directory is still returned without reading its children.
 - Patterns use `/` and `\` escapes on every platform; never build one with
   `PathBuf::join`. Match a `Path` as `ferralk_glob::path_bytes(path)`.
   Put a path or user text into a pattern with `ferralk_glob::escape_str`.

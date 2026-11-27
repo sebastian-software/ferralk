@@ -27,7 +27,7 @@ See [the contributor guide](../readme-theme.md) for commands.
 
 ## Theme badge placement
 
-The project pins mdtheme 0.4.0 and uses one `mdtheme:badges:start` /
+The project pins mdtheme 0.4.1 and uses one `mdtheme:badges:start` /
 `mdtheme:badges:end` comment pair in `README.md.src`. Sebastian's
 `badges-prepend.md` places its badge before the authored project badges.
 Ferramenta's header and footer stay unchanged. Upgrade the CLI and lockfile

@@ -1,14 +1,14 @@
 name: Walker benchmarks
 
-# The wall-time lane, and since 2026-08-19 the only automated performance
-# lane: walker benches touch the filesystem and run on several threads, so
-# only elapsed time says anything useful about them. Criterion measures, and
-# pull requests compare merge-base and head medians back to back in one job.
-# Push and dispatch runs publish one snapshot.
+# Automated walker performance lanes: non-gating wall-time Criterion benchmarks
+# (per shipped backend on pull requests, plus Windows snapshots on push and
+# dispatch) alongside the gating Callgrind user-space CPU instruction-count
+# lane below. For wall time, pull requests compare merge-base and head medians
+# back to back in one job, and push/dispatch runs publish one snapshot.
 #
-# A shared GitHub runner is noisy: read these numbers as indicative, and
+# A shared GitHub runner is noisy: read wall-time numbers as indicative, and
 # compare runs on the same lane rather than treating a single delta as a
-# regression. See docs/benchmark-evidence.md for what this lane does and does
+# regression. See docs/benchmark-evidence.md for what each lane does and does
 # not establish.
 
 on:
