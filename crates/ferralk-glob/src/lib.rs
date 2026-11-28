@@ -2743,14 +2743,17 @@ struct Prefilter {
     /// policy compares the tokens.
     prefix_word: WordLiteral,
     suffix_word: WordLiteral,
+    // The four counts below are bounded by the tokens' retained size, which
+    // `MAX_RETAINED_PATTERN_BYTES` keeps far below `u32::MAX`; they are
+    // stored narrow so the prefilter stays small.
     /// Leading `Literal`/`Separator` token count every match starts with.
-    leading_tokens: usize,
+    leading_tokens: u32,
     /// Byte length of `tokens[..leading_tokens]`.
-    prefix_len: usize,
+    prefix_len: u32,
     /// Trailing `Literal`/`Separator` token count every match ends with.
-    trailing_tokens: usize,
+    trailing_tokens: u32,
     /// Byte length of `tokens[tokens.len() - trailing_tokens..]`.
-    suffix_len: usize,
+    suffix_len: u32,
     /// Bytes the pattern consumes even when every star consumes nothing.
     min_length: usize,
     /// The longest fixed run strictly between the leading and trailing runs,
@@ -2838,66 +2841,63 @@ impl Prefilter {
                 case_insensitive,
                 WordLiteral::suffix,
             ),
-            leading_tokens,
-            prefix_len,
-            trailing_tokens,
-            suffix_len,
+            leading_tokens: narrow(leading_tokens),
+            prefix_len: narrow(prefix_len),
+            trailing_tokens: narrow(trailing_tokens),
+            suffix_len: narrow(suffix_len),
             min_length,
             interior: interior_literal(tokens, leading_tokens, trailing_tokens, elidable_separator)
                 .map(|needle| Box::new(InteriorLiteral(memmem::Finder::new(&needle).into_owned()))),
         };
         debug_assert!(
-            prefilter.min_length >= prefilter.prefix_len
-                && prefilter.min_length >= prefilter.suffix_len,
+            prefilter.min_length >= prefix_len && prefilter.min_length >= suffix_len,
             "the fixed runs are part of what the minimum length counts"
         );
         prefilter
     }
 
+    fn leading_run<'a>(&self, tokens: &'a [Token]) -> &'a [Token] {
+        &tokens[..self.leading_tokens as usize]
+    }
+
+    fn trailing_run<'a>(&self, tokens: &'a [Token]) -> &'a [Token] {
+        &tokens[tokens.len() - self.trailing_tokens as usize..]
+    }
+
     #[cfg(test)]
     fn prefix_bytes(&self, tokens: &[Token]) -> Vec<u8> {
-        run_bytes(&tokens[..self.leading_tokens])
+        run_bytes(self.leading_run(tokens))
     }
 
     #[cfg(test)]
     fn suffix_bytes(&self, tokens: &[Token]) -> Vec<u8> {
-        run_bytes(&tokens[tokens.len() - self.trailing_tokens..])
+        run_bytes(self.trailing_run(tokens))
     }
 
     /// Whether `path` fails a condition every match satisfies. A `true` here is
     /// a rejection the engine would have reached the slow way.
+    #[inline]
     fn rejects(&self, tokens: &[Token], path: &[u8], case_insensitive: bool) -> bool {
         if path.len() < self.min_length {
             return true;
         }
         // The trailing run first: candidates are told apart by their
-        // extension far more often than by their directory.
+        // extension far more often than by their directory. The packed words
+        // answer inline; only a run too long to pack reads its tokens.
         if self.trailing_tokens != 0 {
-            let matches = self
-                .suffix_word
-                .ends_under(path, case_insensitive)
-                .unwrap_or_else(|| {
-                    run_matches_tokens(
-                        &tokens[tokens.len() - self.trailing_tokens..],
-                        &path[path.len() - self.suffix_len..],
-                        case_insensitive,
-                    )
-                });
+            let matches = match self.suffix_word.ends_under(path, case_insensitive) {
+                Some(matches) => matches,
+                None => self.trailing_run_matches(tokens, path, case_insensitive),
+            };
             if !matches {
                 return true;
             }
         }
         if self.leading_tokens != 0 {
-            let matches = self
-                .prefix_word
-                .starts_under(path, case_insensitive)
-                .unwrap_or_else(|| {
-                    run_matches_tokens(
-                        &tokens[..self.leading_tokens],
-                        &path[..self.prefix_len],
-                        case_insensitive,
-                    )
-                });
+            let matches = match self.prefix_word.starts_under(path, case_insensitive) {
+                Some(matches) => matches,
+                None => self.leading_run_matches(tokens, path, case_insensitive),
+            };
             if !matches {
                 return true;
             }
@@ -2907,6 +2907,24 @@ impl Prefilter {
                 .interior
                 .as_ref()
                 .is_some_and(|interior| interior.0.find(path).is_none())
+    }
+
+    #[inline(never)]
+    fn trailing_run_matches(&self, tokens: &[Token], path: &[u8], case_insensitive: bool) -> bool {
+        run_matches_tokens(
+            self.trailing_run(tokens),
+            &path[path.len() - self.suffix_len as usize..],
+            case_insensitive,
+        )
+    }
+
+    #[inline(never)]
+    fn leading_run_matches(&self, tokens: &[Token], path: &[u8], case_insensitive: bool) -> bool {
+        run_matches_tokens(
+            self.leading_run(tokens),
+            &path[..self.prefix_len as usize],
+            case_insensitive,
+        )
     }
 }
 
@@ -2955,6 +2973,11 @@ fn keep_longer_run(best: &mut Option<Vec<u8>>, run: &mut Vec<u8>) {
     } else {
         run.clear();
     }
+}
+
+/// A prefilter count, bounded by the tokens' retained size.
+fn narrow(count: usize) -> u32 {
+    u32::try_from(count).expect("MAX_RETAINED_PATTERN_BYTES keeps prefilter counts within u32")
 }
 
 /// Total candidate bytes consumed by a run of `Literal`/`Separator` tokens.
@@ -3332,16 +3355,15 @@ impl LiteralPrefix {
 
 /// The suffix representation selected once while compiling a fast path.
 ///
-/// An explicit tag keeps the variant a single byte load rather than a niche
-/// decoded from a payload.
+/// The packed variants spell [`PackedLiteral`]'s fields out so the tag can
+/// share their padding: the whole value stays two words.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[repr(u8)]
 enum LiteralSuffix {
     /// A case-sensitive suffix of up to eight bytes, compared with one word
     /// load.
-    Exact(PackedLiteral),
+    Exact { word: u64, len: u8, unused_bits: u8 },
     /// The same for a case-insensitive suffix, folded on both sides.
-    Folded(PackedLiteral),
+    Folded { word: u64, len: u8, unused_bits: u8 },
     /// Borrows the trailing `Token::Literal` bytes directly from `tokens`
     /// after its final byte, kept here, has matched.
     Plain { last: u8 },
@@ -3352,18 +3374,31 @@ enum LiteralSuffix {
 impl LiteralSuffix {
     fn retained_bytes(&self) -> usize {
         match self {
-            Self::Exact(_) | Self::Folded(_) | Self::Plain { .. } => 0,
+            Self::Exact { .. } | Self::Folded { .. } | Self::Plain { .. } => 0,
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             Self::Packed16(_) => size_of::<suffix_word::PreparedSuffix16>(),
         }
     }
 
     fn new(suffix: &[u8], case_insensitive: bool) -> Self {
-        if let Some(packed) = PackedLiteral::suffix(suffix, case_insensitive) {
+        if let Some(PackedLiteral {
+            word,
+            len,
+            unused_bits,
+        }) = PackedLiteral::suffix(suffix, case_insensitive)
+        {
             return if case_insensitive {
-                Self::Folded(packed)
+                Self::Folded {
+                    word,
+                    len,
+                    unused_bits,
+                }
             } else {
-                Self::Exact(packed)
+                Self::Exact {
+                    word,
+                    len,
+                    unused_bits,
+                }
             };
         }
 
@@ -3388,26 +3423,44 @@ impl LiteralSuffix {
         tokens: &[Token],
         case_insensitive: bool,
     ) -> Option<&'a [u8]> {
-        match self {
-            Self::Exact(packed) => {
+        match *self {
+            Self::Exact {
+                word,
+                len,
+                unused_bits,
+            } => {
                 debug_assert!(!case_insensitive, "packed for case-sensitive matching");
+                let packed = PackedLiteral {
+                    word,
+                    len,
+                    unused_bits,
+                };
                 if let Some(matches) = packed.ends::<false>(path) {
                     return matches.then(|| &path[..path.len() - packed.len()]);
                 }
             }
-            Self::Folded(packed) => {
+            Self::Folded {
+                word,
+                len,
+                unused_bits,
+            } => {
                 debug_assert!(case_insensitive, "packed for case-insensitive matching");
+                let packed = PackedLiteral {
+                    word,
+                    len,
+                    unused_bits,
+                };
                 if let Some(matches) = packed.ends::<true>(path) {
                     return matches.then(|| &path[..path.len() - packed.len()]);
                 }
             }
             Self::Plain { last } => {
-                if !bytes_equal(*last, *path.last()?, case_insensitive) {
+                if !bytes_equal(last, *path.last()?, case_insensitive) {
                     return None;
                 }
             }
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-            Self::Packed16(suffix) => {
+            Self::Packed16(ref suffix) => {
                 if !case_insensitive && let Some(matches) = suffix.matches(path) {
                     return matches.then(|| &path[..path.len() - suffix.len()]);
                 }
@@ -4279,7 +4332,8 @@ enum FastPath {
         suffix: LiteralSuffix,
     },
     StaticStar {
-        star_index: usize,
+        /// Narrow, as the prefilter counts are, to keep the variant small.
+        star_index: u32,
         /// The static tokens before and after the star packed as bytes, when
         /// they fit a word and a separator is a single byte.
         prefix: WordLiteral,
@@ -4347,7 +4401,7 @@ impl FastPath {
             })
         {
             return Some(Self::StaticStar {
-                star_index,
+                star_index: narrow(star_index),
                 prefix: pack_static_tokens(
                     &tokens[..star_index],
                     options.case_insensitive,
@@ -4440,7 +4494,14 @@ impl FastPath {
                 star_index,
                 prefix,
                 suffix,
-            } => Self::static_star(*star_index, *prefix, *suffix, tokens, path, options),
+            } => Self::static_star(
+                *star_index as usize,
+                *prefix,
+                *suffix,
+                tokens,
+                path,
+                options,
+            ),
             Self::RecursiveTerminalPrefix { prefix } => {
                 Self::recursive_terminal_prefix(*prefix, tokens, path, options)
             }
@@ -11196,15 +11257,15 @@ mod tests {
     fn only_short_literals_are_packed_into_a_word() {
         assert!(matches!(
             LiteralSuffix::new(b".ts", false),
-            LiteralSuffix::Exact(_)
+            LiteralSuffix::Exact { .. }
         ));
         assert!(matches!(
             LiteralSuffix::new(&[b'x'; 8], false),
-            LiteralSuffix::Exact(_)
+            LiteralSuffix::Exact { .. }
         ));
         assert!(matches!(
             LiteralSuffix::new(b".TS", true),
-            LiteralSuffix::Folded(_)
+            LiteralSuffix::Folded { .. }
         ));
         assert!(matches!(
             LiteralSuffix::new(&[b'x'; 9], true),
