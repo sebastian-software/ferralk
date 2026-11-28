@@ -165,11 +165,13 @@ set.
 The set is faster than a loop, never different from one. At construction each
 member is filed under a literal that every match must contain in a fixed
 place: its final extension (`**/*.rs`), a whole path component
-(`**/node_modules/**`, `dist/**`), or a fixed suffix or prefix. A path then
-asks only the members whose literal it has. A member without such a literal
-— `*`, `**/*x*`, or an extglob — is asked for every path, as a loop would ask
-it; with many of those, `globset`'s regex set is ahead, because this
-crate does not translate globs into a regex
+(`**/node_modules/**`, `dist/**`), or a fixed suffix or prefix. Failing those,
+a member is filed under a literal of two or more bytes that sits between
+wildcards (the `test` of `**/*test*`), which one scan of the path finds. A
+path then asks only the members whose literal it has. A member without any
+such literal — `*`, `**/*x*`, or an extglob — is asked for every path, as a
+loop would ask it; with many of those, `globset`'s regex set is ahead, because
+this crate does not translate globs into a regex
 ([ADR-0013](adr/0013-no-glob-to-regex-translation.md)).
 
 ## Walk filesystems with explicit policy

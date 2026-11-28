@@ -1159,21 +1159,22 @@ the reason the table above is paired.
 
 Wall time per match, same host, one line per benchmark
 (`--output-format bencher`). Both baselines are compiled once outside the timed
-region, as Ferralk's pattern is.
+region, as Ferralk's pattern is. Apple M1 Ultra, macOS 27.2.1, rustc 1.99.1,
+median of three interleaved runs, refreshed 2026-11-28 for #523.
 
 | Benchmark | ferralk | `globset` | `fast-glob` |
 | --- | ---: | ---: | ---: |
-| `common` matching | **11 ns** | 38 ns | 99 ns |
-| `common` non-matching | **3 ns** | 37 ns | 109 ns |
-| `literal` matching | **19 ns** | 38 ns | — |
-| `literal` non-matching | 17 ns | **10 ns** | — |
-| `recursive_casefold` matching | **12 ns** | 28 ns | — |
-| `recursive_casefold` non-matching | **3 ns** | 29 ns | — |
-| `deterministic` matching | 27 ns | **23 ns** | — |
-| `deterministic` non-matching | **12 ns** | 20 ns | — |
-| `long_path` matching | **11 ns** | 196 ns | 548 ns |
-| `long_path` non-matching | **3 ns** | 197 ns | 558 ns |
-| `backtracking` non-matching | **3 ns** | 97 ns | 252 ns |
+| `common` matching | **6 ns** | 37 ns | 106 ns |
+| `common` non-matching | **2 ns** | 36 ns | 116 ns |
+| `literal` matching | **18 ns** | 37 ns | — |
+| `literal` non-matching | **2 ns** | 8 ns | — |
+| `recursive_casefold` matching | **9 ns** | 28 ns | — |
+| `recursive_casefold` non-matching | **2 ns** | 29 ns | — |
+| `deterministic` matching | **16 ns** | 21 ns | — |
+| `deterministic` non-matching | **8 ns** | 18 ns | — |
+| `long_path` matching | **8 ns** | 188 ns | 563 ns |
+| `long_path` non-matching | **2 ns** | 189 ns | 575 ns |
+| `backtracking` non-matching | **3 ns** | 93 ns | 272 ns |
 
 **The last row used to be the one to keep in view.** On a pattern built to force
 backtracking — `a*a*a*a*b` against a run of `a`s — Ferralk ran 1837 ns against
@@ -1199,9 +1200,29 @@ top of it. Every other row of the table above reaches a fast path and is
 unchanged to within a nanosecond; the full before/after listing is in the pull
 request that introduced this.
 
-`globset` is still ahead on a literal non-match and on one deterministic match.
-Everywhere else the byte-first matcher is ahead, most clearly on long paths,
-where the baselines pay for path normalization Ferralk does not do.
+The byte-first matcher is ahead on every row. A literal non-match and a
+deterministic match were the two exceptions: a literal or deterministic
+pattern now rejects a candidate of the wrong length before it reads a token,
+and a bracket class is compiled to a table of the bytes it accepts, so it
+costs one bit test per byte instead of a walk over its members. The margin
+is widest on long paths, where the baselines pay for path normalization
+Ferralk does not do.
+
+**Packed affixes (#523).** Since #521 the fast paths and the prefilter read
+their literals back from the shared tokens instead of keeping a copy, which
+put a dependent load and a token walk in front of even the cheapest
+rejection. A prefix or suffix of up to eight bytes is now packed into a word
+when the pattern compiles and compared with one load, case-folded a word at a
+time for case-insensitive patterns; longer literals keep the token
+comparison. The packed words live inline, so they retain no heap memory. On
+two Linux runs of the issue's workflow (AMD EPYC 9V74 and 7763, three
+rotating rounds each, v1.2.1 against `main` against the change) `common`
+matching was 12% and 14% faster than on v1.2.1, the two rejections in the
+issue stayed within one cycle of v1.2.1, and `general_literal_skip`,
+`general_ir` and `backtracking`, which `main` had slowed by up to 2.4 times,
+came back to within 5% of v1.2.1 or below it. Rows that take a few
+nanoseconds move by a cycle between builds of the same source, so read them
+across both runs. The full listings are in the pull request.
 
 Pattern compilation is measured separately (`compile/*` in the same bench) and
 is not compared against the baselines, whose builders accept different syntax.
@@ -1212,40 +1233,44 @@ is not compared against the baselines, whose builders accept different syntax.
 loop is its before-state and `GlobSet` the external baseline. Every arm asks
 the same 64 root-relative paths; the table divides each run by 64. `globset`
 is built with `literal_separator(true)`, the reading of `is_match_glob_path`.
-Apple M1 Pro, macOS, rustc 1.98.1, one `--output-format bencher` run with every
-arm interleaved, on a host that was loaded (load average 6 to 12), which is why
-only ratios within this run are claimed.
+Apple M1 Ultra, macOS 27.2.1, rustc 1.99.1, median of three interleaved
+`--output-format bencher` runs on a host with a load average of about 2,
+refreshed 2026-11-28 for #523. Only ratios within one run are claimed.
 
 The *keyed* list rotates the shapes long include and exclude lists are made of —
 `**/*.extN`, `dirN/**`, `**/nameN/**`, `**/FileN.txt`, `prefixN*` — so every
 member has a literal extension, component, or prefix. The *unkeyed* list is
-`**/*xNy*` only: a literal with a wildcard on either side, which the set cannot
-index and asks for every path, exactly as the loop does.
+`**/*xNy*` only: a literal with a wildcard on either side and no fixed end.
 
 | Per path | 10 globs | 100 globs | 1000 globs |
 | --- | ---: | ---: | ---: |
-| keyed, any match: loop of `Pattern`s | 86 ns | 779 ns | 7,974 ns |
-| keyed, any match: `PatternSet` | **39 ns** | **49 ns** | **54 ns** |
-| keyed, any match: `GlobSet` | 86 ns | 88 ns | 91 ns |
-| keyed, all matches: `PatternSet` | **41 ns** | **53 ns** | **57 ns** |
-| keyed, all matches: `GlobSet` | 104 ns | 141 ns | 308 ns |
-| unkeyed, any match: loop of `Pattern`s | 122 ns | 1,118 ns | 11,189 ns |
-| unkeyed, any match: `PatternSet` | 122 ns | 1,149 ns | 11,670 ns |
-| unkeyed, any match: `GlobSet` | **52 ns** | **52 ns** | **52 ns** |
-| unkeyed, all matches: `PatternSet` | 134 ns | 1,222 ns | 12,414 ns |
-| unkeyed, all matches: `GlobSet` | **83 ns** | **132 ns** | **517 ns** |
+| keyed, any match: loop of `Pattern`s | 74 ns | 677 ns | 7,131 ns |
+| keyed, any match: `PatternSet` | **29 ns** | **33 ns** | **33 ns** |
+| keyed, any match: `GlobSet` | 74 ns | 75 ns | 75 ns |
+| keyed, all matches: `PatternSet` | **31 ns** | **34 ns** | **34 ns** |
+| keyed, all matches: `GlobSet` | 97 ns | 118 ns | 269 ns |
+| unkeyed, any match: loop of `Pattern`s | 101 ns | 896 ns | 9,303 ns |
+| unkeyed, any match: `PatternSet` | **11 ns** | **12 ns** | **19 ns** |
+| unkeyed, any match: `GlobSet` | 28 ns | 28 ns | 28 ns |
+| unkeyed, all matches: `PatternSet` | **11 ns** | **12 ns** | **19 ns** |
+| unkeyed, all matches: `GlobSet` | 43 ns | 82 ns | 397 ns |
 
 On keyed lists the set is flat in the list length: a path costs one extension
 lookup, one lookup per component, and the few members those lookups name,
-2.2 times less than the loop at 10 globs, 16 times at 100 and 148 times at
+2.6 times less than the loop at 10 globs, 21 times at 100 and 216 times at
 1000, and ahead of `GlobSet` at every size.
-On the unkeyed list the set is the loop plus about 3%, and `GlobSet`'s regex set
-is ahead by the list length. Closing that gap needs a multi-literal substring
-screen (Aho-Corasick, or rolling hashes over the candidate) for interior
-literals; it is not built, because lists made only of infix globs are rare and
-ADR-0013 rules out the regex route. Building a 100-glob keyed set took 97 µs
-against 75 µs to compile the same patterns for a loop and 283 µs for the
-`GlobSet`.
+
+The unkeyed list used to be the loop plus about 3%, with `GlobSet` ahead by
+the list length. A member with no fixed literal is now filed under its
+interior literal when that is two or more bytes long (`x12y` in `**/*x12y*`):
+one scan of the path tests each byte pair against a bitmap of the pairs that
+start a literal, or jumps between their first bytes with `memchr` when there
+are at most three, and asks only the members whose literal it finds. That
+puts the set ahead of `GlobSet` at every size without translating globs into
+a regex ([ADR-0013](adr/0013-no-glob-to-regex-translation.md)). A member
+whose only literal is one byte, such as `**/*x*`, is still asked for every
+path. Building a 100-glob keyed set took 68 µs against 54 µs to compile the
+same patterns for a loop and 259 µs for the `GlobSet`.
 
 ## Limitations
 

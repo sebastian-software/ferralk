@@ -557,7 +557,7 @@ and covered by the cross-platform corpus. See the
   its source: a token per wildcard byte, and for an extglob a program step per
   byte offset of every alternative. A 5 KB pattern that sat inside both other
   budgets compiled to 1.9 GB. A pattern whose compiled program would pass
-  1,048,576 units — roughly 40 MB — is rejected with
+  1,048,576 units — roughly 32 MB — is rejected with
   `pattern compiles to too much`. The dimension is reachable with and without
   extglob syntax, and the boundary is recorded as `error-compiled-ir-*` corpus
   cases (issue #74).

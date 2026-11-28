@@ -46,17 +46,17 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet, hash_map::RandomState},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::RandomState},
     error::Error,
     fmt,
     hash::{BuildHasher, Hasher},
 };
 
-use memchr::memrchr;
+use memchr::{memchr_iter, memchr2_iter, memchr3_iter, memrchr};
 
 use crate::{
     CompiledAlternative, Pattern, PatternError, PatternOptions, Prefilter, Token,
-    has_leading_dot_slash_prefix, next_separator, without_leading_dot_slash,
+    has_leading_dot_slash_prefix, interior_literal, next_separator, without_leading_dot_slash,
 };
 
 /// A list of compiled [`Pattern`]s matched as one, the counterpart of
@@ -73,8 +73,10 @@ use crate::{
 /// possibly satisfy. Literal extensions, whole literal components, and fixed
 /// prefixes and suffixes are indexed once at construction, so a list of
 /// hundreds of `**/*.ext`, `dir/**` and `**/name/**` globs costs a few hash
-/// lookups per path rather than hundreds of matches. Patterns without such a
-/// literal, such as `*` or an extglob, are asked for every path, as they
+/// lookups per path rather than hundreds of matches. A literal that sits
+/// between wildcards, such as the `test` of `**/*test*`, is indexed too, and
+/// found with one scan of the path. Patterns without any literal of two or
+/// more bytes, such as `*` or an extglob, are asked for every path, as they
 /// would be in a loop.
 ///
 /// ```
@@ -540,6 +542,10 @@ enum Key {
     Suffix(Vec<u8>),
     /// The candidate starts with these bytes.
     Prefix(Vec<u8>),
+    /// The candidate contains these bytes somewhere. At least
+    /// [`InteriorIndex::ANCHOR`] bytes long, and the only key that may hold a
+    /// `/`.
+    Contains(Vec<u8>),
 }
 
 impl Key {
@@ -586,7 +592,17 @@ impl Key {
         // `Pattern::is_match` compares a leading `./` literally, so a stripped
         // alternative's first bytes are not where that entry point reads them.
         let prefix = first_component_of_run(&tokens[..leading]);
-        (!stripped && !prefix.is_empty()).then(|| Self::Prefix(prefix.to_vec()))
+        if !stripped && !prefix.is_empty() {
+            return Some(Self::Prefix(prefix.to_vec()));
+        }
+        // The prefilter's interior literal: every match holds these bytes
+        // contiguously, wherever the wildcards around them put it. It is read
+        // from the same tokens the path entry points match, so it holds for
+        // all three, and it never holds a separator a platform spells twice.
+        let (_, _, elidable_separator) = Prefilter::fixed_run_bounds(tokens);
+        interior_literal(tokens, leading, trailing, elidable_separator)
+            .filter(|needle| needle.len() >= InteriorIndex::ANCHOR)
+            .map(Self::Contains)
     }
 }
 
@@ -821,11 +837,15 @@ struct KeyIndex {
     suffixes: MemberTrie,
     /// Forward-byte compressed affix trie for prefix keys.
     prefixes: MemberTrie,
+    /// Interior literals, found by one scan of the candidate.
+    contains: InteriorIndex,
 }
 
 struct KeyIndexBuilder {
     extensions: KeyMap,
     components: KeyMap,
+    /// Sorted, so needles sharing their first bytes end up side by side.
+    contains: BTreeMap<Vec<u8>, Vec<usize>>,
     /// Deduplicates `(affix, member_index)` as patterns are inserted so many
     /// brace arms sharing the same prefix/suffix retain one key copy before
     /// the flat [`MemberTrie`] is assembled.
@@ -840,15 +860,28 @@ impl KeyIndexBuilder {
             components: KeyMap::with_hasher(hasher),
             suffixes: KeyMap::with_hasher(hasher),
             prefixes: KeyMap::with_hasher(hasher),
+            contains: BTreeMap::new(),
         }
     }
 
     fn insert(&mut self, key: Key, index: usize, fold: bool) {
+        if let Key::Contains(mut needle) = key {
+            if fold {
+                needle.make_ascii_lowercase();
+            }
+            let members = self.contains.entry(needle).or_default();
+            // Members are inserted in index order, so a repeat is the last entry.
+            if members.last() != Some(&index) {
+                members.push(index);
+            }
+            return;
+        }
         let (target, mut bytes) = match key {
             Key::Extension(bytes) => (&mut self.extensions, bytes),
             Key::Component(bytes) => (&mut self.components, bytes),
             Key::Suffix(bytes) => (&mut self.suffixes, bytes),
             Key::Prefix(bytes) => (&mut self.prefixes, bytes),
+            Key::Contains(_) => unreachable!("interior keys are filed above"),
         };
         if fold {
             bytes.make_ascii_lowercase();
@@ -864,7 +897,109 @@ impl KeyIndexBuilder {
             components: self.components,
             suffixes: MemberTrie::build_from_map(self.suffixes, true),
             prefixes: MemberTrie::build_from_map(self.prefixes, false),
+            contains: InteriorIndex::build(self.contains),
         }
+    }
+}
+
+/// Interior literals and the members that filed them.
+///
+/// A candidate is scanned once: every position whose two bytes start some
+/// needle is looked up in a bitmap of those pairs, and only a hit compares
+/// the needles that start with them. A path with no such pair costs one bit
+/// test per byte, whatever the number of needles.
+#[derive(Debug, Clone, Default)]
+struct InteriorIndex {
+    /// One bit per byte pair that starts a needle; empty without needles.
+    anchors: Box<[u64]>,
+    /// Needles in byte order, so the ones sharing an anchor are adjacent.
+    needles: Box<[InteriorNeedle]>,
+    /// The distinct first bytes of the needles when there are at most three,
+    /// so the scan can jump between them with `memchr` instead of testing
+    /// every position.
+    first_bytes: Option<Box<[u8]>>,
+}
+
+#[derive(Debug, Clone)]
+struct InteriorNeedle {
+    bytes: Box<[u8]>,
+    members: Box<[usize]>,
+}
+
+impl InteriorIndex {
+    /// The bytes a needle is found by, and so its minimum length. One byte
+    /// would select far too many candidates to be worth an index.
+    const ANCHOR: usize = 2;
+
+    fn anchor(pair: [u8; Self::ANCHOR]) -> usize {
+        usize::from(u16::from_be_bytes(pair))
+    }
+
+    fn build(needles: BTreeMap<Vec<u8>, Vec<usize>>) -> Self {
+        if needles.is_empty() {
+            return Self::default();
+        }
+        let mut anchors = vec![0; (1 << 16) / 64].into_boxed_slice();
+        let mut first_bytes = Vec::new();
+        let needles = needles
+            .into_iter()
+            .map(|(bytes, members)| {
+                // Sorted needles group their first bytes together.
+                if first_bytes.last() != Some(&bytes[0]) {
+                    first_bytes.push(bytes[0]);
+                }
+                let anchor = Self::anchor([bytes[0], bytes[1]]);
+                anchors[anchor / 64] |= 1 << (anchor % 64);
+                InteriorNeedle {
+                    bytes: bytes.into_boxed_slice(),
+                    members: members.into_boxed_slice(),
+                }
+            })
+            .collect();
+        Self {
+            anchors,
+            needles,
+            first_bytes: (first_bytes.len() <= 3).then(|| first_bytes.into_boxed_slice()),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.needles.is_empty()
+    }
+
+    fn find(&self, view: &[u8], visit: &mut impl FnMut(usize) -> bool) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        // A needle can start no later than `ANCHOR` bytes before the end.
+        let Some(last_start) = view.len().checked_sub(Self::ANCHOR) else {
+            return false;
+        };
+        let try_at = |start: usize| {
+            let anchor = Self::anchor([view[start], view[start + 1]]);
+            self.anchors[anchor / 64] & (1 << (anchor % 64)) != 0
+                && self.visit_anchor(&view[start..], visit)
+        };
+        let starts = &view[..=last_start];
+        match self.first_bytes.as_deref() {
+            Some(&[a]) => memchr_iter(a, starts).any(try_at),
+            Some(&[a, b]) => memchr2_iter(a, b, starts).any(try_at),
+            Some(&[a, b, c]) => memchr3_iter(a, b, c, starts).any(try_at),
+            _ => (0..=last_start).any(try_at),
+        }
+    }
+
+    #[inline(never)]
+    fn visit_anchor(&self, rest: &[u8], visit: &mut impl FnMut(usize) -> bool) -> bool {
+        let pair = &rest[..Self::ANCHOR];
+        let first = self
+            .needles
+            .partition_point(|needle| needle.bytes[..Self::ANCHOR] < *pair);
+        self.needles[first..]
+            .iter()
+            .take_while(|needle| needle.bytes[..Self::ANCHOR] == *pair)
+            .filter(|needle| rest.starts_with(&needle.bytes))
+            .any(|needle| visit_member_slice(&needle.members, visit))
     }
 }
 
@@ -1162,6 +1297,7 @@ impl KeyIndex {
             && self.components.is_empty()
             && self.suffixes.is_empty()
             && self.prefixes.is_empty()
+            && self.contains.is_empty()
     }
 
     /// Visits the members of every key `view` satisfies, until `visit` returns
@@ -1193,7 +1329,10 @@ impl KeyIndex {
         if self.suffixes.find_suffix(view, visit) {
             return true;
         }
-        self.prefixes.find_prefix(view, visit)
+        if self.prefixes.find_prefix(view, visit) {
+            return true;
+        }
+        self.contains.find(view, visit)
     }
 }
 
@@ -1530,6 +1669,86 @@ mod tests {
         assert_eq!(set.exact.prefixes.len(), 1);
         // `*` has no literal, and an extglob program is not read from tokens.
         assert_eq!(set.always, [7, 8]);
+    }
+
+    #[test]
+    fn interior_literals_are_keyed_and_answer_like_their_members() {
+        let globs = [
+            "**/*test*",
+            "**/*x12y*",
+            "*ab*",
+            "**/*a/b*",
+            "./**/*mid*",
+            "**/*q*",
+            "*[ab]cd?*",
+            "**/*TeSt*",
+        ];
+        let sensitive = PatternOptions::walker();
+        let folded = sensitive.case_insensitive(true);
+        let patterns = globs
+            .iter()
+            .enumerate()
+            .map(|(index, glob)| {
+                let options = if index == globs.len() - 1 {
+                    folded
+                } else {
+                    sensitive
+                };
+                Pattern::compile(glob, options).expect("the glob is valid")
+            })
+            .collect::<Vec<_>>();
+        let set = patterns.iter().cloned().collect::<PatternSet>();
+        // `**/*q*` has only a one-byte literal, too unselective to index. On
+        // Windows a separator also matches `\`, so `a/b` is two one-byte
+        // literals there and joins it.
+        let (exact_needles, always) = if cfg!(windows) {
+            (5, &[3, 5][..])
+        } else {
+            (6, &[5][..])
+        };
+        assert_eq!(set.exact.contains.needles.len(), exact_needles);
+        assert_eq!(set.folded.contains.needles.len(), 1);
+        assert_eq!(set.always, always);
+        for path in [
+            "src/test.rs",
+            "src/unit_test/main.rs",
+            "docs/x12y.md",
+            "x12/y",
+            "ab",
+            "a",
+            "dir/a/b",
+            "dira/bfile",
+            "a/b",
+            "./mid",
+            "deep/./mid.rs",
+            "sub/xmidx",
+            "q",
+            "zcd!",
+            "acd",
+            "src/TEST.RS",
+            "src/Tes/t",
+            "",
+            "./",
+            "x1",
+        ] {
+            assert_set_agrees(&set, &patterns, path.as_bytes(), &|| path.to_owned());
+        }
+        // One, two and three distinct first bytes take the `memchr` scan.
+        for globs in [
+            &["**/*ab*", "**/*ac*"][..],
+            &["**/*ab*", "**/*bc*"],
+            &["**/*ab*", "**/*bc*", "**/*cd*"],
+        ] {
+            let patterns = globs
+                .iter()
+                .map(|glob| Pattern::compile(glob, sensitive).expect("the glob is valid"))
+                .collect::<Vec<_>>();
+            let set = patterns.iter().cloned().collect::<PatternSet>();
+            assert!(set.exact.contains.first_bytes.is_some());
+            for path in ["ab", "xab", "a/b", "zzbc", "ccd/x", "c", "", "bca"] {
+                assert_set_agrees(&set, &patterns, path.as_bytes(), &|| path.to_owned());
+            }
+        }
     }
 
     #[test]
