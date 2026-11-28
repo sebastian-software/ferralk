@@ -52,7 +52,7 @@ use std::{
     hash::{BuildHasher, Hasher},
 };
 
-use memchr::memrchr;
+use memchr::{memchr_iter, memchr2_iter, memchr3_iter, memrchr};
 
 use crate::{
     CompiledAlternative, Pattern, PatternError, PatternOptions, Prefilter, Token,
@@ -914,6 +914,10 @@ struct InteriorIndex {
     anchors: Box<[u64]>,
     /// Needles in byte order, so the ones sharing an anchor are adjacent.
     needles: Box<[InteriorNeedle]>,
+    /// The distinct first bytes of the needles when there are at most three,
+    /// so the scan can jump between them with `memchr` instead of testing
+    /// every position.
+    first_bytes: Option<Box<[u8]>>,
 }
 
 #[derive(Debug, Clone)]
@@ -936,9 +940,14 @@ impl InteriorIndex {
             return Self::default();
         }
         let mut anchors = vec![0; (1 << 16) / 64].into_boxed_slice();
+        let mut first_bytes = Vec::new();
         let needles = needles
             .into_iter()
             .map(|(bytes, members)| {
+                // Sorted needles group their first bytes together.
+                if first_bytes.last() != Some(&bytes[0]) {
+                    first_bytes.push(bytes[0]);
+                }
                 let anchor = Self::anchor([bytes[0], bytes[1]]);
                 anchors[anchor / 64] |= 1 << (anchor % 64);
                 InteriorNeedle {
@@ -947,7 +956,11 @@ impl InteriorIndex {
                 }
             })
             .collect();
-        Self { anchors, needles }
+        Self {
+            anchors,
+            needles,
+            first_bytes: (first_bytes.len() <= 3).then(|| first_bytes.into_boxed_slice()),
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -958,16 +971,22 @@ impl InteriorIndex {
         if self.is_empty() {
             return false;
         }
-        for (start, pair) in view.windows(Self::ANCHOR).enumerate() {
-            let anchor = Self::anchor([pair[0], pair[1]]);
-            if self.anchors[anchor / 64] & (1 << (anchor % 64)) == 0 {
-                continue;
-            }
-            if self.visit_anchor(&view[start..], visit) {
-                return true;
-            }
+        // A needle can start no later than `ANCHOR` bytes before the end.
+        let Some(last_start) = view.len().checked_sub(Self::ANCHOR) else {
+            return false;
+        };
+        let try_at = |start: usize| {
+            let anchor = Self::anchor([view[start], view[start + 1]]);
+            self.anchors[anchor / 64] & (1 << (anchor % 64)) != 0
+                && self.visit_anchor(&view[start..], visit)
+        };
+        let starts = &view[..=last_start];
+        match self.first_bytes.as_deref() {
+            Some(&[a]) => memchr_iter(a, starts).any(try_at),
+            Some(&[a, b]) => memchr2_iter(a, b, starts).any(try_at),
+            Some(&[a, b, c]) => memchr3_iter(a, b, c, starts).any(try_at),
+            _ => (0..=last_start).any(try_at),
         }
-        false
     }
 
     #[inline(never)]
@@ -1706,6 +1725,22 @@ mod tests {
             "x1",
         ] {
             assert_set_agrees(&set, &patterns, path.as_bytes(), &|| path.to_owned());
+        }
+        // One, two and three distinct first bytes take the `memchr` scan.
+        for globs in [
+            &["**/*ab*", "**/*ac*"][..],
+            &["**/*ab*", "**/*bc*"],
+            &["**/*ab*", "**/*bc*", "**/*cd*"],
+        ] {
+            let patterns = globs
+                .iter()
+                .map(|glob| Pattern::compile(glob, sensitive).expect("the glob is valid"))
+                .collect::<Vec<_>>();
+            let set = patterns.iter().cloned().collect::<PatternSet>();
+            assert!(set.exact.contains.first_bytes.is_some());
+            for path in ["ab", "xab", "a/b", "zzbc", "ccd/x", "c", "", "bca"] {
+                assert_set_agrees(&set, &patterns, path.as_bytes(), &|| path.to_owned());
+            }
         }
     }
 
