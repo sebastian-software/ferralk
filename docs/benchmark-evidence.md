@@ -1170,8 +1170,8 @@ median of three interleaved runs, refreshed 2026-11-28 for #523.
 | `literal` non-matching | **2 ns** | 8 ns | — |
 | `recursive_casefold` matching | **9 ns** | 28 ns | — |
 | `recursive_casefold` non-matching | **2 ns** | 29 ns | — |
-| `deterministic` matching | 30 ns | **21 ns** | — |
-| `deterministic` non-matching | **13 ns** | 18 ns | — |
+| `deterministic` matching | **16 ns** | 21 ns | — |
+| `deterministic` non-matching | **8 ns** | 18 ns | — |
 | `long_path` matching | **8 ns** | 188 ns | 563 ns |
 | `long_path` non-matching | **2 ns** | 189 ns | 575 ns |
 | `backtracking` non-matching | **3 ns** | 93 ns | 272 ns |
@@ -1200,11 +1200,13 @@ top of it. Every other row of the table above reaches a fast path and is
 unchanged to within a nanosecond; the full before/after listing is in the pull
 request that introduced this.
 
-`globset` is still ahead on one deterministic match. A literal non-match used
-to be the other such row; a literal or deterministic pattern now rejects a
-candidate of the wrong length before it reads a token. Everywhere else the
-byte-first matcher is ahead, most clearly on long paths, where the baselines
-pay for path normalization Ferralk does not do.
+The byte-first matcher is ahead on every row. A literal non-match and a
+deterministic match were the two exceptions: a literal or deterministic
+pattern now rejects a candidate of the wrong length before it reads a token,
+and a bracket class is compiled to a table of the bytes it accepts, so it
+costs one bit test per byte instead of a walk over its members. The margin
+is widest on long paths, where the baselines pay for path normalization
+Ferralk does not do.
 
 **Packed affixes (#523).** Since #521 the fast paths and the prefilter read
 their literals back from the shared tokens instead of keeping a copy, which

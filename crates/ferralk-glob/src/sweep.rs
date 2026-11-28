@@ -25,7 +25,10 @@
 
 use std::sync::Arc;
 
-use crate::{IrBudget, PatternError, PatternOptions, TOO_MUCH_COMPILED_IR, Token, is_separator};
+use crate::{
+    IR_UNIT_BYTES, IrBudget, PatternError, PatternOptions, TOO_MUCH_COMPILED_IR, Token,
+    is_separator,
+};
 
 /// Most byte-consuming positions the single-register sweep may hold.
 ///
@@ -41,7 +44,7 @@ const MAX_NARROW_POSITIONS: usize = 63;
 /// [`Token`]-sized units, the currency the budget already counts, whichever
 /// column width it is stored at. The value is pinned by a test: it decides
 /// which patterns fit the budget.
-const NARROW_IR_UNITS: usize = size_of::<NarrowSweepEngine<u64>>().div_ceil(size_of::<Token>());
+const NARROW_IR_UNITS: usize = size_of::<NarrowSweepEngine<u64>>().div_ceil(IR_UNIT_BYTES);
 
 /// Persistent and temporary word rows allocated while compiling a wide sweep.
 ///
@@ -824,7 +827,7 @@ impl WideSweepEngine {
         let peak_bytes = peak_words
             .checked_mul(size_of::<u64>())
             .ok_or_else(|| PatternError::new(0, TOO_MUCH_COMPILED_IR))?;
-        budget.charge(peak_bytes.div_ceil(size_of::<Token>()), 0)
+        budget.charge(peak_bytes.div_ceil(IR_UNIT_BYTES), 0)
     }
 
     fn build(

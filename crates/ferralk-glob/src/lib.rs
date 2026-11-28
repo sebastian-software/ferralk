@@ -923,17 +923,18 @@ impl Pattern {
                 b'[' => {
                     flush_literals(&mut tokens, &mut literals);
                     let (class, next) =
-                        parse_class(pattern, index, options.escape).map_err(|mut error| {
-                            if let Some(source_offset) = walker_source_provenance
-                                .and_then(|provenance| provenance.offset_at(error.offset))
-                            {
-                                error.offset = source_offset;
-                            }
-                            error
-                        })?;
+                        parse_class(pattern, index, options.escape, options.case_insensitive)
+                            .map_err(|mut error| {
+                                if let Some(source_offset) = walker_source_provenance
+                                    .and_then(|provenance| provenance.offset_at(error.offset))
+                                {
+                                    error.offset = source_offset;
+                                }
+                                error
+                            })?;
                     // A class token owns its member list, so it costs more than
                     // the one unit the loop charges for the token itself.
-                    budget.charge(class.members.len(), 0)?;
+                    budget.charge(class.member_units(), 0)?;
                     tokens.push(Token::Class(class));
                     walker_path.wildcard();
                     index = next;
@@ -2561,10 +2562,7 @@ fn cloned_tokens_retained_bytes(tokens: &[Token]) -> usize {
                 .iter()
                 .map(|token| match token {
                     Token::Literal(literal) => literal.capacity(),
-                    Token::Class(class) => class
-                        .members
-                        .capacity()
-                        .saturating_mul(size_of::<ClassMember>()),
+                    Token::Class(_) => Class::RETAINED_BYTES,
                     _ => 0,
                 })
                 .sum::<usize>(),
@@ -5000,25 +4998,148 @@ fn path_after_base<'a>(base_path: &[u8], path: &'a [u8]) -> Option<&'a [u8]> {
         .or_else(|| cfg!(windows).then(|| suffix.strip_prefix(b"\\")).flatten())
 }
 
+/// A bracket expression, compiled to the bytes it accepts.
+///
+/// Matching is one bit test per candidate byte. The table is built for the
+/// case policy the pattern compiles with, which is the policy every entry
+/// point matches under. The folded set is not the plain one widened by case: a
+/// range is compared after folding its ends, so `[Z-a]` accepts seven bytes as
+/// written and none folded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Class {
-    negated: bool,
-    members: Vec<ClassMember>,
+    /// Accepted bytes, negation applied.
+    accepts: Box<ByteSet>,
+    /// Members as written, which is what the IR budget charges for.
+    members: u32,
+    case_insensitive: bool,
 }
 
-impl Class {
-    fn matches(&self, byte: u8, case_insensitive: bool) -> bool {
-        let included = self.members.iter().any(|member| match member {
-            ClassMember::Byte(expected) => bytes_equal(*expected, byte, case_insensitive),
-            ClassMember::Range(start, end) => {
-                let byte = fold_ascii(byte, case_insensitive);
-                let start = fold_ascii(*start, case_insensitive);
-                let end = fold_ascii(*end, case_insensitive);
-                start <= byte && byte <= end
+/// One bit per byte value.
+type ByteSet = [u64; 4];
+
+/// `A`..=`Z` and `a`..=`z` in the second word of a [`ByteSet`].
+const ASCII_UPPERCASE_BITS: u64 = ((1 << 26) - 1) << (b'A' - 64);
+const ASCII_LOWERCASE_BITS: u64 = ASCII_UPPERCASE_BITS << 32;
+
+/// The bytes `start..=end`, empty when `start > end`.
+fn byte_range(start: u8, end: u8) -> ByteSet {
+    let mut set = [0; 4];
+    for (index, word) in set.iter_mut().enumerate() {
+        let low = index * 64;
+        let (start, end) = (usize::from(start).max(low), usize::from(end).min(low + 63));
+        if start <= end {
+            *word = (u64::MAX >> (63 - (end - start))) << (start - low);
+        }
+    }
+    set
+}
+
+/// Every POSIX class as a [`ByteSet`] per case policy, indexed by variant.
+const POSIX_ACCEPTS: [[ByteSet; 2]; 14] = {
+    let classes = [
+        PosixClass::Alnum,
+        PosixClass::Alpha,
+        PosixClass::Ascii,
+        PosixClass::Blank,
+        PosixClass::Cntrl,
+        PosixClass::Digit,
+        PosixClass::Graph,
+        PosixClass::Lower,
+        PosixClass::Print,
+        PosixClass::Punct,
+        PosixClass::Space,
+        PosixClass::Upper,
+        PosixClass::Word,
+        PosixClass::Xdigit,
+    ];
+    let mut table = [[[0; 4]; 2]; 14];
+    let mut index = 0;
+    while index < classes.len() {
+        assert!(classes[index] as usize == index);
+        let mut fold = 0;
+        while fold < 2 {
+            let mut byte = 0_usize;
+            while byte < 256 {
+                if classes[index].matches(byte as u8, fold == 1) {
+                    table[index][fold][byte >> 6] |= 1 << (byte & 63);
+                }
+                byte += 1;
             }
-            ClassMember::Posix(class) => class.matches(byte, case_insensitive),
-        });
-        included != self.negated
+            fold += 1;
+        }
+        index += 1;
+    }
+    table
+};
+
+impl Class {
+    /// Retained heap bytes per class.
+    const RETAINED_BYTES: usize = size_of::<ByteSet>();
+
+    /// Builds the tables in constant time per member, so a class of many
+    /// members costs what the budget charges for it.
+    fn new(negated: bool, members: &[ClassMember], case_insensitive: bool) -> Self {
+        fn insert(set: &mut ByteSet, byte: u8) {
+            set[usize::from(byte >> 6)] |= 1 << (byte & 63);
+        }
+        fn union(set: &mut ByteSet, other: ByteSet) {
+            for (word, other) in set.iter_mut().zip(other) {
+                *word |= other;
+            }
+        }
+        let [mut exact, mut folded] = [[0_u64; 4]; 2];
+        for member in members {
+            match *member {
+                ClassMember::Byte(byte) => {
+                    insert(&mut exact, byte);
+                    insert(&mut folded, byte.to_ascii_lowercase());
+                    insert(&mut folded, byte.to_ascii_uppercase());
+                }
+                ClassMember::Range(start, end) => {
+                    union(&mut exact, byte_range(start, end));
+                    // A byte is accepted when its folded value falls between
+                    // the folded ends: every value in there that is not an
+                    // uppercase letter, and the uppercase twin of every
+                    // lowercase one. Both letter runs sit in the second word,
+                    // 32 bits apart.
+                    let mut range =
+                        byte_range(start.to_ascii_lowercase(), end.to_ascii_lowercase());
+                    range[1] &= !ASCII_UPPERCASE_BITS;
+                    range[1] |= (range[1] & ASCII_LOWERCASE_BITS) >> 32;
+                    union(&mut folded, range);
+                }
+                ClassMember::Posix(class) => {
+                    let [plain, case_folded] = POSIX_ACCEPTS[class as usize];
+                    union(&mut exact, plain);
+                    union(&mut folded, case_folded);
+                }
+            }
+        }
+        let mut accepts = if case_insensitive { folded } else { exact };
+        if negated {
+            for word in &mut accepts {
+                *word = !*word;
+            }
+        }
+        Self {
+            accepts: Box::new(accepts),
+            members: u32::try_from(members.len()).unwrap_or(u32::MAX),
+            case_insensitive,
+        }
+    }
+
+    #[inline(always)]
+    fn matches(&self, byte: u8, case_insensitive: bool) -> bool {
+        debug_assert_eq!(
+            self.case_insensitive, case_insensitive,
+            "a class is matched under the case policy it was built for"
+        );
+        self.accepts[usize::from(byte >> 6)] >> (byte & 63) & 1 != 0
+    }
+
+    /// The units the IR budget charges for this class's members.
+    fn member_units(&self) -> usize {
+        self.members as usize
     }
 }
 
@@ -5080,7 +5201,7 @@ enum PosixClass {
 const MAX_POSIX_CLASS_NAME_LEN: usize = 6;
 
 impl PosixClass {
-    fn matches(self, byte: u8, case_insensitive: bool) -> bool {
+    const fn matches(self, byte: u8, case_insensitive: bool) -> bool {
         match self {
             Self::Alnum => byte.is_ascii_alphanumeric(),
             Self::Alpha => byte.is_ascii_alphabetic(),
@@ -5105,6 +5226,7 @@ fn parse_class(
     pattern: &[u8],
     start: usize,
     escapes: bool,
+    case_insensitive: bool,
 ) -> Result<(Class, usize), PatternError> {
     let mut index = start + 1;
     let mut negated = false;
@@ -5134,13 +5256,9 @@ fn parse_class(
                 });
             }
             return Ok((
-                Class {
-                    negated,
-                    members: {
-                        members.extend(class_members(values));
-                        members.shrink_to_fit();
-                        members
-                    },
+                {
+                    members.extend(class_members(values));
+                    Class::new(negated, &members, case_insensitive)
                 },
                 index + 1,
             ));
@@ -5869,12 +5987,19 @@ const MAX_BRACE_EXPANSION_BYTES: usize = 1 << 26;
 /// list, so it is charged for both. Affix tries charge their temporary builder
 /// and flattened node/edge representation together at the construction peak.
 /// The transition charge bounds the product of exact extglob arms without
-/// adding a separate viability limit. [`Token`] is 32 bytes and
-/// [`ExtglobStep`] is 40, pinned by a test so this arithmetic cannot go stale,
-/// which puts the ceiling around 40 MB of compiled program and tens of
-/// milliseconds of work. That is orders of magnitude past any real pattern:
+/// adding a separate viability limit. A unit is reckoned at
+/// [`IR_UNIT_BYTES`], and a [`Token`] and an [`ExtglobStep`] each fit in one,
+/// pinned by a test so this arithmetic cannot go stale, which puts the ceiling
+/// around 32 MB of compiled program and tens of milliseconds of work. A class
+/// keeps a table of the bytes it accepts that fits in the unit charged for
+/// its first member. That is orders of magnitude past any real pattern:
 /// a language's extension list against a path glob is a few hundred units.
 const MAX_COMPILED_IR_UNITS: usize = 1 << 20;
+
+/// The bytes one compiled unit stands for, where a charge is derived from a
+/// byte count rather than counted in tokens. Fixed rather than read off
+/// [`Token`], so a smaller token never moves which patterns compile.
+pub(crate) const IR_UNIT_BYTES: usize = 32;
 
 /// Tracks compiled units across every alternative of one [`Pattern::compile`].
 ///
@@ -6461,7 +6586,7 @@ fn source_classes_are_stable_and_valid(pattern: &[u8], escapes: bool) -> bool {
             b'{' => brace_depth += 1,
             b'}' => brace_depth = brace_depth.saturating_sub(1),
             b'[' => {
-                let Ok((_, next)) = parse_class(pattern, index, escapes) else {
+                let Ok((_, next)) = parse_class(pattern, index, escapes, false) else {
                     return false;
                 };
                 let mut class_index = index + 1;
@@ -6700,8 +6825,8 @@ fn compiled_ir_lower_bound(pattern: &[u8], options: PatternOptions) -> Option<us
         match pattern[index] {
             b'\\' if options.escape => index += usize::from(index + 1 < pattern.len()) + 1,
             b'[' => {
-                let (class, next) = parse_class(pattern, index, options.escape).ok()?;
-                units = units.saturating_add(1 + class.members.len());
+                let (class, next) = parse_class(pattern, index, options.escape, false).ok()?;
+                units = units.saturating_add(1 + class.member_units());
                 index = next;
             }
             b'?' => {
@@ -8549,7 +8674,7 @@ fn compile_extglob_step(
         b'?' => ExtglobStep::Any,
         // An unparseable class never matched and was never read as a literal
         // bracket either: its arm had no guard to fall through.
-        b'[' => match parse_class(pattern, index, options.escape) {
+        b'[' => match parse_class(pattern, index, options.escape, options.case_insensitive) {
             Ok((class, next)) => ExtglobStep::Class { class, next },
             Err(_) => ExtglobStep::NoMatch,
         },
@@ -12513,26 +12638,101 @@ mod tests {
     }
 
     #[test]
+    fn class_tables_accept_what_their_members_do() {
+        use super::{Class, ClassMember, PosixClass};
+        // The member-by-member reading the tables replace.
+        fn reference(negated: bool, members: &[ClassMember], byte: u8, fold: bool) -> bool {
+            let fold_byte = |byte: u8| {
+                if fold {
+                    byte.to_ascii_lowercase()
+                } else {
+                    byte
+                }
+            };
+            let included = members.iter().any(|member| match *member {
+                ClassMember::Byte(expected) => fold_byte(expected) == fold_byte(byte),
+                ClassMember::Range(start, end) => {
+                    (fold_byte(start)..=fold_byte(end)).contains(&fold_byte(byte))
+                }
+                ClassMember::Posix(class) => class.matches(byte, fold),
+            });
+            included != negated
+        }
+        let edges = [
+            0, b'-', b'0', b'9', b'@', b'A', b'M', b'Z', b'[', b'`', b'a', b'm', b'z', b'{', 0x7f,
+            0x80, 0xc4, 0xff,
+        ];
+        let posix = [
+            PosixClass::Alnum,
+            PosixClass::Alpha,
+            PosixClass::Ascii,
+            PosixClass::Blank,
+            PosixClass::Cntrl,
+            PosixClass::Digit,
+            PosixClass::Graph,
+            PosixClass::Lower,
+            PosixClass::Print,
+            PosixClass::Punct,
+            PosixClass::Space,
+            PosixClass::Upper,
+            PosixClass::Word,
+            PosixClass::Xdigit,
+        ];
+        let mut cases = Vec::new();
+        cases.extend((0..=u8::MAX).map(|byte| vec![ClassMember::Byte(byte)]));
+        for &start in &edges {
+            for &end in &edges {
+                cases.push(vec![ClassMember::Range(start, end)]);
+            }
+        }
+        cases.extend(posix.iter().map(|&class| vec![ClassMember::Posix(class)]));
+        cases.push(vec![
+            ClassMember::Byte(b'_'),
+            ClassMember::Range(b'Z', b'a'),
+            ClassMember::Posix(PosixClass::Upper),
+            ClassMember::Range(b'0', b'9'),
+        ]);
+        for members in &cases {
+            for negated in [false, true] {
+                for fold in [false, true] {
+                    let class = Class::new(negated, members, fold);
+                    for byte in 0..=u8::MAX {
+                        assert_eq!(
+                            class.matches(byte, fold),
+                            reference(negated, members, byte, fold),
+                            "{members:?} negated={negated} fold={fold} byte={byte:#04x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn compiled_unit_sizes_match_what_the_budget_documents() {
         // The ceiling is expressed in units, and its documentation converts
         // that to memory. If a unit grows, the documented ceiling silently
         // becomes a larger one.
-        assert_eq!(
-            size_of::<Token>(),
-            32,
-            "Token grew; the budget doc is stale"
+        assert!(
+            size_of::<Token>() <= super::IR_UNIT_BYTES,
+            "Token outgrew its unit; the budget doc is stale"
         );
-        assert_eq!(
-            size_of::<super::ExtglobStep>(),
-            40,
-            "ExtglobStep grew; the budget doc is stale"
+        assert!(
+            size_of::<super::ExtglobStep>() <= super::IR_UNIT_BYTES,
+            "ExtglobStep outgrew its unit; the budget doc is stale"
         );
+        const {
+            assert!(
+                super::Class::RETAINED_BYTES <= super::IR_UNIT_BYTES,
+                "a class table outgrew the unit its member is charged"
+            );
+        }
         assert!(
             size_of::<super::BuildingAffixNode>()
                 + size_of::<(u8, usize)>()
                 + size_of::<super::AffixNode>()
                 + size_of::<super::AffixEdge>()
-                <= 3 * size_of::<Token>(),
+                <= 3 * super::IR_UNIT_BYTES,
             "affix-trie construction outgrew its three-unit charge"
         );
     }
