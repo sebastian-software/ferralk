@@ -975,7 +975,7 @@ impl Pattern {
         let tokens = tokens.into_boxed_slice();
         ensure_retained_alternative_bytes(&tokens, budget)?;
         let fast_path = FastPath::compile(&tokens, options);
-        let prefilter = Prefilter::compile(&tokens);
+        let prefilter = Prefilter::compile(&tokens, options.case_insensitive);
         charge_retained_alternative_bytes(&tokens, &fast_path, &prefilter, budget)?;
         let sweep = if defer_sweeps {
             None
@@ -1608,7 +1608,7 @@ impl Pattern {
             )
             .filter(FastPath::supports_component_wildcards)
         };
-        let prefilter = Prefilter::compile(&tokens);
+        let prefilter = Prefilter::compile(&tokens, options.case_insensitive);
         charge_retained_alternative_bytes(&tokens, &fast_path, &prefilter, budget)?;
         let extglob = if options.extglob && alternative.extglob.is_some() {
             let mut provenance_budget = ProvenanceBudget::new();
@@ -2644,7 +2644,7 @@ fn compile_sweep(
     if extglob.is_some()
         || matches!(
             fast_path,
-            Some(FastPath::LiteralTokens | FastPath::DeterministicTokens)
+            Some(FastPath::LiteralTokens { .. } | FastPath::DeterministicTokens { .. })
         )
     {
         return Ok(None);
@@ -2704,7 +2704,7 @@ fn sweep_is_deferred(alternative: &CompiledAlternative) -> bool {
             fast_path.supports_component_wildcards()
                 && !matches!(
                     fast_path,
-                    FastPath::LiteralTokens | FastPath::DeterministicTokens
+                    FastPath::LiteralTokens { .. } | FastPath::DeterministicTokens { .. }
                 )
         })
 }
@@ -2737,6 +2737,12 @@ fn sweep_is_deferred(alternative: &CompiledAlternative) -> bool {
 /// fixed end, yet every match contains `node_modules`. See [`InteriorLiteral`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Prefilter {
+    /// The leading and trailing runs packed into a word each when they fit,
+    /// so most rejections never read the runs back from `tokens`. Packed for
+    /// the case policy the pattern was compiled with; a call under the other
+    /// policy compares the tokens.
+    prefix_word: WordLiteral,
+    suffix_word: WordLiteral,
     /// Leading `Literal`/`Separator` token count every match starts with.
     leading_tokens: usize,
     /// Byte length of `tokens[..leading_tokens]`.
@@ -2815,13 +2821,23 @@ impl Prefilter {
         (leading, trailing, elidable_separator)
     }
 
-    fn compile(tokens: &[Token]) -> Self {
+    fn compile(tokens: &[Token], case_insensitive: bool) -> Self {
         let (leading_tokens, trailing_tokens, elidable_separator) = Self::fixed_run_bounds(tokens);
         let prefix_len = run_byte_len(&tokens[..leading_tokens]);
         let suffix_len = run_byte_len(&tokens[tokens.len() - trailing_tokens..]);
         let min_length =
             tokens.iter().map(token_min_length).sum::<usize>() - usize::from(elidable_separator);
         let prefilter = Self {
+            prefix_word: pack_static_tokens(
+                &tokens[..leading_tokens],
+                case_insensitive,
+                WordLiteral::prefix,
+            ),
+            suffix_word: pack_static_tokens(
+                &tokens[tokens.len() - trailing_tokens..],
+                case_insensitive,
+                WordLiteral::suffix,
+            ),
             leading_tokens,
             prefix_len,
             trailing_tokens,
@@ -2854,22 +2870,35 @@ impl Prefilter {
         if path.len() < self.min_length {
             return true;
         }
-        if self.leading_tokens != 0
-            && !run_matches_tokens(
-                &tokens[..self.leading_tokens],
-                &path[..self.prefix_len],
-                case_insensitive,
-            )
-        {
-            return true;
-        }
+        // The trailing run first: candidates are told apart by their
+        // extension far more often than by their directory.
         if self.trailing_tokens != 0 {
-            let tail = path.len() - self.suffix_len;
-            if !run_matches_tokens(
-                &tokens[tokens.len() - self.trailing_tokens..],
-                &path[tail..],
-                case_insensitive,
-            ) {
+            let matches = self
+                .suffix_word
+                .ends_under(path, case_insensitive)
+                .unwrap_or_else(|| {
+                    run_matches_tokens(
+                        &tokens[tokens.len() - self.trailing_tokens..],
+                        &path[path.len() - self.suffix_len..],
+                        case_insensitive,
+                    )
+                });
+            if !matches {
+                return true;
+            }
+        }
+        if self.leading_tokens != 0 {
+            let matches = self
+                .prefix_word
+                .starts_under(path, case_insensitive)
+                .unwrap_or_else(|| {
+                    run_matches_tokens(
+                        &tokens[..self.leading_tokens],
+                        &path[..self.prefix_len],
+                        case_insensitive,
+                    )
+                });
+            if !matches {
                 return true;
             }
         }
@@ -2997,11 +3026,325 @@ fn run_matches_tokens(run: &[Token], mut actual: &[u8], case_insensitive: bool) 
     true
 }
 
+/// A literal of one to eight bytes, packed once at compile time so a fast
+/// path compares it against a candidate's first or last eight bytes with one
+/// word load, without reading the literal back from `tokens`.
+///
+/// A literal packed for case-insensitive matching is stored ASCII-lowercased
+/// and compared with `FOLD`, which folds the candidate's word the same way,
+/// byte for byte what [`bytes_equal`] does. It lives inline in the fast path,
+/// so it retains no heap memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PackedLiteral {
+    /// The literal in little-endian byte order: in the low bytes for a
+    /// prefix, right-aligned in the high bytes for a suffix. Unused bytes are
+    /// zero and shifted away.
+    word: u64,
+    /// The literal's length, from one to [`PackedLiteral::BYTES`].
+    len: u8,
+    /// `64 - 8 * len`: how far the word comparison shifts the unused bytes
+    /// out, precomputed so a rejection costs no arithmetic on `len`.
+    unused_bits: u8,
+}
+
+impl PackedLiteral {
+    const BYTES: usize = 8;
+
+    fn prefix(literal: &[u8], fold: bool) -> Option<Self> {
+        Self::pack(literal, 0, fold)
+    }
+
+    fn suffix(literal: &[u8], fold: bool) -> Option<Self> {
+        Self::pack(literal, Self::BYTES.checked_sub(literal.len())?, fold)
+    }
+
+    fn pack(literal: &[u8], offset: usize, fold: bool) -> Option<Self> {
+        if literal.is_empty() || literal.len() > Self::BYTES {
+            return None;
+        }
+        let len = u8::try_from(literal.len()).ok()?;
+        let mut bytes = [0; Self::BYTES];
+        bytes[offset..offset + literal.len()].copy_from_slice(literal);
+        let word = u64::from_le_bytes(bytes);
+        Some(Self {
+            word: if fold { fold_ascii_word(word) } else { word },
+            len,
+            unused_bits: 64 - 8 * len,
+        })
+    }
+
+    #[inline(always)]
+    fn len(self) -> usize {
+        usize::from(self.len)
+    }
+
+    /// Whether `path` starts with the literal, or `None` when `path` is
+    /// shorter than a word.
+    #[inline(always)]
+    fn starts<const FOLD: bool>(self, path: &[u8]) -> Option<bool> {
+        let head = u64::from_le_bytes(*path.first_chunk::<{ Self::BYTES }>()?);
+        // The literal sits in the low bytes; shifting left drops the rest.
+        // `unused_bits` is zero to 56.
+        let differs =
+            |head: u64, ignored: u64| ((head ^ self.word) & !ignored) << self.unused_bits != 0;
+        if FOLD && differs(head, CASE_BITS) {
+            return Some(false);
+        }
+        let head = if FOLD { fold_ascii_word(head) } else { head };
+        Some(!differs(head, 0))
+    }
+
+    /// Whether `path` ends with the literal, or `None` when `path` is
+    /// shorter than a word.
+    #[inline(always)]
+    fn ends<const FOLD: bool>(self, path: &[u8]) -> Option<bool> {
+        let tail = u64::from_le_bytes(*path.last_chunk::<{ Self::BYTES }>()?);
+        // The literal sits in the high bytes; shifting right drops the rest.
+        let differs =
+            |tail: u64, ignored: u64| ((tail ^ self.word) & !ignored) >> self.unused_bits != 0;
+        if FOLD && differs(tail, CASE_BITS) {
+            return Some(false);
+        }
+        let tail = if FOLD { fold_ascii_word(tail) } else { tail };
+        Some(!differs(tail, 0))
+    }
+}
+
+/// The ASCII case bit of every byte. Two bytes that differ anywhere else
+/// cannot fold to the same byte, which rejects most case-insensitive
+/// mismatches before the fold runs.
+const CASE_BITS: u64 = u64::from_ne_bytes([0x20; 8]);
+
+/// ASCII-lowercases every byte of `word` at once, exactly as
+/// [`u8::to_ascii_lowercase`] does each byte: only `A` through `Z` change, and
+/// bytes at or above `0x80` are left alone.
+#[inline(always)]
+const fn fold_ascii_word(word: u64) -> u64 {
+    const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
+    const HIGH: u64 = ONES * 0x80;
+    let low_seven = word & !HIGH;
+    // Each byte's top bit: set when its low seven bits are at least `A`,
+    // and when they are past `Z`. Neither sum carries into the next byte.
+    let from_a = low_seven + ONES * (0x80 - b'A' as u64);
+    let past_z = low_seven + ONES * (0x80 - b'Z' as u64 - 1);
+    let upper = from_a & !past_z & !word & HIGH;
+    word | (upper >> 2)
+}
+
+/// How a [`WordLiteral`] was packed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordKind {
+    /// Packed for case-sensitive matching.
+    Exact,
+    /// Packed ASCII-lowercased for case-insensitive matching.
+    Folded,
+    /// Too long to pack, or empty: the byte comparison answers.
+    Unpacked,
+}
+
+/// A literal packed for one case policy, or not packed at all.
+///
+/// The policy is part of the kind rather than a flag the comparison reads, so
+/// the case-sensitive comparison carries no folding code. A candidate shorter
+/// than a word gets no answer and falls back to the byte comparison. The kind sits in the
+/// packed literal's padding, so the whole value stays two words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WordLiteral {
+    word: u64,
+    len: u8,
+    unused_bits: u8,
+    kind: WordKind,
+}
+
+impl Default for WordLiteral {
+    fn default() -> Self {
+        Self::UNPACKED
+    }
+}
+
+impl WordLiteral {
+    const UNPACKED: Self = Self {
+        word: 0,
+        len: 0,
+        unused_bits: 0,
+        kind: WordKind::Unpacked,
+    };
+
+    fn prefix(literal: &[u8], case_insensitive: bool) -> Self {
+        Self::tag(
+            PackedLiteral::prefix(literal, case_insensitive),
+            case_insensitive,
+        )
+    }
+
+    fn suffix(literal: &[u8], case_insensitive: bool) -> Self {
+        Self::tag(
+            PackedLiteral::suffix(literal, case_insensitive),
+            case_insensitive,
+        )
+    }
+
+    fn tag(packed: Option<PackedLiteral>, case_insensitive: bool) -> Self {
+        match packed {
+            None => Self::UNPACKED,
+            Some(packed) => Self {
+                word: packed.word,
+                len: packed.len,
+                unused_bits: packed.unused_bits,
+                kind: if case_insensitive {
+                    WordKind::Folded
+                } else {
+                    WordKind::Exact
+                },
+            },
+        }
+    }
+
+    /// A pattern is matched under the case policy it was compiled with —
+    /// only [`PatternOptions::case_insensitive`] sets it — so the kind alone
+    /// selects the comparison and the call's flag is only checked here.
+    #[inline(always)]
+    fn debug_assert_policy(self, case_insensitive: bool) {
+        debug_assert_eq!(
+            self.kind == WordKind::Folded,
+            case_insensitive,
+            "a packed literal is compared under the case policy it was packed for"
+        );
+    }
+
+    #[inline(always)]
+    fn packed(self) -> PackedLiteral {
+        PackedLiteral {
+            word: self.word,
+            len: self.len,
+            unused_bits: self.unused_bits,
+        }
+    }
+
+    /// `Some(Some(rest))` with the literal stripped from the front of `path`,
+    /// `Some(None)` when `path` does not start with it, and `None` when the
+    /// byte comparison has to answer.
+    #[inline(always)]
+    fn strip_prefix(self, path: &[u8], case_insensitive: bool) -> Option<Option<&[u8]>> {
+        let packed = self.packed();
+        let matches = match self.kind {
+            WordKind::Exact => packed.starts::<false>(path)?,
+            WordKind::Folded => packed.starts::<true>(path)?,
+            WordKind::Unpacked => return None,
+        };
+        self.debug_assert_policy(case_insensitive);
+        Some(matches.then(|| &path[packed.len()..]))
+    }
+
+    /// Whether `path` starts with the literal, for a caller that may ask
+    /// under either case policy; `None` when the byte comparison has to
+    /// answer, including under a policy the literal was not packed for.
+    #[inline(always)]
+    fn starts_under(self, path: &[u8], case_insensitive: bool) -> Option<bool> {
+        match self.kind {
+            WordKind::Exact if !case_insensitive => self.packed().starts::<false>(path),
+            WordKind::Folded if case_insensitive => self.packed().starts::<true>(path),
+            _ => None,
+        }
+    }
+
+    /// Like [`Self::starts_under`], at the end of `path`.
+    #[inline(always)]
+    fn ends_under(self, path: &[u8], case_insensitive: bool) -> Option<bool> {
+        match self.kind {
+            WordKind::Exact if !case_insensitive => self.packed().ends::<false>(path),
+            WordKind::Folded if case_insensitive => self.packed().ends::<true>(path),
+            _ => None,
+        }
+    }
+
+    /// Like [`Self::strip_prefix`], from the end of `path`.
+    #[inline(always)]
+    fn strip_suffix(self, path: &[u8], case_insensitive: bool) -> Option<Option<&[u8]>> {
+        let packed = self.packed();
+        let matches = match self.kind {
+            WordKind::Exact => packed.ends::<false>(path)?,
+            WordKind::Folded => packed.ends::<true>(path)?,
+            WordKind::Unpacked => return None,
+        };
+        self.debug_assert_policy(case_insensitive);
+        Some(matches.then(|| &path[..path.len() - packed.len()]))
+    }
+}
+
+/// The leading literal of a fast path, read from the first token.
+#[inline]
+fn first_literal(tokens: &[Token]) -> &[u8] {
+    let Some(Token::Literal(literal)) = tokens.first() else {
+        unreachable!("the fast path compiled from a leading literal token");
+    };
+    literal
+}
+
+/// The trailing literal of a fast path, read from the last token.
+#[inline]
+fn last_literal(tokens: &[Token]) -> &[u8] {
+    let Some(Token::Literal(literal)) = tokens.last() else {
+        unreachable!("the fast path compiled from a trailing literal token");
+    };
+    literal
+}
+
+/// The prefix representation selected once while compiling a fast path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiteralPrefix {
+    word: WordLiteral,
+}
+
+impl LiteralPrefix {
+    fn new(prefix: &[u8], case_insensitive: bool) -> Self {
+        Self {
+            word: WordLiteral::prefix(prefix, case_insensitive),
+        }
+    }
+
+    /// Strips the leading literal of `tokens` from `path`.
+    ///
+    /// The word comparison is forced inline so a rejection needs no call;
+    /// only the byte comparison against the token stays out of line.
+    #[inline(always)]
+    fn strip_from<'a>(
+        self,
+        path: &'a [u8],
+        tokens: &[Token],
+        case_insensitive: bool,
+    ) -> Option<&'a [u8]> {
+        if let Some(answer) = self.word.strip_prefix(path, case_insensitive) {
+            return answer;
+        }
+        Self::strip_token_from(path, tokens, case_insensitive)
+    }
+
+    #[inline(never)]
+    fn strip_token_from<'a>(
+        path: &'a [u8],
+        tokens: &[Token],
+        case_insensitive: bool,
+    ) -> Option<&'a [u8]> {
+        strip_literal_prefix(path, first_literal(tokens), case_insensitive)
+    }
+}
+
 /// The suffix representation selected once while compiling a fast path.
+///
+/// An explicit tag keeps the variant a single byte load rather than a niche
+/// decoded from a payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(u8)]
 enum LiteralSuffix {
-    /// Borrows the trailing `Token::Literal` bytes directly from `tokens`.
-    Plain,
+    /// A case-sensitive suffix of up to eight bytes, compared with one word
+    /// load.
+    Exact(PackedLiteral),
+    /// The same for a case-insensitive suffix, folded on both sides.
+    Folded(PackedLiteral),
+    /// Borrows the trailing `Token::Literal` bytes directly from `tokens`
+    /// after its final byte, kept here, has matched.
+    Plain { last: u8 },
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     Packed16(Box<suffix_word::PreparedSuffix16>),
 }
@@ -3009,40 +3352,77 @@ enum LiteralSuffix {
 impl LiteralSuffix {
     fn retained_bytes(&self) -> usize {
         match self {
-            Self::Plain => 0,
+            Self::Exact(_) | Self::Folded(_) | Self::Plain { .. } => 0,
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             Self::Packed16(_) => size_of::<suffix_word::PreparedSuffix16>(),
         }
     }
 
     fn new(suffix: &[u8], case_insensitive: bool) -> Self {
-        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-        let _ = (suffix, case_insensitive);
+        if let Some(packed) = PackedLiteral::suffix(suffix, case_insensitive) {
+            return if case_insensitive {
+                Self::Folded(packed)
+            } else {
+                Self::Exact(packed)
+            };
+        }
 
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         if !case_insensitive && let Some(prepared) = suffix_word::PreparedSuffix16::new(suffix) {
             return Self::Packed16(Box::new(prepared));
         }
 
-        Self::Plain
+        Self::Plain {
+            last: *suffix.last().expect("literal token is non-empty"),
+        }
     }
 
+    /// Strips the trailing literal of `tokens` from `path`. The cheap word
+    /// or final-byte rejection runs before the literal is read from `tokens`,
+    /// and is forced inline so a rejection needs no call; only the byte
+    /// comparison against the token stays out of line.
+    #[inline(always)]
     fn strip_from<'a>(
         &self,
         path: &'a [u8],
-        literal: &[u8],
+        tokens: &[Token],
         case_insensitive: bool,
     ) -> Option<&'a [u8]> {
         match self {
-            Self::Plain => strip_literal_suffix(path, literal, case_insensitive),
+            Self::Exact(packed) => {
+                debug_assert!(!case_insensitive, "packed for case-sensitive matching");
+                if let Some(matches) = packed.ends::<false>(path) {
+                    return matches.then(|| &path[..path.len() - packed.len()]);
+                }
+            }
+            Self::Folded(packed) => {
+                debug_assert!(case_insensitive, "packed for case-insensitive matching");
+                if let Some(matches) = packed.ends::<true>(path) {
+                    return matches.then(|| &path[..path.len() - packed.len()]);
+                }
+            }
+            Self::Plain { last } => {
+                if !bytes_equal(*last, *path.last()?, case_insensitive) {
+                    return None;
+                }
+            }
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             Self::Packed16(suffix) => {
                 if !case_insensitive && let Some(matches) = suffix.matches(path) {
-                    return matches.then_some(&path[..path.len() - suffix.len()]);
+                    return matches.then(|| &path[..path.len() - suffix.len()]);
                 }
-                strip_literal_suffix(path, literal, case_insensitive)
             }
         }
+        Self::strip_token_from(path, tokens, case_insensitive)
+    }
+
+    #[inline(never)]
+    fn strip_token_from<'a>(
+        path: &'a [u8],
+        tokens: &[Token],
+        case_insensitive: bool,
+    ) -> Option<&'a [u8]> {
+        strip_literal_suffix(path, last_literal(tokens), case_insensitive)
     }
 }
 
@@ -3876,26 +4256,44 @@ impl AffixTrie {
 /// compiled variant makes the optimization opt-in by syntax and leaves every
 /// other pattern on the corpus-tested general path.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(u8)]
 enum FastPath {
-    LiteralTokens,
-    DeterministicTokens,
+    /// Every token consumes a fixed number of bytes, so only candidates of
+    /// exactly `len` bytes can match; any other length is rejected before a
+    /// token is read.
+    LiteralTokens {
+        len: usize,
+    },
+    DeterministicTokens {
+        len: usize,
+    },
     Star,
-    PrefixStar,
+    PrefixStar {
+        prefix: LiteralPrefix,
+    },
     StarSuffix {
         suffix: LiteralSuffix,
     },
-    InfixStar,
+    InfixStar {
+        prefix: LiteralPrefix,
+        suffix: LiteralSuffix,
+    },
     StaticStar {
         star_index: usize,
+        /// The static tokens before and after the star packed as bytes, when
+        /// they fit a word and a separator is a single byte.
+        prefix: WordLiteral,
+        suffix: WordLiteral,
     },
-    RecursiveTerminalPrefix,
+    RecursiveTerminalPrefix {
+        prefix: LiteralPrefix,
+    },
     RecursiveSuffix {
         suffix: LiteralSuffix,
-        suffix_last: u8,
     },
     RecursivePrefixSuffix {
+        prefix: LiteralPrefix,
         suffix: LiteralSuffix,
-        suffix_last: u8,
     },
 }
 
@@ -3905,7 +4303,9 @@ impl FastPath {
             .iter()
             .all(|token| matches!(token, Token::Literal(_) | Token::Separator))
         {
-            return Some(Self::LiteralTokens);
+            return Some(Self::LiteralTokens {
+                len: tokens.iter().map(token_min_length).sum(),
+            });
         }
         if tokens.iter().all(|token| {
             matches!(
@@ -3913,23 +4313,30 @@ impl FastPath {
                 Token::Literal(_) | Token::Separator | Token::Any | Token::Class(_)
             )
         }) {
-            return Some(Self::DeterministicTokens);
+            return Some(Self::DeterministicTokens {
+                len: tokens.iter().map(token_min_length).sum(),
+            });
         }
         if options.component_wildcards {
             return None;
         }
         match tokens {
             [Token::Star] => return Some(Self::Star),
-            [Token::Literal(_), Token::Star] => {
-                return Some(Self::PrefixStar);
+            [Token::Literal(prefix), Token::Star] => {
+                return Some(Self::PrefixStar {
+                    prefix: LiteralPrefix::new(prefix, options.case_insensitive),
+                });
             }
             [Token::Star, Token::Literal(suffix)] => {
                 return Some(Self::StarSuffix {
                     suffix: LiteralSuffix::new(suffix, options.case_insensitive),
                 });
             }
-            [Token::Literal(_), Token::Star, Token::Literal(_)] => {
-                return Some(Self::InfixStar);
+            [Token::Literal(prefix), Token::Star, Token::Literal(suffix)] => {
+                return Some(Self::InfixStar {
+                    prefix: LiteralPrefix::new(prefix, options.case_insensitive),
+                    suffix: LiteralSuffix::new(suffix, options.case_insensitive),
+                });
             }
             _ => {}
         }
@@ -3939,19 +4346,37 @@ impl FastPath {
                 index == star_index || matches!(token, Token::Literal(_) | Token::Separator)
             })
         {
-            return Some(Self::StaticStar { star_index });
+            return Some(Self::StaticStar {
+                star_index,
+                prefix: pack_static_tokens(
+                    &tokens[..star_index],
+                    options.case_insensitive,
+                    WordLiteral::prefix,
+                ),
+                suffix: pack_static_tokens(
+                    &tokens[star_index + 1..],
+                    options.case_insensitive,
+                    WordLiteral::suffix,
+                ),
+            });
         }
-        if let [Token::Literal(_), Token::Separator, Token::RecursiveStar] = tokens {
-            return Some(Self::RecursiveTerminalPrefix);
+        if let [
+            Token::Literal(prefix),
+            Token::Separator,
+            Token::RecursiveStar,
+        ] = tokens
+        {
+            return Some(Self::RecursiveTerminalPrefix {
+                prefix: LiteralPrefix::new(prefix, options.case_insensitive),
+            });
         }
         if let [Token::RecursivePrefix, Token::Star, Token::Literal(suffix)] = tokens {
             return Some(Self::RecursiveSuffix {
                 suffix: LiteralSuffix::new(suffix, options.case_insensitive),
-                suffix_last: *suffix.last().expect("literal token is non-empty"),
             });
         }
         let [
-            Token::Literal(_),
+            Token::Literal(prefix),
             Token::Separator,
             Token::RecursivePrefix,
             Token::Star,
@@ -3961,18 +4386,18 @@ impl FastPath {
             return None;
         };
         Some(Self::RecursivePrefixSuffix {
+            prefix: LiteralPrefix::new(prefix, options.case_insensitive),
             suffix: LiteralSuffix::new(suffix, options.case_insensitive),
-            suffix_last: *suffix.last().expect("literal token is non-empty"),
         })
     }
 
     fn supports_component_wildcards(&self) -> bool {
         matches!(
             self,
-            Self::LiteralTokens
-                | Self::DeterministicTokens
+            Self::LiteralTokens { .. }
+                | Self::DeterministicTokens { .. }
                 | Self::StarSuffix { .. }
-                | Self::RecursiveTerminalPrefix
+                | Self::RecursiveTerminalPrefix { .. }
                 | Self::RecursiveSuffix { .. }
                 | Self::RecursivePrefixSuffix { .. }
         )
@@ -3980,322 +4405,377 @@ impl FastPath {
 
     fn retained_bytes(&self) -> usize {
         match self {
-            Self::LiteralTokens
-            | Self::DeterministicTokens
+            Self::LiteralTokens { .. }
+            | Self::DeterministicTokens { .. }
             | Self::Star
-            | Self::PrefixStar
-            | Self::InfixStar
+            | Self::PrefixStar { .. }
             | Self::StaticStar { .. }
-            | Self::RecursiveTerminalPrefix => 0,
+            | Self::RecursiveTerminalPrefix { .. } => 0,
             Self::StarSuffix { suffix }
-            | Self::RecursiveSuffix { suffix, .. }
+            | Self::InfixStar { suffix, .. }
+            | Self::RecursiveSuffix { suffix }
             | Self::RecursivePrefixSuffix { suffix, .. } => suffix.retained_bytes(),
         }
     }
 
+    /// Dispatches to the variant's own matcher. Kept small and inlinable so
+    /// each shape pays only for its own work, not for the register pressure
+    /// of every other shape.
+    #[inline]
     fn is_match(&self, tokens: &[Token], path: &[u8], options: PatternOptions) -> bool {
         match self {
-            Self::LiteralTokens => {
-                let mut path_index = 0;
-                for token in tokens {
-                    match token {
-                        Token::Literal(literal) => {
-                            let Some(candidate) = path.get(path_index..path_index + literal.len())
-                            else {
-                                return false;
-                            };
-                            if !literal.iter().zip(candidate).all(|(&expected, &actual)| {
-                                bytes_equal(expected, actual, options.case_insensitive)
-                            }) {
-                                return false;
-                            }
-                            path_index += literal.len();
-                        }
-                        Token::Separator => {
-                            if !path.get(path_index).is_some_and(|byte| is_separator(*byte)) {
-                                return false;
-                            }
-                            path_index += 1;
-                        }
-                        _ => unreachable!("literal fast path only stores literal tokens"),
-                    }
-                }
-                path_index == path.len()
+            Self::LiteralTokens { len } => {
+                path.len() == *len && Self::literal_tokens(tokens, path, options)
             }
-            Self::DeterministicTokens => {
-                let mut path_index = 0;
-                for (token_index, token) in tokens.iter().enumerate() {
-                    match token {
-                        Token::Literal(literal) => {
-                            let Some(candidate) = path.get(path_index..path_index + literal.len())
-                            else {
-                                return false;
-                            };
-                            if !literal.iter().zip(candidate).all(|(&expected, &actual)| {
-                                bytes_equal(expected, actual, options.case_insensitive)
-                            }) {
-                                return false;
-                            }
-                            path_index += literal.len();
-                        }
-                        Token::Separator => {
-                            if !path.get(path_index).is_some_and(|byte| is_separator(*byte)) {
-                                return false;
-                            }
-                            path_index += 1;
-                        }
-                        Token::Any => {
-                            let Some(&byte) = path.get(path_index) else {
-                                return false;
-                            };
-                            if Pattern::component_wildcard(tokens, token_index, options)
-                                && is_separator(byte)
-                            {
-                                return false;
-                            }
-                            if !options.match_hidden
-                                && byte == b'.'
-                                && at_component_start(path, path_index, options)
-                            {
-                                return false;
-                            }
-                            path_index += 1;
-                        }
-                        Token::Class(class) => {
-                            let Some(&byte) = path.get(path_index) else {
-                                return false;
-                            };
-                            if (Pattern::component_wildcard(tokens, token_index, options)
-                                && is_separator(byte))
-                                || !class.matches(byte, options.case_insensitive)
-                                || (!options.match_hidden
-                                    && byte == b'.'
-                                    && at_component_start(path, path_index, options))
-                            {
-                                return false;
-                            }
-                            path_index += 1;
-                        }
-                        Token::Star | Token::RecursiveStar | Token::RecursivePrefix => {
-                            return false;
-                        }
-                    }
-                }
-                path_index == path.len()
+            Self::DeterministicTokens { len } => {
+                path.len() == *len && Self::deterministic_tokens(tokens, path, options)
             }
-            Self::Star => {
-                options.match_hidden
-                    || !contains_hidden_component_in(
-                        path,
-                        0,
-                        path.len(),
-                        options.candidate_starts_component,
-                    )
+            Self::Star => Self::star(path, options),
+            Self::PrefixStar { prefix } => Self::prefix_star(*prefix, tokens, path, options),
+            Self::StarSuffix { suffix } => Self::star_suffix(suffix, tokens, path, options),
+            Self::InfixStar { prefix, suffix } => {
+                Self::infix_star(*prefix, suffix, tokens, path, options)
             }
-            Self::PrefixStar => {
-                let [Token::Literal(prefix), Token::Star] = tokens else {
-                    unreachable!("PrefixStar fast path only compiles from `[Literal, Star]`");
-                };
-                let Some(variable) = strip_literal_prefix(path, prefix, options.case_insensitive)
-                else {
-                    return false;
-                };
-                options.match_hidden
-                    || !contains_hidden_component_in(
-                        path,
-                        path.len() - variable.len(),
-                        path.len(),
-                        options.candidate_starts_component,
-                    )
-            }
-            Self::StarSuffix { suffix } => {
-                let [Token::Star, Token::Literal(literal)] = tokens else {
-                    unreachable!("StarSuffix fast path only compiles from `[Star, Literal]`");
-                };
-                let Some(variable) = suffix.strip_from(path, literal, options.case_insensitive)
-                else {
-                    return false;
-                };
-                // The leading star is component-local only in a
-                // component-local root position, exactly as
-                // `Pattern::component_wildcard` answers for token zero.
-                if options.component_wildcards
-                    && (options.root_component_wildcards
-                        || options.candidate_root_component_wildcard)
-                    && next_separator(variable).is_some()
-                {
-                    return false;
-                }
-                if star_stops_before_hidden_component(path, variable.len(), options) {
-                    return false;
-                }
-                options.match_hidden
-                    || !contains_hidden_component_in(
-                        path,
-                        0,
-                        variable.len(),
-                        options.candidate_starts_component,
-                    )
-            }
-            Self::InfixStar => {
-                let [Token::Literal(prefix), Token::Star, Token::Literal(suffix)] = tokens else {
-                    unreachable!(
-                        "InfixStar fast path only compiles from `[Literal, Star, Literal]`"
-                    );
-                };
-                let Some(remainder) = strip_literal_prefix(path, prefix, options.case_insensitive)
-                else {
-                    return false;
-                };
-                let Some(variable) =
-                    strip_literal_suffix(remainder, suffix, options.case_insensitive)
-                else {
-                    return false;
-                };
-                let variable_start = path.len() - remainder.len();
-                let variable_end = variable_start + variable.len();
-                if star_stops_before_hidden_component(path, variable_end, options) {
-                    return false;
-                }
-                options.match_hidden
-                    || !contains_hidden_component_in(
-                        path,
-                        variable_start,
-                        variable_end,
-                        options.candidate_starts_component,
-                    )
-            }
-            Self::StaticStar { star_index } => {
-                let prefix = &tokens[..*star_index];
-                let suffix = &tokens[*star_index + 1..];
-                let Some(variable_start) = match_static_prefix(prefix, path, options) else {
-                    return false;
-                };
-                let Some(variable_end) = match_static_suffix(suffix, path, options) else {
-                    return false;
-                };
-                if variable_start > variable_end {
-                    return false;
-                }
-                if star_stops_before_hidden_component(path, variable_end, options) {
-                    return false;
-                }
-                options.match_hidden
-                    || !contains_hidden_component_in(
-                        path,
-                        variable_start,
-                        variable_end,
-                        options.candidate_starts_component,
-                    )
-            }
-            Self::RecursiveTerminalPrefix => {
-                let [
-                    Token::Literal(prefix),
-                    Token::Separator,
-                    Token::RecursiveStar,
-                ] = tokens
-                else {
-                    unreachable!(
-                        "RecursiveTerminalPrefix fast path only compiles from `[Literal, Separator, RecursiveStar]`"
-                    );
-                };
-                let Some(remainder) = strip_literal_prefix(path, prefix, options.case_insensitive)
-                else {
-                    return false;
-                };
-                remainder.is_empty()
-                    || remainder.first().is_some_and(|byte| is_separator(*byte))
-                        && (options.match_hidden
-                            || !contains_hidden_component_in(
-                                path,
-                                path.len() - remainder.len() + 1,
-                                path.len(),
-                                options.candidate_starts_component,
-                            ))
-            }
-            Self::RecursiveSuffix {
+            Self::StaticStar {
+                star_index,
+                prefix,
                 suffix,
-                suffix_last,
-            } => {
-                let [Token::RecursivePrefix, Token::Star, Token::Literal(literal)] = tokens else {
-                    unreachable!(
-                        "RecursiveSuffix fast path only compiles from `[RecursivePrefix, Star, Literal]`"
-                    );
-                };
-                let Some(&path_last) = path.last() else {
-                    return false;
-                };
-                if !bytes_equal(*suffix_last, path_last, options.case_insensitive) {
-                    return false;
-                }
-                let Some(variable) = suffix.strip_from(path, literal, options.case_insensitive)
-                else {
-                    return false;
-                };
-                if star_stops_before_hidden_component(path, variable.len(), options) {
-                    return false;
-                }
-                options.match_hidden
-                    || !contains_hidden_component_in(
-                        path,
-                        0,
-                        variable.len(),
-                        options.candidate_starts_component,
-                    )
+            } => Self::static_star(*star_index, *prefix, *suffix, tokens, path, options),
+            Self::RecursiveTerminalPrefix { prefix } => {
+                Self::recursive_terminal_prefix(*prefix, tokens, path, options)
             }
-            Self::RecursivePrefixSuffix {
-                suffix,
-                suffix_last,
-            } => {
-                let [
-                    Token::Literal(prefix),
-                    Token::Separator,
-                    Token::RecursivePrefix,
-                    Token::Star,
-                    Token::Literal(literal),
-                ] = tokens
-                else {
-                    unreachable!(
-                        "RecursivePrefixSuffix fast path only compiles from `[Literal, Separator, RecursivePrefix, Star, Literal]`"
-                    );
-                };
-                let Some(&path_last) = path.last() else {
-                    return false;
-                };
-                if !bytes_equal(*suffix_last, path_last, options.case_insensitive) {
-                    return false;
-                }
-                let Some(prefix_and_variable) =
-                    suffix.strip_from(path, literal, options.case_insensitive)
-                else {
-                    return false;
-                };
-                let Some(remainder) =
-                    strip_literal_prefix(prefix_and_variable, prefix, options.case_insensitive)
-                else {
-                    return false;
-                };
-                let Some((&separator, variable)) = remainder.split_first() else {
-                    return false;
-                };
-                if !is_separator(separator) {
-                    return false;
-                }
-                let variable_start = prefix.len() + 1;
-                let variable_end = variable_start + variable.len();
-                if star_stops_before_hidden_component(path, variable_end, options) {
-                    return false;
-                }
-                options.match_hidden
-                    || !contains_hidden_component_in(
-                        path,
-                        variable_start,
-                        variable_end,
-                        options.candidate_starts_component,
-                    )
+            Self::RecursiveSuffix { suffix } => {
+                Self::recursive_suffix(suffix, tokens, path, options)
+            }
+            Self::RecursivePrefixSuffix { prefix, suffix } => {
+                Self::recursive_prefix_suffix(*prefix, suffix, tokens, path, options)
             }
         }
     }
+
+    #[inline(always)]
+    fn literal_tokens(tokens: &[Token], path: &[u8], options: PatternOptions) -> bool {
+        let mut path_index = 0;
+        for token in tokens {
+            match token {
+                Token::Literal(literal) => {
+                    let Some(candidate) = path.get(path_index..path_index + literal.len()) else {
+                        return false;
+                    };
+                    if !literal.iter().zip(candidate).all(|(&expected, &actual)| {
+                        bytes_equal(expected, actual, options.case_insensitive)
+                    }) {
+                        return false;
+                    }
+                    path_index += literal.len();
+                }
+                Token::Separator => {
+                    if !path.get(path_index).is_some_and(|byte| is_separator(*byte)) {
+                        return false;
+                    }
+                    path_index += 1;
+                }
+                _ => unreachable!("literal fast path only stores literal tokens"),
+            }
+        }
+        path_index == path.len()
+    }
+
+    #[inline(always)]
+    fn deterministic_tokens(tokens: &[Token], path: &[u8], options: PatternOptions) -> bool {
+        let mut path_index = 0;
+        for (token_index, token) in tokens.iter().enumerate() {
+            match token {
+                Token::Literal(literal) => {
+                    let Some(candidate) = path.get(path_index..path_index + literal.len()) else {
+                        return false;
+                    };
+                    if !literal.iter().zip(candidate).all(|(&expected, &actual)| {
+                        bytes_equal(expected, actual, options.case_insensitive)
+                    }) {
+                        return false;
+                    }
+                    path_index += literal.len();
+                }
+                Token::Separator => {
+                    if !path.get(path_index).is_some_and(|byte| is_separator(*byte)) {
+                        return false;
+                    }
+                    path_index += 1;
+                }
+                Token::Any => {
+                    let Some(&byte) = path.get(path_index) else {
+                        return false;
+                    };
+                    if Pattern::component_wildcard(tokens, token_index, options)
+                        && is_separator(byte)
+                    {
+                        return false;
+                    }
+                    if !options.match_hidden
+                        && byte == b'.'
+                        && at_component_start(path, path_index, options)
+                    {
+                        return false;
+                    }
+                    path_index += 1;
+                }
+                Token::Class(class) => {
+                    let Some(&byte) = path.get(path_index) else {
+                        return false;
+                    };
+                    if (Pattern::component_wildcard(tokens, token_index, options)
+                        && is_separator(byte))
+                        || !class.matches(byte, options.case_insensitive)
+                        || (!options.match_hidden
+                            && byte == b'.'
+                            && at_component_start(path, path_index, options))
+                    {
+                        return false;
+                    }
+                    path_index += 1;
+                }
+                Token::Star | Token::RecursiveStar | Token::RecursivePrefix => {
+                    return false;
+                }
+            }
+        }
+        path_index == path.len()
+    }
+
+    #[inline(always)]
+    fn star(path: &[u8], options: PatternOptions) -> bool {
+        options.match_hidden
+            || !contains_hidden_component_in(
+                path,
+                0,
+                path.len(),
+                options.candidate_starts_component,
+            )
+    }
+
+    #[inline(always)]
+    fn prefix_star(
+        prefix: LiteralPrefix,
+        tokens: &[Token],
+        path: &[u8],
+        options: PatternOptions,
+    ) -> bool {
+        let Some(variable) = prefix.strip_from(path, tokens, options.case_insensitive) else {
+            return false;
+        };
+        options.match_hidden
+            || !contains_hidden_component_in(
+                path,
+                path.len() - variable.len(),
+                path.len(),
+                options.candidate_starts_component,
+            )
+    }
+
+    #[inline(always)]
+    fn star_suffix(
+        suffix: &LiteralSuffix,
+        tokens: &[Token],
+        path: &[u8],
+        options: PatternOptions,
+    ) -> bool {
+        let Some(variable) = suffix.strip_from(path, tokens, options.case_insensitive) else {
+            return false;
+        };
+        // The leading star is component-local only in a
+        // component-local root position, exactly as
+        // `Pattern::component_wildcard` answers for token zero.
+        if options.component_wildcards
+            && (options.root_component_wildcards || options.candidate_root_component_wildcard)
+            && next_separator(variable).is_some()
+        {
+            return false;
+        }
+        if star_stops_before_hidden_component(path, variable.len(), options) {
+            return false;
+        }
+        options.match_hidden
+            || !contains_hidden_component_in(
+                path,
+                0,
+                variable.len(),
+                options.candidate_starts_component,
+            )
+    }
+
+    #[inline(always)]
+    fn infix_star(
+        prefix: LiteralPrefix,
+        suffix: &LiteralSuffix,
+        tokens: &[Token],
+        path: &[u8],
+        options: PatternOptions,
+    ) -> bool {
+        let Some(remainder) = prefix.strip_from(path, tokens, options.case_insensitive) else {
+            return false;
+        };
+        let Some(variable) = suffix.strip_from(remainder, tokens, options.case_insensitive) else {
+            return false;
+        };
+        let variable_start = path.len() - remainder.len();
+        let variable_end = variable_start + variable.len();
+        if star_stops_before_hidden_component(path, variable_end, options) {
+            return false;
+        }
+        options.match_hidden
+            || !contains_hidden_component_in(
+                path,
+                variable_start,
+                variable_end,
+                options.candidate_starts_component,
+            )
+    }
+
+    #[inline(always)]
+    fn static_star(
+        star_index: usize,
+        packed_prefix: WordLiteral,
+        packed_suffix: WordLiteral,
+        tokens: &[Token],
+        path: &[u8],
+        options: PatternOptions,
+    ) -> bool {
+        let variable_start = match packed_prefix.strip_prefix(path, options.case_insensitive) {
+            Some(Some(rest)) => path.len() - rest.len(),
+            Some(None) => return false,
+            None => match match_static_prefix(&tokens[..star_index], path, options) {
+                Some(start) => start,
+                None => return false,
+            },
+        };
+        let variable_end = match packed_suffix.strip_suffix(path, options.case_insensitive) {
+            Some(Some(rest)) => rest.len(),
+            Some(None) => return false,
+            None => match match_static_suffix(&tokens[star_index + 1..], path, options) {
+                Some(end) => end,
+                None => return false,
+            },
+        };
+        if variable_start > variable_end {
+            return false;
+        }
+        if star_stops_before_hidden_component(path, variable_end, options) {
+            return false;
+        }
+        options.match_hidden
+            || !contains_hidden_component_in(
+                path,
+                variable_start,
+                variable_end,
+                options.candidate_starts_component,
+            )
+    }
+
+    #[inline(always)]
+    fn recursive_terminal_prefix(
+        prefix: LiteralPrefix,
+        tokens: &[Token],
+        path: &[u8],
+        options: PatternOptions,
+    ) -> bool {
+        let Some(remainder) = prefix.strip_from(path, tokens, options.case_insensitive) else {
+            return false;
+        };
+        remainder.is_empty()
+            || remainder.first().is_some_and(|byte| is_separator(*byte))
+                && (options.match_hidden
+                    || !contains_hidden_component_in(
+                        path,
+                        path.len() - remainder.len() + 1,
+                        path.len(),
+                        options.candidate_starts_component,
+                    ))
+    }
+
+    #[inline(always)]
+    fn recursive_suffix(
+        suffix: &LiteralSuffix,
+        tokens: &[Token],
+        path: &[u8],
+        options: PatternOptions,
+    ) -> bool {
+        let Some(variable) = suffix.strip_from(path, tokens, options.case_insensitive) else {
+            return false;
+        };
+        if star_stops_before_hidden_component(path, variable.len(), options) {
+            return false;
+        }
+        options.match_hidden
+            || !contains_hidden_component_in(
+                path,
+                0,
+                variable.len(),
+                options.candidate_starts_component,
+            )
+    }
+
+    #[inline(always)]
+    fn recursive_prefix_suffix(
+        prefix: LiteralPrefix,
+        suffix: &LiteralSuffix,
+        tokens: &[Token],
+        path: &[u8],
+        options: PatternOptions,
+    ) -> bool {
+        let Some(prefix_and_variable) = suffix.strip_from(path, tokens, options.case_insensitive)
+        else {
+            return false;
+        };
+        let Some(remainder) =
+            prefix.strip_from(prefix_and_variable, tokens, options.case_insensitive)
+        else {
+            return false;
+        };
+        let Some((&separator, variable)) = remainder.split_first() else {
+            return false;
+        };
+        if !is_separator(separator) {
+            return false;
+        }
+        let variable_start = prefix_and_variable.len() - remainder.len() + 1;
+        let variable_end = variable_start + variable.len();
+        if star_stops_before_hidden_component(path, variable_end, options) {
+            return false;
+        }
+        options.match_hidden
+            || !contains_hidden_component_in(
+                path,
+                variable_start,
+                variable_end,
+                options.candidate_starts_component,
+            )
+    }
+}
+
+/// Packs a run of literal and separator tokens as the bytes they match. It
+/// stays unpacked when the run is empty, longer than a word, or contains a
+/// separator on a platform where a separator is more than one byte value.
+fn pack_static_tokens(
+    tokens: &[Token],
+    case_insensitive: bool,
+    pack: fn(&[u8], bool) -> WordLiteral,
+) -> WordLiteral {
+    let mut bytes = [0; PackedLiteral::BYTES];
+    let mut len = 0;
+    for token in tokens {
+        let piece: &[u8] = match token {
+            Token::Literal(literal) => literal,
+            Token::Separator if !cfg!(windows) => b"/",
+            _ => return WordLiteral::UNPACKED,
+        };
+        let Some(slot) = bytes.get_mut(len..len + piece.len()) else {
+            return WordLiteral::UNPACKED;
+        };
+        slot.copy_from_slice(piece);
+        len += piece.len();
+    }
+    pack(&bytes[..len], case_insensitive)
 }
 
 fn match_static_prefix(tokens: &[Token], path: &[u8], options: PatternOptions) -> Option<usize> {
@@ -10687,8 +11167,6 @@ impl CompiledExtglob {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    use super::LiteralSuffix;
     use super::{
         AlternativeFastPath, ComponentBounds, ExtglobStep, FailedStates, FastPath, IrBudget,
         Pattern, PatternOptions, PositiveExtglobMatcher, PositiveExtglobState, Prefilter,
@@ -10701,6 +11179,7 @@ mod tests {
         scoped_suffix_set_scan_stats, scratch_capacities, sweep_is_deferred,
         unconditional_brace_peak, unconditional_brace_scanned_bytes,
     };
+    use super::{LiteralPrefix, LiteralSuffix, PackedLiteral, WordKind, WordLiteral};
 
     fn compile(pattern: &str) -> Pattern {
         Pattern::compile(pattern, PatternOptions::default()).unwrap()
@@ -10713,21 +11192,159 @@ mod tests {
         assert_send_sync::<PatternOptions>();
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
-    fn apple_silicon_only_packs_short_case_sensitive_suffixes() {
+    fn only_short_literals_are_packed_into_a_word() {
         assert!(matches!(
             LiteralSuffix::new(b".ts", false),
-            LiteralSuffix::Packed16(_)
+            LiteralSuffix::Exact(_)
         ));
         assert!(matches!(
-            LiteralSuffix::new(b".ts", true),
-            LiteralSuffix::Plain
+            LiteralSuffix::new(&[b'x'; 8], false),
+            LiteralSuffix::Exact(_)
+        ));
+        assert!(matches!(
+            LiteralSuffix::new(b".TS", true),
+            LiteralSuffix::Folded(_)
+        ));
+        assert!(matches!(
+            LiteralSuffix::new(&[b'x'; 9], true),
+            LiteralSuffix::Plain { last: b'x' }
         ));
         assert!(matches!(
             LiteralSuffix::new(&[b'x'; 17], false),
-            LiteralSuffix::Plain
+            LiteralSuffix::Plain { last: b'x' }
         ));
+        assert_eq!(LiteralPrefix::new(b"src", false).word.kind, WordKind::Exact);
+        assert_eq!(LiteralPrefix::new(b"Src", true).word.kind, WordKind::Folded);
+        assert_eq!(
+            LiteralPrefix::new(&[b'x'; 9], false).word.kind,
+            WordKind::Unpacked
+        );
+        assert_eq!(size_of::<WordLiteral>(), 16);
+    }
+
+    #[test]
+    fn word_folding_lowercases_like_each_byte() {
+        for byte in 0..=u8::MAX {
+            for position in 0..PackedLiteral::BYTES {
+                let mut bytes = [b'Q'; PackedLiteral::BYTES];
+                bytes[position] = byte;
+                let expected = bytes.map(|byte| byte.to_ascii_lowercase());
+                assert_eq!(
+                    super::fold_ascii_word(u64::from_le_bytes(bytes)).to_le_bytes(),
+                    expected,
+                    "byte {byte:#04x} at {position}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn packed_literals_strip_in_their_own_case_policy() {
+        let sensitive = WordLiteral::suffix(b".rs", false);
+        let folded = WordLiteral::suffix(b".RS", true);
+        let stripped: Option<Option<&[u8]>> = Some(Some(b"src/main"));
+        assert_eq!(sensitive.strip_suffix(b"src/main.rs", false), stripped);
+        assert_eq!(sensitive.strip_suffix(b"src/main.RS", false), Some(None));
+        assert_eq!(folded.strip_suffix(b"src/main.rs", true), stripped);
+        assert_eq!(
+            folded.strip_suffix(b"src/MAIN.Rs", true),
+            Some(Some(&b"src/MAIN"[..]))
+        );
+        assert_eq!(folded.strip_suffix(b"src/main.r\xd3", true), Some(None));
+        assert_eq!(sensitive.strip_suffix(b"main.rs", false), None);
+        let prefix = WordLiteral::prefix(b"SRC/", true);
+        assert_eq!(
+            prefix.strip_prefix(b"src/main.rs", true),
+            Some(Some(&b"main.rs"[..]))
+        );
+        assert_eq!(prefix.strip_prefix(b"lib/main.rs", true), Some(None));
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn apple_silicon_packs_suffixes_longer_than_a_word_into_two() {
+        assert!(matches!(
+            LiteralSuffix::new(&[b'x'; 9], false),
+            LiteralSuffix::Packed16(_)
+        ));
+        assert!(matches!(
+            LiteralSuffix::new(&[b'x'; 16], false),
+            LiteralSuffix::Packed16(_)
+        ));
+    }
+
+    #[test]
+    fn folded_packed_literals_match_byte_folding() {
+        // Letters, the bytes beside `A`, `Z`, `a` and `z`, and a byte with
+        // the case bit set that is no letter.
+        for literal in [&b"Src/"[..], b".Rs", b"@AZ[`az{", b"x"] {
+            let fold = |literal: &[u8]| literal.to_ascii_lowercase();
+            let prefix = PackedLiteral::prefix(&fold(literal), true).expect("short literal packs");
+            let suffix = PackedLiteral::suffix(&fold(literal), true).expect("short literal packs");
+            for position in 0..literal.len() {
+                for byte in 0..=u8::MAX {
+                    let mut candidate = literal.to_vec();
+                    candidate[position] = byte;
+                    let mut leading = candidate.clone();
+                    leading.extend_from_slice(b"/padding");
+                    let mut trailing = b"padding/".to_vec();
+                    trailing.extend_from_slice(&candidate);
+                    assert_eq!(
+                        prefix.starts::<true>(&leading),
+                        Some(super::strip_literal_prefix(&leading, literal, true).is_some()),
+                        "prefix {literal:?}, byte {byte:#04x} at {position}"
+                    );
+                    assert_eq!(
+                        suffix.ends::<true>(&trailing),
+                        Some(super::strip_literal_suffix(&trailing, literal, true).is_some()),
+                        "suffix {literal:?}, byte {byte:#04x} at {position}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_literals_match_slice_semantics() {
+        for len in 1..=PackedLiteral::BYTES {
+            let literal = (0..len).map(|index| b'a' + index as u8).collect::<Vec<_>>();
+            let prefix = PackedLiteral::prefix(&literal, false).expect("short literal packs");
+            let suffix = PackedLiteral::suffix(&literal, false).expect("short literal packs");
+            assert_eq!(prefix.len(), len);
+            assert_eq!(suffix.len(), len);
+            for pad in 0..=PackedLiteral::BYTES * 2 {
+                let mut leading = literal.clone();
+                leading.extend(std::iter::repeat_n(b'z', pad));
+                let mut trailing = vec![b'z'; pad];
+                trailing.extend_from_slice(&literal);
+                let long_enough = |path: &[u8]| path.len() >= PackedLiteral::BYTES;
+                assert_eq!(
+                    prefix.starts::<false>(&leading),
+                    long_enough(&leading).then_some(true),
+                    "prefix length {len}, padding {pad}"
+                );
+                assert_eq!(
+                    suffix.ends::<false>(&trailing),
+                    long_enough(&trailing).then_some(true),
+                    "suffix length {len}, padding {pad}"
+                );
+                for index in 0..len {
+                    leading[index] ^= 1;
+                    trailing[pad + index] ^= 1;
+                    assert_eq!(
+                        prefix.starts::<false>(&leading),
+                        long_enough(&leading).then_some(false)
+                    );
+                    assert_eq!(
+                        suffix.ends::<false>(&trailing),
+                        long_enough(&trailing).then_some(false)
+                    );
+                    leading[index] ^= 1;
+                    trailing[pad + index] ^= 1;
+                }
+            }
+        }
     }
 
     #[test]
@@ -13292,7 +13909,7 @@ mod tests {
         let fast = Pattern::compile("Src/**", options).expect("pattern compiles");
         assert!(matches!(
             fast.alternatives[0].fast_path,
-            Some(FastPath::RecursiveTerminalPrefix)
+            Some(FastPath::RecursiveTerminalPrefix { .. })
         ));
         let mut general = fast.clone();
         general.alternatives[0].fast_path = None;
@@ -13326,7 +13943,7 @@ mod tests {
         let fast = Pattern::compile("Src/Readme", options).expect("pattern compiles");
         assert!(matches!(
             fast.alternatives[0].fast_path,
-            Some(FastPath::LiteralTokens)
+            Some(FastPath::LiteralTokens { .. })
         ));
         let mut general = fast.clone();
         general.alternatives[0].fast_path = None;
@@ -13352,7 +13969,7 @@ mod tests {
         let fast = Pattern::compile("src/[ab]?.[Rr][Ss]", options).expect("pattern compiles");
         assert!(matches!(
             fast.alternatives[0].fast_path,
-            Some(FastPath::DeterministicTokens)
+            Some(FastPath::DeterministicTokens { .. })
         ));
         let mut general = fast.clone();
         general.alternatives[0].fast_path = None;
@@ -13384,7 +14001,7 @@ mod tests {
         let fast = Pattern::compile("Src*.rs", options).expect("pattern compiles");
         assert!(matches!(
             fast.alternatives[0].fast_path,
-            Some(FastPath::InfixStar)
+            Some(FastPath::InfixStar { .. })
         ));
         let mut general = fast.clone();
         general.alternatives[0].fast_path = None;
@@ -14040,7 +14657,7 @@ mod tests {
         assert!(fast.path_filter.as_ref().is_some_and(|filter| {
             matches!(
                 filter.compiled[0].fast_path,
-                Some(FastPath::DeterministicTokens)
+                Some(FastPath::DeterministicTokens { .. })
             )
         }));
         let mut general = fast.clone();
@@ -17204,7 +17821,7 @@ mod tests {
             .expect("zero-copy DeterministicTokens brace pattern compiles within 40 MiB");
         assert!(matches!(
             det_compiled.alternatives[0].fast_path,
-            Some(FastPath::DeterministicTokens)
+            Some(FastPath::DeterministicTokens { .. })
         ));
         let det_accept = format!("{}{}x", "b".repeat(12), "abc".repeat(80));
         assert!(det_compiled.is_match(&det_accept));
@@ -17399,7 +18016,7 @@ mod tests {
                         if source == "dir/**" {
                             assert!(matches!(
                                 pattern.alternatives[0].fast_path,
-                                Some(FastPath::RecursiveTerminalPrefix)
+                                Some(FastPath::RecursiveTerminalPrefix { .. })
                             ));
                             assert!(
                                 pattern.alternatives[0]
@@ -17416,7 +18033,7 @@ mod tests {
                                 .expect("./dir/** builds a stripped path_filter copy");
                             assert!(matches!(
                                 filter.compiled[0].fast_path,
-                                Some(FastPath::RecursiveTerminalPrefix)
+                                Some(FastPath::RecursiveTerminalPrefix { .. })
                             ));
                             assert!(filter.compiled[0].sweep.is_none());
                         }
@@ -17450,7 +18067,7 @@ mod tests {
         assert_eq!(compiled_literal.alternatives.len(), 2_048);
         assert!(matches!(
             compiled_literal.alternatives[0].fast_path,
-            Some(FastPath::LiteralTokens)
+            Some(FastPath::LiteralTokens { .. })
         ));
         let hit = format!("{}{}", "b".repeat(11), "z".repeat(6_000));
         let miss = format!("{}{}y", "b".repeat(11), "z".repeat(5_999));
@@ -17474,7 +18091,7 @@ mod tests {
         assert_eq!(compiled_det.alternatives.len(), 2_048);
         assert!(matches!(
             compiled_det.alternatives[0].fast_path,
-            Some(FastPath::DeterministicTokens)
+            Some(FastPath::DeterministicTokens { .. })
         ));
         for alternative in &compiled_det.alternatives {
             for token in &alternative.tokens {

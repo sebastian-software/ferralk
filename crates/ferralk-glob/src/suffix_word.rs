@@ -48,11 +48,13 @@ impl PreparedSuffix16 {
         bytes
     }
 
+    #[inline(always)]
     pub(crate) fn len(&self) -> usize {
         self.len.into()
     }
 
     /// Returns `None` when `path` is too short for a complete word load.
+    #[inline(always)]
     pub(crate) fn matches(&self, path: &[u8]) -> Option<bool> {
         let candidate = path.get(path.len().checked_sub(WORD_BYTES)?..)?;
         let low = u64::from_ne_bytes(candidate[..8].try_into().expect("eight-byte half"));
