@@ -9348,7 +9348,7 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
                 let use_retries = program.has_retryable_star_segment
                     && (!options.match_hidden || options.component_wildcards);
                 visited.clear();
-                failed.clear();
+                reset_extglob_failed_rows(failed);
                 pending.clear();
                 if use_retries {
                     handoff_pending.clear();
@@ -9399,7 +9399,7 @@ fn match_extglob_program(program: &CompiledExtglob, path: &[u8], options: Patter
             if scratch.visited.capacity() > RETAINED_SCRATCH_WORDS {
                 scratch.visited.shrink_to(RETAINED_SCRATCH_WORDS);
             }
-            scratch.failed.clear();
+            reset_extglob_failed_rows(&mut scratch.failed);
             let retained_rows = RETAINED_SCRATCH_WORDS * std::mem::size_of::<u64>()
                 / std::mem::size_of::<ExtglobFailedRow>();
             if scratch.failed.capacity() > retained_rows {
@@ -9539,7 +9539,12 @@ fn extglob_scratch_capacities() -> (usize, usize, usize, usize, usize, usize, us
         (
             scratch.visited.capacity(),
             scratch.failed.capacity() * std::mem::size_of::<ExtglobFailedRow>()
-                / std::mem::size_of::<u64>(),
+                / std::mem::size_of::<u64>()
+                + scratch
+                    .failed
+                    .iter()
+                    .map(|row| row.first.capacity())
+                    .sum::<usize>(),
             scratch.pending.capacity(),
             scratch.ends.capacity(),
             scratch.candidate_ends.capacity(),
@@ -9555,7 +9560,13 @@ fn extglob_scratch_capacities() -> (usize, usize, usize, usize, usize, usize, us
 
 #[cfg(test)]
 fn extglob_failed_len() -> usize {
-    EXTGLOB_SCRATCH.with(|cell| cell.borrow().failed.len())
+    EXTGLOB_SCRATCH.with(|cell| {
+        cell.borrow()
+            .failed
+            .iter()
+            .filter(|row| !row.first.is_empty() || !row.pages.is_empty())
+            .count()
+    })
 }
 
 #[cfg(test)]
@@ -9579,7 +9590,44 @@ fn extglob_group_expansions() -> usize {
 /// Failure memoization for a single dense interpreter row.
 #[derive(Default)]
 struct ExtglobFailedRow {
+    /// The first page, which is the only one a path shorter than 4,096 bytes
+    /// reaches. It grows only to the words a match touches and is kept
+    /// between matches, zeroed rather than freed, so a warm match allocates
+    /// nothing here.
+    first: Vec<u64>,
+    /// The pages past the first, for longer candidates.
     pages: BTreeMap<usize, Box<[u64; EXTGLOB_MEMO_PAGE_WORDS]>>,
+}
+
+impl ExtglobFailedRow {
+    /// Forgets every failed state and keeps the first page's capacity.
+    fn clear(&mut self) {
+        self.first.clear();
+        if !self.pages.is_empty() {
+            self.pages.clear();
+        }
+    }
+
+    /// The words this row keeps between matches, header included.
+    fn retained_words(&self) -> usize {
+        size_of::<Self>().div_ceil(size_of::<u64>()) + self.first.capacity()
+    }
+}
+
+/// Zeroes the rows of `failed` and keeps as many of them as fit in
+/// [`RETAINED_SCRATCH_WORDS`], so the next match reuses their first pages.
+fn reset_extglob_failed_rows(failed: &mut Vec<ExtglobFailedRow>) {
+    let mut retained_words = 0_usize;
+    let mut kept = 0;
+    for row in failed.iter_mut() {
+        row.clear();
+        retained_words = retained_words.saturating_add(row.retained_words());
+        if retained_words > RETAINED_SCRATCH_WORDS {
+            break;
+        }
+        kept += 1;
+    }
+    failed.truncate(kept);
 }
 
 /// A page holds 4,096 candidate offsets. This keeps a sparse failed-state
@@ -9626,6 +9674,27 @@ impl<'scratch> ExtglobFailedStates<'scratch> {
         let candidate_page = path_index / EXTGLOB_MEMO_PAGE_BITS;
         let page_bit = path_index % EXTGLOB_MEMO_PAGE_BITS;
         let row = &mut self.rows[state_index];
+        if candidate_page == 0 {
+            let index = page_bit / u64::BITS as usize;
+            if row.first.len() <= index {
+                #[cfg(test)]
+                if row.first.is_empty() {
+                    *self.page_count += 1;
+                }
+                row.first.resize(index + 1, 0);
+            }
+            let word = &mut row.first[index];
+            let mask = 1_u64 << (page_bit % u64::BITS as usize);
+            if *word & mask != 0 {
+                return false;
+            }
+            *word |= mask;
+            #[cfg(test)]
+            {
+                *self.state_count += 1;
+            }
+            return true;
+        }
         let words = match row.pages.entry(candidate_page) {
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::btree_map::Entry::Vacant(entry) => {
