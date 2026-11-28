@@ -1698,10 +1698,17 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let set = patterns.iter().cloned().collect::<PatternSet>();
-        // `**/*q*` has only a one-byte literal, too unselective to index.
-        assert_eq!(set.exact.contains.needles.len(), 6);
+        // `**/*q*` has only a one-byte literal, too unselective to index. On
+        // Windows a separator also matches `\`, so `a/b` is two one-byte
+        // literals there and joins it.
+        let (exact_needles, always) = if cfg!(windows) {
+            (5, &[3, 5][..])
+        } else {
+            (6, &[5][..])
+        };
+        assert_eq!(set.exact.contains.needles.len(), exact_needles);
         assert_eq!(set.folded.contains.needles.len(), 1);
-        assert_eq!(set.always, [5]);
+        assert_eq!(set.always, always);
         for path in [
             "src/test.rs",
             "src/unit_test/main.rs",
