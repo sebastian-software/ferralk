@@ -1,5 +1,37 @@
 # Changelog
 
+## [1.3.0](https://github.com/sebastian-software/ferralk/compare/v1.2.1...v1.3.0) (2026-11-28)
+
+
+### Features
+
+* **msrv:** bump MSRV to 1.98 per ADR-0004 ([#511](https://github.com/sebastian-software/ferralk/issues/511)) ([35e9a24](https://github.com/sebastian-software/ferralk/commit/35e9a247ccdebcdd58c2d8f07fb49ce0d1015bb9)), closes [#500](https://github.com/sebastian-software/ferralk/issues/500)
+* **walker:** keep traversal on each root filesystem ([#477](https://github.com/sebastian-software/ferralk/issues/477)) ([c257330](https://github.com/sebastian-software/ferralk/commit/c257330892229ef8578d744ebd531e628691e6a1))
+
+
+### Bug Fixes
+
+* **glob:** bound extglob group memoization and unclosed delimiter scans ([#508](https://github.com/sebastian-software/ferralk/issues/508)) ([6bbe00e](https://github.com/sebastian-software/ferralk/commit/6bbe00eac30cc3ef108765837b6a9258d3083b03)), closes [#486](https://github.com/sebastian-software/ferralk/issues/486)
+* **glob:** fix ScopedSuffixSet splits, extglob dotfile backtrack, and Windows separators ([#519](https://github.com/sebastian-software/ferralk/issues/519)) ([3152363](https://github.com/sebastian-software/ferralk/commit/315236332dfc2899bbe694e426e4111e3464dde4))
+* **glob:** handle repeated extglob globstars, escaped separators, and bracket-class scan ([#520](https://github.com/sebastian-software/ferralk/issues/520)) ([767cf69](https://github.com/sebastian-software/ferralk/commit/767cf69fbbb088713919fbc5b00e738df9263dc3))
+* **ignore:** close Git parity gaps in bracket classes, POSIX classes, and git config ([#517](https://github.com/sebastian-software/ferralk/issues/517)) ([186285b](https://github.com/sebastian-software/ferralk/commit/186285bc5a70090364d8557971b5f982789feff5))
+* **walker:** align stop, abort, cancel, and error delivery across frontends ([#506](https://github.com/sebastian-software/ferralk/issues/506)) ([eb70d98](https://github.com/sebastian-software/ferralk/commit/eb70d9864004f1b32c1c42ec62ad993d51b1ebfd)), closes [#489](https://github.com/sebastian-software/ferralk/issues/489)
+* **walker:** bound ignore-rule components and stream git config lines ([#514](https://github.com/sebastian-software/ferralk/issues/514)) ([2880de3](https://github.com/sebastian-software/ferralk/commit/2880de3c41c5f3c5589fb4e263f8b57cf745ab51)), closes [#487](https://github.com/sebastian-software/ferralk/issues/487)
+* **walker:** eliminate quadratic POSIX-class scan in ignore rule parsing ([#503](https://github.com/sebastian-software/ferralk/issues/503)) ([6d7dcb6](https://github.com/sebastian-software/ferralk/commit/6d7dcb64138f2b88dc2d0f48f1e91d6239b15b4d)), closes [#484](https://github.com/sebastian-software/ferralk/issues/484)
+* **walker:** guard ignore and git metadata reads against FIFOs and non-regular files ([#509](https://github.com/sebastian-software/ferralk/issues/509)) ([f60e6e9](https://github.com/sebastian-software/ferralk/commit/f60e6e9429b0e3420fc38fc179b98e6353d2f6e9)), closes [#485](https://github.com/sebastian-software/ferralk/issues/485)
+* **walker:** handle escaped brackets and root-spelling slashes in ignore rules ([#510](https://github.com/sebastian-software/ferralk/issues/510)) ([07e93cb](https://github.com/sebastian-software/ferralk/commit/07e93cb0f98dbf3b4dc875494f7ba00cbe8bfa8f)), closes [#488](https://github.com/sebastian-software/ferralk/issues/488)
+* **walker:** make AncestorLink and IgnoreNode drop and verdict iterative ([#504](https://github.com/sebastian-software/ferralk/issues/504)) ([4f13c71](https://github.com/sebastian-software/ferralk/commit/4f13c71d95c1e7f86793287c68b5e054da25ad57)), closes [#490](https://github.com/sebastian-software/ferralk/issues/490)
+* **walker:** skip pre-include symlink stat and pre-cancelled root I/O ([#507](https://github.com/sebastian-software/ferralk/issues/507)) ([0444187](https://github.com/sebastian-software/ferralk/commit/044418784fdfe7ddc6221418d5e00314d681a379)), closes [#496](https://github.com/sebastian-software/ferralk/issues/496)
+
+
+### Performance Improvements
+
+* **gitignore:** optimize case-insensitive gates, basename matching, precompose hoisting, and enter scan ([#518](https://github.com/sebastian-software/ferralk/issues/518)) ([335455f](https://github.com/sebastian-software/ferralk/commit/335455fa596ae57c9098cfd72d9f47d88167e83a))
+* **glob:** pack short affixes into words and index interior literals ([#525](https://github.com/sebastian-software/ferralk/issues/525)) ([e1e99f3](https://github.com/sebastian-software/ferralk/commit/e1e99f3d1e86130a8ac26667987baafe1a2da2b4))
+* **glob:** reuse the first failed-state page between extglob matches ([#526](https://github.com/sebastian-software/ferralk/issues/526)) ([79414e1](https://github.com/sebastian-software/ferralk/commit/79414e14cac11485a5566917663bb785202d7121))
+* **glob:** seed PatternSet hashing, optimize affix/dedup scaling, and deduplicate literal retention ([#521](https://github.com/sebastian-software/ferralk/issues/521)) ([cdbc8b6](https://github.com/sebastian-software/ferralk/commit/cdbc8b6b37fb8bf7a2db761d35495971112ea03f))
+* **walker:** optimize scheduler contention, multi-root widening, stat fusion, and scratch retention ([#515](https://github.com/sebastian-software/ferralk/issues/515)) ([5e02b00](https://github.com/sebastian-software/ferralk/commit/5e02b0083e75311301fb64e68b464298e35d3f6d))
+
 ## [1.2.1](https://github.com/sebastian-software/ferralk/compare/v1.2.0...v1.2.1) (2026-11-10)
 
 

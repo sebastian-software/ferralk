@@ -1,7 +1,7 @@
 [package]
 name = "oracle"
 description = "Development-only zlob corpus regeneration adapter."
-version = "1.2.1"
+version = "1.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
